@@ -222,6 +222,9 @@ __marimo__/
 # 运行时数据（数据库、记忆库等），含用户的 openid 与聊天内容，永不提交
 /data/
 
+# 本地配置：从 config.example.toml 复制后修改
+/config.toml
+
 # Claude Code：子代理的 worktree 与本机设置
 .claude/worktrees/
 .claude/settings.local.json
