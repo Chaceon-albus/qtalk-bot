@@ -4,7 +4,7 @@ TOML 按表校验：每个表由一个 `_parse_*` 函数经 `_Table` 读取，�
 最后一次报出。问题只写键名和原因，不回显取值。
 
 以后加一个表（如 `[decisions]`）时，给 `_Table` 补上需要的读取方法，写一个 `_parse_decisions(table)`，
-再在 `_parse_root()` 里读出它即可。
+再在 `_parse_root()` 里经 `table.table("decisions")` 读出它即可，`[invites]` 是现成的例子。
 """
 
 import os
@@ -12,12 +12,17 @@ import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 CONFIG_ENV = "QTALK_CONFIG"
 DEFAULT_CONFIG_PATH = "config.toml"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_DATA_DIR = "data"
+DEFAULT_INVITE_TTL_HOURS = 7 * 24
+DEFAULT_INVITE_MAX_USES = 1
+MAX_INVITE_TTL_HOURS = 10 * 365 * 24  # 再大就可能超出 datetime 能表示的范围
+MAX_INVITE_MAX_USES = 10000  # 邀请是给认识的人的；也免得超出 SQLite 的 64 位整数
 
 _REQUIRED_SECRETS = ("APP_ID", "APP_SECRET", "ADMIN_OPENID")
 _OPTIONAL_SECRETS = ("OPENAI_API_KEY", "GEMINI_API_KEY")
@@ -56,11 +61,20 @@ class Secrets:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class InviteSettings:
+    """`[invites]` 表：新建邀请的默认有效期与可用次数。"""
+
+    ttl_hours: int = DEFAULT_INVITE_TTL_HOURS
+    max_uses: int = DEFAULT_INVITE_MAX_USES
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Settings:
     """来自 TOML 配置文件的静态设置。"""
 
     timezone: ZoneInfo
     data_dir: Path  # 绝对路径
+    invites: InviteSettings = InviteSettings()
 
 
 def load_secrets(environ: Mapping[str, str] | None = None) -> Secrets:
@@ -159,6 +173,26 @@ class _Table:
             return None
         return value
 
+    def integer(self, key: str, default: int) -> int | None:
+        self._read.add(key)
+        if key not in self._data:
+            return default
+        value = self._data[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            self.problem(key, f"应为整数，实际是{_type_name(value)}")
+            return None
+        return value
+
+    def table(self, key: str) -> _Table | None:
+        """读取子表；缺省时当作空表，类型不符时记下问题并返回 `None`。"""
+        self._read.add(key)
+        value = self._data.get(key, {})
+        if not isinstance(value, dict):
+            self.problem(key, f"应为表，实际是{_type_name(value)}")
+            return None
+        full = f"{self._name}.{key}" if self._name else key
+        return _Table(cast(dict[str, object], value), full, self._problems)
+
     def finish(self) -> None:
         for key in self._data:
             if key in self._read:
@@ -174,10 +208,34 @@ class _Table:
 def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
     timezone = _parse_timezone(table)
     data_dir = _parse_data_dir(table, base_dir)
+    invites_table = table.table("invites")
+    invites = None if invites_table is None else _parse_invites(invites_table)
     table.finish()
-    if timezone is None or data_dir is None:
+    if timezone is None or data_dir is None or invites is None:
         return None
-    return Settings(timezone=timezone, data_dir=data_dir)
+    return Settings(timezone=timezone, data_dir=data_dir, invites=invites)
+
+
+def _parse_invites(table: _Table) -> InviteSettings | None:
+    ttl_hours = _positive_int(table, "ttl_hours", DEFAULT_INVITE_TTL_HOURS, MAX_INVITE_TTL_HOURS)
+    max_uses = _positive_int(table, "max_uses", DEFAULT_INVITE_MAX_USES, MAX_INVITE_MAX_USES)
+    table.finish()
+    if ttl_hours is None or max_uses is None:
+        return None
+    return InviteSettings(ttl_hours=ttl_hours, max_uses=max_uses)
+
+
+def _positive_int(table: _Table, key: str, default: int, maximum: int) -> int | None:
+    value = table.integer(key, default)
+    if value is None:
+        return None
+    if value < 1:
+        table.problem(key, "应为正整数")
+        return None
+    if value > maximum:
+        table.problem(key, f"不能大于 {maximum}")
+        return None
+    return value
 
 
 def _parse_timezone(table: _Table) -> ZoneInfo | None:
@@ -198,6 +256,9 @@ def _parse_data_dir(table: _Table, base_dir: Path) -> Path | None:
         return None
     if not value.strip():
         table.problem("data_dir", "不能为空")
+        return None
+    if "\0" in value:
+        table.problem("data_dir", "不能包含 NUL 字符")
         return None
     return base_dir / value  # 绝对路径与 base_dir 拼接后仍是它自己
 

@@ -5,6 +5,7 @@ import pytest
 
 from qtalk_bot.config import (
     ConfigError,
+    InviteSettings,
     Secrets,
     config_path,
     load_secrets,
@@ -225,3 +226,70 @@ def test_all_problems_are_reported_at_once(tmp_path: Path) -> None:
     assert str(path) in message
     for problem in error.problems:
         assert problem in message
+
+
+# ---- [invites] ----
+
+
+def test_invites_default_to_one_use_for_seven_days(tmp_path: Path) -> None:
+    settings = load_settings(write_config(tmp_path, ""))
+    assert settings.invites == InviteSettings(ttl_hours=168, max_uses=1)
+
+
+def test_invites_values_are_read(tmp_path: Path) -> None:
+    path = write_config(tmp_path, "[invites]\nttl_hours = 24\nmax_uses = 3\n")
+    assert load_settings(path).invites == InviteSettings(ttl_hours=24, max_uses=3)
+
+
+def test_invites_table_may_set_only_some_keys(tmp_path: Path) -> None:
+    path = write_config(tmp_path, "[invites]\nmax_uses = 5\n")
+    assert load_settings(path).invites == InviteSettings(ttl_hours=168, max_uses=5)
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ("[invites]\nttl_hours = 0\n", "invites.ttl_hours：应为正整数"),
+        ("[invites]\nmax_uses = -1\n", "invites.max_uses：应为正整数"),
+        ("[invites]\nttl_hours = 87601\n", "invites.ttl_hours：不能大于 87600"),
+        ("[invites]\nmax_uses = 10001\n", "invites.max_uses：不能大于 10000"),
+        ("[invites]\nmax_uses = 9223372036854775808\n", "invites.max_uses：不能大于 10000"),
+        ('[invites]\nttl_hours = "24"\n', "invites.ttl_hours：应为整数，实际是字符串"),
+        ("[invites]\nmax_uses = true\n", "invites.max_uses：应为整数，实际是布尔值"),
+        ("[invites]\nmax_uses = 1.0\n", "invites.max_uses：应为整数，实际是浮点数"),
+        ("[invites]\nttl = 24\n", "invites.ttl：未知的键"),
+        ('invites = "x"\n', "invites：应为表，实际是字符串"),
+    ],
+)
+def test_invalid_invites(tmp_path: Path, text: str, problem: str) -> None:
+    assert config_error(write_config(tmp_path, text)).problems == (problem,)
+
+
+def test_invites_problems_are_reported_with_others(tmp_path: Path) -> None:
+    text = 'timezone = 1\n[invites]\nttl_hours = 0\nmax_uses = "x"\n'
+    error = config_error(write_config(tmp_path, text))
+    assert error.problems == (
+        "timezone：应为字符串，实际是整数",
+        "invites.ttl_hours：应为正整数",
+        "invites.max_uses：应为整数，实际是字符串",
+    )
+
+
+def test_secret_in_invites_table_is_rejected(tmp_path: Path) -> None:
+    value = FAKE_SECRETS["ADMIN_OPENID"]
+    error = config_error(write_config(tmp_path, f'[invites]\nadmin_openid = "{value}"\n'))
+    assert error.problems == (
+        "invites.admin_openid：未知的键；密钥只能由环境变量 ADMIN_OPENID 提供，不要写进配置文件",
+    )
+    assert value not in str(error)
+
+
+def test_invites_max_uses_at_the_limit_is_accepted(tmp_path: Path) -> None:
+    path = write_config(tmp_path, "[invites]\nmax_uses = 10000\n")
+    assert load_settings(path).invites.max_uses == 10000
+
+
+def test_data_dir_with_nul_is_rejected_without_echoing(tmp_path: Path) -> None:
+    error = config_error(write_config(tmp_path, 'data_dir = "secret-dir\\u0000x"\n'))
+    assert error.problems == ("data_dir：不能包含 NUL 字符",)
+    assert "secret-dir" not in str(error)

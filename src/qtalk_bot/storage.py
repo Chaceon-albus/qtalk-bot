@@ -29,10 +29,62 @@ FILE_MODE = 0o600
 
 type Params = Sequence[object] | Mapping[str, object]
 type Migration = str | Callable[[sqlite3.Connection], None]
-"""一个迁移：SQL 脚本，或在事务里拿到连接执行的同步函数。都不得自行提交或回滚。"""
+"""一个迁移：SQL 脚本，或在事务里拿到连接执行的同步函数。都不得自行提交或回滚：执行期间装着授权
+回调，事务控制语句在编译时就被拒绝，整个迁移回滚。"""
 
-MIGRATIONS: tuple[Migration, ...] = ()
-"""本程序的迁移列表。业务表由以后的里程碑各自追加。"""
+_V1_ACCESS = """
+-- 邀请：code 是 secrets.token_hex(16)；revoked_at 非空即已撤销。
+CREATE TABLE invites (
+    id INTEGER PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE,
+    note TEXT NOT NULL,
+    max_uses INTEGER NOT NULL CHECK (max_uses >= 1),
+    used_count INTEGER NOT NULL DEFAULT 0 CHECK (used_count BETWEEN 0 AND max_uses),
+    expires_at INTEGER NOT NULL,
+    revoked_at INTEGER,
+    created_at INTEGER NOT NULL
+) STRICT;
+
+-- 用户。经邀请加入的人 invite_id 非空；管理员也有一行（invite_id 为空），是不是管理员只看环境变量
+-- ADMIN_OPENID。invite_id 为空、又不是现任管理员的行（如换下来的旧管理员）没有权限。
+-- disabled_notice_sent：停用后是否已经回过一次说明，状态改变时清零。
+-- welcomed_at：欢迎语（含第三方处理的告知）确认发出的时间；为空时先补发欢迎语，不进入对话。
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    openid TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    invite_id INTEGER REFERENCES invites (id),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled')),
+    disabled_notice_sent INTEGER NOT NULL DEFAULT 0 CHECK (disabled_notice_sent IN (0, 1)),
+    welcomed_at INTEGER,
+    joined_at INTEGER NOT NULL
+) STRICT;
+
+-- 回过一次拒绝语的未授权用户，之后不再回。
+CREATE TABLE refusals (
+    openid TEXT PRIMARY KEY,
+    refused_at INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+
+-- 全局的服务状态，只有 id = 1 这一行。
+CREATE TABLE service_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+    updated_at INTEGER NOT NULL
+) STRICT;
+INSERT INTO service_state (id, paused, updated_at)
+VALUES (1, 0, CAST(strftime('%s', 'now') AS INTEGER));
+
+-- 处理过的平台事件，用来丢弃重复推送；key 形如 msg:<消息 ID>、event:<事件 ID>。
+CREATE TABLE processed_events (
+    key TEXT PRIMARY KEY,
+    processed_at INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+CREATE INDEX processed_events_by_time ON processed_events (processed_at);
+"""
+
+MIGRATIONS: tuple[Migration, ...] = (_V1_ACCESS,)
+"""本程序的迁移列表。业务表由各里程碑在末尾追加。"""
 
 
 class StorageError(Exception):
@@ -67,16 +119,23 @@ class Database:
 
         上级目录不存在时会创建。相对路径按调用时的当前目录解析，之后不再随当前目录变化。
 
+        `path` 是符号链接时跟随它：`Database.path` 是打开后确定的真实路径。
+
         Raises:
             StorageError: 数据库的版本高于 `migrations` 的长度或为负数（此时不改动文件），
-                某个迁移失败，或无法启用 WAL。
+                某个迁移失败，无法启用 WAL，或打开阶段的文件与 SQLite 错误（如上级路径是普通文件、
+                文件不是有效的数据库），后者的原始异常在 `__cause__` 里。
         """
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=THREAD_NAME_PREFIX)
         opening = executor.submit(_open_connection, Path(path), busy_timeout, migrations)
+        waiting = asyncio.wrap_future(opening)
         try:
             # shield：被取消时连接仍在打开，不能连带取消。
-            file, conn = await asyncio.shield(asyncio.wrap_future(opening))
+            file, conn = await asyncio.shield(waiting)
         except asyncio.CancelledError:
+            # shield 被取消后不再理会 waiting：它之后若以异常结束，要由这里取走，否则事件循环会报
+            # 「Future exception was never retrieved」。
+            waiting.add_done_callback(_retrieve_exception)
             # 单线程、先进先出：这个任务一定排在打开之后执行，不依赖事件循环是否还在运行。
             executor.submit(_close_opened, opening)
             executor.shutdown(wait=False)
@@ -172,7 +231,8 @@ class Database:
     async def backup(self, target: str | os.PathLike[str]) -> None:
         """把数据库在线备份到 `target`，已存在的文件会被替换。上级目录不存在时会创建。
 
-        先写到同目录下独占创建的临时文件，完成后再改名，中途失败不会留下残缺的备份。
+        先写到同目录下独占创建的临时文件，完成后再改名，中途失败不会留下残缺的备份。备份文件不用 WAL；
+        目标旁边残留的 `-wal`、`-shm`（旧备份被打开写过时留下的）会被删除。
 
         Raises:
             ValueError: `target` 是数据库文件本身或它的 `-wal`、`-shm` 文件。
@@ -212,9 +272,22 @@ def _open_connection(
 ) -> tuple[Path, sqlite3.Connection]:
     if str(path) == ":memory:":  # 否则会被当成当前目录下名为 `:memory:` 的文件
         raise StorageError("不支持内存数据库，需要数据库文件的路径")
-    path = path.absolute()
+    try:
+        return _connect(path.absolute(), busy_timeout, migrations)
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+        raise StorageError(f"无法打开数据库 {path}：{reason}") from exc
+    except sqlite3.Error as exc:
+        # SQLite 打开阶段的错误文案只是原因（如 file is not a database），不含文件内容。
+        raise StorageError(f"无法打开数据库 {path}：{exc}") from exc
+
+
+def _connect(
+    path: Path, busy_timeout: float, migrations: Sequence[Migration]
+) -> tuple[Path, sqlite3.Connection]:
     path.parent.mkdir(parents=True, exist_ok=True)
     _create_private_file(path)
+    path = path.resolve()  # 文件已存在，跟随符号链接；备份时据此认出主库与边车文件
     # autocommit=True：sqlite3 模块不再自己隐式开启事务，事务边界全部由本模块显式控制。
     conn = sqlite3.connect(path, timeout=busy_timeout, autocommit=True)
     try:
@@ -242,6 +315,11 @@ def _create_private_file(path: Path) -> None:
         return
     os.close(fd)
     os.chmod(path, FILE_MODE)  # os.open 的权限会被 umask 削减，这里再明确设一次
+
+
+def _retrieve_exception[T](future: asyncio.Future[T]) -> None:
+    if not future.cancelled():
+        future.exception()
 
 
 def _close_opened(opening: Future[tuple[Path, sqlite3.Connection]]) -> None:
@@ -313,28 +391,45 @@ def _migrate_one(conn: sqlite3.Connection, migrations: Sequence[Migration]) -> b
         return True
     target = version + 1
     migration = migrations[version]
+    denied: list[str] = []
+
+    def forbid_transaction_control(
+        action: int, arg1: str | None, arg2: str | None, db: str | None, trigger: str | None
+    ) -> int:
+        # 在语句编译时拦截：脚本里的 COMMIT / ROLLBACK / BEGIN 还没生效就报错，外层事务完整回滚。
+        # 设置或撤销授权回调都会让已编译的语句失效，缓存里的 COMMIT 也会重新编译、再经过这里。
+        if action == sqlite3.SQLITE_TRANSACTION:
+            denied.append(arg1 or "")
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    conn.set_authorizer(forbid_transaction_control)
     try:
         if isinstance(migration, str):
             conn.executescript(migration)
         else:
             migration(conn)
-        if not conn.in_transaction:
-            raise StorageError(f"迁移到版本 {target} 失败：迁移不得自行提交或回滚事务")
         violation = conn.execute("PRAGMA foreign_key_check").fetchone()
-    except StorageError:
-        raise
     except Exception as exc:
+        if denied:
+            raise StorageError(f"迁移到版本 {target} 失败：迁移不得自行提交或回滚事务") from exc
         raise StorageError(f"迁移到版本 {target} 失败：{type(exc).__name__}: {exc}") from exc
+    finally:
+        conn.set_authorizer(None)
+    if denied or not conn.in_transaction:
+        # 迁移吞掉了被拒绝的错误，或以授权回调拦不住的方式结束了事务。
+        raise StorageError(f"迁移到版本 {target} 失败：迁移不得自行提交或回滚事务")
     if violation is not None:
         raise StorageError(f"迁移到版本 {target} 失败：迁移后存在违反外键约束的行")
     conn.execute(f"PRAGMA user_version = {target}")
     return False
 
 
+_SIDECAR_SUFFIXES = ("-wal", "-shm")
+
+
 def _backup(conn: sqlite3.Connection, source: Path, target: Path) -> None:
-    protected = {Path(f"{source}{suffix}").resolve() for suffix in ("", "-wal", "-shm")}
-    if target.resolve() in protected:
-        raise ValueError(f"备份目标不能是数据库文件本身或它的 -wal、-shm 文件：{target}")
+    _refuse_database_files(source, target)
     target.parent.mkdir(parents=True, exist_ok=True)
     # mkstemp 独占创建、权限 0600：不会碰到已有的文件，并发的备份也各用各的临时文件。
     fd, name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".partial")
@@ -344,7 +439,28 @@ def _backup(conn: sqlite3.Connection, source: Path, target: Path) -> None:
         os.chmod(partial, FILE_MODE)  # 不依赖 umask
         with closing(sqlite3.connect(partial)) as destination:
             conn.backup(destination)
+            # 备份文件不用 WAL：文件头里的 WAL 标记随主库一起复制过来了，改回 DELETE。
+            destination.execute("PRAGMA journal_mode = DELETE")
         partial.replace(target)
     except BaseException:
         partial.unlink(missing_ok=True)
         raise
+    # 旧备份被打开写过时可能留下 -wal / -shm，留着会让新的备份读出旧数据。
+    for suffix in _SIDECAR_SUFFIXES:
+        Path(f"{target}{suffix}").unlink(missing_ok=True)
+
+
+def _refuse_database_files(source: Path, target: Path) -> None:
+    """`target` 是主库或它的边车文件时抛 `ValueError`。`source` 是打开时确定的真实路径。
+
+    已存在的文件按文件身份比较（经符号链接、不区分大小写的文件系统上换了大小写都认得出）；
+    还不存在的边车文件只能按解析后的路径比较。
+    """
+    candidates = [source, *(Path(f"{source}{suffix}") for suffix in _SIDECAR_SUFFIXES)]
+    resolved = target.resolve()
+    target_exists = target.exists()
+    for candidate in candidates:
+        if resolved == candidate or (
+            target_exists and candidate.exists() and os.path.samefile(target, candidate)
+        ):
+            raise ValueError(f"备份目标不能是数据库文件本身或它的 -wal、-shm 文件：{target}")

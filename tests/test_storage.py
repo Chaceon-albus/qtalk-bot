@@ -1,11 +1,14 @@
 import asyncio
+import gc
 import os
+import shutil
 import sqlite3
 import stat
 import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Iterator
+from contextlib import closing, suppress
 from pathlib import Path
 
 import pytest
@@ -252,6 +255,7 @@ async def test_migration_that_ends_its_own_transaction_is_rejected(db_path: Path
         with pytest.raises(StorageError, match="迁移到版本 1 失败：迁移不得自行提交或回滚事务"):
             await Database.open(db_path, migrations=[migration])
         assert user_version(db_path) == 0
+        assert "early" not in table_names(db_path)
 
 
 async def test_foreign_key_check_error_is_wrapped(db_path: Path) -> None:
@@ -578,3 +582,168 @@ async def test_async_with_closes(db_path: Path) -> None:
     async with await Database.open(db_path) as database:
         assert not database.closed
     assert database.closed
+
+
+# ---- 复审修正：迁移里的事务控制语句在生效之前被拦截 ----
+
+
+async def test_early_commit_in_script_is_blocked_before_it_takes_effect(db_path: Path) -> None:
+    script = "CREATE TABLE early (id INTEGER); COMMIT; CREATE TABLE late (id INTEGER);"
+    with pytest.raises(StorageError, match="迁移到版本 2 失败：迁移不得自行提交或回滚事务"):
+        await Database.open(db_path, migrations=[CREATE_PARENTS, script])
+    assert user_version(db_path) == 1
+    assert table_names(db_path) == {"parents"}  # COMMIT 之前建的表也回滚了
+
+    fixed = "CREATE TABLE early (id INTEGER); CREATE TABLE late (id INTEGER);"
+    async with await Database.open(db_path, migrations=[CREATE_PARENTS, fixed]):
+        pass
+    assert user_version(db_path) == 2
+    assert {"early", "late"} <= table_names(db_path)
+
+
+async def test_cached_commit_statement_is_still_blocked(db_path: Path) -> None:
+    # 第一个迁移结束时本模块执行过 "COMMIT"，它在语句缓存里；迁移再执行同样的文字也要被拦截。
+    def commits(conn: sqlite3.Connection) -> None:
+        conn.execute("CREATE TABLE cached (id INTEGER)")
+        conn.execute("COMMIT")
+
+    with pytest.raises(StorageError, match="迁移不得自行提交或回滚事务"):
+        await Database.open(db_path, migrations=[CREATE_PARENTS, commits])
+    assert user_version(db_path) == 1
+    assert "cached" not in table_names(db_path)
+
+
+async def test_migration_swallowing_the_blocked_commit_is_still_rejected(db_path: Path) -> None:
+    def swallows(conn: sqlite3.Connection) -> None:
+        conn.execute("CREATE TABLE sneaky (id INTEGER)")
+        with suppress(sqlite3.DatabaseError):
+            conn.execute("COMMIT")
+
+    with pytest.raises(StorageError, match="迁移不得自行提交或回滚事务"):
+        await Database.open(db_path, migrations=[swallows])
+    assert user_version(db_path) == 0
+    assert "sneaky" not in table_names(db_path)
+
+
+async def test_transaction_control_is_allowed_again_after_migrations(db: Database) -> None:
+    # 授权回调只在迁移期间生效：之后本模块自己的事务照常工作。
+    await db.transaction(lambda conn: conn.execute("INSERT INTO parents (name) VALUES ('a')"))
+    assert len(await db.fetch_all("SELECT * FROM parents")) == 1
+
+
+# ---- 复审修正：打开阶段的错误包装成 StorageError ----
+
+
+async def test_parent_path_that_is_a_file_is_a_storage_error(tmp_path: Path) -> None:
+    blocker = tmp_path / "data"
+    await asyncio.to_thread(blocker.write_text, "not a directory")
+    with pytest.raises(StorageError, match="无法打开数据库") as info:
+        await Database.open(blocker / "qtalk.db")
+    assert isinstance(info.value.__cause__, OSError)
+
+
+async def test_file_that_is_not_a_database_is_a_storage_error(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True)
+    content = "secret-looking content that must not be echoed " * 20
+    await asyncio.to_thread(db_path.write_text, content)
+    with pytest.raises(StorageError, match="无法打开数据库") as info:
+        await Database.open(db_path)
+    assert isinstance(info.value.__cause__, sqlite3.DatabaseError)
+    assert "secret-looking" not in str(info.value)
+
+
+# ---- 复审修正：取消打开之后迁移失败，不留下没人取的异常 ----
+
+
+async def test_cancelled_open_whose_migration_fails_leaves_no_unretrieved_exception(
+    db_path: Path,
+) -> None:
+    loop = asyncio.get_running_loop()
+    reported: list[object] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context.get("message")))
+    started, release = threading.Event(), threading.Event()
+
+    def fails_late(conn: sqlite3.Connection) -> None:
+        started.set()
+        release.wait(HANG_GUARD)
+        raise RuntimeError("迁移失败")
+
+    try:
+        task = asyncio.create_task(Database.open(db_path, migrations=[fails_late]))
+        await asyncio.to_thread(started.wait, HANG_GUARD)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        del task
+        release.set()
+        await asyncio.to_thread(wait_for_db_threads_to_exit)
+        for _ in range(5):  # 让线程那边转交过来的回调都跑完
+            await asyncio.sleep(0.01)
+        gc.collect()  # 「never retrieved」在 Future 被回收时报告
+        await asyncio.sleep(0.01)
+    finally:
+        loop.set_exception_handler(previous)
+    assert reported == []
+    assert user_version(db_path) == 0
+
+
+# ---- 复审修正：备份目标按文件身份比较、不留旧的 WAL ----
+
+
+async def test_backup_onto_database_reached_through_symlink_is_refused(tmp_path: Path) -> None:
+    real = tmp_path / "real" / "qtalk.db"
+    link_dir = tmp_path / "link"
+    async with await Database.open(real, migrations=TEST_MIGRATIONS):
+        pass
+    link_dir.mkdir()
+    (link_dir / "qtalk.db").symlink_to(real)
+    async with await Database.open(link_dir / "qtalk.db", migrations=TEST_MIGRATIONS) as database:
+        assert database.path == real.resolve()
+        for suffix in ("", "-wal", "-shm"):
+            with pytest.raises(ValueError, match="数据库文件本身"):
+                await database.backup(Path(f"{real}{suffix}"))
+        # 反过来：经符号链接指向主库的目标也认得出。
+        alias = tmp_path / "alias.db"
+        alias.symlink_to(real)
+        with pytest.raises(ValueError, match="数据库文件本身"):
+            await database.backup(alias)
+
+
+def case_insensitive(directory: Path) -> bool:
+    probe = directory / "CaseProbe"
+    probe.write_text("")
+    try:
+        return (directory / "caseprobe").exists()
+    finally:
+        probe.unlink()
+
+
+async def test_backup_onto_database_with_other_case_is_refused(db: Database, db_path: Path) -> None:
+    if not case_insensitive(db_path.parent):
+        pytest.skip("文件系统区分大小写")
+    with pytest.raises(ValueError, match="数据库文件本身"):
+        await db.backup(db_path.parent / db_path.name.upper())
+
+
+async def test_backup_ignores_stale_wal_left_next_to_target(db: Database, tmp_path: Path) -> None:
+    target = tmp_path / "backup.db"
+    # 造一个旧备份：数据还在 WAL 里没有检查点，像是被打开写过、进程异常退出。
+    scratch = tmp_path / "scratch.db"
+    stale = sqlite3.connect(scratch, autocommit=True)
+    stale.execute("PRAGMA journal_mode = WAL")
+    stale.execute("PRAGMA wal_autocheckpoint = 0")
+    stale.executescript(CREATE_PARENTS)
+    stale.execute("INSERT INTO parents (name) VALUES ('stale')")
+    shutil.copyfile(scratch, target)
+    shutil.copyfile(f"{scratch}-wal", f"{target}-wal")
+    stale.close()
+
+    await db.execute("INSERT INTO parents (name) VALUES ('fresh')")
+    await db.backup(target)
+
+    assert not await asyncio.to_thread(Path(f"{target}-wal").exists)
+    assert journal_mode(target) == "delete"
+    with closing(sqlite3.connect(target)) as conn:
+        names = [row[0] for row in conn.execute("SELECT name FROM parents")]
+    assert names == ["fresh"]

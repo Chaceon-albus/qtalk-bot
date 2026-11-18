@@ -2,7 +2,17 @@
 
 基于 [pyqbot](https://github.com/capric98/pyqbot) 的 QQ 聊天助手：管理员在聊天里生成邀请链接，经链接添加机器人的用户可以和大模型对话，每个用户的记忆相互隔离。
 
-> 还在设计阶段，没有可用的功能。
+> 开发中：已经可以启动，邀请与授权可用；对话功能还没有实现。
+
+## 运行
+
+```sh
+cp config.example.toml config.toml   # 按需修改
+cp .env.example .env                 # 填上密钥
+uv run --env-file .env python -m qtalk_bot
+```
+
+管理员（`.env` 里的 `ADMIN_OPENID`）给机器人发 `/help` 可以看到管理命令。
 
 ## 文档
 

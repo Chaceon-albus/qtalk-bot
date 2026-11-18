@@ -1,0 +1,459 @@
+"""接线层的端到端测试：真实的 `pyqbot.Bot` 连上本地替身扮演的开放平台（HTTP 与网关），不访问网络。
+
+替身的写法照搬 pyqbot 的 `tests/test_network_doubles.py` 与 `tests/test_bot_run.py`。
+"""
+
+import asyncio
+import itertools
+import json
+import sqlite3
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, MutableMapping
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import httpx2
+import pyqbot
+import pytest
+from httpx2.websockets import ASGIWebSocketTransport
+
+from qtalk_bot import access, texts
+from qtalk_bot.access import User
+from qtalk_bot.bot import ShareLinks, is_rejection, register
+from qtalk_bot.chat import ChatHandler, ChatNotReady
+from qtalk_bot.config import InviteSettings
+from qtalk_bot.gate import Delivery, FriendAdded, Gate, IncomingMessage, Outcome, Reply
+from qtalk_bot.storage import DATABASE_FILENAME, Database
+
+HANG_GUARD = 5  # 秒：回归时应失败而不是挂起
+SETTLE = 0.05  # 秒：所有事件处理完之后再等一会儿，确认没有多发
+
+# 明显是假的 openid 与邀请码。
+ADMIN = "FAKE0PENID0ADMIN0000000000000000"
+ALICE = "FAKE0PENID0ALICE0000000000000000"
+STRANGER = "FAKE0PENID0STRANGER0000000000000"
+CODE = "f" * 32
+SHARE_URL = "https://bot.q.qq.com/s/fakeLink"
+
+# ASGI 消息是结构随 type 变化的字典，标准里没有更精确的类型。
+type ASGIMessage = MutableMapping[str, Any]
+type Receive = Callable[[], Awaitable[ASGIMessage]]
+type Send = Callable[[ASGIMessage], Awaitable[None]]
+type Payload = dict[str, Any]
+
+
+def c2c(openid: str, content: str, message_id: str) -> Payload:
+    return {
+        "op": 0,
+        "t": "C2C_MESSAGE_CREATE",
+        "d": {
+            "author": {"id": openid, "user_openid": openid, "union_openid": "", "bot": False},
+            "content": content,
+            "id": message_id,
+            "timestamp": "2026-11-18T10:00:00+08:00",
+        },
+    }
+
+
+def friend_add(openid: str, scene_param: str, event_id: str) -> Payload:
+    return {
+        "op": 0,
+        "id": event_id,
+        "t": "FRIEND_ADD",
+        "d": {
+            "author": {"union_openid": ""},
+            "openid": openid,
+            "scene": 1000,
+            "scene_param": scene_param,
+            "timestamp": 1794861114,
+        },
+    }
+
+
+def group_at(openid: str, content: str) -> Payload:
+    return {
+        "op": 0,
+        "id": "GROUP_AT_MESSAGE_CREATE:fake",
+        "t": "GROUP_AT_MESSAGE_CREATE",
+        "d": {
+            "author": {"id": openid, "member_openid": openid, "union_openid": ""},
+            "content": f" {content}",
+            "group_id": "FAKE0GROUP",
+            "group_openid": "FAKE0GROUP",
+            "id": "ROBOT1.0_fake-group-message",
+            "timestamp": "2026-11-18T10:00:00+08:00",
+        },
+    }
+
+
+type Respond = Callable[[Payload], httpx2.Response | None]
+
+
+def reject(body: Payload) -> httpx2.Response:
+    """平台明确拒绝：HTTP 400 带错误码。"""
+    error = {"message": "消息内容违规", "err_code": 40034006, "trace_id": "fake"}
+    return httpx2.Response(400, json=error)
+
+
+def garble(body: Payload) -> httpx2.Response:
+    """说不准有没有发出：HTTP 200，但响应解析不了。"""
+    return httpx2.Response(200, content=b"<html>gateway timeout</html>")
+
+
+def reject_links(body: Payload) -> httpx2.Response | None:
+    return reject(body) if "https://" in body.get("content", "") else None
+
+
+class Platform:
+    """扮演开放平台：READY 之后按顺序推送 `events`，记下机器人发出的单聊消息与生成链接的请求。
+
+    `respond` 给出某条单聊消息的响应时用它（模拟失败），不记进 `sent`，只记进 `attempts`。
+    """
+
+    def __init__(self, events: list[Payload], *, respond: Respond | None = None) -> None:
+        self.events = events
+        self.respond = respond
+        self.attempts: list[Payload] = []
+        self.sent: list[Payload] = []
+        self.share_links: list[Payload] = []
+        self.changed = asyncio.Event()  # 每发出一条消息置位一次
+
+    def handle(self, request: httpx2.Request) -> httpx2.Response:
+        path = request.url.path
+        if path == "/app/getAppAccessToken":
+            return httpx2.Response(200, json={"access_token": "fake-token", "expires_in": "7200"})
+        if path == "/gateway":
+            return httpx2.Response(200, json={"url": "wss://gateway.test/websocket"})
+        body: Payload = json.loads(request.content)
+        if path == "/v2/generate_url_link":
+            self.share_links.append(body)
+            return httpx2.Response(
+                200, json={"retcode": 0, "msg": "success", "data": {"url": SHARE_URL}}
+            )
+        if path.startswith("/v2/users/") and path.endswith("/messages"):
+            self.attempts.append(body)
+            if self.respond is not None and (response := self.respond(body)) is not None:
+                return response
+            self.sent.append({"path": path, **body})
+            self.changed.set()
+            return httpx2.Response(200, json={"id": f"ROBOT1.0_sent-{len(self.sent)}"})
+        raise AssertionError(f"意外的请求：{request.method} {path}")
+
+    async def gateway(self, scope: ASGIMessage, receive: Receive, send: Send) -> None:
+        async def push(payload: Payload) -> None:
+            await send({"type": "websocket.send", "text": json.dumps(payload)})
+
+        await receive()  # websocket.connect
+        await send({"type": "websocket.accept"})
+        await push({"op": 10, "d": {"heartbeat_interval": 60000}})
+        await receive()  # Identify
+        ready = {
+            "version": 1,
+            "session_id": "fake-session",
+            "user": {"id": "1", "username": "测试机器人", "bot": True},
+            "shard": [0, 1],
+        }
+        await push({"op": 0, "s": 1, "t": "READY", "d": ready})
+        for seq, event in enumerate(self.events, start=2):
+            await push({**event, "s": seq})
+        while (message := await receive())["type"] != "websocket.disconnect":
+            if json.loads(message["text"])["op"] == 1:
+                await push({"op": 11})
+
+
+class CountingGate(Gate):
+    """记下处理完了几个事件，测试据此判断事件都已处理；每处理完一个置位 `changed`。
+
+    得到 `Reply` 的事件要等接线层发完、调用过 `settle()` 才算处理完。
+    """
+
+    done = 0
+    changed: asyncio.Event
+    settled: list[Delivery]
+
+    async def on_message(self, message: IncomingMessage) -> Outcome:
+        return self._count_unless_reply(await super().on_message(message))
+
+    async def on_friend_add(self, event: FriendAdded) -> Outcome:
+        return self._count_unless_reply(await super().on_friend_add(event))
+
+    async def settle(self, reply: Reply, delivery: Delivery) -> None:
+        self.settled.append(delivery)
+        await super().settle(reply, delivery)
+        self._finish()
+
+    def _count_unless_reply(self, outcome: Outcome) -> Outcome:
+        if not isinstance(outcome, Reply):
+            self._finish()
+        return outcome
+
+    def _finish(self) -> None:
+        self.done += 1
+        self.changed.set()
+
+
+class RecordingChat:
+    """对话处理器的替身：只记下被谁调用。"""
+
+    def __init__(self) -> None:
+        self.users: list[User] = []
+
+    async def handle(self, user: User, message: pyqbot.C2CMessage) -> None:
+        self.users.append(user)
+
+
+@pytest.fixture
+async def db(tmp_path: Path) -> AsyncIterator[Database]:
+    async with await Database.open(tmp_path / DATABASE_FILENAME) as database:
+        yield database
+
+
+@asynccontextmanager
+async def bot_on(platform: Platform) -> AsyncGenerator[pyqbot.Bot]:
+    # 只能在测试函数体内用 async with 进入：ASGIWebSocketTransport 在 __aenter__ 里才建好内部任务组。
+    async with (
+        httpx2.AsyncClient(
+            transport=httpx2.MockTransport(platform.handle),
+            mounts={"wss://": ASGIWebSocketTransport(platform.gateway)},
+        ) as http_client,
+        pyqbot.Bot("fake-app-id", "fake-app-secret", http_client=http_client) as bot,
+    ):
+        yield bot
+
+
+async def run_until_handled(
+    platform: Platform,
+    db: Database,
+    chat: ChatHandler,
+    *,
+    events: int,
+    sent: int,
+    invites: InviteSettings | None = None,
+    settled: list[Delivery] | None = None,
+) -> None:
+    """跑机器人，直到 `events` 个事件都经过 `Gate`、平台至少收到 `sent` 条消息，再稍等后关闭。"""
+    codes = itertools.count(1)
+    async with asyncio.timeout(HANG_GUARD), bot_on(platform) as bot:
+        gate = CountingGate(
+            db,
+            admin_openid=ADMIN,
+            timezone=ZoneInfo("Asia/Shanghai"),
+            invites=InviteSettings() if invites is None else invites,
+            share_link=ShareLinks(bot),
+            new_code=lambda: f"{next(codes):032x}",
+        )
+        gate.changed = platform.changed
+        gate.settled = settled if settled is not None else []
+        register(bot, gate, chat)
+        running = asyncio.create_task(bot.start())
+        while gate.done < events or len(platform.sent) < sent:
+            platform.changed.clear()
+            await platform.changed.wait()
+        await asyncio.sleep(SETTLE)
+        await bot.close()
+        await running
+
+
+async def add_invite(db: Database, *, note: str = "小王", max_uses: int = 1) -> None:
+    def create(conn: sqlite3.Connection) -> None:
+        access.create_invite(conn, code=CODE, note=note, max_uses=max_uses, expires_at=2**40, now=0)
+
+    await db.transaction(create)
+
+
+async def test_friend_add_with_invite_gets_welcome_once(db: Database) -> None:
+    await add_invite(db, max_uses=5)
+    event = friend_add(ALICE, CODE, "FRIEND_ADD:fake-1")
+    platform = Platform([event, event])  # 第二次是重复推送
+
+    await run_until_handled(platform, db, ChatNotReady(), events=2, sent=1)
+
+    assert platform.sent == [
+        {
+            "path": f"/v2/users/{ALICE}/messages",
+            "msg_type": 0,
+            "content": texts.welcome("小王"),
+            "event_id": "FRIEND_ADD:fake-1",
+            "msg_seq": 1,
+        }
+    ]
+    invite = await db.transaction(access.get_invite_by_code, CODE)
+    assert invite is not None
+    assert invite.used_count == 1
+
+
+async def test_unauthorized_messages_get_one_refusal_and_never_reach_chat(db: Database) -> None:
+    first = c2c(STRANGER, "你好", "ROBOT1.0_fake-1")
+    platform = Platform(
+        [
+            first,
+            first,  # 重复推送
+            c2c(STRANGER, "/help", "ROBOT1.0_fake-2"),
+            c2c(STRANGER, "e" * 32, "ROBOT1.0_fake-3"),
+            group_at(STRANGER, "你好"),  # 群聊没有注册处理函数
+        ]
+    )
+    chat = RecordingChat()
+
+    await run_until_handled(platform, db, chat, events=4, sent=1)
+
+    assert platform.sent == [
+        {
+            "path": f"/v2/users/{STRANGER}/messages",
+            "msg_type": 0,
+            "content": texts.REFUSAL,
+            "msg_id": "ROBOT1.0_fake-1",
+            "msg_seq": 1,
+        }
+    ]
+    assert chat.users == []
+
+
+async def test_authorized_message_reaches_placeholder_chat(db: Database) -> None:
+    await add_invite(db)
+    user = await db.transaction(access.redeem_invite, CODE, ALICE, 0)
+    assert isinstance(user, User)
+    await db.transaction(access.mark_welcomed, user.id, 0)
+    platform = Platform([c2c(ALICE, "你好", "ROBOT1.0_fake-1")])
+
+    await run_until_handled(platform, db, ChatNotReady(), events=1, sent=1)
+
+    assert [(m["content"], m["msg_id"]) for m in platform.sent] == [
+        (texts.CHAT_NOT_READY, "ROBOT1.0_fake-1")
+    ]
+
+
+async def test_redeemed_user_reaches_injected_chat_handler_after_welcome(db: Database) -> None:
+    await add_invite(db)
+    welcomed = Platform([friend_add(ALICE, CODE, "FRIEND_ADD:fake-1")])
+    await run_until_handled(welcomed, db, RecordingChat(), events=1, sent=1)
+
+    chat = RecordingChat()
+    later = Platform([c2c(ALICE, "你好", "ROBOT1.0_fake-1")])
+    await run_until_handled(later, db, chat, events=1, sent=0)
+
+    assert [user.name for user in chat.users] == ["小王"]
+    assert later.sent == []
+
+
+async def test_rejected_welcome_is_resent_and_message_does_not_reach_chat(db: Database) -> None:
+    await add_invite(db)
+    settled: list[Delivery] = []
+    rejected = Platform([friend_add(ALICE, CODE, "FRIEND_ADD:fake-1")], respond=reject)
+    await run_until_handled(rejected, db, RecordingChat(), events=1, sent=0, settled=settled)
+    assert settled == [Delivery.NOT_SENT]
+
+    chat = RecordingChat()
+    later = Platform([c2c(ALICE, "你好", "ROBOT1.0_fake-1")])
+    await run_until_handled(later, db, chat, events=1, sent=1)
+
+    assert [m["content"] for m in later.sent] == [texts.welcome("小王")]
+    assert chat.users == []
+
+
+@pytest.mark.parametrize(
+    ("respond", "expected", "second_run_sent"),
+    [(reject, Delivery.NOT_SENT, [texts.REFUSAL]), (garble, Delivery.UNKNOWN, [])],
+)
+async def test_refusal_is_only_released_when_definitely_not_sent(
+    db: Database, respond: Respond, expected: Delivery, second_run_sent: list[str]
+) -> None:
+    settled: list[Delivery] = []
+    first = Platform([c2c(STRANGER, "你好", "ROBOT1.0_fake-1")], respond=respond)
+    await run_until_handled(first, db, RecordingChat(), events=1, sent=0, settled=settled)
+    assert settled == [expected]
+    assert len(first.attempts) == 1  # 没有备用文案，也不重发
+
+    second = Platform([c2c(STRANGER, "在吗", "ROBOT1.0_fake-2")])
+    await run_until_handled(second, db, RecordingChat(), events=1, sent=len(second_run_sent))
+    assert [m["content"] for m in second.sent] == second_run_sent
+
+
+async def test_friend_add_without_event_id_releases_the_refusal(db: Database) -> None:
+    event = friend_add(STRANGER, "", "unused")
+    del event["id"]
+    settled: list[Delivery] = []
+    first = Platform([event])
+    await run_until_handled(first, db, RecordingChat(), events=1, sent=0, settled=settled)
+    assert settled == [Delivery.NOT_SENT]
+    assert first.attempts == []
+
+    second = Platform([c2c(STRANGER, "你好", "ROBOT1.0_fake-1")])
+    await run_until_handled(second, db, RecordingChat(), events=1, sent=1)
+    assert [m["content"] for m in second.sent] == [texts.REFUSAL]
+
+
+async def test_disabled_notice_rejected_by_platform_is_sent_next_time(db: Database) -> None:
+    await add_invite(db)
+    user = await db.transaction(access.redeem_invite, CODE, ALICE, 0)
+    assert isinstance(user, User)
+    await db.transaction(access.mark_welcomed, user.id, 0)
+    await db.transaction(access.set_user_status, user.id, access.UserStatus.DISABLED)
+
+    first = Platform([c2c(ALICE, "你好", "ROBOT1.0_fake-1")], respond=reject)
+    await run_until_handled(first, db, RecordingChat(), events=1, sent=0)
+    second = Platform([c2c(ALICE, "在吗", "ROBOT1.0_fake-2")])
+    await run_until_handled(second, db, RecordingChat(), events=1, sent=1)
+    assert [m["content"] for m in second.sent] == [texts.DISABLED]
+
+
+async def test_admin_invite_sends_link_and_code(db: Database) -> None:
+    platform = Platform([c2c(ADMIN, "/invite 小王", "ROBOT1.0_fake-1")])
+
+    await run_until_handled(platform, db, ChatNotReady(), events=1, sent=1)
+
+    code = f"{1:032x}"
+    assert platform.share_links == [{"callback_data": code}]
+    (message,) = platform.sent
+    assert SHARE_URL in message["content"]
+    assert code in message["content"]
+
+
+async def test_admin_invite_falls_back_to_code_only_when_link_is_rejected(db: Database) -> None:
+    platform = Platform([c2c(ADMIN, "/invite 小王", "ROBOT1.0_fake-1")], respond=reject_links)
+
+    await run_until_handled(platform, db, ChatNotReady(), events=1, sent=1)
+
+    code = f"{1:032x}"
+    (message,) = platform.sent
+    assert "https://" not in message["content"]
+    assert code in message["content"]
+    assert texts.LINK_REJECTED in message["content"]
+    assert message["msg_id"] == "ROBOT1.0_fake-1"
+    assert message["msg_seq"] == 2  # 第 1 个序号被拒绝的那条用掉了
+
+
+async def test_invite_link_with_ambiguous_failure_gets_no_fallback(db: Database) -> None:
+    def garble_links(body: Payload) -> httpx2.Response | None:
+        return garble(body) if "https://" in body.get("content", "") else None
+
+    settled: list[Delivery] = []
+    platform = Platform([c2c(ADMIN, "/invite 小王", "ROBOT1.0_fake-1")], respond=garble_links)
+
+    await run_until_handled(platform, db, ChatNotReady(), events=1, sent=0, settled=settled)
+
+    assert len(platform.attempts) == 1  # 说不准有没有发出：不改发，免得收到两条
+    assert platform.sent == []
+    assert settled == [Delivery.UNKNOWN]
+
+
+def api_error(status_code: int, err_code: int | None) -> pyqbot.APIError:
+    return pyqbot.APIError("发送失败", status_code=status_code, err_code=err_code)
+
+
+@pytest.mark.parametrize(
+    ("error", "rejected"),
+    [
+        (api_error(400, 40034006), True),  # 带错误码
+        (api_error(200, 40034006), True),  # 2xx 但带失败结构
+        (api_error(500, 11264), True),
+        (api_error(404, None), True),  # 4xx 没有错误码
+        (api_error(200, None), False),  # 响应解析不了
+        (api_error(502, None), False),
+        (pyqbot.NetworkError("超时"), False),
+        (pyqbot.AuditPendingError("等待审核", status_code=202, err_code=304023), False),
+    ],
+)
+def test_is_rejection(error: pyqbot.QQBotError, rejected: bool) -> None:
+    assert is_rejection(error) is rejected
