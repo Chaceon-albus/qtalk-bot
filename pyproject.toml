@@ -2,6 +2,7 @@
 name = "qtalk-bot"
 version = "0.1.0"
 description = "基于 pyqbot 的 QQ 聊天助手"
+readme = "README.md"
 authors = [{ name = "capric98" }]
 requires-python = ">=3.14"
 dependencies = [
