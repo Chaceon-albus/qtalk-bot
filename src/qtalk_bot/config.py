@@ -52,6 +52,14 @@ DEFAULT_DECISION_HISTORY_TURNS = 3
 MAX_DECISION_HISTORY_TURNS = 20
 DEFAULT_SWITCH_MARGIN = 0.2
 
+DEFAULT_TOPIC_CANDIDATES = 20
+MAX_TOPIC_CANDIDATES = MAX_OPTIONS - 1  # 再加上「新话题」这一项，不超过选择题的选项上限
+DEFAULT_TOPIC_DIRECTORY = 20
+MAX_TOPIC_DIRECTORY = 100
+DEFAULT_TOPIC_RECENT_TURNS = 3
+MAX_TOPIC_RECENT_TURNS = 20
+DEFAULT_TOPIC_SECOND_THRESHOLD = 0.25
+
 DEFAULT_ATTACHMENT_MAX_SIZE_MB = 20
 MAX_ATTACHMENT_MAX_SIZE_MB = 100
 DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 30
@@ -200,6 +208,26 @@ class DecisionSettings:
     timeout_seconds: float = DEFAULT_DECISION_TIMEOUT_SECONDS
     history_turns: int = DEFAULT_DECISION_HISTORY_TURNS
     switch_margin: float = DEFAULT_SWITCH_MARGIN
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TopicSettings:
+    """`[topics]` 表：话题线。只在配置了 `[decisions]` 时生效，不配就不分话题。
+
+    Attributes:
+        candidates: 选话题那道题的候选：这个用户最近活跃的这么多条话题，外加「新话题」。更早的话题会被判成
+            新话题。
+        directory: 系统提示词里的话题目录：最近活跃的这么多条话题的标题（不含当前话题）。
+        recent_turns: 不分话题、带上最近几轮原文，兜住「它」「刚才那个」这类指代。
+        second_threshold: 第二可能的已有话题的概率不低于它时，再带上它的摘要。
+
+    分话题时 `[chat].history_turns` 是选中话题最近几轮的原文。
+    """
+
+    candidates: int = DEFAULT_TOPIC_CANDIDATES
+    directory: int = DEFAULT_TOPIC_DIRECTORY
+    recent_turns: int = DEFAULT_TOPIC_RECENT_TURNS
+    second_threshold: float = DEFAULT_TOPIC_SECOND_THRESHOLD
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -370,6 +398,7 @@ class Settings:
     providers: ProvidersSettings = ProvidersSettings()
     qq: QQSettings = QQSettings()
     decisions: DecisionSettings | None = None
+    topics: TopicSettings = TopicSettings()  # 只在 `decisions` 不为空时生效
     attachments: AttachmentSettings = AttachmentSettings()
     describe: DescribeSettings | None = None
     turns: TurnSettings = TurnSettings()
@@ -620,6 +649,8 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
     qq_table = table.table("qq")
     qq = None if qq_table is None else _parse_qq(qq_table)
     decisions_ok, decisions = _parse_decisions(table)
+    topics_table = table.table("topics")
+    topics = None if topics_table is None else _parse_topics(topics_table)
     attachments_table = table.table("attachments")
     attachments = None if attachments_table is None else _parse_attachments(attachments_table)
     describe_ok, describe = _parse_describe(table)
@@ -646,6 +677,7 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         or providers is None
         or qq is None
         or not decisions_ok
+        or topics is None
         or attachments is None
         or not describe_ok
         or turns is None
@@ -661,6 +693,7 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         providers=providers,
         qq=qq,
         decisions=decisions,
+        topics=topics,
         attachments=attachments,
         describe=describe,
         turns=turns,
@@ -899,6 +932,27 @@ def _parse_decisions(root: _Table) -> tuple[bool, DecisionSettings | None]:
         timeout_seconds=timeout_seconds,
         history_turns=history_turns,
         switch_margin=switch_margin,
+    )
+
+
+def _parse_topics(table: _Table) -> TopicSettings | None:
+    candidates = _positive_int(table, "candidates", DEFAULT_TOPIC_CANDIDATES, MAX_TOPIC_CANDIDATES)
+    directory = _bounded_int(table, "directory", DEFAULT_TOPIC_DIRECTORY, 0, MAX_TOPIC_DIRECTORY)
+    recent_turns = _bounded_int(
+        table, "recent_turns", DEFAULT_TOPIC_RECENT_TURNS, 0, MAX_TOPIC_RECENT_TURNS
+    )
+    threshold = table.number("second_threshold", DEFAULT_TOPIC_SECOND_THRESHOLD)
+    if threshold is not None and not 0 < threshold <= 1:
+        table.problem("second_threshold", "应大于 0、不大于 1")
+        threshold = None
+    table.finish()
+    if candidates is None or directory is None or recent_turns is None or threshold is None:
+        return None
+    return TopicSettings(
+        candidates=candidates,
+        directory=directory,
+        recent_turns=recent_turns,
+        second_threshold=threshold,
     )
 
 

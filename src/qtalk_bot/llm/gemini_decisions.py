@@ -19,8 +19,9 @@
 
 SDK 解析时不校验（`validate=False`），还会做宽松的转换：缺了 `type` 的答案被补成选择题，JSON 布尔值的概率
 变成 1.0 / 0.0。所以这里经公开的原始响应接口（`with_raw_response`，返回的响应对象有 `json()`）拿到响应体，
-按原始的 JSON 逐项检查：`type` 必须明写且对得上，概率必须是 [0, 1] 内的数字、选择题的和为 1；缺题、多题、
-不合法都算坏响应（`MALFORMED`）。原始响应接口与普通的 `create()` 走同一套请求、重试与错误处理，4xx/5xx 照样
+按原始的 JSON 逐项检查：`type` 必须明写且对得上，概率必须是 [0, 1] 内的数字、选择题的和为 1。缺题、多题、
+答案不是对象这类整体结构的问题是整次的坏响应（`MALFORMED`）；某一道题的答案不合法只把那一道记成
+`Malformed`，其它题照常（每一道都坏时仍按整次的坏响应抛出，见 `decisions.settle_answers()`）。原始响应接口与普通的 `create()` 走同一套请求、重试与错误处理，4xx/5xx 照样
 抛异常。
 
 安全拦截：文档说返回 HTTP 400，`error.code` 是 `safety`、`prohibited_content`、`blocklist`、`image_safety`、
@@ -48,12 +49,14 @@ from .decisions import (
     DecisionMedia,
     DecisionRequest,
     DecisionResult,
+    Malformed,
     Question,
     YesNoAnswer,
     YesNoQuestion,
     choice_answer,
     json_object,
     probability,
+    settle_answers,
     usage_or_none,
 )
 
@@ -152,14 +155,14 @@ def _result(request: DecisionRequest, body: object) -> DecisionResult:
     by_name = dict(raw)
     answers: dict[str, Answer] = {}
     for question in request.questions:
-        item = json_object(by_name.pop(question.name, None))
-        answer = None if item is None else _answer(question, item)
-        if answer is None:
+        if question.name not in by_name:  # 缺题：整次的结构不对
             raise DecisionError(Provider.GEMINI, ErrorKind.MALFORMED, usage=usage)
-        answers[question.name] = answer
+        item = json_object(by_name.pop(question.name))
+        answer = None if item is None else _answer(question, item)
+        answers[question.name] = Malformed() if answer is None else answer
     if by_name:  # 多出题目里没有的答案
         raise DecisionError(Provider.GEMINI, ErrorKind.MALFORMED, usage=usage)
-    return DecisionResult(answers=answers, usage=usage)
+    return settle_answers(Provider.GEMINI, answers, usage)
 
 
 def _answer(question: Question, item: dict[str, object]) -> Answer | None:

@@ -11,8 +11,10 @@
 
 SDK 解析响应时不校验，还会做宽松的转换（JSON 布尔值的概率变成 1.0 / 0.0，缺了 `type` 的答案被构造成别的
 题型），所以这里经公开的原始响应接口（`with_raw_response`）拿到响应体，按原始的 JSON 逐项检查：按 `name`
-对上每道题（`name` 必须是字符串），缺题、多出不认识的题、题型对不上、概率不是 [0, 1] 内的数字或和不为 1
-都算坏响应（`MALFORMED`），此时响应里若有用量仍带在 `DecisionError.usage` 上。
+对上每道题（`name` 必须是字符串）。整体结构不对（答案不是数组、某项不是对象或 `name` 不是字符串、重名、缺题、
+多出不认识的题）是整次的坏响应（`MALFORMED`），此时响应里若有用量仍带在 `DecisionError.usage` 上；某一道题的
+题型对不上、概率不是 [0, 1] 内的数字或和不为 1，只把那一道记成 `Malformed`，其它题照常（每一道都坏时仍按
+整次的坏响应抛出，见 `decisions.settle_answers()`）。
 
 出错：与对话适配器一样，只取数字状态码与本地的分类，SDK 的异常文案（可能带响应体）一概不用。
 """
@@ -29,6 +31,7 @@ from .decisions import (
     DecisionError,
     DecisionRequest,
     DecisionResult,
+    Malformed,
     Question,
     Refusal,
     YesNoAnswer,
@@ -37,6 +40,7 @@ from .decisions import (
     json_array,
     json_object,
     probability,
+    settle_answers,
     usage_or_none,
 )
 
@@ -122,13 +126,13 @@ def _result(request: DecisionRequest, body: object) -> DecisionResult:
     answers: dict[str, Answer] = {}
     for question in request.questions:
         item = by_name.pop(question.name, None)
-        answer = None if item is None else _answer(question, item)
-        if answer is None:
+        if item is None:  # 缺题：整次的结构不对
             raise DecisionError(Provider.OPENAI, ErrorKind.MALFORMED, usage=usage)
-        answers[question.name] = answer
+        answer = _answer(question, item)
+        answers[question.name] = Malformed() if answer is None else answer
     if by_name:  # 多出题目里没有的答案
         raise DecisionError(Provider.OPENAI, ErrorKind.MALFORMED, usage=usage)
-    return DecisionResult(answers=answers, usage=usage)
+    return settle_answers(Provider.OPENAI, answers, usage)
 
 
 def _answer(question: Question, item: dict[str, object]) -> Answer | None:

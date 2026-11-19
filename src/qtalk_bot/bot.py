@@ -159,8 +159,37 @@ def chat_input(message: pyqbot.C2CMessage) -> ChatInput:
         message_id=message.id,
         text=text,
         msg_idx=message.msg_idx,
+        ref_msg_idx=ref_msg_idx(message),
         attachments=tuple(items[:MAX_ATTACHMENTS]),
     )
+
+
+MAX_REF_LENGTH = 512  # 引用索引最长存这么多字符；更长的当作没有（平台的索引实测是几十个字符）
+
+
+def ref_msg_idx(message: pyqbot.C2CMessage) -> str | None:
+    """这条消息引用的那条消息的引用索引；没有引用时为 `None`。按引用定位话题时用。
+
+    平台的真实形态还没有实测，这里是按官方文档推断的：引用消息（`message_type=103`）的 `message_scene.ext` 里
+    有 `ref_msg_idx=...`，`msg_elements` 里被引用的那条也带 `msg_idx`。优先取前者；没有时取 `msg_elements`
+    第一项的 `msg_idx`。pyqbot 只提供了 `msg_idx`（这条消息自己的索引），没有现成的 `ref_msg_idx`，所以这里
+    自己读 `ext`。
+    """
+    if message.message_scene is not None:
+        for item in message.message_scene.ext:
+            key, sep, value = item.partition("=")
+            if sep and key == "ref_msg_idx":
+                return _ref_value(value)
+    for element in message.msg_elements:
+        return _ref_value(element.msg_idx)
+    return None
+
+
+def _ref_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value if value and len(value) <= MAX_REF_LENGTH else None
 
 
 def _attachment(item: pyqbot.MessageAttachment, *, quoted: bool) -> IncomingAttachment:
@@ -666,6 +695,9 @@ class _Ark(Protocol):
 
 class _Element(Protocol):
     """pyqbot 的 `MessageElement`（被引用的消息）里用到的部分；同样没有公开导出。"""
+
+    @property
+    def msg_idx(self) -> str | None: ...
 
     @property
     def message_type(self) -> pyqbot.ReceivedMessageType | None: ...

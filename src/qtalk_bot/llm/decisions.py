@@ -9,10 +9,12 @@
   媒体时不发请求，抛 `DecisionError(UNSUPPORTED)`。现在只用到语音：Gemini 的 Decisions API 收音频（SDK 的
   `DecisionInputContentParam` 里有 `AudioContentParam`），OpenAI 的不收。
 - 结果是 `DecisionResult`：按题目名给出答案，选择题是每个选项的概率（`ChoiceAnswer`），是非题是「是」的
-  概率（`YesNoAnswer`）；某一道题被服务商拒答时是 `Refusal`，同一次调用里的其它题照常有答案。
+  概率（`YesNoAnswer`）；某一道题被服务商拒答时是 `Refusal`，某一道题的答案不合法（题型不对、缺选项、概率
+  不合法）时是 `Malformed`，同一次调用里的其它题照常有答案。
 - 调用失败抛 `DecisionError`（`ModelError` 的子类，文案规则相同：只有服务商、本地的错误分类与数字状态码）。
-  缺题、概率不合法这类坏响应也算失败（`ErrorKind.MALFORMED`），整次调用作废；失败前服务商报告了用量时
-  带在 `usage` 上。
+  整体结构不对（不是 JSON 对象、没有答案列表、缺题、多题、重名）算整次的坏响应（`ErrorKind.MALFORMED`）；
+  每一道题的答案都不合法时也按整次的坏响应抛出，所以只问一道题时，它坏了就是整次失败。失败前服务商报告了
+  用量时带在 `usage` 上。
 
 名字的限制取两家的交集：题目名是 1–64 个 ASCII 字母、数字、`_`、`-`（Gemini 的题目键）；选项取值非空、
 最长 128 个字符，首尾不能是空白，不能含控制字符（Gemini 的选项键）；每道选择题 2–255 个选项。
@@ -171,7 +173,22 @@ class Refusal:
     """服务商拒绝回答这道题（OpenAI 的单题拒答）。"""
 
 
-type Answer = ChoiceAnswer | YesNoAnswer | Refusal
+@dataclass(frozen=True, slots=True)
+class Malformed:
+    """这道题的答案不合法（题型不对、缺选项、多出选项、概率不合法），同一次调用的其它题照常有答案。"""
+
+
+type Answer = ChoiceAnswer | YesNoAnswer | Refusal | Malformed
+
+
+def settle_answers(
+    provider: Provider, answers: Mapping[str, Answer], usage: Usage | None
+) -> DecisionResult:
+    """适配器整理好逐题的答案后调用：每一道都是 `Malformed` 时按整次的坏响应抛 `DecisionError`（只问一道题时
+    与逐题之前的行为一致），否则返回结果。"""
+    if answers and all(isinstance(answer, Malformed) for answer in answers.values()):
+        raise DecisionError(provider, ErrorKind.MALFORMED, usage=usage)
+    return DecisionResult(answers=answers, usage=usage)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

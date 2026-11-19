@@ -92,6 +92,9 @@ class HistoryEntry:
     faces_only: bool = field(default=False, compare=False)
     """用户消息只由表情组成（流水的 `faces_only` 列）。取历史与这一轮的输入时已经跳过这样的消息，这一项只为
     防御：它不让一轮变得可答。"""
+    reply_to: int | None = field(default=None, compare=False)
+    """回复所回答的用户消息（流水的 `reply_to`）；用户消息为 `None`。合并几段历史时按它排位置（见
+    `position()`）。"""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -129,13 +132,22 @@ def add_user_message(
     *,
     msg_idx: str | None = None,
     faces_only: bool = False,
+    ref_msg_idx: str | None = None,
 ) -> int:
     """把用户发来的文字（没有文字时是空串）写进流水，返回它的编号。`msg_idx` 是平台的引用索引；`faces_only`
-    表示这条消息只由表情组成（`faces.is_sticker()`），它只留个记录，永远不进模型的输入。"""
+    表示这条消息只由表情组成（`faces.is_sticker()`），它只留个记录，永远不进模型的输入；`ref_msg_idx` 是它
+    引用的那条消息的引用索引（按引用定位话题时用）。"""
+    columns = "user_id, role, content, qq_message_id, created_at, msg_idx, faces_only"
+    marks = "?, 'user', ?, ?, ?, ?, ?"
+    values: list[object] = [user_id, content, qq_message_id, now, msg_idx, int(faces_only)]
+    if ref_msg_idx is not None:
+        # 没有引用时不写这一列（默认为空），迁移测试里第 9 版之前的库也能照常写入。
+        columns += ", ref_msg_idx"
+        marks += ", ?"
+        values.append(ref_msg_idx)
     row = conn.execute(
-        "INSERT INTO messages (user_id, role, content, qq_message_id, created_at, msg_idx,"
-        " faces_only) VALUES (?, 'user', ?, ?, ?, ?, ?) RETURNING id",
-        (user_id, content, qq_message_id, now, msg_idx, int(faces_only)),
+        f"INSERT INTO messages ({columns}) VALUES ({marks}) RETURNING id",  # noqa: S608  只拼列名常量与 ? 占位符
+        values,
     ).fetchone()
     message_id: int = row["id"]
     return message_id
@@ -350,11 +362,18 @@ def add_reply(
 NOTICE_DELIVERIES = frozenset((ReplyDelivery.FAILED, ReplyDelivery.REJECTED, ReplyDelivery.NOTICED))
 """这几种送达状态下，用户确实收到了固定说明或附件的说明（即使 `content` 为空）。"""
 
-_ENDS_TURN_SQL = (
-    "(role = 'assistant' AND (content != '' OR delivery IN ("
-    + ", ".join(f"'{d.value}'" for d in sorted(NOTICE_DELIVERIES))
-    + ")))"
-)
+
+def _ends_turn_sql(alias: str = "") -> str:
+    """`ends_turn()` 的 SQL 写法；`alias` 是 `messages` 表在查询里的别名。只由代码里的常量拼成。"""
+    prefix = f"{alias}." if alias else ""
+    deliveries = ", ".join(f"'{d.value}'" for d in sorted(NOTICE_DELIVERIES))
+    return (
+        f"({prefix}role = 'assistant' AND ({prefix}content != ''"
+        f" OR {prefix}delivery IN ({deliveries})))"
+    )
+
+
+_ENDS_TURN_SQL = _ends_turn_sql()
 
 
 def ends_turn(content: str, delivery: ReplyDelivery) -> bool:
@@ -433,6 +452,13 @@ def recent_history(
             seen_user = True
         picked.append((row, age))
     picked.reverse()
+    return _entries(conn, user_id, picked)
+
+
+def _entries(
+    conn: sqlite3.Connection, user_id: int, picked: Sequence[tuple[sqlite3.Row, int]]
+) -> list[HistoryEntry]:
+    """把（行，往前数第几轮）整理成上下文里的消息，带上用户消息的附件；正文为空的回复不带。"""
     attachments = message_attachments(
         conn, user_id, (row["id"] for row, _ in picked if row["role"] == Role.USER.value)
     )
@@ -444,6 +470,7 @@ def recent_history(
             turns_ago=age,
             message_id=row["id"],
             faces_only=bool(row["faces_only"]),
+            reply_to=row["reply_to"],
         )
         for row, age in picked
         if row["role"] == Role.USER.value or row["content"] != ""
@@ -455,6 +482,58 @@ def _position(row: sqlite3.Row) -> tuple[int, int, int]:
     if row["reply_to"] is None:
         return (row["id"], 0, row["id"])
     return (row["reply_to"], 1, row["id"])
+
+
+def position(entry: HistoryEntry) -> tuple[int, int, int]:
+    """上下文里一条消息的位置，规则同 `_position()`。没有编号的排在最前（只为类型完整，取自流水的都有编号）。"""
+    message_id = -1 if entry.message_id is None else entry.message_id
+    if entry.reply_to is None:
+        return (message_id, 0, message_id)
+    return (entry.reply_to, 1, message_id)
+
+
+def topic_history(
+    conn: sqlite3.Connection, user_id: int, topic_id: int, before: int, turns: int
+) -> list[HistoryEntry]:
+    """这个用户的话题 `topic_id` 在消息 `before` 之前最近 `turns` 轮的原文与附件，按时间排列。
+
+    话题归属（`topic_messages`）只在一轮结束时写，一轮的用户消息与结束它的回复一起归进去，所以从归进这个话题、
+    结束了一轮的回复（`ends_turn()`）里取最近 `turns` 条，再取这些轮次的用户消息即可：编号在更早一轮的
+    `reply_to` 之后、不大于最近一条的 `reply_to`。话题、消息与归属三处都按 `user_id` 过滤，别人的话题编号取不出
+    任何东西。`turns_ago` 是在这个话题里往前数第几轮；只由表情组成的消息不带。
+    """
+    if turns <= 0:
+        return []
+    replies = conn.execute(
+        "SELECT m.id, m.role, m.content, m.faces_only, m.reply_to, m.delivery"  # noqa: S608  只拼代码里的常量条件
+        " FROM messages AS m JOIN topic_messages AS t ON t.message_id = m.id"
+        " JOIN topics ON topics.id = t.topic_id"
+        " WHERE m.user_id = ? AND t.user_id = ? AND topics.user_id = ? AND t.topic_id = ?"
+        f" AND m.role = 'assistant' AND m.reply_to < ? AND {_ends_turn_sql('m')}"
+        " ORDER BY m.reply_to DESC, m.id DESC LIMIT ?",
+        (user_id, user_id, user_id, topic_id, before, turns + 1),
+    ).fetchall()
+    if not replies:
+        return []
+    kept = replies[:turns]
+    upper = max(row["reply_to"] for row in kept)
+    lower = replies[turns]["reply_to"] if len(replies) > turns else 0
+    users = conn.execute(
+        "SELECT m.id, m.role, m.content, m.faces_only, NULL AS reply_to, NULL AS delivery"
+        " FROM messages AS m JOIN topic_messages AS t ON t.message_id = m.id"
+        " WHERE m.user_id = ? AND t.user_id = ? AND t.topic_id = ? AND m.role = 'user'"
+        " AND m.faces_only = 0 AND m.id > ? AND m.id <= ?",
+        (user_id, user_id, topic_id, lower, upper),
+    ).fetchall()
+    rows = sorted([*users, *kept], key=_position, reverse=True)
+    picked: list[tuple[sqlite3.Row, int]] = []
+    age = -1
+    for row in rows:
+        if row["role"] == Role.ASSISTANT.value:
+            age += 1
+        picked.append((row, max(age, 0)))
+    picked.reverse()
+    return _entries(conn, user_id, picked)
 
 
 def pending_messages(conn: sqlite3.Connection, user_id: int, before: int) -> list[HistoryEntry]:

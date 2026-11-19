@@ -1292,6 +1292,43 @@ async def test_messages_are_converted_with_quoted_images_and_unsupported_parts(
     assert quoted.url == QUOTED[0]["attachments"][0]["url"]
 
 
+async def test_quoted_message_index_is_taken_from_ext_then_from_msg_elements(
+    db: Database,
+) -> None:
+    # 平台的真实形态没有实测，按官方文档推断：优先 ext 里的 ref_msg_idx，没有时取 msg_elements 的 msg_idx。
+    await welcomed_alice(db)
+    both = c2c(
+        ALICE,
+        "接着说",
+        "ROBOT1.0_fake-1",
+        message_type=103,
+        msg_elements=[{"msg_idx": "REFIDX_element", "content": "旧消息"}],
+        message_scene={"ext": ["ref_msg_idx=REFIDX_ext", "msg_idx=REFIDX_self"]},
+    )
+    elements_only = c2c(
+        ALICE,
+        "接着说",
+        "ROBOT1.0_fake-2",
+        message_type=103,
+        msg_elements=[{"msg_idx": "REFIDX_element", "content": "旧消息"}],
+        message_scene={"ext": ["msg_idx=REFIDX_self2"]},
+    )
+    plain = c2c(ALICE, "没引用", "ROBOT1.0_fake-3", message_scene={"ext": ["msg_idx=REFIDX_3"]})
+    platform = Platform([both, elements_only, plain])
+    chat = CapturingChat(platform)
+
+    await run_until_handled(
+        platform, db, chat, events=3, sent=0, until=lambda: len(chat.messages) == 3
+    )
+
+    converted = [chat_input(m) for m in chat.messages]
+    assert [(c.msg_idx, c.ref_msg_idx) for c in converted] == [
+        ("REFIDX_self", "REFIDX_ext"),
+        ("REFIDX_self2", "REFIDX_element"),
+        ("REFIDX_3", None),
+    ]
+
+
 async def test_cards_and_chat_history_become_unsupported_parts(db: Database) -> None:
     await welcomed_alice(db)
     card = c2c(ALICE, "", "ROBOT1.0_fake-1", message_type=3, ark_data={"ark_type": "map"})

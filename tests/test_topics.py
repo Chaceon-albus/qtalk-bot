@@ -1,0 +1,342 @@
+"""话题线的数据层（`topics.py`）、话题里的历史（`journal.topic_history()`）与迁移 V9。"""
+
+import sqlite3
+from collections.abc import AsyncIterator
+from pathlib import Path
+
+import pytest
+
+from qtalk_bot import access, journal, topics
+from qtalk_bot.journal import Ending, HistoryEntry, ReplyDelivery
+from qtalk_bot.llm import Role
+from qtalk_bot.storage import DATABASE_FILENAME, MIGRATIONS, Database
+
+ALICE = "FAKE-OPENID-ALICE"
+BOB = "FAKE-OPENID-BOB"
+
+
+@pytest.fixture
+async def db(tmp_path: Path) -> AsyncIterator[Database]:
+    async with await Database.open(tmp_path / DATABASE_FILENAME) as database:
+        yield database
+
+
+async def new_user(db: Database, openid: str, name: str) -> int:
+    user = await db.transaction(access.ensure_user, openid, name, 0)
+    return user.id
+
+
+def turn(
+    conn: sqlite3.Connection,
+    user_id: int,
+    question: str,
+    answer: str,
+    *,
+    topic: int | None = None,
+    msg_idx: str | None = None,
+    ref: str | None = None,
+    delivery: ReplyDelivery = ReplyDelivery.STREAMED,
+    now: int = 0,
+) -> tuple[int, int]:
+    """写一轮并归到话题 `topic`（`None` 时建新话题），返回（话题编号，用户消息编号）。"""
+    message_id = journal.add_user_message(
+        conn, user_id, question, f"qq-{question}", now, msg_idx=msg_idx, ref_msg_idx=ref
+    )
+    reply_id = journal.add_reply(
+        conn,
+        user_id=user_id,
+        reply_to=message_id,
+        content=answer,
+        model="main",
+        ending=Ending.COMPLETED,
+        delivery=delivery,
+        now=now,
+    )
+    topic_id = topics.attribute(
+        conn, user_id, topic, [message_id], title_text=question, reply_id=reply_id, now=now
+    )
+    return topic_id, message_id
+
+
+async def attributed(db: Database) -> list[tuple[int, int, int]]:
+    rows = await db.fetch_all(
+        "SELECT message_id, topic_id, user_id FROM topic_messages ORDER BY message_id"
+    )
+    return [(r["message_id"], r["topic_id"], r["user_id"]) for r in rows]
+
+
+# ---- 迁移 ----
+
+
+async def test_version_8_database_gets_topic_tables_and_an_empty_ref_column(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / DATABASE_FILENAME
+    async with await Database.open(path, migrations=MIGRATIONS[:8]) as old:
+        user = await old.transaction(access.ensure_user, ALICE, "小王", 0)
+        await old.transaction(journal.add_user_message, user.id, "旧消息", "qq-1", 0)
+
+    async with await Database.open(path) as db:
+        row = await db.fetch_one("SELECT content, ref_msg_idx FROM messages")
+        assert row is not None
+        assert tuple(row) == ("旧消息", None)
+        # 6a 之前的消息不回填话题。
+        assert await db.fetch_all("SELECT * FROM topics") == []
+        assert await attributed(db) == []
+
+        def later(conn: sqlite3.Connection) -> tuple[int, int]:
+            return turn(conn, user.id, "新的一轮", "答")
+
+        topic_id, message_id = await db.transaction(later)
+        assert [(m, t) for m, t, _ in await attributed(db)] == [
+            (message_id, topic_id),
+            (message_id + 1, topic_id),
+        ]
+
+
+async def test_topic_rows_reject_unknown_users(db: Database) -> None:
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.execute(
+            "INSERT INTO topics (user_id, provisional_title, created_at, active_at,"
+            " last_message_id) VALUES (999, 't', 0, 0, 0)"
+        )
+
+
+# ---- 建行、归属、最近活跃 ----
+
+
+def test_provisional_title_takes_the_first_40_characters_on_one_line() -> None:
+    assert topics.provisional_title("  帮我\n看看  这段代码 ") == "帮我 看看 这段代码"
+    assert topics.provisional_title("字" * 50) == "字" * topics.PROVISIONAL_TITLE_CHARS
+    assert topics.provisional_title(" \n ") == topics.UNTITLED
+
+
+async def test_new_topic_gets_a_provisional_title_and_the_whole_turn(db: Database) -> None:
+    alice = await new_user(db, ALICE, "小王")
+
+    def write(conn: sqlite3.Connection) -> tuple[int, list[int], int]:
+        first = journal.add_user_message(conn, alice, "先看这个", "qq-1", 0)
+        second = journal.add_user_message(conn, alice, "x" * 60, "qq-2", 0)
+        reply = journal.add_reply(
+            conn,
+            user_id=alice,
+            reply_to=second,
+            content="答",
+            model="main",
+            ending=Ending.COMPLETED,
+            delivery=ReplyDelivery.STREAMED,
+            now=5,
+        )
+        topic_id = topics.attribute(
+            conn,
+            alice,
+            None,
+            [first, second],
+            title_text="先看这个 " + "x" * 60,
+            reply_id=reply,
+            now=5,
+        )
+        return topic_id, [first, second], reply
+
+    topic_id, messages, reply = await db.transaction(write)
+
+    row = await db.fetch_one(
+        "SELECT user_id, provisional_title, title, summary, summarized_through, created_at,"
+        " active_at, last_message_id FROM topics WHERE id = ?",
+        (topic_id,),
+    )
+    assert row is not None
+    assert tuple(row) == (alice, ("先看这个 " + "x" * 60)[:40], None, None, None, 5, 5, reply)
+    assert await attributed(db) == [(m, topic_id, alice) for m in (*messages, reply)]
+    topic = await db.transaction(topics.get_topic, alice, topic_id)
+    assert topic is not None
+    assert topic.display_title == ("先看这个 " + "x" * 60)[:40]
+
+
+async def test_existing_topic_is_touched_and_ordered_by_its_latest_turn(db: Database) -> None:
+    alice = await new_user(db, ALICE, "小王")
+
+    def write(conn: sqlite3.Connection) -> tuple[int, int]:
+        a, _ = turn(conn, alice, "话题甲", "答", now=1)
+        b, _ = turn(conn, alice, "话题乙", "答", now=2)
+        turn(conn, alice, "回到甲", "答", topic=a, now=2)  # 同一秒：按回复的编号排
+        return a, b
+
+    a, b = await db.transaction(write)
+
+    recent = await db.transaction(topics.recent_topics, alice, 10)
+    assert [t.id for t in recent] == [a, b]
+    assert [t.display_title for t in recent] == ["话题甲", "话题乙"]
+    assert await db.transaction(topics.recent_topics, alice, 1) == recent[:1]
+    assert await db.transaction(topics.recent_topics, alice, 0) == []
+
+
+async def test_topics_of_another_user_are_never_used(db: Database) -> None:
+    # AGENTS.md 的第二条不变量：别人的话题编号写不进、查不出。
+    alice = await new_user(db, ALICE, "小王")
+    bob = await new_user(db, BOB, "小李")
+
+    def write(conn: sqlite3.Connection) -> tuple[int, int, int]:
+        bobs, bob_message = turn(conn, bob, "小李的秘密", "答")
+        # 小王这一轮指向小李的话题编号（正常不会发生）：另建一条自己的话题。
+        alices, _ = turn(conn, alice, "小王的问题", "答", topic=bobs)
+        return bobs, alices, bob_message
+
+    bobs, alices, bob_message = await db.transaction(write)
+
+    assert alices != bobs
+    assert [t.id for t in await db.transaction(topics.recent_topics, alice, 10)] == [alices]
+    assert [t.id for t in await db.transaction(topics.recent_topics, bob, 10)] == [bobs]
+    assert await db.transaction(topics.get_topic, alice, bobs) is None
+    assert {user for _, topic, user in await attributed(db) if topic == bobs} == {bob}
+
+    def steal(conn: sqlite3.Connection) -> None:
+        # 小王的归属里混进小李的消息编号：只归小王自己的消息。
+        topics.attribute(
+            conn, alice, alices, [bob_message], title_text="", reply_id=bob_message, now=0
+        )
+
+    await db.transaction(steal)
+    assert {(m, t) for m, t, _ in await attributed(db) if m == bob_message} == {(bob_message, bobs)}
+    assert await db.transaction(journal.topic_history, alice, bobs, 10_000, 10) == []
+
+
+async def test_set_summary_only_moves_forward_and_only_for_the_owner(db: Database) -> None:
+    alice = await new_user(db, ALICE, "小王")
+    bob = await new_user(db, BOB, "小李")
+    topic_id, message_id = await db.transaction(lambda conn: turn(conn, alice, "问", "答"))
+    reply_id = message_id + 1
+
+    assert not await db.transaction(
+        lambda conn: topics.set_summary(
+            conn, bob, topic_id, title="偷改", summary="偷改", through=reply_id
+        )
+    )
+    assert await db.transaction(
+        lambda conn: topics.set_summary(
+            conn, alice, topic_id, title="标题", summary="摘要", through=reply_id
+        )
+    )
+    assert not await db.transaction(
+        lambda conn: topics.set_summary(
+            conn, alice, topic_id, title="旧的", summary="旧的", through=message_id
+        )
+    )
+    topic = await db.transaction(topics.get_topic, alice, topic_id)
+    assert topic is not None
+    assert (topic.display_title, topic.summary) == ("标题", "摘要")
+
+
+# ---- 按引用定位 ----
+
+
+async def test_quote_finds_the_topic_of_this_users_own_message(db: Database) -> None:
+    alice = await new_user(db, ALICE, "小王")
+
+    def write(conn: sqlite3.Connection) -> tuple[int, int, int]:
+        a, _ = turn(conn, alice, "话题甲", "答", msg_idx="REFIDX_a")
+        turn(conn, alice, "话题乙", "答", msg_idx="REFIDX_b")
+        quoting = journal.add_user_message(conn, alice, "接着说", "qq-q", 0, ref_msg_idx="REFIDX_a")
+        plain = journal.add_user_message(conn, alice, "没引用", "qq-p", 0)
+        return a, quoting, plain
+
+    a, quoting, plain = await db.transaction(write)
+
+    assert await db.transaction(topics.quoted_topic, alice, [plain, quoting]) == a
+    assert await db.transaction(topics.quoted_topic, alice, [plain]) is None
+    assert await db.transaction(topics.quoted_topic, alice, []) is None
+
+
+async def test_quote_of_an_unknown_or_unattributed_message_finds_nothing(db: Database) -> None:
+    alice = await new_user(db, ALICE, "小王")
+
+    def write(conn: sqlite3.Connection) -> list[int]:
+        journal.add_user_message(conn, alice, "还没有话题", "qq-1", 0, msg_idx="REFIDX_loose")
+        return [
+            journal.add_user_message(conn, alice, "引用", "qq-2", 0, ref_msg_idx="REFIDX_loose"),
+            journal.add_user_message(conn, alice, "引用", "qq-3", 0, ref_msg_idx="REFIDX_none"),
+        ]
+
+    quoting = await db.transaction(write)
+
+    assert await db.transaction(topics.quoted_topic, alice, quoting) is None
+
+
+async def test_quote_of_another_users_message_index_finds_nothing(db: Database) -> None:
+    # AGENTS.md 的第二条不变量：别人的 msg_idx 解析不到任何话题。
+    alice = await new_user(db, ALICE, "小王")
+    bob = await new_user(db, BOB, "小李")
+
+    def write(conn: sqlite3.Connection) -> tuple[int, int]:
+        bobs, _ = turn(conn, bob, "小李的秘密", "答", msg_idx="REFIDX_bob")
+        quoting = journal.add_user_message(conn, alice, "引用", "qq-a", 0, ref_msg_idx="REFIDX_bob")
+        return bobs, quoting
+
+    _, quoting = await db.transaction(write)
+
+    assert await db.transaction(topics.quoted_topic, alice, [quoting]) is None
+    # 小李的消息编号也不能当成小王的这一轮来查。
+    bob_quoting = await db.transaction(
+        lambda conn: journal.add_user_message(
+            conn, bob, "引用", "qq-b", 0, ref_msg_idx="REFIDX_bob"
+        )
+    )
+    assert await db.transaction(topics.quoted_topic, alice, [bob_quoting]) is None
+
+
+# ---- 话题里的历史 ----
+
+
+async def test_topic_history_takes_the_last_turns_of_that_topic_only(db: Database) -> None:
+    alice = await new_user(db, ALICE, "小王")
+
+    def write(conn: sqlite3.Connection) -> tuple[int, int]:
+        a, _ = turn(conn, alice, "甲1", "答甲1")
+        b, _ = turn(conn, alice, "乙1", "答乙1")
+        turn(conn, alice, "甲2", "答甲2", topic=a)
+        turn(conn, alice, "乙2", "答乙2", topic=b)
+        turn(conn, alice, "甲3", "答甲3", topic=a)
+        current = journal.add_user_message(conn, alice, "甲4", "qq-now", 0)
+        return a, current
+
+    a, current = await db.transaction(write)
+
+    history = await db.transaction(journal.topic_history, alice, a, current, 2)
+    assert history == [
+        HistoryEntry(Role.USER, "甲2"),
+        HistoryEntry(Role.ASSISTANT, "答甲2"),
+        HistoryEntry(Role.USER, "甲3"),
+        HistoryEntry(Role.ASSISTANT, "答甲3"),
+    ]
+    assert [e.turns_ago for e in history] == [1, 1, 0, 0]
+    assert [
+        e.content for e in await db.transaction(journal.topic_history, alice, a, current, 9)
+    ] == [
+        "甲1",
+        "答甲1",
+        "甲2",
+        "答甲2",
+        "甲3",
+        "答甲3",
+    ]
+    assert await db.transaction(journal.topic_history, alice, a, current, 0) == []
+
+
+async def test_topic_history_skips_notice_only_replies_but_keeps_their_questions(
+    db: Database,
+) -> None:
+    alice = await new_user(db, ALICE, "小王")
+
+    def write(conn: sqlite3.Connection) -> tuple[int, int]:
+        a, _ = turn(conn, alice, "问1", "", delivery=ReplyDelivery.FAILED)
+        turn(conn, alice, "问2", "答2", topic=a)
+        return a, journal.add_user_message(conn, alice, "问3", "qq-now", 0)
+
+    a, current = await db.transaction(write)
+
+    history = await db.transaction(journal.topic_history, alice, a, current, 5)
+    assert [(e.role, e.content) for e in history] == [
+        (Role.USER, "问1"),
+        (Role.USER, "问2"),
+        (Role.ASSISTANT, "答2"),
+    ]

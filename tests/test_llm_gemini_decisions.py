@@ -26,6 +26,7 @@ from qtalk_bot.llm.decisions import (
     DecisionMedia,
     DecisionRequest,
     DecisionResult,
+    Malformed,
     Option,
     YesNoAnswer,
     YesNoQuestion,
@@ -168,6 +169,38 @@ async def test_several_questions_in_one_call() -> None:
         "damaged": YesNoAnswer(0.2),
     }
     assert list(server.body["questions"]) == ["model", "damaged"]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        choice(solve=1.0),  # 缺选项
+        choice(solve=1.5, chat=0.0),  # 概率越界
+        noul(0.5),  # 题型不对
+        {k: v for k, v in choice(solve=0.6, chat=0.4).items() if k != "type"},  # 没写 type
+        [0.5],  # 不是对象
+    ],
+    ids=["missing_option", "probability_above_one", "wrong_type", "missing_type", "not_an_object"],
+)
+async def test_one_bad_answer_keeps_the_other_question(bad: object) -> None:
+    # 两道题同批：一道的答案不合法只标出那一道，另一道照常返回。
+    server = replying({"answers": {"model": bad, "damaged": noul(0.3)}, "usage": USAGE})
+
+    result = await model_on(server).decide(request(ROUTE, DAMAGED))
+
+    assert result.answers == {"model": Malformed(), "damaged": YesNoAnswer(0.3)}
+    assert result.usage == Usage(42, 0)
+
+
+async def test_every_answer_bad_is_a_malformed_call() -> None:
+    server = replying(decision(model=choice(solve=1.0), damaged=noul(1.5)))
+    error = await failure(server, ROUTE, DAMAGED)
+    assert (error.kind, error.usage) == (ErrorKind.MALFORMED, Usage(42, 0))
+
+
+async def test_missing_question_is_still_a_malformed_call() -> None:
+    error = await failure(replying(decision(damaged=noul(0.3))), ROUTE, DAMAGED)
+    assert error.kind is ErrorKind.MALFORMED
 
 
 async def test_custom_model_name_and_repr() -> None:

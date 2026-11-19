@@ -308,6 +308,42 @@ _V8_PROCESS = """
 ALTER TABLE messages ADD COLUMN process TEXT;
 """
 
+_V9_TOPICS = """
+-- ref_msg_idx：用户消息引用了哪条消息（被引用消息的 msg_idx），是平台给的事实，按引用定位话题时用。取自
+-- message_scene.ext 的 ref_msg_idx，没有时取 msg_elements 里的 msg_idx（平台的真实形态还没有实测）。没有引用
+-- 的消息、回复与升级前的行为空。
+ALTER TABLE messages ADD COLUMN ref_msg_idx TEXT;
+-- 按引用定位时在这个用户自己的消息里按 msg_idx 查。
+CREATE INDEX messages_by_msg_idx ON messages (user_id, msg_idx) WHERE msg_idx IS NOT NULL;
+
+-- 话题线：每个用户自动划分出的隐式 session，属于派生数据，以后可以从流水重算。
+-- provisional_title 是建行时取这一轮用户消息文字版的前 40 字，后台还没写出标题时用它；title 与 summary 由
+-- 后台的小模型写（里程碑 6a 之后的一步），没写时为空；summarized_through 是摘要覆盖到的最后一条消息，摘要
+-- 只需要补上它之后的各轮。created_at 是建行时刻，active_at 是最近一次有轮次归进来的时刻；last_message_id 是
+-- 最近一次归进来的那一轮的回复，「最近活跃」按它排序（时钟可能回拨，行号不会）。
+CREATE TABLE topics (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id),
+    provisional_title TEXT NOT NULL,
+    title TEXT,
+    summary TEXT,
+    summarized_through INTEGER REFERENCES messages (id) ON DELETE SET NULL,
+    created_at INTEGER NOT NULL,
+    active_at INTEGER NOT NULL,
+    last_message_id INTEGER NOT NULL
+) STRICT;
+CREATE INDEX topics_by_activity ON topics (user_id, last_message_id);
+
+-- 话题归属：消息（用户消息与回复）属于哪条话题线。派生数据，流水 messages 仍只追加。user_id 与消息、话题的
+-- user_id 相同，查询一律同时按它过滤。
+CREATE TABLE topic_messages (
+    message_id INTEGER PRIMARY KEY REFERENCES messages (id) ON DELETE CASCADE,
+    topic_id INTEGER NOT NULL REFERENCES topics (id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users (id)
+) STRICT;
+CREATE INDEX topic_messages_by_topic ON topic_messages (topic_id, message_id);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     _V1_ACCESS,
     _V2_CHAT,
@@ -317,6 +353,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     _v6_faces_summaries_and_given,
     _V7_SEARCHES,
     _V8_PROCESS,
+    _V9_TOPICS,
 )
 """本程序的迁移列表。业务表由各里程碑在末尾追加，已发布的不能修改。"""
 

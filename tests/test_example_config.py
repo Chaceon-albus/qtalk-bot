@@ -17,6 +17,7 @@ from qtalk_bot.config import (
     QQSettings,
     Secrets,
     Settings,
+    TopicSettings,
     TurnSettings,
     load_secrets,
     load_settings,
@@ -57,6 +58,7 @@ def test_example_config_is_valid_and_spells_out_the_defaults() -> None:
     assert example.decisions == DecisionSettings(
         provider=Provider.OPENAI, model=DEFAULT_DECISION_MODELS[Provider.OPENAI]
     )
+    assert example.topics == TopicSettings()
     assert example.attachments == AttachmentSettings()
     assert example.turns == TurnSettings()
     # [describe] 的模型没有默认值，其余各项要与默认值一致。

@@ -65,6 +65,18 @@
 「正在输入」发完（`_Turn.typing_settled()`），免得内容先到、随后才显示正在输入；一轮结束或被取消时取消在途的
 「正在输入」，最多等 `GRACE_SECONDS`。
 
+**话题线**（里程碑 6a，`Router.topics` 不为空，即配置了 `[decisions]` 时）：
+- 开轮的事务里取出这个用户最近活跃的 `[topics].candidates` 条话题，并按这一轮消息的引用（`ref_msg_idx`）在这个
+  用户自己的消息里找被引用消息的话题（`topics.quoted_topic()`）；找到就定下它，话题题不问。
+- 选话题与选模型在同一次决策调用里（`routing.Router.select()` 的 `topics`）；两道都不问时不调用决策。
+- 决策之后在事务里复查授权，按选中的话题组装上下文（`_topic_context()`）：不分话题的最近 `[topics].recent_turns`
+  轮、选中话题最近 `[chat].history_turns` 轮（`journal.topic_history()`），合并去重（`context.merge_history()`）；
+  选中话题与第二可能的话题的摘要、别的话题的标题（目录）放进系统提示词（`prompt.Memory`）。没有话题的旧消息只经
+  「最近几轮」出现。
+- 一轮结束（`journal.ends_turn()`）时与回复写在同一个事务里：这一轮的用户消息与回复归到选中的话题，选「新话题」
+  时在这时建行，临时标题取这一轮用户消息文字版的开头（`topics.attribute()`）。被插话打断、没有结束一轮的不写。
+- 话题题的决策记录与选模型的写在一起，同一次调用只记一次用量。
+
 **判断插话**（`judge()`）：在事务里复查授权、取出正在回答的消息与新消息的文字版（只有这个用户自己的），交给
 `routing.SteerJudge`；决策记录与用量挂在新消息里最后一条上，被取消时也照记。
 """
@@ -81,7 +93,7 @@ from enum import Enum
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
-from . import access, citations, faces, journal, texts
+from . import access, citations, faces, journal, texts, topics
 from .access import User
 from .citations import Source
 from .config import AttachmentSettings, ChatSettings, ProcessSettings
@@ -92,6 +104,7 @@ from .context import (
     decision_latest,
     decision_text,
     fallback_allowed,
+    merge_history,
     plan_turn,
 )
 from .describe import Describer
@@ -147,7 +160,17 @@ from .process import (
     Sleep,
     Timer,
 )
-from .routing import LATEST_CHARS, DecisionRecord, Router, Selection, Steer, SteerJudge
+from .prompt import Memory
+from .routing import (
+    LATEST_CHARS,
+    DecisionRecord,
+    Router,
+    Selection,
+    Steer,
+    SteerJudge,
+    TopicOption,
+    TopicQuery,
+)
 from .storage import Database
 
 logger = logging.getLogger(__name__)
@@ -282,6 +305,7 @@ class ChatInput:
         message_id: 平台的消息 ID。
         text: 文字；`None` 表示没有文字（纯图片、语音、文件等）。
         msg_idx: 平台的引用索引，没有时为 `None`。
+        ref_msg_idx: 这条消息引用的那条消息的引用索引，没有引用时为 `None`。
         attachments: 附件，以及卡片、转发的聊天记录这类不支持的内容；被引用的消息里的图片也在这里
             （`quoted` 为真）。
     """
@@ -289,6 +313,7 @@ class ChatInput:
     message_id: str
     text: str | None = field(repr=False)
     msg_idx: str | None = None
+    ref_msg_idx: str | None = None
     attachments: tuple[IncomingAttachment, ...] = ()
 
     @property
@@ -396,6 +421,7 @@ class _Begun:
     current: list[HistoryEntry] = field(repr=False)  # 这一轮的用户消息与附件
     decision_history: list[HistoryEntry] = field(repr=False)  # 附件已写成简短的标记
     previous: str | None  # 这个用户上一轮实际回答的模型
+    topics: TopicQuery | None = None  # 分话题时这一轮的话题题；不分话题时为 `None`
 
     @property
     def last_message_id(self) -> int:
@@ -780,6 +806,7 @@ class Conversation:
             begun.previous,
             label=user.label,
             candidates=plan.candidates,
+            topics=begun.topics,
         )
         builder = RequestBuilder(
             None if self._fetcher is None else self._fetcher.store,
@@ -818,7 +845,7 @@ class Conversation:
         )
         cancelled: asyncio.CancelledError | None = None
         try:
-            outcome = await self._generate(turn, builder, begun.current)
+            outcome = await self._generate(turn, builder, begun)
             await turn.stop_pulses(GRACE_SECONDS)
         except asyncio.CancelledError as exc:
             if control.preempted:
@@ -847,7 +874,12 @@ class Conversation:
         processes = [*control.earlier, turn.process]
         await asyncio.shield(
             self._record(
-                turn, begun.last_message_id, outcome, turn_messages, _transcript(processes)
+                turn,
+                begun.last_message_id,
+                outcome,
+                turn_messages,
+                _transcript(processes),
+                _title_text(begun.current) if begun.topics is not None else None,
             )
         )
         if cancelled is not None:
@@ -901,8 +933,12 @@ class Conversation:
         outcome: _Outcome,
         turn_messages: Sequence[int],
         process: str | None = None,
+        title_text: str | None = None,
     ) -> None:
-        """记账。`turn_messages` 是这一轮的全部用户消息（含并进来的），它们的附件按这一轮重记 `given`。"""
+        """记账。`turn_messages` 是这一轮的全部用户消息（含并进来的），它们的附件按这一轮重记 `given`。
+
+        `title_text` 不为空（分话题）时，这一轮结束了就把它的消息与回复归到选中的话题（新话题以它为临时标题）。
+        """
         # 没有调用过对话模型时（选完模型后发现已不能使用对话，或正在决策时被取消）没有调用结果：结局记成
         # 没有调用或被取消，不记对话的用量。
         model = turn.attempts[-1].model if turn.attempts else turn.selection.model
@@ -923,12 +959,17 @@ class Conversation:
             if turn.attempts and journal.ends_turn(outcome.content, outcome.delivery)
             else frozenset[int]()
         )
+        topic: _TopicWrite | None = None
+        if title_text is not None and journal.ends_turn(outcome.content, outcome.delivery):
+            topic = _TopicWrite(turn.selection.topic, title_text)
         await self._db.transaction(
             self._finish,
             turn.user,
             message_id,
-            turn.selection.record,
-            _Reply(model, ending, turn.attempts, outcome, tuple(turn_messages), given, process),
+            turn.selection.records,
+            _Reply(
+                model, ending, turn.attempts, outcome, tuple(turn_messages), given, process, topic
+            ),
         )
         commentaries, _ = turn.process.notes.counts
         logger.info(
@@ -944,7 +985,7 @@ class Conversation:
 
     async def _record_preempted(self, turn: _Turn, message_id: int) -> None:
         await self._db.transaction(
-            self._finish_preempted, turn.user, message_id, turn.selection.record, turn.attempts
+            self._finish_preempted, turn.user, message_id, turn.selection.records, turn.attempts
         )
         logger.info(
             "用户 %s 插话：取消了还没开始显示的回答（模型 %s，调用 %d 次，搜索 %d 次），不记回复",
@@ -978,6 +1019,7 @@ class Conversation:
             now,
             msg_idx=message.msg_idx,
             faces_only=faces_only,
+            ref_msg_idx=message.ref_msg_idx,
         )
         for item in acquired:
             describe = self._describable(item.kind, item.status, item.mime_type, item.size)
@@ -1027,20 +1069,70 @@ class Conversation:
                 journal.recent_history(conn, user.id, before, self._router.history_turns)
             )
             previous = journal.last_answered_model(conn, user.id, before)
-        return _Begun(tuple(message_ids), now, history, current, decisions, previous)
+        query: TopicQuery | None = None
+        if (settings := self._router.topics) is not None:
+            # 分话题：历史要等选完话题再取（`_topic_context()`）。候选与按引用定下的话题都只来自这个用户。
+            history = []
+            candidates = topics.recent_topics(conn, user.id, settings.candidates)
+            pinned = topics.quoted_topic(
+                conn, user.id, (e.message_id for e in current if e.message_id is not None)
+            )
+            query = TopicQuery(
+                candidates=tuple(
+                    TopicOption(topic.id, topic.display_title, topic.summary or "")
+                    for topic in candidates
+                ),
+                pinned=pinned,
+            )
+        return _Begun(tuple(message_ids), now, history, current, decisions, previous, query)
+
+    def _topic_context(
+        self,
+        conn: sqlite3.Connection,
+        user: User,
+        before: int,
+        topic_id: int | None,
+        second_id: int | None,
+    ) -> tuple[list[HistoryEntry], Memory] | None:
+        """分话题时选完话题后的上下文：历史（不分话题的最近几轮加选中话题的最近几轮，合并去重）与记忆（摘要、
+        目录）。一律只取这个用户的；复查授权不通过时返回 `None`。"""
+        settings = self._router.topics
+        if settings is None or not access.chat_allowed(conn, user.id, self._admin_openid):
+            return None
+        recent = journal.recent_history(conn, user.id, before, settings.recent_turns)
+        topic = None if topic_id is None else topics.get_topic(conn, user.id, topic_id)
+        mine: list[HistoryEntry] = []
+        if topic is not None:
+            mine = journal.topic_history(
+                conn, user.id, topic.id, before, self._settings.history_turns
+            )
+        related = None
+        if second_id is not None and second_id != topic_id:
+            related = topics.get_topic(conn, user.id, second_id)
+        others = [
+            t.display_title
+            for t in topics.recent_topics(conn, user.id, settings.directory + 1)
+            if topic is None or t.id != topic.id
+        ][: settings.directory]
+        memory = Memory(
+            summary=(topic.summary or "") if topic is not None else "",
+            related_title="" if related is None else related.display_title,
+            related_summary=(related.summary or "") if related is not None else "",
+            directory=tuple(others),
+        )
+        return merge_history(recent, mine), memory
 
     def _finish(
         self,
         conn: sqlite3.Connection,
         user: User,
         message_id: int,
-        decision: DecisionRecord | None,
+        decisions: Sequence[DecisionRecord],
         reply: _Reply,
     ) -> None:
         now = int(self._clock())
-        if decision is not None:
-            _record_decision(conn, user.id, message_id, decision, now)
-        journal.add_reply(
+        _record_decisions(conn, user.id, message_id, decisions, now)
+        reply_id = journal.add_reply(
             conn,
             user_id=user.id,
             reply_to=message_id,
@@ -1053,19 +1145,28 @@ class Conversation:
         )
         journal.set_given(conn, user.id, reply.messages, reply.given)
         _record_usage(conn, user.id, message_id, reply.attempts, now)
+        if reply.topic is not None:
+            topics.attribute(
+                conn,
+                user.id,
+                reply.topic.topic_id,
+                reply.messages,
+                title_text=reply.topic.title_text,
+                reply_id=reply_id,
+                now=now,
+            )
 
     def _finish_preempted(
         self,
         conn: sqlite3.Connection,
         user: User,
         message_id: int,
-        decision: DecisionRecord | None,
+        decisions: Sequence[DecisionRecord],
         attempts: Sequence[_Attempt],
     ) -> None:
-        """被插话打断的一轮：只记决策与各次调用的用量，不写回复行，也不动 `given`。"""
+        """被插话打断的一轮：只记决策与各次调用的用量，不写回复行，也不动 `given` 与话题归属。"""
         now = int(self._clock())
-        if decision is not None:
-            _record_decision(conn, user.id, message_id, decision, now)
+        _record_decisions(conn, user.id, message_id, decisions, now)
         _record_usage(conn, user.id, message_id, attempts, now)
 
     def _steer_texts(
@@ -1087,7 +1188,7 @@ class Conversation:
     def _record_steer(
         self, conn: sqlite3.Connection, user: User, message_id: int, record: DecisionRecord
     ) -> None:
-        _record_decision(conn, user.id, message_id, record, int(self._clock()))
+        _record_decisions(conn, user.id, message_id, (record,), int(self._clock()))
 
     def _waiting_counts(
         self, conn: sqlite3.Connection, user: User, messages: Sequence[int]
@@ -1106,13 +1207,12 @@ class Conversation:
 
     # ---- 生成与回复 ----
 
-    async def _generate(
-        self, turn: _Turn, builder: RequestBuilder, current: Sequence[HistoryEntry]
-    ) -> _Outcome:
+    async def _generate(self, turn: _Turn, builder: RequestBuilder, begun: _Begun) -> _Outcome:
         # 每一次有代价的调用（决策、主模型、备用模型）之前都在事务里复查一次授权，并且紧挨着调用：发说明、
         # 等决策、读文件组装请求这些等待都在复查之前结束。已知的窗口：复查的事务提交之后、调用真正发出之前，
         # 管理员的 /disable 恰好提交时调用仍会发出。任何「先检查、后行动」都有这样的窗口，它和「停用发生在
         # 调用开始后的一瞬间」无法区分；要消除它只能让管理命令等待进行中的对话，不值得，所以接受。
+        current = begun.current
         voices = self._decision_voices(current) if turn.selection.deciding else []
         # 读原声、编码、等决策响应这段时间占着进程级的多模态名额（见 MULTIMODAL_REQUESTS）。
         slot: AbstractAsyncContextManager[object] = self._media_slots if voices else nullcontext()
@@ -1124,6 +1224,19 @@ class Conversation:
                     return self._withhold(turn)
             chosen = await turn.selection.run(media)
             media.clear()  # 归还名额之前丢掉对原声的引用
+        if begun.topics is not None:
+            # 按选中的话题取上下文，同时复查授权（决策可能等了几秒）。
+            context = await self._db.transaction(
+                self._topic_context,
+                turn.user,
+                begun.last_message_id + 1,
+                turn.selection.topic,
+                turn.selection.second_topic,
+            )
+            if context is None:
+                logger.info("用户 %s 已不能使用对话，不再组装上下文", turn.user.label)
+                return self._withhold(turn)
+            builder.set_context(*context)
         withheld = await self._attempts(turn, builder, self._chain(chosen, current))
         if withheld and not turn.attempts:
             return self._withhold(turn)
@@ -1510,6 +1623,20 @@ class _Reply:
         frozenset()
     )  # 其中实际以原件交给了模型的附件（见 `journal.set_given()`）
     process: str | None = field(default=None, repr=False)  # 处理过程的全文，只存档
+    topic: _TopicWrite | None = None  # 分话题、这一轮结束了时要写的话题归属
+
+
+@dataclass(frozen=True, slots=True)
+class _TopicWrite:
+    """一轮结束时要写的话题归属：`topic_id` 为 `None` 表示新话题，`title_text` 是这一轮用户消息的文字版。"""
+
+    topic_id: int | None
+    title_text: str = field(repr=False)
+
+
+def _title_text(current: Sequence[HistoryEntry]) -> str:
+    """这一轮用户消息的文字版（新话题的临时标题取它的开头）：正文加附件的简短标记，表情标记去掉。"""
+    return " ".join(decision_text(entry) for entry in current if not entry.faces_only)
 
 
 def _record_usage(
@@ -1535,23 +1662,32 @@ def _record_usage(
         )
 
 
-def _record_decision(
-    conn: sqlite3.Connection, user_id: int, message_id: int, record: DecisionRecord, now: int
+def _record_decisions(
+    conn: sqlite3.Connection,
+    user_id: int,
+    message_id: int,
+    records: Sequence[DecisionRecord],
+    now: int,
 ) -> None:
-    journal.add_decision(
-        conn,
-        user_id=user_id,
-        message_id=message_id,
-        question=record.question,
-        provider=record.provider,
-        provider_model=record.provider_model,
-        probabilities=record.probabilities,
-        chosen=record.chosen,
-        kept_previous=record.kept_previous,
-        latency_ms=record.latency_ms,
-        error=record.error,
-        now=now,
-    )
+    """记一次决策调用：每道题一行决策记录，用量只记一行（同一次调用的各道题共用用量）。"""
+    if not records:
+        return
+    for record in records:
+        journal.add_decision(
+            conn,
+            user_id=user_id,
+            message_id=message_id,
+            question=record.question,
+            provider=record.provider,
+            provider_model=record.provider_model,
+            probabilities=record.probabilities,
+            chosen=record.chosen,
+            kept_previous=record.kept_previous,
+            latency_ms=record.latency_ms,
+            error=record.error,
+            now=now,
+        )
+    record = records[0]
     usage = record.usage
     journal.add_usage(
         conn,

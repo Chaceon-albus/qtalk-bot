@@ -30,17 +30,21 @@
 没有这个记录的照旧用当时的文字版。本轮的原件与文字版不变。
 
 只由表情组成的消息在取流水时已经跳过（见 `journal.py`），表情标记也从所有文字里去掉（`faces.clean()`）。
+
+**分话题时的上下文**（里程碑 6a）：历史由几段合成（`merge_history()`）：不分话题的最近几轮，加上选中话题的最近
+几轮，按消息去重、按对话里的位置排列，「往前数第几轮」按合成后的各轮重算，所以「最近几轮给原图」的规则对合成
+出的各轮照常适用。话题目录与摘要经 `prompt.Memory` 放进系统提示词（`RequestBuilder.set_context()`）。
 """
 
 import asyncio
 from collections.abc import Callable, Collection, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from . import texts
 from .config import ModelSettings
 from .faces import clean
-from .journal import HistoryEntry
+from .journal import HistoryEntry, position
 from .llm import (
     INPUT_LIMITS,
     AudioPart,
@@ -65,7 +69,7 @@ from .media import (
     history_text,
     marker,
 )
-from .prompt import system_prompt
+from .prompt import Memory, system_prompt
 
 _MODALITIES = {
     AttachmentKind.IMAGE: Modality.IMAGE,
@@ -301,6 +305,33 @@ def decision_history(history: Sequence[HistoryEntry]) -> list[HistoryEntry]:
     return [HistoryEntry(entry.role, decision_text(entry)) for entry in history]
 
 
+def merge_history(*groups: Sequence[HistoryEntry]) -> list[HistoryEntry]:
+    """几段取自流水的历史合成一段：按消息编号去重，按对话里的位置排列（`journal.position()`：回复紧跟在它
+    回答的消息之后），`turns_ago` 按合成后的各轮重算（每遇到一条更早的回复，就是往前的又一轮）。"""
+    unique: dict[int, HistoryEntry] = {}
+    loose: list[HistoryEntry] = []
+    for group in groups:
+        for entry in group:
+            if entry.message_id is None:
+                loose.append(entry)
+            else:
+                unique.setdefault(entry.message_id, entry)
+    ordered = sorted([*loose, *unique.values()], key=position)
+    merged: list[HistoryEntry] = []
+    age = 0
+    seen_user = False
+    for entry in reversed(ordered):
+        if entry.role is Role.ASSISTANT:
+            if seen_user:
+                age += 1
+                seen_user = False
+        else:
+            seen_user = True
+        merged.append(replace(entry, turns_ago=age))
+    merged.reverse()
+    return merged
+
+
 @dataclass(frozen=True, slots=True)
 class Built:
     """为某个模型组装好的请求。
@@ -339,6 +370,7 @@ class RequestBuilder:
         models: Sequence[ModelSettings] = (),
         announce: Collection[int] | None = None,
         max_size_mb: int = 20,
+        memory: Memory | None = None,
     ) -> None:
         self._store = store
         self._user_id = user_id
@@ -351,6 +383,12 @@ class RequestBuilder:
         self._models = models
         self._announce = announce
         self._max_size_mb = max_size_mb
+        self._memory = memory
+
+    def set_context(self, history: Sequence[HistoryEntry], memory: Memory | None) -> None:
+        """换上选完话题之后才组装出的历史与记忆（分话题时，决策之后调用，组装请求之前）。"""
+        self._history = history
+        self._memory = memory
 
     def needs_originals(self, model: ModelSettings) -> bool:
         """组装给 `model` 的请求时会不会读附件原件（当前这一轮的，或最近几轮历史里的图片）。"""
@@ -386,6 +424,7 @@ class RequestBuilder:
                 self._now,
                 process=model.show_process,
                 preamble=model.provider is Provider.OPENAI and model.search,
+                memory=self._memory,
             ),
             messages=tuple(messages),
             max_output_tokens=self._max_output_tokens,

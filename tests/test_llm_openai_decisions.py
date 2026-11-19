@@ -22,6 +22,7 @@ from qtalk_bot.llm.decisions import (
     DecisionError,
     DecisionRequest,
     DecisionResult,
+    Malformed,
     Option,
     Refusal,
     YesNoAnswer,
@@ -187,6 +188,31 @@ async def test_refusal_of_one_question_keeps_the_others() -> None:
 
     assert result.answers == {"model": Refusal(), "damaged": YesNoAnswer(0.3)}
     assert result.usage == Usage(9, 0)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        choice("model", solve=1.0),  # 缺选项
+        choice("model", solve=1.5, chat=0.0),  # 概率越界
+        predicate("model", 0.5),  # 题型不对
+    ],
+    ids=["missing_option", "probability_above_one", "wrong_type"],
+)
+async def test_one_bad_answer_keeps_the_other_question(bad: Payload) -> None:
+    # 两道题同批：一道的答案不合法只标出那一道，另一道照常返回。
+    server = replying(decision(bad, predicate("damaged", 0.3), used=usage(9)))
+
+    result = await model_on(server).decide(request(ROUTE, DAMAGED))
+
+    assert result.answers == {"model": Malformed(), "damaged": YesNoAnswer(0.3)}
+    assert result.usage == Usage(9, 0)
+
+
+async def test_every_answer_bad_is_a_malformed_call() -> None:
+    server = replying(decision(choice("model", solve=1.0), predicate("damaged", 1.5)))
+    error = await failure(server, ROUTE, DAMAGED)
+    assert (error.kind, error.usage) == (ErrorKind.MALFORMED, Usage(42, 0))
 
 
 async def test_custom_model_name_is_sent() -> None:

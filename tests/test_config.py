@@ -24,6 +24,7 @@ from qtalk_bot.config import (
     QQSettings,
     Secrets,
     Settings,
+    TopicSettings,
     TurnSettings,
     check_provider_secrets,
     config_path,
@@ -1218,3 +1219,34 @@ def test_invalid_describe_file_max_output_tokens(tmp_path: Path) -> None:
     text = '[describe]\nprovider = "openai"\nmodel = "m"\nfile_max_output_tokens = 0\n'
     (problem,) = config_error(write_config(tmp_path, text)).problems
     assert problem.startswith("describe.file_max_output_tokens：")
+
+
+# ---- [topics] ----
+
+
+def test_topics_defaults_and_values(tmp_path: Path) -> None:
+    assert load_settings(write_config(tmp_path, "")).topics == TopicSettings(
+        candidates=20, directory=20, recent_turns=3, second_threshold=0.25
+    )
+    text = "[topics]\ncandidates = 254\ndirectory = 0\nrecent_turns = 20\nsecond_threshold = 1\n"
+    assert load_settings(write_config(tmp_path, text)).topics == TopicSettings(
+        candidates=254, directory=0, recent_turns=20, second_threshold=1.0
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        # 候选加上「新话题」不能超过选择题的 255 个选项。
+        ("[topics]\ncandidates = 255\n", "topics.candidates：不能大于 254"),
+        ("[topics]\ncandidates = 0\n", "topics.candidates：应为正整数"),
+        ("[topics]\ndirectory = 101\n", "topics.directory：不能大于 100"),
+        ("[topics]\nrecent_turns = -1\n", "topics.recent_turns：不能小于 0"),
+        ("[topics]\nrecent_turns = 21\n", "topics.recent_turns：不能大于 20"),
+        ("[topics]\nsecond_threshold = 0\n", "topics.second_threshold：应大于 0、不大于 1"),
+        ("[topics]\nsecond_threshold = 1.5\n", "topics.second_threshold：应大于 0、不大于 1"),
+        ("[topics]\nlimit = 3\n", "topics.limit：未知的键"),
+    ],
+)
+def test_invalid_topics(tmp_path: Path, text: str, problem: str) -> None:
+    assert config_error(write_config(tmp_path, text)).problems == (problem,)

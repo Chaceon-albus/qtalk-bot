@@ -108,7 +108,13 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                     db,
                     admin_openid=secrets.admin_openid,
                     models=models,
-                    router=Router(settings.models, settings.decisions, models.decider),
+                    # 话题线只在配置了 [decisions] 时启用：Router 没有决策时不理会 topics。
+                    router=Router(
+                        settings.models,
+                        settings.decisions,
+                        models.decider,
+                        topics=settings.topics,
+                    ),
                     settings=settings.chat,
                     timezone=settings.timezone,
                     attachments=settings.attachments,
