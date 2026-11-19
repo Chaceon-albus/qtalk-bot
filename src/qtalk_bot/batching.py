@@ -19,18 +19,24 @@
   执行一次 `attachment_timeout_action`：`ask` 问一句（`Responder.ask()`，不调用模型），`answer` 把它们作为
   一轮去回答，`none` 什么都不做。同一组等待中的附件只做一次；之后再来的附件算进同一组，直到有一轮把它们带走。
 
-**回答进行中**（`_watch()`）来了新的文字或语音：
+**回答进行中**（`_watch()`）来了新的文字或语音，这一轮还能重来（重来的次数少于 `max_restarts`；为 0 时完全不考虑
+插话）时，`Responder.judge()` 判断新消息是在补充或修正正在回答的问题，还是一个新问题。判断的输入是这一轮实际带上
+的消息（`TurnControl.included`，含流水里之前遗留的待回复消息）与新消息。
 
-- 回答还没开始显示（`TurnControl.displayed` 为假，即还没有任何内容交给 QQ）、这一轮还能重来（重来的次数少于
-  `max_restarts`）：`Responder.judge()` 判断新消息是在补充或修正正在回答的问题，还是一个新问题。
-  - 补充，或判断失败、没有配置（当作补充）：`TurnControl.preempt()` 成功就取消正在进行的生成，带上新消息重新
-    开始这一轮（重新选模型、重新组装请求）；判断期间回答已经开始显示的，`preempt()` 不成功，新消息排到下一轮。
-  - 新问题：让当前这一轮答完，新消息作为下一轮；这一轮剩下的时间里再来的消息也排到下一轮，不再判断。
-  - 判断期间又来的消息不另判，跟着这次的结论走（补充就一起带上重来）。
-- 重来的请求装不下：这一轮实际带上的消息（`TurnControl.included`，含流水里之前遗留的待回复消息）加上触发
-  判断的那条文字或语音（连同它之前到达的消息）超过 `MAX_BATCH` 条时，不判断也不打断，新消息排到下一轮。
-  判断的输入也是这一轮实际带上的那些消息。
-- 回答已经开始显示，或不能再重来：不判断，让它答完，新消息作为下一轮，答完后立即处理。
+- 回答还没开始显示（`TurnControl.displayed` 为假，即还没有任何内容交给 QQ）：
+  - 补充，或判断失败、没有配置（当作补充）：`TurnControl.preempt()` 后取消正在进行的生成，带上新消息重新开始
+    这一轮（重新选模型、重新组装请求）。
+  - 重来的请求装不下：这一轮实际带上的消息加上触发判断的那条文字或语音（连同它之前到达的消息）超过
+    `MAX_BATCH` 条时，不判断也不打断，新消息排到下一轮。
+- 回答已经开始显示（显示中来的，或判断期间开始显示的）：
+  - 补充：`TurnControl.cut()` 停下这段回答（只在回答本身的流式消息已经开始、模型还在写时才停得下，见
+    `conversation.py`）。停下的这一轮照常收尾、算结束，新消息不并进这一轮，留在等待中，等这一轮收完尾立刻
+    作为下一轮（回复挂在新消息上）。停下不算重来，不占 `max_restarts`，也不看装不装得下。停不下就排到下一轮。
+  - 判断失败或没有配置：不停，排到下一轮。代价不对等：还没显示时重来几乎没有代价，显示到一半停下就丢了一段
+    好回答；没配决策时每条插话都会打断回答。
+- 新问题：让当前这一轮答完，新消息作为下一轮。
+- 判断有了结论、但没有重来（新问题、装不下、停下或停不下）之后，这一轮剩下的时间里再来的消息都排到下一轮，
+  不再判断；已达到重来上限时同样不再判断。判断期间又来的消息不另判，跟着这次的结论走（重来就一起带上）。
 - 单独的图片或文件不触发判断；重来时一并带上，否则留到下一轮按上面「空闲时」的规则等文字。
 
 只显示了过程消息（`process.py`）不算回答已开始显示，照常可以重来；重来时把上一次的 `TurnControl` 交给新的
@@ -206,7 +212,7 @@ class _UserState:
 
 
 class Batcher:
-    """决定何时开始一轮、插话时要不要重来。同一个实例服务所有用户，每个进程只建一个。"""
+    """决定何时开始一轮、插话时要不要重来或停下。同一个实例服务所有用户，每个进程只建一个。"""
 
     def __init__(
         self,
@@ -362,7 +368,8 @@ class Batcher:
             logger.warning("询问用户 %s 的附件时出错：%s", state.user.label, type(exc).__name__)
 
     async def _turn(self, state: _UserState, taken: list[_Arrival]) -> None:
-        """回答一轮：等带上的消息都收完，交给 `Responder.respond()`；插话判为补充时带上新消息重来。"""
+        """回答一轮：等带上的消息都收完，交给 `Responder.respond()`；回答还没开始显示时插话判为补充，带上新消息
+        重来。"""
         user = state.user
         restarts = 0
         control: TurnControl | None = None
@@ -401,12 +408,13 @@ class Batcher:
         control: TurnControl,
         restarts: int,
     ) -> list[_Arrival] | None:
-        """看着正在回答的一轮，处理期间到达的消息（规则见模块的说明）。这一轮答完（或出错）时返回 `None`；判为
-        补充、取消了这一轮时返回要带上重来的消息（已从等待中取走）。
+        """看着正在回答的一轮，处理期间到达的消息（规则见模块的说明）。这一轮答完（或出错，或因插话停下已在显示的
+        回答后收完尾）时返回 `None`；判为补充、取消了还没开始显示的这一轮时返回要带上重来的消息（已从等待中取走）。
 
         重来的请求会带上这一轮实际带上的消息（`TurnControl.included`，回答一轮的一方从流水里取出后告诉这里）
         加上新消息，合计不能超过 `MAX_BATCH` 条：超过时最早的消息进不了请求，却会被重答的回复划进已覆盖的范围。
-        所以只有触发判断的那条文字或语音（连同它之前到达的消息）装得下时才判断、才打断；装不下就排到下一轮。
+        所以回答还没开始显示时，只有触发判断的那条文字或语音（连同它之前到达的消息）装得下时才判断、才打断；装不下
+        就排到下一轮。回答已经开始显示时只可能停下、不会重来，新消息留在等待中自己开一轮，不受这个限制。
         """
         user = state.user
         judging: asyncio.Task[Steer] | None = None
@@ -426,13 +434,15 @@ class Batcher:
                     if verdict is Steer.NEW:
                         logger.info("用户 %s 插话：判为新问题，当前这一轮答完后再答", user.label)
                         settled = True
+                    elif control.displayed:  # 显示中判断的，或判断期间回答开始显示了
+                        settled = True
+                        self._cut(user, control, verdict)
                     elif needed > room:
                         logger.info("用户 %s 插话：重来的请求装不下新消息，排到下一轮", user.label)
                         settled = True
-                    elif not control.preempt():
-                        logger.info("用户 %s 插话：回答已经开始显示，新消息排到下一轮", user.label)
-                        settled = True
                     else:
+                        preempted = control.preempt()
+                        assert preempted  # 刚看过还没开始显示，其间没有让出事件循环
                         how = "判为补充" if verdict is Steer.SUPPLEMENT else "判断失败，当作补充"
                         logger.info("用户 %s 插话：%s，取消正在进行的生成", user.label, how)
                         task.cancel()
@@ -443,27 +453,29 @@ class Batcher:
                         del state.arrivals[:room]
                         return extra
                     continue
-                if judging is None and not settled and control.included is not None:
-                    if control.displayed:
+                if (
+                    judging is None
+                    and not settled
+                    and control.included is not None
+                    and (found := _trigger(state.arrivals)) is not None
+                ):
+                    index, trigger = found
+                    # 回答已经开始显示时只可能停下、不会重来，新消息不并进这一轮，不看装不装得下。
+                    if not control.displayed and index + 1 > _room(control):
+                        logger.info(
+                            "用户 %s 插话：重来的请求装不下新消息，不判断，排到下一轮", user.label
+                        )
                         settled = True
-                    elif (found := _trigger(state.arrivals)) is not None:
-                        index, trigger = found
-                        if index + 1 > _room(control):
-                            logger.info(
-                                "用户 %s 插话：重来的请求装不下新消息，不判断，排到下一轮",
-                                user.label,
-                            )
-                            settled = True
-                            trigger = None
-                        else:
-                            latest = [
-                                item.message_id
-                                for a in state.arrivals[: index + 1]
-                                if (item := a.recorded) is not None
-                            ]
-                            judging = asyncio.create_task(
-                                self._responder.judge(user, control.included, latest)
-                            )
+                        trigger = None
+                    else:
+                        latest = [
+                            item.message_id
+                            for a in state.arrivals[: index + 1]
+                            if (item := a.recorded) is not None
+                        ]
+                        judging = asyncio.create_task(
+                            self._responder.judge(user, control.included, latest)
+                        )
                 await self._woken(state, task, judging)
         finally:
             # 先向判断与回答一起发出取消（关停时两者都还在），再等各自收尾：判断收尾要写数据库，数据库排着队时
@@ -475,6 +487,19 @@ class Batcher:
                 await asyncio.wait(stopping)
             if judging is not None:
                 _verdict(judging, user)  # 取回结果，免得事件循环原样打印异常
+
+    def _cut(self, user: User, control: TurnControl, verdict: Steer) -> None:
+        """回答已经开始显示时插话的结论：判为补充就试着停下这段回答（`TurnControl.cut()`），新消息都留在等待中，
+        这一轮结束后作为下一轮；判断失败或没有配置时不停（显示到一半停下会丢掉一段好回答）。"""
+        if verdict is Steer.ASSUMED:
+            logger.info(
+                "用户 %s 插话：判断失败或没有配置，回答已经开始显示，不停下，新消息排到下一轮",
+                user.label,
+            )
+        elif control.cut():
+            logger.info("用户 %s 插话：判为补充，停下已在显示的回答，新消息另起一轮", user.label)
+        else:
+            logger.info("用户 %s 插话：判为补充，但这段回答停不下来，新消息排到下一轮", user.label)
 
     async def _woken(
         self, state: _UserState, task: asyncio.Task[None], judging: asyncio.Task[Steer] | None

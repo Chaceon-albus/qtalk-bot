@@ -651,6 +651,49 @@ async def test_preempted_attempt_writes_no_topic_and_the_restart_decides_again(
     ]
 
 
+async def test_answer_stopped_by_a_supplement_ends_its_turn_with_a_topic_and_a_summary(
+    db: Database,
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", [TextDelta("快排先选基准"), asyncio.Event()])
+    writer = ScriptedModel("memory", [TextDelta("标题：快排\n摘要：用户在学快排。"), DONE])
+    summarizer = Summarizer(
+        db,
+        writer,
+        MemorySettings(provider=writer.provider, model=writer.model),
+        admin_openid=ADMIN,
+        clock=lambda: START,
+    )
+    decider = Picker()  # 插话的是非题答「是」0.9：补充
+    chat = topical(db, decider, model, steer=True, summarizer=summarizer)
+    batcher = batcher_of(chat, ManualClock())
+    first, second = FakeChannel(), FakeChannel()
+
+    await submit(batcher, alice, message("快排怎么写"), first)
+    async with asyncio.timeout(HANG_GUARD):
+        await first.delivered.wait()  # 回答已经开始显示
+    model.script = answer("用 Python 这样写")
+    await submit(batcher, alice, message("用 Python"), second)
+    await finish(batcher)
+    async with asyncio.timeout(HANG_GUARD):
+        await summarizer.wait_idle()
+
+    assert [q.name for r in decider.requests for q in r.questions] == ["steer", TOPIC_QUESTION]
+    (topic, _, title), (later, _, _) = await topic_rows(db)  # 第二轮按 `Picker` 选了新话题
+    assert title == "快排怎么写"
+    # 停下的那一轮照常结束：消息与没写完的回答归到话题，后台照常写了摘要。
+    assert await membership(db) == [
+        ("user", "快排怎么写", topic),
+        ("user", "用 Python", later),
+        ("assistant", "快排先选基准", topic),
+        ("assistant", "用 Python 这样写", later),
+    ]
+    summary = await db.fetch_all("SELECT summary FROM topics WHERE id = ?", (topic,))
+    assert [r["summary"] for r in summary] == ["用户在学快排。"]
+    assert second.streamed == "用 Python 这样写"
+    await summarizer.aclose()
+
+
 # ---- 后台写标题与摘要（第二步）----
 
 

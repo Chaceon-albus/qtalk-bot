@@ -205,7 +205,11 @@ type Verdict = Steer | Exception
 class FakeResponder:
     """收消息：按顺序编号；`refused` 里的用户、`refused_messages` 里的消息不写进流水；`gates` 里的消息收到一半
     要等。回答：记下来，`answer_gate` 不为空时要等它；`controls` 是各次回答拿到的 `TurnControl`。判断插话：依次
-    给出 `verdicts`（用完了就是补充），`judge_gate` 不为空时要等它。询问附件：记下来。"""
+    给出 `verdicts`（用完了就是补充），`judge_gate` 不为空时要等它。询问附件：记下来。
+
+    停下已在显示的回答（`TurnControl.cut()`）：`cuttable` 为真时停得下，这一轮不再等 `answer_gate`，先等
+    `cut_tail`（不为空时；模拟停下之后还要发说明、结束流式消息）再正常结束；`cut_calls` 是被要求停下的次数，
+    `cut` 是停下了的那几轮（`started` 里的下标）。"""
 
     clock: ManualClock
     refused: set[int] = field(default_factory=set[int])
@@ -229,6 +233,10 @@ class FakeResponder:
     cancelled: int = 0
     preempted: int = 0
     fail_answer: bool = False
+    cuttable: bool = False
+    cut_tail: asyncio.Event | None = None
+    cut_calls: int = 0
+    cut: list[int] = field(default_factory=list[int])
     _ids: itertools.count[int] = field(default_factory=lambda: itertools.count(1))
 
     async def receive(
@@ -255,13 +263,27 @@ class FakeResponder:
         assert isinstance(channel, Channel)
         assert control is not None
         self.controls.append(control)
+        index = len(self.started)
+        stopped = asyncio.Event()
+
+        def cutter() -> bool:
+            self.cut_calls += 1
+            if not self.cuttable or stopped.is_set():
+                return False
+            self.cut.append(index)
+            stopped.set()
+            return True
+
+        control.on_cut(cutter)
         control.begin([*self.leftover, *messages])
         record = Answered(user.id, list(messages), channel.name, self.clock.now)
         self.started.append(record)
         self.answering += 1
         try:
             if self.answer_gate is not None:
-                await self.answer_gate.wait()
+                await either(self.answer_gate, stopped)
+            if stopped.is_set() and self.cut_tail is not None:
+                await self.cut_tail.wait()
             if self.fail_answer:
                 raise RuntimeError("意外")
             self.answered.append(record)
@@ -290,6 +312,16 @@ class FakeResponder:
     async def ask(self, user: User, messages: Sequence[int], channel: ReplyChannel) -> None:
         assert isinstance(channel, Channel)
         self.asked.append(Answered(user.id, list(messages), channel.name, self.clock.now))
+
+
+async def either(*events: asyncio.Event) -> None:
+    """等到其中任意一个事件置位。"""
+    waits = [asyncio.ensure_future(event.wait()) for event in events]
+    try:
+        await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for waiting in waits:
+            waiting.cancel()
 
 
 @pytest.fixture
@@ -595,13 +627,36 @@ async def test_restarts_stop_at_the_limit_and_later_messages_wait_for_the_next_t
     assert [a.messages for a in responder.answered] == [[1, 2, 3], [4]]
 
 
-async def test_zero_restarts_never_judges(clock: ManualClock) -> None:
-    responder = FakeResponder(clock)
+async def test_shown_answer_at_the_restart_limit_is_neither_judged_nor_cut(
+    clock: ManualClock,
+) -> None:
+    responder = FakeResponder(clock, cuttable=True)
+    chat = batcher_of(responder, TurnSettings(max_restarts=1))
+    await answering(chat, responder)
+    await submit(chat, ALICE, text("补一"), "补一")  # 重来一次，到了上限
+    assert responder.controls[1].claim()
+
+    await submit(chat, ALICE, text("补二"), "补二")
+    assert len(responder.judged) == 1
+    assert responder.cut_calls == 0
+    assert responder.answer_gate is not None
+    responder.answer_gate.set()
+    await settle()
+
+    assert [a.messages for a in responder.answered] == [[1, 2], [3]]
+
+
+@pytest.mark.parametrize("shown", [False, True])
+async def test_zero_restarts_never_judges(clock: ManualClock, shown: bool) -> None:
+    responder = FakeResponder(clock, cuttable=True)
     chat = batcher_of(responder, TurnSettings(max_restarts=0))
     await answering(chat, responder)
+    if shown:
+        assert responder.controls[0].claim()
 
     await submit(chat, ALICE, text("二"), "二")
     assert responder.judged == []
+    assert responder.cut_calls == 0
     assert responder.answer_gate is not None
     responder.answer_gate.set()
     await settle()
@@ -609,22 +664,146 @@ async def test_zero_restarts_never_judges(clock: ManualClock) -> None:
     assert [a.messages for a in responder.answered] == [[1], [2]]
 
 
-async def test_answer_already_shown_is_not_judged_and_the_message_comes_next(
-    clock: ManualClock,
+async def test_supplement_that_cannot_cut_the_shown_answer_comes_next(
+    clock: ManualClock, caplog: pytest.LogCaptureFixture
 ) -> None:
+    # 回答已经开始显示，但停不下来（只显示了固定说明、模型已经写完等，由回答一轮的一方判断）：排到下一轮。
+    caplog.set_level(logging.INFO)
     responder = FakeResponder(clock)
     chat = batcher_of(responder)
     await answering(chat, responder)
-    assert responder.controls[0].claim()  # 第一片已经交给 QQ
+    assert responder.controls[0].claim()  # 有东西交给了 QQ
 
     await submit(chat, ALICE, text("二"), "二")
-    assert responder.judged == []
+    await submit(chat, ALICE, text("三"), "三")  # 已有结论：不再判断
+    assert responder.judged == [Judged(ALICE.id, [1], [2])]
+    assert responder.cut_calls == 1
     assert responder.cancelled == 0
     assert responder.answer_gate is not None
     responder.answer_gate.set()
     await settle()
 
-    assert [(a.messages, a.channel) for a in responder.answered] == [([1], "问一"), ([2], "二")]
+    assert [(a.messages, a.channel) for a in responder.answered] == [
+        ([1], "问一"),
+        ([2, 3], "三"),
+    ]
+    assert "停不下来" in caplog.text
+
+
+async def test_supplement_while_shown_cuts_the_answer_and_the_message_is_its_own_turn(
+    clock: ManualClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    responder = FakeResponder(clock, cuttable=True, cut_tail=asyncio.Event())
+    chat = batcher_of(responder, TurnSettings(max_restarts=1))
+    await answering(chat, responder)
+    assert responder.controls[0].claim()  # 回答的第一片已经交给 QQ
+
+    await submit(chat, ALICE, text("用 Python"), "补充")
+    assert responder.judged == [Judged(ALICE.id, [1], [2])]
+    assert responder.cut == [0]
+    assert responder.cancelled == responder.preempted == 0  # 不是重来
+    await submit(chat, ALICE, text("再补一句"), "再补")  # 已有结论：不再判断，也一起排到下一轮
+    assert len(responder.judged) == 1
+    assert turns(responder) == [([1], "问一")]  # 停下的这一轮收完尾才开下一轮
+    assert responder.cut_tail is not None
+    responder.cut_tail.set()
+    await settle()
+
+    assert turns(responder) == [([1], "问一"), ([2, 3], "再补")]
+    assert responder.answered[0].messages == [1]  # 停下的这一轮正常结束
+    assert responder.controls[1].earlier is not responder.controls[0].earlier  # 新的一轮从头开始
+    assert "停下已在显示的回答" in caplog.text
+    assert "重来" not in caplog.text
+    assert "Python" not in caplog.text
+
+    # 停下不占重来的次数：新的一轮里还没开始显示时的补充照常重来（`max_restarts` 为 1）。
+    await submit(chat, ALICE, text("还有"), "还有")
+    assert responder.preempted == 1
+    assert turns(responder)[-1] == ([2, 3, 4], "还有")
+
+
+async def test_new_question_while_shown_lets_the_answer_finish(clock: ManualClock) -> None:
+    responder = FakeResponder(clock, verdicts=[Steer.NEW], cuttable=True)
+    chat = batcher_of(responder)
+    await answering(chat, responder)
+    assert responder.controls[0].claim()
+
+    await submit(chat, ALICE, text("明天天气怎么样"), "新问题")
+    await submit(chat, ALICE, text("上海的"), "补充新问题")
+    assert len(responder.judged) == 1
+    assert responder.cut_calls == 0
+    assert responder.answer_gate is not None
+    responder.answer_gate.set()
+    await settle()
+
+    assert responder.cut == []
+    assert [(a.messages, a.channel) for a in responder.answered] == [
+        ([1], "问一"),
+        ([2, 3], "补充新问题"),
+    ]
+
+
+@pytest.mark.parametrize("verdict", [Steer.ASSUMED, RuntimeError("意外")])
+async def test_failed_or_unconfigured_judgment_while_shown_does_not_cut(
+    clock: ManualClock, verdict: Verdict, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    responder = FakeResponder(clock, verdicts=[verdict], cuttable=True)
+    chat = batcher_of(responder)
+    await answering(chat, responder)
+    assert responder.controls[0].claim()
+
+    await submit(chat, ALICE, text("二"), "二")
+    await submit(chat, ALICE, text("三"), "三")
+    assert len(responder.judged) == 1
+    assert responder.cut_calls == 0  # 不去停
+    assert responder.preempted == 0
+    assert responder.answer_gate is not None
+    responder.answer_gate.set()
+    await settle()
+
+    assert [a.messages for a in responder.answered] == [[1], [2, 3]]
+    assert "不停下" in caplog.text
+
+
+async def test_answer_shown_while_judging_is_cut_on_a_supplement(clock: ManualClock) -> None:
+    responder = FakeResponder(
+        clock, verdicts=[Steer.SUPPLEMENT], judge_gate=asyncio.Event(), cuttable=True
+    )
+    chat = batcher_of(responder)
+    await answering(chat, responder)
+
+    await submit(chat, ALICE, text("二"), "二")
+    assert len(responder.judged) == 1
+    assert responder.controls[0].claim()  # 判断期间回答开始显示了：重来不成，改为停下
+    assert responder.judge_gate is not None
+    responder.judge_gate.set()
+    await settle()
+
+    assert responder.cut == [0]
+    assert responder.preempted == 0
+    assert turns(responder) == [([1], "问一"), ([2], "二")]
+    assert [a.messages for a in responder.answered] == [[1]]  # 第二轮还在回答
+
+
+async def test_stop_while_a_cut_turn_winds_down_cancels_it_and_starts_nothing(
+    clock: ManualClock,
+) -> None:
+    responder = FakeResponder(clock, cuttable=True, cut_tail=asyncio.Event())
+    chat = batcher_of(responder)
+    await answering(chat, responder)
+    assert responder.controls[0].claim()
+    await submit(chat, ALICE, text("二"), "二")
+    assert responder.cut == [0]
+
+    async with asyncio.timeout(HANG_GUARD):
+        await chat.drain()  # 关停优先：停下的这一轮还在收尾，被取消，下一轮不再开始
+
+    assert responder.cancelled == 1
+    assert responder.preempted == 0
+    assert turns(responder) == [([1], "问一")]
+    assert not workers(chat)
 
 
 async def test_answer_shown_while_judging_is_not_cancelled(clock: ManualClock) -> None:
@@ -727,16 +906,22 @@ async def test_restarts_carry_over_when_typing_was_actually_last_sent(clock: Man
     assert [control.typed_at for control in responder.controls] == [3.0, 12.0, 12.0]
 
 
-async def test_refused_message_during_a_turn_triggers_no_judgment(clock: ManualClock) -> None:
-    # AGENTS.md 的第一条不变量：没写进流水（已不能使用对话）的消息不会触发插话的判断。
-    responder = FakeResponder(clock)
+@pytest.mark.parametrize("shown", [False, True])
+async def test_refused_message_during_a_turn_triggers_no_judgment(
+    clock: ManualClock, shown: bool
+) -> None:
+    # AGENTS.md 的第一条不变量：没写进流水（已不能使用对话）的消息不会触发插话的判断，也停不下已在显示的回答。
+    responder = FakeResponder(clock, cuttable=True)
     chat = batcher_of(responder)
     await answering(chat, responder)
+    if shown:
+        assert responder.controls[0].claim()
     refused = text("停用之后")
     responder.refused_messages.add(refused.message_id)
 
     await submit(chat, ALICE, refused, "停用之后")
     assert responder.judged == []
+    assert responder.cut_calls == 0
     assert responder.answer_gate is not None
     responder.answer_gate.set()
     await settle()

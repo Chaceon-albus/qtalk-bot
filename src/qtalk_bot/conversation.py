@@ -3,7 +3,7 @@
 不依赖 pyqbot 与 SDK：模型经 `llm.ChatModel`，选模型经 `routing.Router`（决策经 `llm.decisions.DecisionModel`），
 附件经 `media.Fetcher`（下载经接线层实现的 `media.Downloader`），回复经 `ReplyChannel`（接线层用 pyqbot 实现，
 见 `bot.py`），图片描述经 `describe.Describer`，插话的判断经 `routing.SteerJudge`。什么时候开始一轮、插话时
-要不要重来由 `batching.py` 决定：它对每条消息调用一次 `receive()`，每开始（或重新开始）一轮调用一次
+要不要重来或停下由 `batching.py` 决定：它对每条消息调用一次 `receive()`，每开始（或重新开始）一轮调用一次
 `respond()`，插话时调用 `judge()`，单独的附件等不到下文时调用 `ask()`；`handle()` 是收消息与回答一轮连在一起的
 写法。
 
@@ -47,6 +47,15 @@
 带上），只记选模型的决策与已有的用量，然后把取消传播出去。服务商内置的搜索在回答开始显示之前进行，所以搜索
 期间照常可以被打断；适配器每执行一次搜索就交出新的 `Usage`，被打断的那次调用里已经执行的搜索照常计数。
 
+**插话时停下已在显示的回答**：回答已经开始显示、插话被判为补充时，`batching.py` 调用 `TurnControl.cut()`。只有
+回答本身的流式消息已经开始（`_Outbox.handed`）、读模型的任务还在跑、没有出错也没有在被别处取消时才停
+（`_Turn.cut()`）：做法同时限，记下 `_Run.steered` 再取消读流的任务，`_consume()` 认出是这次停止发起的取消
+（标记已设、`uncancel()` 回到开始时的值）就把结局记成 `steered` 正常返回。时限与停下都只在没有别的取消在进行
+时才取消，两者至多一个生效，谁先发起谁定结局；关停或发送出错后停读的取消来得更晚时照常传播，关停优先。停下之后
+这一轮照常收尾：已送达的部分后面接上 `texts.REPLY_STEERED`（正文停在代码围栏里时先闭合它，所有固定说明都这样
+接），正常结束流式消息，按已确认送达的部分写回复行（送达状态 `interrupted`），话题归属与后台摘要照常。不换备用
+模型（回答已经显示）。只显示了固定说明、模型已经写完、已在改发纯文本时不停，新消息排到下一轮。
+
 **处理过程**（`process.py`）：模型配置了 `show_process` 时，它调用工具前的说明与搜索进展经
 `process.ProcessPresenter` 写成单独的一条流式消息（经 `ReplyChannel.open_process()`）。过程消息不算「已开始
 显示」（不 `claim()`），所以只显示了过程时插话照常可以重来：被重来的一轮给过程消息写一行「收到补充，重新开始」
@@ -76,7 +85,8 @@
   选中话题与第二可能的话题的摘要、别的话题的标题（目录）放进系统提示词（`prompt.Memory`）。没有话题的旧消息只经
   「最近几轮」出现。
 - 一轮结束（`journal.ends_turn()`）时与回复写在同一个事务里：这一轮的用户消息与回复归到选中的话题，选「新话题」
-  时在这时建行，临时标题取这一轮用户消息文字版的开头（`topics.attribute()`）。被插话打断、没有结束一轮的不写。
+  时在这时建行，临时标题取这一轮用户消息文字版的开头（`topics.attribute()`）。被插话打断重来、没有结束一轮的
+  不写；因插话停下已在显示的回答的那一轮照写。
 - 话题题的决策记录与选模型的写在一起，同一次调用只记一次用量。
 - 写了归属、正常结束的一轮，交给 `memory.Summarizer` 在后台更新这个话题的标题与摘要（配置了 `[memory]` 时）。
 
@@ -220,6 +230,10 @@ class TurnControl:
       `preempted`，之后 `claim()` 都不成功，被取消的这一轮按「重来」收尾：不写回复行，消息仍是待回复的。
     - `begin()`：回答一轮的一方从流水里取出这一轮实际带上的用户消息（`included`，含之前遗留的待回复消息）后
       调用，再调用 `notify`。要重来的一方据此判断重来的请求装不装得下新消息，插话判断的输入也用它。
+    - `cut()`：回答已经开始显示、插话被判为补充时，要停下这段回答的一方调用。回答一轮的一方经 `on_cut()` 注册
+      停下的办法：只有回答本身的流式消息已经开始、模型还在写时才真正发起停止并返回 `True`（这一轮随后以结局
+      `steered` 正常收尾、写回复行）；否则（还没注册、只显示了固定说明、模型已写完、已在改发纯文本等）返回
+      `False`，什么也不做。停下不是重来：新消息不并进这一轮，而是在这一轮结束后自己开一轮。
     - `previous`：重来时传入上一次的 `TurnControl`。被重来的几次的过程消息（`earlier`，与上一次共用同一个
       列表）由最后答完的那一次连同自己的过程一起存档；上次发「正在输入」的时刻（`typed_at`）也接着
       用，「正在输入」的间隔据此计算。过程消息不算「已开始显示」。
@@ -235,6 +249,7 @@ class TurnControl:
         self.preempted = False
         self.included: tuple[int, ...] | None = None
         self._notify = notify
+        self._cutter: Callable[[], bool] | None = None
         self.earlier: list[ProcessPresenter] = [] if previous is None else previous.earlier
         # 这一轮（含被重来的几次）上次发「正在输入」的时刻（`Conversation` 的单调时钟）。
         self.typed_at: float | None = None if previous is None else previous.typed_at
@@ -255,6 +270,12 @@ class TurnControl:
             return False
         self.preempted = True
         return True
+
+    def on_cut(self, cutter: Callable[[], bool]) -> None:
+        self._cutter = cutter
+
+    def cut(self) -> bool:
+        return self._cutter is not None and self._cutter()
 
 
 class ReplyStream(Protocol):
@@ -375,10 +396,12 @@ class _Attempt:
         return 0 if self.usage is None else self.usage.searches or 0
 
 
-_ANSWERED = frozenset((Ending.COMPLETED, Ending.MAX_TOKENS, Ending.INCOMPLETE))
+# 有文字时算作给出了回答、不再换备用模型的结局。`steered` 只在回答已经交给 QQ 之后才会出现，本来也不换。
+_ANSWERED = frozenset((Ending.COMPLETED, Ending.MAX_TOKENS, Ending.INCOMPLETE, Ending.STEERED))
 # 没有调用对话模型就结束的送达状态：复查授权不通过（withheld），或请求里没有可答的内容、只发了说明。
 _NOT_CALLED = frozenset((ReplyDelivery.WITHHELD, ReplyDelivery.FAILED, ReplyDelivery.NOTICE_LOST))
-_BROKEN = frozenset((Ending.ERROR, Ending.TIMEOUT))
+# 流式回复正常结束、送达状态却记 `interrupted` 的结局：回答没写完就停了，已送达的部分后接了说明。
+_INTERRUPTING = frozenset((Ending.ERROR, Ending.TIMEOUT, Ending.STEERED))
 _FINISH_ENDINGS = {
     FinishReason.COMPLETED: Ending.COMPLETED,
     FinishReason.MAX_TOKENS: Ending.MAX_TOKENS,
@@ -394,6 +417,11 @@ class _Run:
         self.given = given  # 这次请求里以原件交给模型的、本轮的附件
         self.usage: Usage | None = None
         self.ending = Ending.ERROR  # 流没有给出 Finished 就结束，也按出错处理
+        self.finished = False  # 流已经给出 Finished（模型写完了，可能还在关闭响应流）
+        self.steered = False  # 插话被判为补充，`_Turn.cut()` 停下了这次调用（见 `_consume()`）
+        self.stopping = (
+            asyncio.Event()
+        )  # 与 `steered` 同时置位：`_attempt()` 从这时起限时等读流的任务收尾
         self.parts: list[str] = []
         self.citations: list[Citation] = []  # 模型引用的来源，原样
 
@@ -541,6 +569,30 @@ class _Turn:
         self.sent_notices: set[str] = set()  # 已确认送达的说明
         self.tried_notices: set[str] = set()  # 已发出、没有被平台明确拒绝的说明（含送达不明的）
         self.consumer: asyncio.Task[None] | None = None  # 读模型流的任务
+        # 正文停在没闭合的代码围栏里时闭合它的那一行（`MarkdownGuard.closing_fence()`），接固定说明之前先接上。
+        self.fence = ""
+        self.control.on_cut(self.cut)
+
+    def cut(self) -> bool:
+        """插话被判为补充、回答已经开始显示时停下这段回答（`TurnControl.cut()`）：只有回答本身的流式消息已经开始、
+        模型还在写时才停，做法同 `_Deadlines`：记下 `_Run.steered`，取消读流的任务，由 `_consume()` 按结局
+        `steered` 正常返回。已经在被别处取消（时限到期、关停、发送出错后停读）时不再取消，让那次取消决定结局。"""
+        run, consumer, outbox = self.run, self.consumer, self.outbox
+        if not outbox.handed:
+            why = "回答的流式消息还没开始"
+        elif run is None or consumer is None or consumer.done() or run.finished:
+            why = "模型已经写完"
+        elif outbox.error is not None:
+            why = "流式回复已经出错"
+        elif consumer.cancelling():
+            why = "这次调用已经在停下"
+        else:
+            run.steered = True
+            run.stopping.set()
+            consumer.cancel()
+            return True
+        logger.info("用户 %s 插话：%s，不停下这段回答", self.user.label, why)
+        return False
 
     @property
     def shown(self) -> bool:
@@ -1475,11 +1527,14 @@ class Conversation:
                 )
                 continue
             turn.outbox.push(guard.finish())
+            # 正文停在没闭合的代码围栏里时，后面接别的 Markdown（「来源」、固定说明）之前先闭合它，否则会被渲染成
+            # 代码。只闭合一次。
+            turn.fence = guard.closing_fence()
             section = citations.markdown_section(attempt.sources)
             if section and attempt.text.strip():
                 # 回答写完之后接上「来源」：它也是回答的一部分（算进用户实际看到的内容），排在固定说明之前。
-                # 正文停在没闭合的代码围栏里时先闭合它，否则「来源」会被渲染成代码。
-                turn.outbox.push(guard.closing_fence() + section)
+                turn.outbox.push(turn.fence + section)
+                turn.fence = ""
             break
         return False
 
@@ -1561,10 +1616,27 @@ class Conversation:
         )
         turn.consumer = consumer
         broken = asyncio.create_task(turn.outbox.broken.wait())
+        stopping = asyncio.create_task(run.stopping.wait())
         try:
-            await asyncio.wait((consumer, broken), return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait((consumer, broken, stopping), return_when=asyncio.FIRST_COMPLETED)
+            if stopping.done() and not consumer.done() and not broken.done():
+                # 插话停下了这次调用，读流的任务正在关闭响应流。时限的看门任务见它在被取消就不再管（免得打断
+                # 清理），所以由这里限时等：关闭卡住时不能让这一轮一直收不了尾，补充的消息也就一直开不了轮。
+                await asyncio.wait(
+                    (consumer, broken), timeout=GRACE_SECONDS, return_when=asyncio.FIRST_COMPLETED
+                )
+                if not consumer.done() and not broken.done():
+                    logger.warning(
+                        "模型 %s 的流停下后 %g 秒仍没关闭，不再等它", model.name, GRACE_SECONDS
+                    )
+                    _cancel_and_retrieve(consumer)
+                    run.ending = Ending.STEERED
+                    turn.run = None
+                    turn.consumer = None
+                    return run.attempt()
         finally:
             broken.cancel()
+            stopping.cancel()
         if not consumer.done():
             # 发送出了说不准的错误：不再等模型（它可能正卡在读下一帧），也不再为它付费。
             consumer.cancel()
@@ -1597,7 +1669,6 @@ class Conversation:
         settings = self._settings
         deadlines = _Deadlines(self._timer, self._sleep, settings.idle_timeout_seconds, total)
         watcher = asyncio.create_task(deadlines.watch(task, cancelling))
-        finished = False
         try:
             async with aclosing(model.stream(request)) as events:
                 async for event in events:
@@ -1612,7 +1683,7 @@ class Conversation:
                             run.usage = event
                         case Finished(reason=reason):
                             run.ending = _FINISH_ENDINGS[reason]
-                            finished = True
+                            run.finished = True
                         case Commentary() | SearchProgress():
                             note(event)  # 思考摘要（万一服务商仍给了）不展示也不存档
                         case _:
@@ -1621,10 +1692,18 @@ class Conversation:
             logger.warning("模型 %s 调用失败：%s", model.name, exc)
             run.ending = Ending.ERROR
         except asyncio.CancelledError:
+            # 时限与插话各自只在没有别的取消在进行时才取消这个任务（`_Deadlines.watch()`、`_Turn.cut()`），所以
+            # 两个标记至多有一个；之后又来的取消（关停、发送出错后停止读模型）让 `uncancel()` 回不到开始时的值，
+            # 照常传播，关停优先。
             expired = deadlines.expired
-            if expired is None or task.uncancel() > cancelling:
+            if (expired is None and not run.steered) or task.uncancel() > cancelling:
                 raise  # 别处的取消（关停、发送出错后停止读模型）
-            if not finished:  # 已经正常结束、只是关闭响应流时到期的，不算超时
+            if run.finished:
+                pass  # 已经正常结束、只是关闭响应流时到期或被叫停的，结局照旧
+            elif expired is None:  # 只能是插话停下的
+                logger.info("模型 %s 的回答显示到一半时用户补充了消息，停下这次调用", model.name)
+                run.ending = Ending.STEERED
+            else:
                 match expired:
                     case _Expiry.IDLE:
                         logger.warning(
@@ -1651,6 +1730,8 @@ class Conversation:
         notice = _notice(last.ending)
         if outbox.error is None and outbox.has_content:
             if notice is not None:
+                # 闭合代码围栏的那一行算回答的一部分（同「来源」之前的那一行），说明不算。
+                outbox.push(turn.fence)
                 outbox.push(f"\n\n{notice}", answer=False)
             # 回答的第一片交出之前（`claim()` 成功之后）才结束过程消息：等过程消息第一片的那段时间仍可插话。
             await outbox.close()
@@ -1663,7 +1744,9 @@ class Conversation:
             if outbox.unclosed:
                 return outbox.outcome(ReplyDelivery.UNCLOSED)
             delivery = (
-                ReplyDelivery.INTERRUPTED if last.ending in _BROKEN else ReplyDelivery.STREAMED
+                ReplyDelivery.INTERRUPTED
+                if last.ending in _INTERRUPTING
+                else ReplyDelivery.STREAMED
             )
             return outbox.outcome(delivery)
         if isinstance(outbox.error, SendUncertainError):
@@ -1894,12 +1977,14 @@ def _cancel_and_retrieve(task: asyncio.Task[object]) -> None:
 
 
 def _notice(ending: Ending) -> str | None:
-    """回答没有正常写完时，接在后面的固定说明。"""
+    """回答没有正常写完（含插话时主动停下）时，接在后面的固定说明。"""
     match ending:
         case Ending.ERROR | Ending.TIMEOUT:
             return texts.REPLY_INTERRUPTED
         case Ending.MAX_TOKENS | Ending.INCOMPLETE:
             return texts.REPLY_CUT_SHORT
+        case Ending.STEERED:
+            return texts.REPLY_STEERED
         case Ending.COMPLETED | Ending.EMPTY | Ending.ABORTED | Ending.CANCELLED | Ending.SKIPPED:
             return None
 

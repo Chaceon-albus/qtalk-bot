@@ -33,6 +33,7 @@ class Ending(StrEnum):
     TIMEOUT = "timeout"  # 超过 `[chat]` 的空闲时限或总时限（总时限可能被被动回复的截止点截短）
     EMPTY = "empty"  # 正常结束，但只有空白
     ABORTED = "aborted"  # 发送回答时出了说不准是否送达的错误，主动停止
+    STEERED = "steered"  # 回答显示到一半时用户插话、被判为补充，主动停下
     CANCELLED = "cancelled"  # 处理被取消（如关停）
     # 没有调用对话模型：复查授权时发现已不能使用对话（送达状态是 withheld），或组装出的请求里没有可答的
     # 内容（附件文件缺失、实际大小放不下），只发了说明（送达状态是 failed 或 notice_lost）。
@@ -43,7 +44,9 @@ class ReplyDelivery(StrEnum):
     """一轮回复的送达状态。`content` 记的总是用户实际看到（已确认送达）的回答，不含固定的说明文字。"""
 
     STREAMED = "streamed"  # 流式完整送达，结束分片也已确认
-    INTERRUPTED = "interrupted"  # 模型中途出错或超时：已送达的部分后接了中断说明，流式消息正常结束
+    # 模型中途出错或超时，或回答显示到一半时用户插话、被判为补充而主动停下（结局 steered）：已送达的部分后接了
+    # 相应的说明，流式消息正常结束
+    INTERRUPTED = "interrupted"
     UNCLOSED = "unclosed"  # 正文分片都已确认，结束分片被拒或说不准；客户端可能一直显示「生成中」
     PLAIN = "plain"  # 流式被平台拒绝，改用纯文本的普通消息送达
     REJECTED = "rejected"  # 流式与纯文本都被拒绝，已发出固定说明；content 是流式已送达的部分

@@ -38,6 +38,7 @@ from qtalk_bot.conversation import (
     SendError,
     SendRejectedError,
     SendUncertainError,
+    TurnControl,
 )
 from qtalk_bot.describe import FILE_PROMPT, Describer
 from qtalk_bot.journal import DECISION_USAGE_MODEL
@@ -3465,7 +3466,7 @@ async def test_messages_after_the_answer_began_showing_are_the_next_turn(db: Dat
 
     await submit(batcher, alice, message("一"), channels[0])
     async with asyncio.timeout(HANG_GUARD):
-        await channels[0].delivered.wait()  # 回答已经开始显示：不再考虑插话
+        await channels[0].delivered.wait()  # 回答已经开始显示，没配置决策：不停，排到下一轮
     await submit(batcher, alice, message("二"), channels[1])
     await submit(batcher, alice, message("三"), channels[2])
     assert len(model.requests) == 1
@@ -3924,8 +3925,16 @@ def steer_result(chance: float) -> DecisionResult:
     return DecisionResult(answers={STEER_QUESTION: YesNoAnswer(chance)}, usage=Usage(20, 0))
 
 
-def steering(db: Database, model: ScriptedModel, decider: FakeDecider | None) -> Conversation:
-    """只有一个模型（不选模型）；`decider` 不为空时配置了 `[decisions]`，用它判断插话。"""
+def steering(
+    db: Database,
+    model: ScriptedModel,
+    decider: FakeDecider | None,
+    *,
+    clock: ManualClock | None = None,
+    idle_timeout_seconds: float = 300,
+) -> Conversation:
+    """只有一个模型（不选模型）；`decider` 不为空时配置了 `[decisions]`，用它判断插话。`clock` 不为空时模型调用的
+    时限按它计时。"""
     settings = [
         ModelSettings(name=model.name, provider=model.provider, model=model.model, default=True)
     ]
@@ -3935,10 +3944,12 @@ def steering(db: Database, model: ScriptedModel, decider: FakeDecider | None) ->
         admin_openid=ADMIN,
         models={model.name: model},
         router=Router(settings, decisions, decider),
-        settings=ChatSettings(),
+        settings=ChatSettings(idle_timeout_seconds=idle_timeout_seconds),
         timezone=SHANGHAI,
         steer=None if decider is None else SteerJudge(decisions, decider),
         clock=lambda: START,
+        timer=None if clock is None else clock,
+        sleep=asyncio.sleep if clock is None else clock.sleep,
     )
 
 
@@ -4049,11 +4060,100 @@ async def test_without_a_judgment_the_new_message_is_merged(
     assert [(row[5], row[7]) for row in await decision_rows(db)] == expected
 
 
-async def test_answer_already_showing_is_not_judged(db: Database) -> None:
+async def test_supplement_while_showing_stops_the_answer_and_answers_the_message_next(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel(
+        "main", [TextDelta("第一段"), asyncio.Event(), TextDelta("不该出现"), Usage(5, 5), DONE]
+    )
+    decider = FakeDecider(steer_result(0.9))
+    chat = steering(db, model, decider)
+    batcher = batcher_of(chat, ManualClock())
+    first, second = FakeChannel(), FakeChannel()
+
+    await submit(batcher, alice, message("讲讲快排"), first)
+    async with asyncio.timeout(HANG_GUARD):
+        await first.delivered.wait()  # 回答已经开始显示，模型还在写
+    model.script = answer("用 Python 的写法")
+    await submit(batcher, alice, message("用 Python"), second)
+    await finish(batcher)
+
+    (judged,) = decider.requests
+    assert judged.input == '{"answering": ["讲讲快排"], "latest": ["用 Python"]}'
+    # 停下的回答：已送达的部分后接说明，结束分片照常发出。
+    assert first.log == [
+        ("typing", ""),
+        ("stream", "第一段"),
+        ("stream", f"\n\n{texts.REPLY_STEERED}"),
+        ("finish", ""),
+    ]
+    assert model.closed == 2
+    # 新消息紧接着作为下一轮，回复挂在新消息上；上下文里带着没写完的回答。
+    assert second.kinds == ["typing", "stream", "finish"]
+    assert second.streamed == "用 Python 的写法"
+    assert model.requests[1].messages == (
+        Message.text(Role.USER, "讲讲快排"),
+        Message.text(Role.ASSISTANT, "第一段"),
+        Message.text(Role.USER, "用 Python"),
+    )
+    ids = await user_ids(db)
+    assert [target for _, target in await reply_targets(db)] == ids
+    assert [row for row in await rows(db) if row.role == "assistant"] == [
+        Row("assistant", "第一段", "main", "steered", "interrupted"),
+        Row("assistant", "用 Python 的写法", "main", "completed", "streamed"),
+    ]
+    assert [(row[0], row[5]) for row in await decision_rows(db)] == [(ids[1], "supplement")]
+    assert await usage_by_purpose(db) == [
+        ("decision", DECISION_USAGE_MODEL, 20, 0),
+        ("chat", "main", None, None),  # 停下的那次调用没等到用量
+        ("chat", "main", 12, 34),
+    ]
+    assert "停下已在显示的回答" in caplog.text
+    assert "结局 steered，送达 interrupted" in caplog.text
+    assert "第一段" not in caplog.text
+    assert "Python" not in caplog.text
+
+
+async def test_new_question_while_showing_lets_the_answer_finish(db: Database) -> None:
     alice = await invited(db, ALICE, "小王")
     gate = asyncio.Event()
-    model = ScriptedModel("main", [TextDelta("答"), gate, Usage(1, 1), DONE])
-    decider = FakeDecider(steer_result(0.9))
+    model = ScriptedModel("main", [TextDelta("二分查找"), gate, TextDelta("讲完了"), *answer()])
+    decider = FakeDecider(steer_result(0.2))
+    chat = steering(db, model, decider)
+    batcher = batcher_of(chat, ManualClock())
+    first, second = FakeChannel(), FakeChannel()
+
+    await submit(batcher, alice, message("讲讲二分查找"), first)
+    async with asyncio.timeout(HANG_GUARD):
+        await first.delivered.wait()
+    await submit(batcher, alice, message("明天天气怎么样"), second)
+    assert len(decider.requests) == 1
+    model.script = answer("晴")
+    gate.set()
+    await finish(batcher)
+
+    assert first.streamed == "二分查找讲完了"
+    assert second.streamed == "晴"
+    assert [row for row in await rows(db) if row.role == "assistant"] == [
+        Row("assistant", "二分查找讲完了", "main", "completed", "streamed"),
+        Row("assistant", "晴", "main", "completed", "streamed"),
+    ]
+    assert [row[5] for row in await decision_rows(db)] == ["new"]
+
+
+@pytest.mark.parametrize(
+    "decider",
+    [None, FakeDecider(DecisionError(Provider.GEMINI, ErrorKind.SERVER, 503))],
+    ids=["unconfigured", "failed"],
+)
+async def test_without_a_judgment_the_showing_answer_is_not_stopped(
+    db: Database, decider: FakeDecider | None
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    model = ScriptedModel("main", [TextDelta("答"), gate, TextDelta("完"), *answer()])
     chat = steering(db, model, decider)
     batcher = batcher_of(chat, ManualClock())
     first = FakeChannel()
@@ -4062,12 +4162,275 @@ async def test_answer_already_showing_is_not_judged(db: Database) -> None:
     async with asyncio.timeout(HANG_GUARD):
         await first.delivered.wait()
     await submit(batcher, alice, message("二"), FakeChannel())
+    model.script = answer("答二")
+    gate.set()
+    await finish(batcher)
+
+    assert first.streamed == "答完"
+    assert [user_texts(request) for request in model.requests] == [["一"], ["一", "二"]]
+    assert [row.finish for row in await rows(db) if row.role == "assistant"] == [
+        "completed",
+        "completed",
+    ]
+
+
+async def test_answer_that_began_showing_during_the_judgment_is_stopped(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    thinking = asyncio.Event()
+    model = ScriptedModel("main", [thinking, TextDelta("第一段"), asyncio.Event(), *answer()])
+    decider = FakeDecider(steer_result(0.9), gate=asyncio.Event())
+    chat = steering(db, model, decider)
+    batcher = batcher_of(chat, ManualClock())
+    first, second = FakeChannel(), FakeChannel()
+
+    await submit(batcher, alice, message("一"), first)
+    await started(model, 1)
+    await submit(batcher, alice, message("二"), second)
+    async with asyncio.timeout(HANG_GUARD):
+        await decider.started.wait()  # 判断时回答还没开始显示
+        thinking.set()
+        await first.delivered.wait()  # 判断期间回答开始显示了
+    model.script = answer("答二")
+    assert decider.gate is not None
+    decider.gate.set()
+    await finish(batcher)
+
+    assert first.streamed == f"第一段\n\n{texts.REPLY_STEERED}"
+    assert second.streamed == "答二"
+    assert [user_texts(request) for request in model.requests] == [["一"], ["一", "二"]]
+    assert [(row.content, row.finish, row.delivery) for row in await rows(db)][-2:] == [
+        ("第一段", "steered", "interrupted"),
+        ("答二", "completed", "streamed"),
+    ]
+
+
+async def test_answer_already_written_is_not_stopped_while_it_is_being_sent(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("写完了"))
+    decider = FakeDecider(steer_result(0.9))
+    chat = steering(db, model, decider)
+    batcher = batcher_of(chat, ManualClock())
+    first = FakeChannel(finish_gate=asyncio.Event())
+
+    await submit(batcher, alice, message("一"), first)
+    async with asyncio.timeout(HANG_GUARD):
+        await first.finish_started.wait()  # 模型已经写完，只剩结束分片
+    model.script = answer("答二")
+    await submit(batcher, alice, message("二"), FakeChannel())
+    assert len(decider.requests) == 1
+    assert first.finish_gate is not None
+    first.finish_gate.set()
+    await finish(batcher)
+
+    assert first.streamed == "写完了"
+    assert [(row.content, row.finish, row.delivery) for row in await rows(db)][-2:] == [
+        ("写完了", "completed", "streamed"),
+        ("答二", "completed", "streamed"),
+    ]
+    assert "模型已经写完" in caplog.text
+    assert "停不下来" in caplog.text
+
+
+async def test_answer_with_only_a_notice_shown_is_not_stopped(
+    db: Database, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    alice = await invited(db, ALICE, "小王")
+    thinking = asyncio.Event()
+    model = ScriptedModel("main", [thinking, *answer("没看到图")])
+    decider = FakeDecider(steer_result(0.9))
+    settings = [
+        ModelSettings(
+            name=model.name, provider=model.provider, model=model.model, default=True, inputs=SEES
+        )
+    ]
+    decisions = DecisionSettings(provider=Provider.GEMINI, model="decision-fake")
+    attachments = AttachmentSettings()
+    chat = Conversation(
+        db,
+        admin_openid=ADMIN,
+        models={model.name: model},
+        router=Router(settings, decisions, decider),
+        settings=ChatSettings(),
+        timezone=SHANGHAI,
+        attachments=attachments,
+        fetcher=Fetcher(MediaStore.under(tmp_path), FakeDownloader({}), attachments),
+        steer=SteerJudge(decisions, decider),
+        clock=lambda: START,
+    )
+    batcher = batcher_of(chat, ManualClock())
+    first = FakeChannel()
+
+    await submit(batcher, alice, message("看看这个", image_attachment()), first)
+    await started(model, 1)
+    assert first.sent == [texts.ATTACHMENT_FAILED]  # 只显示了附件说明，回答的流式消息还没开始
+    model.script = answer("答二")
+    await submit(batcher, alice, message("是只猫"), FakeChannel())
+    assert len(decider.requests) == 1
+    thinking.set()
+    await finish(batcher)
+
+    assert first.streamed == "没看到图"
+    assert [(row.content, row.finish) for row in await rows(db) if row.role == "assistant"] == [
+        ("没看到图", "completed"),
+        ("答二", "completed"),
+    ]
+    assert "回答的流式消息还没开始" in caplog.text
+
+
+@pytest.mark.parametrize("first", ["cut", "timeout"])
+async def test_stopping_and_the_idle_timeout_at_the_same_moment_have_a_definite_result(
+    db: Database, first: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # 两者都只在没有别的取消在进行时才取消读模型的任务：先发起的那个定结局，后到的（读模型的任务还在关闭响应流、
+    # 没处理完先到的那次取消）不起作用。
+    caplog.set_level(logging.INFO)
+    alice = await invited(db, ALICE, "小王")
+    clock = ManualClock()
+    model = ScriptedModel("main", [TextDelta("第一段"), asyncio.Event()], close_delay=0.05)
+    chat = steering(db, model, None, clock=clock, idle_timeout_seconds=10)
+    channel = FakeChannel()
+    control = TurnControl()
+    async with asyncio.timeout(HANG_GUARD):
+        received = await chat.receive(alice, message("一"), channel)
+        assert received is not None
+        turn = asyncio.create_task(chat.respond(alice, [received.message_id], channel, control))
+        await channel.delivered.wait()
+        if first == "cut":
+            assert control.cut()
+            await model.closing.wait()
+            await clock.advance_to(10.0)  # 空闲时限在关闭响应流期间到期
+        else:
+            await clock.advance_to(10.0)
+            assert model.closing.is_set()
+            assert not control.cut()  # 时限已经在停下这次调用
+        await turn
+
+    ending, notice = (
+        ("steered", texts.REPLY_STEERED) if first == "cut" else ("timeout", texts.REPLY_INTERRUPTED)
+    )
+    assert channel.streamed == f"第一段\n\n{notice}"
+    assert (await rows(db))[-1] == Row("assistant", "第一段", "main", ending, "interrupted")
+    assert ("空闲时限" in caplog.text) is (first == "timeout")
+    assert ("这次调用已经在停下" in caplog.text) is (first == "timeout")
+
+
+async def test_stopped_answer_closes_an_open_code_fence_before_the_notice(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", [TextDelta("看代码：\n```python\nprint(1)\n"), asyncio.Event()])
+    chat = steering(db, model, None)
+    channel = FakeChannel()
+    control = TurnControl()
+    async with asyncio.timeout(HANG_GUARD):
+        received = await chat.receive(alice, message("一"), channel)
+        assert received is not None
+        turn = asyncio.create_task(chat.respond(alice, [received.message_id], channel, control))
+        await channel.delivered.wait()
+        assert control.cut()
+        await turn
+
+    answer_text = "看代码：\n```python\nprint(1)\n```"
+    assert channel.streamed == f"{answer_text}\n\n{texts.REPLY_STEERED}"
+    assert (await rows(db))[-1] == Row("assistant", answer_text, "main", "steered", "interrupted")
+
+
+async def test_disabled_user_cannot_stop_the_showing_answer(db: Database) -> None:
+    # AGENTS.md 的第一条不变量：回答显示中被停用的用户再发消息，既不触发判断，也停不下回答、开不了新的一轮。
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    model = ScriptedModel("main", [TextDelta("答"), gate, TextDelta("完"), *answer()])
+    decider = FakeDecider(steer_result(0.9))
+    chat = steering(db, model, decider)
+    batcher = batcher_of(chat, ManualClock())
+    first = FakeChannel()
+
+    await submit(batcher, alice, message("一"), first)
+    async with asyncio.timeout(HANG_GUARD):
+        await first.delivered.wait()
+    await db.transaction(access.set_user_status, alice.id, UserStatus.DISABLED)
+    await submit(batcher, alice, message("二"), FakeChannel())
     gate.set()
     await finish(batcher)
 
     assert decider.requests == []
-    assert [user_texts(request) for request in model.requests] == [["一"], ["一", "二"]]
-    assert len(await reply_targets(db)) == 2
+    assert len(model.requests) == 1
+    assert first.streamed == "答完"
+    assert [row.content for row in await rows(db)] == ["一", "答完"]
+
+
+async def test_stopped_answer_does_not_wait_forever_for_the_stream_to_close(
+    db: Database, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # 停下之后关闭响应流卡住：时限的看门任务见它在被取消就不再管，由 `_attempt()` 限时等，补充照常开轮。
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(conversation_module, "GRACE_SECONDS", 0.05)
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", [TextDelta("第一段"), asyncio.Event()], close_delay=30)
+    decider = FakeDecider(steer_result(0.9))
+    chat = steering(db, model, decider)
+    batcher = batcher_of(chat, ManualClock())
+    first, second = FakeChannel(), FakeChannel()
+
+    await submit(batcher, alice, message("讲讲快排"), first)
+    async with asyncio.timeout(HANG_GUARD):
+        await first.delivered.wait()
+    model.script = answer("用 Python 的写法")
+    await submit(batcher, alice, message("用 Python"), second)
+    async with asyncio.timeout(HANG_GUARD):
+        await model.closing.wait()  # 第一次调用开始关闭流，卡在清理里
+    model.close_delay = 0  # 之后的调用正常关闭
+    async with asyncio.timeout(HANG_GUARD):
+        await finish(batcher)
+
+    assert first.log[-2:] == [("stream", f"\n\n{texts.REPLY_STEERED}"), ("finish", "")]
+    assert second.streamed == "用 Python 的写法"
+    assert [row for row in await rows(db) if row.role == "assistant"] == [
+        Row("assistant", "第一段", "main", "steered", "interrupted"),
+        Row("assistant", "用 Python 的写法", "main", "completed", "streamed"),
+    ]
+    assert "停下后 0.05 秒仍没关闭" in caplog.text
+
+
+async def test_shutdown_while_stopping_the_answer_wins(db: Database) -> None:
+    # 停下与关停同时发生：读模型的任务还没处理停下的那次取消，关停就来了。关停优先：结局记取消，不发说明。
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel(
+        "main", [TextDelta("第一段"), asyncio.Event()], close_delay=0.01
+    )  # 关闭响应流要花点时间
+    decider = FakeDecider(steer_result(0.9))
+    chat = steering(db, model, decider)
+    batcher = batcher_of(chat, ManualClock())
+    first = FakeChannel()
+    before = asyncio.all_tasks()
+
+    await submit(batcher, alice, message("一"), first)
+    async with asyncio.timeout(HANG_GUARD):
+        await first.delivered.wait()
+    model.closing.clear()
+    second = asyncio.create_task(batcher.submit(alice, message("二"), FakeChannel()))
+    async with asyncio.timeout(HANG_GUARD):
+        await model.closing.wait()  # 停下已经发起，模型流正在关闭
+        batcher.stop()
+        await second
+        await batcher.drain()
+        await chat.drain()
+    await settle()
+
+    assert asyncio.all_tasks() == before
+    assert texts.REPLY_STEERED not in first.streamed
+    assert first.kinds == ["typing", "stream", "finish"]  # 已送达的部分照常结束流式消息
+    ids = await user_ids(db)
+    assert [(row.content, row.finish, row.delivery) for row in await rows(db)][-1] == (
+        "第一段",
+        "cancelled",
+        "cancelled",
+    )
+    assert len(model.requests) == 1  # 新消息没有开始下一轮，重启后是待回复的消息
+    pending = await db.transaction(journal.pending_messages, alice.id, ids[-1] + 1)
+    assert [entry.content for entry in pending] == ["二"]
 
 
 async def test_judgment_reads_only_this_users_messages_and_rechecks_access(db: Database) -> None:
@@ -4453,6 +4816,29 @@ async def test_unclosed_code_fence_is_closed_before_the_sources(
 
     section = citations.markdown_section(sources_of(Citation(WEATHER, "上海天气")))
     answer_text = "看代码：\n```python\nprint(1)\n```" + section
+    assert channel.streamed == f"{answer_text}\n\n{notice}"
+    assert (await rows(db))[-1] == Row(
+        "assistant", answer_text, "main", ending, "interrupted" if ending == "error" else "streamed"
+    )
+
+
+@pytest.mark.parametrize(
+    ("tail", "ending", "notice"),
+    [
+        ([Usage(1, 2), Finished(FinishReason.MAX_TOKENS)], "max_tokens", texts.REPLY_CUT_SHORT),
+        ([ModelError(Provider.OPENAI, ErrorKind.SERVER)], "error", texts.REPLY_INTERRUPTED),
+    ],
+    ids=["max_tokens", "error"],
+)
+async def test_unclosed_code_fence_is_closed_before_the_notice(
+    db: Database, tail: list[Step], ending: str, notice: str
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", [TextDelta("看代码：\n```python\nprint(1)"), *tail])
+
+    channel = await say(conversation(db, model), alice, "写段代码")
+
+    answer_text = "看代码：\n```python\nprint(1)\n```"
     assert channel.streamed == f"{answer_text}\n\n{notice}"
     assert (await rows(db))[-1] == Row(
         "assistant", answer_text, "main", ending, "interrupted" if ending == "error" else "streamed"

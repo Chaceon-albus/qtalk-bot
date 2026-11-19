@@ -392,7 +392,8 @@ async def test_steer_while_only_the_process_is_shown_restarts_with_a_new_process
     assert archived == "[说明] **想想怎么排序**\n\n（插话重来）\n\n[说明] **想想怎么排序**"
 
 
-async def test_steer_after_the_answer_started_does_not_restart(db: Database) -> None:
+async def test_steer_after_the_answer_started_cuts_the_answer(db: Database) -> None:
+    # 回答已经开始显示时判为补充：停下这段回答（接一句说明），不重来；过程消息早已结束，不写「收到补充」。
     alice = await invited(db, ALICE, "小王")
     clock = ManualClock()
     thought, gate = asyncio.Event(), asyncio.Event()
@@ -410,13 +411,15 @@ async def test_steer_after_the_answer_started_does_not_restart(db: Database) -> 
     thought.set()
     await wait_for(lambda: first.streamed == "开头")
     await submit(batcher, alice, message("补充"), second)
+    await wait_for(lambda: first.streamed != "开头")
     gate.set()
     await finish(batcher)
 
-    assert decider.requests == []  # 回答已经开始显示：不判断，排到下一轮
+    assert len(decider.requests) >= 1  # 显示中也判断（下一轮可能还有选模型的决策）
     assert first.process_text == "想想"
     assert "收到补充" not in first.process_text
-    assert first.streamed == "开头结尾"
+    assert first.streamed == "开头\n\n" + texts.REPLY_STEERED
+    assert second.streamed  # 补充紧接着作为下一轮回答，回复挂在它上面
 
 
 async def test_steer_is_still_possible_while_the_first_process_chunk_is_in_flight(
