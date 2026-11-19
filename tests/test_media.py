@@ -29,6 +29,7 @@ from qtalk_bot.media import (
     AttachmentStatus,
     DownloadError,
     Fetcher,
+    HostRefusedError,
     IncomingAttachment,
     MediaStore,
     detect_format,
@@ -866,3 +867,56 @@ async def test_reading_a_named_pipe_does_not_block(tmp_path: Path) -> None:
         # 万一有读者卡在管道上，打开写端再关掉，让它读到文件结束，测试进程才能正常退出。
         with contextlib.suppress(OSError):
             os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+
+
+# ---- 下载因为主机被拒：交给钩子提醒管理员 ----
+
+
+def refused(host: str) -> HostRefusedError:
+    return HostRefusedError("拒绝下载：主机不在下载白名单里", key=host, shown=host, is_host=True)
+
+
+async def test_refused_host_is_reported_to_the_hook_with_the_user(tmp_path: Path) -> None:
+    calls: list[tuple[str, str]] = []
+    f = Fetcher(
+        MediaStore.under(tmp_path),
+        FakeDownloader({SECRET_URL: refused("evil.example.com")}),
+        AttachmentSettings(),
+        on_host_refused=lambda label, exc: calls.append((label, exc.key)),
+    )
+
+    result = await acquire_one(f, image())
+
+    assert result.status is AttachmentStatus.FAILED
+    assert calls == [("#7 小王", "evil.example.com")]
+
+
+async def test_other_download_errors_do_not_reach_the_hook(tmp_path: Path) -> None:
+    calls: list[str] = []
+    f = Fetcher(
+        MediaStore.under(tmp_path),
+        FakeDownloader({SECRET_URL: DownloadError("HTTP 404")}),
+        AttachmentSettings(),
+        on_host_refused=lambda label, exc: calls.append(label),
+    )
+
+    assert (await acquire_one(f, image())).status is AttachmentStatus.FAILED
+    assert calls == []
+
+
+async def test_a_failing_hook_does_not_change_the_download_result(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    def broken(label: str, exc: HostRefusedError) -> None:
+        raise RuntimeError("钩子里的秘密")
+
+    f = Fetcher(
+        MediaStore.under(tmp_path),
+        FakeDownloader({SECRET_URL: refused("evil.example.com")}),
+        AttachmentSettings(),
+        on_host_refused=broken,
+    )
+
+    assert (await acquire_one(f, image())).status is AttachmentStatus.FAILED
+    assert "提醒管理员时出错：RuntimeError" in caplog.text
+    assert "钩子里的秘密" not in caplog.text

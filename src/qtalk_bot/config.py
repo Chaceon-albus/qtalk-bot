@@ -7,6 +7,7 @@ TOML 按表校验：每个表由一个 `_parse_*` 函数经 `_Table` 读取，�
 `table.table("<表名>")` 读出它即可，`[invites]` 是现成的例子。
 """
 
+import ipaddress
 import math
 import os
 import re
@@ -58,6 +59,7 @@ DEFAULT_RETENTION_DAYS = 30
 MAX_RETENTION_DAYS = 3650
 DEFAULT_ATTACHMENT_HISTORY_TURNS = 3
 MAX_ATTACHMENT_HISTORY_TURNS = 20
+MAX_EXTRA_DOWNLOAD_HOSTS = 32
 
 DEFAULT_TEXT_WAIT_SECONDS = 2.5
 DEFAULT_ATTACHMENT_WAIT_SECONDS = 12.0
@@ -70,6 +72,9 @@ DEFAULT_DESCRIBE_TIMEOUT_SECONDS = 60
 MAX_DESCRIBE_TIMEOUT_SECONDS = 600
 DEFAULT_DESCRIBE_MAX_OUTPUT_TOKENS = 1024
 
+# 下载白名单里的一个域名后缀：至少两段，每段 1–63 个字母、数字或连字符（不以连字符开头或结尾），最后一段是
+# 2–63 个字母，总长不超过 253。与 `bot.py` 判断主机名的规则一致，否则追加的后缀永远匹配不上。
+_DOMAIN = re.compile(r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
 _MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 _REASONING = re.compile(r"[a-z][a-z0-9_]{0,31}")
 _PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
@@ -181,12 +186,15 @@ class AttachmentSettings:
         retention_days: 附件文件在本地保存的天数；过期的文件定期删除，之后历史里只用文字版。
         history_turns: 最近几轮里的图片在选中的模型能收图片、本地文件还在时给原件（当前这一轮不算在内）；
             更早的只给文字版。音频与文件在历史里总是只给文字版。
+        extra_download_hosts: 追加到内置下载白名单（QQ 的下载域名，见 `bot.py`）之后的域名后缀，已转成小写；
+            它本身和它的子域名都放行。平台换了下载域名、管理员收到提醒并确认可信后加在这里。
     """
 
     max_size_mb: int = DEFAULT_ATTACHMENT_MAX_SIZE_MB
     download_timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
     retention_days: int = DEFAULT_RETENTION_DAYS
     history_turns: int = DEFAULT_ATTACHMENT_HISTORY_TURNS
+    extra_download_hosts: tuple[str, ...] = ()
 
     @property
     def max_bytes(self) -> int:
@@ -649,15 +657,70 @@ def _parse_attachments(table: _Table) -> AttachmentSettings | None:
     history_turns = _bounded_int(
         table, "history_turns", DEFAULT_ATTACHMENT_HISTORY_TURNS, 0, MAX_ATTACHMENT_HISTORY_TURNS
     )
+    extra_hosts = _parse_download_hosts(table, "extra_download_hosts")
     table.finish()
-    if max_size_mb is None or timeout is None or retention_days is None or history_turns is None:
+    if (
+        max_size_mb is None
+        or timeout is None
+        or retention_days is None
+        or history_turns is None
+        or extra_hosts is None
+    ):
         return None
     return AttachmentSettings(
         max_size_mb=max_size_mb,
         download_timeout_seconds=timeout,
         retention_days=retention_days,
         history_turns=history_turns,
+        extra_download_hosts=extra_hosts,
     )
+
+
+def _parse_download_hosts(table: _Table, key: str) -> tuple[str, ...] | None:
+    """下载白名单的追加项：域名后缀的数组，转成小写。只写域名本身，不带协议、路径、端口、用户信息，不能是 IP
+    地址，不能重复，最多 `MAX_EXTRA_DOWNLOAD_HOSTS` 项。报错只说是第几项、什么原因，不回显取值。"""
+    values = table.string_list(key)
+    if values is None:
+        return None
+    if len(values) > MAX_EXTRA_DOWNLOAD_HOSTS:
+        table.problem(key, f"最多 {MAX_EXTRA_DOWNLOAD_HOSTS} 项")
+        return None
+    hosts: list[str] = []
+    ok = True
+    for index, value in enumerate(values):
+        host = value.strip().lower()
+        reason = _domain_problem(host)
+        if reason is None and host in hosts:
+            reason = "与前面的项重复"
+        if reason is not None:
+            table.problem(f"{key}[{index}]", reason)
+            ok = False
+            continue
+        hosts.append(host)
+    return tuple(hosts) if ok else None
+
+
+def _domain_problem(host: str) -> str | None:
+    """一个下载白名单追加项的问题；是合法的域名后缀时返回 `None`。"""
+    if not host:
+        return "不能为空"
+    if "://" in host:
+        return "只写域名，不能带协议"
+    if "@" in host:
+        return "只写域名，不能带用户信息"
+    if "/" in host or "?" in host or "#" in host:
+        return "只写域名，不能带路径"
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        pass
+    else:
+        return "不能是 IP 地址"
+    if ":" in host:
+        return "只写域名，不能带端口"
+    if not _DOMAIN.fullmatch(host):
+        return "应为合法的域名（至少两段，只含字母、数字和连字符，最后一段是字母）"
+    return None
 
 
 def _parse_describe(root: _Table) -> tuple[bool, DescribeSettings | None]:

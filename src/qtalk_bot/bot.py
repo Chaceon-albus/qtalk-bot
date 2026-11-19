@@ -21,6 +21,7 @@ import ipaddress
 import logging
 import re
 from collections.abc import AsyncGenerator, Awaitable, Sequence
+from dataclasses import dataclass
 from http.cookiejar import DefaultCookiePolicy
 from typing import Protocol
 from urllib.parse import urljoin, urlsplit
@@ -29,18 +30,44 @@ import pyqbot
 
 from . import texts
 from .access import User
+from .alerts import AlertGroup, Alerts, AlertSendError
 from .batching import Batcher
 from .chat import ChatHandler
 from .conversation import ChatInput, SendError, SendRejectedError, SendUncertainError
 from .gate import Chat, Delivery, FriendAdded, Gate, IncomingMessage, Reply, ShareLinkError
-from .media import AttachmentKind, DownloadError, DownloadTooLargeError, IncomingAttachment
+from .media import (
+    AttachmentKind,
+    DownloadError,
+    DownloadTooLargeError,
+    HostRefusedError,
+    HostRefusedHook,
+    IncomingAttachment,
+)
 
 logger = logging.getLogger(__name__)
 
+PLATFORM_HOSTS = (
+    # 内置的下载白名单。形态日志与附件下载共用它与配置里追加的项合并后的一份（`download_hosts()`）。
+    # 这些域名是按 2026-11-18 的实测样本和官方文档示例整理的，不是固定值：平台的下载主机随时可能变化。下载因
+    # 「主机不在下载白名单里」失败时（管理员会收到提醒），先核实新域名确实属于 QQ 平台，再补进这里；部署方也
+    # 可以先加进配置的 `[attachments] extra_download_hosts`。
+    "qq.com",  # 文件的下载地址（实测 grouptalk.c2c.qq.com）
+    "qq.com.cn",  # 图片、语音的下载地址（实测 multimedia.nt.qq.com.cn）
+    "ugcimg.cn",  # 语音转出的 WAV（实测 qqbot.ugcimg.cn）
+    "qpic.cn",  # 文档示例里的图片地址
+    "gtimg.cn",  # 文档示例里的小程序图标
+)
+_HOST = re.compile(r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
 
-def register(bot: pyqbot.Bot, gate: Gate, chat: ChatHandler) -> Handlers:
-    """在 `bot` 上注册单聊消息与加好友的处理函数。关停时要在关数据库之前等返回值的 `drain()`。"""
-    handlers = Handlers(gate, chat)
+
+def register(
+    bot: pyqbot.Bot, gate: Gate, chat: ChatHandler, *, hosts: Sequence[str] = PLATFORM_HOSTS
+) -> Handlers:
+    """在 `bot` 上注册单聊消息与加好友的处理函数。关停时要在关数据库之前等返回值的 `drain()`。
+
+    `hosts` 是下载白名单（`download_hosts()` 合并后的），形态日志按它决定记不记主机名。
+    """
+    handlers = Handlers(gate, chat, hosts=hosts)
     bot.on_c2c_message(handlers.on_c2c_message)
     bot.on_friend_add(handlers.on_friend_add)
     return handlers
@@ -165,34 +192,99 @@ _REDIRECT_STATUSES = frozenset((301, 302, 303, 307, 308))
 _CREDENTIAL_HEADERS = ("authorization", "proxy-authorization", "cookie")
 
 
-def download_refusal(url: str) -> str | None:
+def download_hosts(extra: Sequence[str] = ()) -> tuple[str, ...]:
+    """下载白名单：内置的 QQ 下载域名（`PLATFORM_HOSTS`），后面接上配置里追加的（`[attachments]
+    extra_download_hosts`，已校验、转成小写），去掉重复的。下载与形态日志共用合并后的这一份。"""
+    return tuple(dict.fromkeys((*PLATFORM_HOSTS, *extra)))
+
+
+def download_refusal(url: str, hosts: Sequence[str] = PLATFORM_HOSTS) -> str | None:
     """这个地址不能下载的原因（固定的分类，不含地址）；可以下载时返回 `None`。
 
     每一跳（包括第一跳与每次重定向的目标）都要检查：只认 http(s)；不能带用户信息（否则 HTTP 客户端会据此
     构造 Basic 鉴权）；主机名是 IP 字面量时拒绝（内网、回环、链路本地等地址明确说是内网，公网 IP 也不在
-    白名单里）；主机名必须属于已知的 QQ 平台域名（`_HOST_SUFFIXES`，与形态日志共用一份）。
+    白名单里）；主机名必须是合法的域名，并属于下载白名单 `hosts`（与形态日志共用一份）。
     """
+    refusal = _refusal(url, hosts)
+    return None if refusal is None else refusal.reason
+
+
+@dataclass(frozen=True, slots=True)
+class _Refusal:
+    """拒绝下载的原因。因为主机被拒时带上提醒管理员要用的键与能写出来的内容（见 `HostRefusedError`）。"""
+
+    reason: str
+    host: HostRefusedError | None = None
+
+
+def _refusal(url: str, hosts: Sequence[str]) -> _Refusal | None:
     try:
         parts = urlsplit(url)
         host = parts.hostname
         parts.port  # noqa: B018  端口不是数字时这里抛 ValueError
     except ValueError:
-        return "地址不合法"
+        return _Refusal("地址不合法")
     if parts.scheme not in ("http", "https"):
-        return "协议不是 http(s)"
+        return _Refusal("协议不是 http(s)")
     if "@" in parts.netloc:
-        return "地址带用户信息"
+        return _Refusal("地址带用户信息")
     if "\\" in url or any(c.isspace() or not c.isprintable() for c in url) or host is None:
-        return "地址不合法"
+        return _Refusal("地址不合法")
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
         address = None
     if address is not None:
-        return "主机是 IP 地址" if address.is_global else "主机是内网地址"
-    if not _known_host(host):
-        return "主机不在下载白名单里"
+        reason = "主机是 IP 地址" if address.is_global else "主机是内网地址"
+        return _Refusal(reason, _host_refused(reason, texts.HOST_KIND_IP, is_host=False))
+    reason = "主机不在下载白名单里"
+    if not _HOST.fullmatch(host):
+        return _Refusal(reason, _host_refused(reason, texts.HOST_KIND_UNRECOGNIZED, is_host=False))
+    if not _in_hosts(host, hosts):
+        # 主机名是合法的域名：提醒里只写它（urlsplit 已转成小写，不含端口、路径与查询串）。
+        return _Refusal(reason, _host_refused(reason, host, is_host=True))
     return None
+
+
+def _host_refused(reason: str, shown: str, *, is_host: bool) -> HostRefusedError:
+    return HostRefusedError(f"拒绝下载：{reason}", key=shown, shown=shown, is_host=is_host)
+
+
+ALERT_KEY_PREFIX = "下载域名:"
+"""提醒管理员「白名单外的下载域名」时，提醒键的前缀，后面是主机名或类别；与以后别的提醒的键分开。"""
+
+DOWNLOAD_HOST_ALERTS = AlertGroup("下载域名", hourly_limit=3)
+"""「白名单外的下载域名」这类提醒每小时最多 3 条：一个个不同的子域名各是一个键，不能一下子用完全局每小时的
+预算、挤掉之后真正要紧的提醒（如掉线、额度用尽）。"""
+
+
+def refused_host_alert(alerts: Alerts) -> HostRefusedHook:
+    """`media.Fetcher` 的 `on_host_refused`：下载因为主机被拒时提醒管理员（同一个主机或类别 24 小时内一次，
+    这一类每小时最多 `DOWNLOAD_HOST_ALERTS.hourly_limit` 条）。
+    提醒里只有用户的称呼和主机名（或类别），没有完整链接、路径、查询串与文件名。"""
+
+    def alert(user_label: str, exc: HostRefusedError) -> None:
+        text = texts.download_host_refused(user_label, exc.shown, is_host=exc.is_host)
+        alerts.notify(f"{ALERT_KEY_PREFIX}{exc.key}", text, group=DOWNLOAD_HOST_ALERTS)
+
+    return alert
+
+
+class AdminAlertSender:
+    """把提醒以主动消息发给管理员（`client.users.send_message()`，不带 `reply_to`），符合 `alerts.AlertSender`。
+    pyqbot 的异常转成文案已脱敏的 `AlertSendError`（异常类型、`err_code`、`trace_id`）。"""
+
+    def __init__(self, client: pyqbot.Client, admin_openid: str) -> None:
+        self._client = client
+        self._admin_openid = admin_openid
+
+    async def __call__(self, text: str) -> None:
+        try:
+            await self._client.users.send_message(self._admin_openid, text)
+        except pyqbot.QQBotError as exc:
+            raise AlertSendError(_describe(exc)) from None
+        except RuntimeError as exc:  # 客户端已关闭
+            raise AlertSendError(type(exc).__name__) from None
 
 
 class QQDownloader:
@@ -216,8 +308,10 @@ class QQDownloader:
       这次关闭同样留在后台。
     """
 
-    def __init__(self, client: pyqbot.Client) -> None:
+    def __init__(self, client: pyqbot.Client, *, hosts: Sequence[str] = PLATFORM_HOSTS) -> None:
+        """`hosts` 是下载白名单（`download_hosts()` 合并后的）。"""
         self._client = client
+        self._hosts = tuple(hosts)
         # 正在关闭的响应与留在后台收尾的读取：持有引用，关停时要等。
         self._closing: set[_Background] = set()
 
@@ -232,8 +326,10 @@ class QQDownloader:
         http = self._client.http_client
         current = url
         for _ in range(MAX_REDIRECTS + 1):
-            if (reason := download_refusal(current)) is not None:
-                raise DownloadError(f"拒绝下载：{reason}")
+            if (refusal := _refusal(current, self._hosts)) is not None:
+                if refusal.host is not None:
+                    raise refusal.host  # 因为主机被拒：调用方据此提醒管理员
+                raise DownloadError(f"拒绝下载：{refusal.reason}")
             try:
                 template = http.build_request("GET", current)
                 request = type(template)("GET", current, extensions=template.extensions)
@@ -399,9 +495,12 @@ class Handlers:
     平台重推也会被丢弃。
     """
 
-    def __init__(self, gate: Gate, chat: ChatHandler) -> None:
+    def __init__(
+        self, gate: Gate, chat: ChatHandler, *, hosts: Sequence[str] = PLATFORM_HOSTS
+    ) -> None:
         self._gate = gate
         self._chat = chat
+        self._hosts = tuple(hosts)
         # 同一个人的回复链成组发出：管理员连发两条 /invite 时，两组「状态 + 邀请」不会交叉，免得把
         # 不带备注的邀请转发错人。只锁回复链的发送，对话处理器不在锁里。
         self._reply_locks = _KeyedLock()
@@ -458,7 +557,7 @@ class Handlers:
             case Reply() as reply:
                 await self._deliver(message.user_openid, message.reply, reply)
             case Chat(user=user):
-                _log_shape(user, message)
+                _log_shape(user, message, self._hosts)
                 try:
                     await self._chat.handle(user, message)
                 except pyqbot.QQBotError as exc:
@@ -490,11 +589,11 @@ class Handlers:
                 await self._gate.settle(reply, await _send(send, reply))
 
 
-def _log_shape(user: User, message: pyqbot.C2CMessage) -> None:
+def _log_shape(user: User, message: pyqbot.C2CMessage, hosts: Sequence[str]) -> None:
     """记下非文本内容的形态。出任何错都只记一条固定的警告（异常类型名，不带文案与回溯），不挡住对话。"""
     try:
         if logger.isEnabledFor(logging.INFO) and has_non_text(message):
-            shape = describe_non_text(message)
+            shape = describe_non_text(message, hosts)
             if shape is not None:
                 logger.info("用户 %s 的消息带非文本内容：%s", user.label, shape)
     except Exception as exc:  # noqa: BLE001  日志只是辅助，任何问题都不能挡住对话
@@ -554,17 +653,6 @@ _ARK_NAMES = frozenset(
     # 官方文档说 ark_name 是 ark_type 的中文名，这里是文档里各取值的中文说明
     ("图文 H5", "图文卡片", "小程序", "位置卡片", "好友名片", "视频分享", "一起听歌", "图片")
 )
-_HOST_SUFFIXES = (
-    # 形态日志与附件下载共用这份白名单（`_known_host()`）。
-    # 这些域名是按 2026-11-18 的实测样本和官方文档示例整理的，不是固定值：平台的下载主机随时可能变化。下载因
-    # 「主机不在下载白名单里」失败时，先核实新域名确实属于 QQ 平台，再补进这里。
-    "qq.com",  # 文件的下载地址（实测 grouptalk.c2c.qq.com）
-    "qq.com.cn",  # 图片、语音的下载地址（实测 multimedia.nt.qq.com.cn）
-    "ugcimg.cn",  # 语音转出的 WAV（实测 qqbot.ugcimg.cn）
-    "qpic.cn",  # 文档示例里的图片地址
-    "gtimg.cn",  # 文档示例里的小程序图标
-)
-_HOST = re.compile(r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
 _EXTENSIONS = frozenset(
     (
         *("jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "tif", "tiff"),
@@ -590,14 +678,17 @@ def has_non_text(message: pyqbot.C2CMessage) -> bool:
     )
 
 
-def describe_non_text(message: pyqbot.C2CMessage) -> str | None:
+def describe_non_text(
+    message: pyqbot.C2CMessage, hosts: Sequence[str] = PLATFORM_HOSTS
+) -> str | None:
     """消息里非文本内容的形态，只含固定标签与数字；是普通的文字消息时返回 `None`。
 
-    附件和被引用的元素各有总预算（`MAX_*_DESCRIBED`，所有层级合计），超出的只计数。
+    附件和被引用的元素各有总预算（`MAX_*_DESCRIBED`，所有层级合计），超出的只计数。地址的主机名属于下载白名单
+    `hosts` 时才记下。
     """
     if not has_non_text(message):
         return None
-    budget = _Budget()
+    budget = _Budget(hosts)
     parts = [
         _describe_body(
             message.message_type,
@@ -618,7 +709,10 @@ def describe_non_text(message: pyqbot.C2CMessage) -> str | None:
 
 
 class _Budget:
-    def __init__(self) -> None:
+    """一次形态描述的上下文：附件与被引用元素的剩余预算，以及下载白名单。"""
+
+    def __init__(self, hosts: Sequence[str]) -> None:
+        self.hosts = tuple(hosts)
         self.attachments = MAX_ATTACHMENTS_DESCRIBED
         self.elements = MAX_ELEMENTS_DESCRIBED
         self.skipped_attachments = 0
@@ -690,7 +784,7 @@ def _describe_attachments(
     return [
         f"{label} {index}：content_type={_content_type(item.content_type)}，"
         f"size={_number(item.size)}，尺寸 {_number(item.width)}x{_number(item.height)}，"
-        f"url {_host(item.url)}，voice_wav_url {_host(item.voice_wav_url)}，"
+        f"url {_host(item.url, budget.hosts)}，voice_wav_url {_host(item.voice_wav_url, budget.hosts)}，"
         f"asr_refer_text {_length(item.asr_refer_text)}，扩展名 {_extension(item.filename)}"
         for index, item in enumerate(shown, 1)
     ]
@@ -708,7 +802,7 @@ def _number(value: int | None) -> str:
     return "无" if value is None else str(int(value))
 
 
-def _host(url: str | None) -> str:
+def _host(url: str | None, hosts: Sequence[str]) -> str:
     """地址有没有；主机名是合法域名且属于已知的平台域名时才记下它。路径与查询串里可能有令牌，从不记。"""
     if not url:
         return "无"
@@ -723,17 +817,20 @@ def _host(url: str | None) -> str:
         or "\\" in url
         or "@" in parts.netloc
         or host is None
-        or not _known_host(host)
+        or not _known_host(host, hosts)
     ):
         return "有（其它主机）"
     return f"有（主机 {host}）"
 
 
-def _known_host(host: str) -> bool:
-    """主机名是合法的域名，并且属于已知的平台域名（`_HOST_SUFFIXES`）。"""
-    return bool(_HOST.fullmatch(host)) and any(
-        host == suffix or host.endswith(f".{suffix}") for suffix in _HOST_SUFFIXES
-    )
+def _known_host(host: str, hosts: Sequence[str]) -> bool:
+    """主机名是合法的域名，并且属于下载白名单 `hosts`。"""
+    return bool(_HOST.fullmatch(host)) and _in_hosts(host, hosts)
+
+
+def _in_hosts(host: str, hosts: Sequence[str]) -> bool:
+    """主机名是 `hosts` 里的某一项，或它的子域名。"""
+    return any(host == suffix or host.endswith(f".{suffix}") for suffix in hosts)
 
 
 def _length(text: str | None) -> str:

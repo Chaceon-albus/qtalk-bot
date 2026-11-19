@@ -482,6 +482,26 @@ class DownloadTooLargeError(DownloadError):
     """超过大小上限，已停止下载。"""
 
 
+class HostRefusedError(DownloadError):
+    """因为主机拒绝下载（不在白名单里、是 IP 地址、不是合法的域名），包括重定向的某一跳。
+
+    Attributes:
+        key: 提醒管理员时用的键：合法域名就是主机名，否则是类别。
+        shown: 提醒里可以写出来的东西：主机名（只有主机名，不含端口、路径与查询串），或类别。
+        is_host: `shown` 是主机名（而不是类别）。
+    """
+
+    def __init__(self, reason: str, *, key: str, shown: str, is_host: bool) -> None:
+        super().__init__(reason)
+        self.key = key
+        self.shown = shown
+        self.is_host = is_host
+
+
+type HostRefusedHook = Callable[[str, HostRefusedError], None]
+"""下载因为主机被拒时调用：（用户的称呼，异常）。同步执行，不能抛出（抛出也只记日志）。"""
+
+
 class Downloader(Protocol):
     """下载一个附件。"""
 
@@ -626,11 +646,18 @@ class Fetcher:
     """
 
     def __init__(
-        self, store: MediaStore, downloader: Downloader, settings: AttachmentSettings
+        self,
+        store: MediaStore,
+        downloader: Downloader,
+        settings: AttachmentSettings,
+        *,
+        on_host_refused: HostRefusedHook | None = None,
     ) -> None:
+        """`on_host_refused` 在下载因为主机被拒时调用（接线层用它提醒管理员），它出错不影响下载的结果。"""
         self.store = store
         self._downloader = downloader
         self._settings = settings
+        self._on_host_refused = on_host_refused
         self._slots = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
         self._active: set[asyncio.Task[Acquired]] = set()
         self.busy = 0  # 正占着下载槽位的下载数
@@ -771,6 +798,10 @@ class Fetcher:
         except TimeoutError:
             logger.warning("用户 %s 的附件下载超时", label)
             return result(AttachmentStatus.FAILED)
+        except HostRefusedError as exc:
+            logger.warning("用户 %s 的附件下载失败：%s", label, exc)
+            self._report_host(label, exc)
+            return result(AttachmentStatus.FAILED)
         except DownloadError as exc:
             logger.warning("用户 %s 的附件下载失败：%s", label, exc)
             return result(AttachmentStatus.FAILED)
@@ -783,6 +814,14 @@ class Fetcher:
             finally:
                 self.busy -= 1  # 无论收尾出了什么错，槽位都要还
                 self._slots.release()
+
+    def _report_host(self, label: str, exc: HostRefusedError) -> None:
+        if self._on_host_refused is None:
+            return
+        try:
+            self._on_host_refused(label, exc)
+        except Exception as exc2:  # noqa: BLE001  提醒出错不能影响下载的结果；只记类型
+            logger.warning("提醒管理员时出错：%s", type(exc2).__name__)
 
     async def _download(self, url: str, spool: _Spool, max_bytes: int) -> tuple[bytes, int]:
         """把内容写进临时文件，返回（文件头，总字节数）。超过上限抛 `DownloadTooLargeError`。"""

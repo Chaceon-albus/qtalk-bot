@@ -14,14 +14,18 @@ from collections.abc import Awaitable, Callable
 
 import pyqbot
 
+from .alerts import Alerts
 from .batching import Batcher
 from .bot import (
+    AdminAlertSender,
     Handlers,
     QQChat,
     QQDownloader,
     ShareLinks,
+    download_hosts,
     fetch_bot_name,
     refuse_cookies,
+    refused_host_alert,
     register,
 )
 from .chat import ChatHandler
@@ -64,6 +68,8 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
         else:
             bot = pyqbot.Bot(secrets.app_id, secrets.app_secret, base_url=settings.qq.base_url)
         refuse_cookies(bot)  # 附件下载与 pyqbot 共用这个客户端，见 `refuse_cookies()`
+        alerts = Alerts(AdminAlertSender(bot, secrets.admin_openid))
+        hosts = download_hosts(settings.attachments.extra_download_hosts)
         describer: Describer | None = None
         fetcher: Fetcher | None = None
         conversation: Conversation | None = None
@@ -91,7 +97,12 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                     admin_openid=secrets.admin_openid,
                 )
             if chat is None:
-                fetcher = Fetcher(store, QQDownloader(bot), settings.attachments)
+                fetcher = Fetcher(
+                    store,
+                    QQDownloader(bot, hosts=hosts),
+                    settings.attachments,
+                    on_host_refused=refused_host_alert(alerts),
+                )
                 conversation = Conversation(
                     db,
                     admin_openid=secrets.admin_openid,
@@ -105,14 +116,18 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                 )
                 batcher = Batcher(conversation, settings.batching)
                 chat = QQChat(batcher)
-            handlers = register(bot, gate, chat)
+            handlers = register(bot, gate, chat, hosts=hosts)
             cleanup = asyncio.create_task(run_cleanup(db, store, settings.attachments))
             logger.info("机器人启动")
             await bot.start()
         except BaseException:
-            await _shut_down(bot, conversation, cleanup, describer, fetcher, batcher, handlers)
+            await _shut_down(
+                bot, conversation, cleanup, describer, fetcher, batcher, handlers, alerts
+            )
             raise
-        if await _shut_down(bot, conversation, cleanup, describer, fetcher, batcher, handlers):
+        if await _shut_down(
+            bot, conversation, cleanup, describer, fetcher, batcher, handlers, alerts
+        ):
             raise asyncio.CancelledError  # 关停期间又被取消过：收尾做完了，再把取消传出去
 
 
@@ -133,6 +148,7 @@ async def _shut_down(
     fetcher: Fetcher | None,
     batcher: Batcher | None = None,
     handlers: Handlers | None = None,
+    alerts: Alerts | None = None,
 ) -> bool:
     """按顺序关停，返回期间是否又被取消过。
 
@@ -142,17 +158,21 @@ async def _shut_down(
     2. `Batcher.drain()` 与 `Conversation.drain()`：等处理批次的任务与在途的轮次真正结束。对话被取消后最多先用
        几秒停模型、再用几秒等在途的分片与结束分片，然后写流水与用量。这一步要在关闭 QQ 客户端之前：回答在
        `Batcher` 自己的任务里，`Bot.close()` 不等它们，客户端先关的话结束分片发不出去，用户会一直看到「生成中」。
-    3. `Bot.close()`：断开网关，取消前台还在运行的处理函数（它们只在收消息、下载附件；消息在下载之前已经入库），
+    3. `Alerts.stop()` 与 `Alerts.aclose()`：同步地不再接受新的提醒、取消还在发的，再限时等它们退出。提醒经
+       QQ 的 HTTP 客户端发出，要在关闭它之前收住；`stop()` 是同步、无条件执行的，前面的收尾用完了时限也照样
+       生效（否则 `aclose()` 可能在开始之前就被取消，在途的发送越过客户端的关闭）。之后再触发的提醒（如关停中
+       还在下载的附件被拒）直接丢弃，只记日志。
+    4. `Bot.close()`：断开网关，取消前台还在运行的处理函数（它们只在收消息、下载附件；消息在下载之前已经入库），
        最多等它们 5 秒，再关 QQ 的 HTTP 客户端。
-    4. `Handlers.drain()`：等前台的处理真正结束。被取消的处理函数仍会等 Gate 的决定、把放行的消息写进流水；
+    5. `Handlers.drain()`：等前台的处理真正结束。被取消的处理函数仍会等 Gate 的决定、把放行的消息写进流水；
        数据库的队列堵着时这可能晚于 pyqbot 的 5 秒，不等它，数据库先关，这条消息就丢了（去重记录已经提交，
        平台重推也会被丢弃）。
        理想的顺序是先断开网关、不再收新事件，再收尾，最后关 HTTP 客户端；但 pyqbot 的 `Bot.close()` 把这三步
-       连在一起，没有只断开网关的公开接口（自己传入 HTTP 客户端可以避开，但要直接依赖 `httpx2`）。所以第 2 步
+       连在一起，没有只断开网关的公开接口（自己传入 HTTP 客户端可以避开，但要直接依赖 `httpx2`）。所以第 2、3 步
        期间网关仍在收事件：这些消息照常放行、入库，因为 `Batcher` 已停，它们不会被回答，重启后是待回复的。
-    5. 向后台发出停止请求：停掉清理、`Describer.stop()`、`Fetcher.stop()`。这些是同步的、无条件执行，前面
+    6. 向后台发出停止请求：停掉清理、`Describer.stop()`、`Fetcher.stop()`。这些是同步的、无条件执行，前面
        用完了时间也照样发出，免得后台任务在模型客户端和数据库关闭后还在跑。
-    6. 限时等后台收尾：清理任务、描述任务与它们受保护的写入、下载与响应的关闭。
+    7. 限时等后台收尾：清理任务、描述任务与它们受保护的写入、下载与响应的关闭。
     之后由调用方（外层的 `async with`）关模型的客户端与数据库。
 
     每一步的等待都受保护：再次取消（如连按两次 Ctrl+C）不会打断这一段；但所有等待共用
@@ -167,6 +187,10 @@ async def _shut_down(
         interrupted |= await _drain(batcher.drain(), replies_deadline, "等待攒批的任务收尾")
     if conversation is not None:
         interrupted |= await _drain(conversation.drain(), replies_deadline, "等待在途的对话收尾")
+    if alerts is not None:
+        alerts.stop()
+        # 在途的发送已被取消，很快退出；用总时限而不是回答收尾的时限，回答收尾超时了也照样等它们退出。
+        interrupted |= await _drain(alerts.aclose(), deadline, "等待给管理员的提醒退出")
     interrupted |= await _drain(bot.close(), deadline, "关闭 QQ 连接与前台的处理函数")
     if handlers is not None:
         interrupted |= await _drain(handlers.drain(), deadline, "等待放行的消息写进流水")

@@ -12,6 +12,7 @@ import pyqbot
 import pytest
 
 from qtalk_bot import __main__ as entry
+from qtalk_bot.alerts import Alerts
 from qtalk_bot.batching import Batcher
 from qtalk_bot.bot import Handlers
 from qtalk_bot.config import AttachmentSettings, DescribeSettings, load_secrets, load_settings
@@ -507,3 +508,80 @@ async def test_handlers_are_drained_after_the_bot_closes_and_before_the_backgrou
 
 class _NoDownloads:
     async def aclose(self) -> None: ...
+
+
+async def test_admin_alerts_are_drained_before_the_bot_closes_its_http_client() -> None:
+    # 提醒经 QQ 的 HTTP 客户端发出：要在 Bot.close() 关掉它之前发完；之后再触发的直接丢弃。
+    order: list[str] = []
+
+    class RecordingBot:
+        async def close(self) -> None:
+            order.append("bot")
+
+    class RecordingAlerts:
+        def stop(self) -> None:
+            order.append("stop")
+
+        async def aclose(self) -> None:
+            order.append("alerts")
+
+    await entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+        cast(pyqbot.Bot, RecordingBot()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        cast(Alerts, RecordingAlerts()),
+    )
+
+    assert order == ["stop", "alerts", "bot"]
+
+
+async def test_alerts_are_stopped_even_when_the_whole_budget_is_used_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 攒批或对话收尾用完了时限：aclose() 会在开始之前就被取消，所以要先同步 stop()，在途的发送也取消，
+    # 不越过 QQ 客户端的关闭。
+    monkeypatch.setattr(entry, "SHUTDOWN_GRACE_SECONDS", 0.2)
+    monkeypatch.setattr(entry, "BOT_CLOSE_SECONDS", 0.0)  # 收尾用完的就是整个总时限
+    sending = asyncio.Event()
+
+    async def send(text: str) -> None:
+        sending.set()
+        await asyncio.Event().wait()
+
+    alerts = Alerts(send)
+
+    class StuckBatcher:
+        def stop(self) -> None: ...
+
+        async def drain(self) -> None:
+            await asyncio.Event().wait()  # 收尾一直不结束
+
+    class QuickBot:
+        async def close(self) -> None: ...
+
+    before = asyncio.all_tasks()
+    alerts.notify("k", "在途的提醒")
+    await sending.wait()
+    (in_flight,) = asyncio.all_tasks() - before
+    async with asyncio.timeout(5):
+        await entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+            cast(pyqbot.Bot, QuickBot()),
+            None,
+            None,
+            None,
+            None,
+            cast(Batcher, StuckBatcher()),
+            None,
+            alerts,
+        )
+
+    assert in_flight.done() or in_flight.cancelling()  # 关停结束时已经取消了在途的发送
+    assert not alerts.notify("k2", "关停之后")
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert in_flight.cancelled()
+    assert asyncio.all_tasks() == before

@@ -379,3 +379,23 @@ def usage_message(rows: Sequence[UsageRow]) -> Rich:
         ]
     )
     return Rich(markdown, plain)
+
+
+# ---- 给管理员的提醒（主动消息，纯文本） ----
+
+HOST_KIND_IP = "IP 地址"
+HOST_KIND_UNRECOGNIZED = "无法识别的地址"
+DOWNLOAD_HOSTS_SETTING = "[attachments] extra_download_hosts"
+
+
+def download_host_refused(user_label: str, shown: str, *, is_host: bool) -> str:
+    """附件因为下载地址的主机不在白名单里被拒。`shown` 是主机名（`is_host` 为真）或类别，不含完整链接。"""
+    if is_host:
+        return (
+            f"用户 {user_label} 的附件来自白名单外的下载域名 {shown}，没有下载。"
+            f"确认可信后可以加进配置的 {DOWNLOAD_HOSTS_SETTING}。"
+        )
+    return (
+        f"用户 {user_label} 的附件下载地址是「{shown}」，没有下载。"
+        f"如果平台改用了新的下载域名，确认可信后可以加进配置的 {DOWNLOAD_HOSTS_SETTING}。"
+    )

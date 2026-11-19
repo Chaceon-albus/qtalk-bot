@@ -9,7 +9,14 @@ import json
 import logging
 import sqlite3
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, MutableMapping
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    MutableMapping,
+    Sequence,
+)
 from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -23,21 +30,28 @@ from httpx2.websockets import ASGIWebSocketTransport
 from qtalk_bot import access, texts
 from qtalk_bot import bot as bot_module
 from qtalk_bot.access import User
+from qtalk_bot.alerts import AlertGroup, Alerts, AlertSendError
 from qtalk_bot.batching import Batcher
 from qtalk_bot.bot import (
+    ALERT_KEY_PREFIX,
+    DOWNLOAD_HOST_ALERTS,
     MAX_ATTACHMENTS_DESCRIBED,
     MAX_ELEMENTS_DESCRIBED,
     MAX_REDIRECTS,
+    PLATFORM_HOSTS,
+    AdminAlertSender,
     Handlers,
     QQChat,
     QQDownloader,
     ShareLinks,
     chat_input,
     describe_non_text,
+    download_hosts,
     download_refusal,
     fetch_bot_name,
     is_rejection,
     refuse_cookies,
+    refused_host_alert,
     register,
 )
 from qtalk_bot.chat import ChatHandler
@@ -78,6 +92,8 @@ from qtalk_bot.media import (
     DownloadError,
     DownloadTooLargeError,
     Fetcher,
+    HostRefusedError,
+    HostRefusedHook,
     IncomingAttachment,
     MediaStore,
 )
@@ -941,7 +957,11 @@ PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 
 
 def media_chat(
-    db: Database, model: FakeModel, platform: Platform, tmp_path: Path
+    db: Database,
+    model: FakeModel,
+    platform: Platform,
+    tmp_path: Path,
+    on_host_refused: HostRefusedHook | None = None,
 ) -> tuple[Tracked, LateDownloader]:
     downloader = LateDownloader()
     settings = AttachmentSettings()
@@ -963,7 +983,9 @@ def media_chat(
         settings=ChatSettings(),
         timezone=ZoneInfo("Asia/Shanghai"),
         attachments=settings,
-        fetcher=Fetcher(MediaStore.under(tmp_path), downloader, settings),
+        fetcher=Fetcher(
+            MediaStore.under(tmp_path), downloader, settings, on_host_refused=on_host_refused
+        ),
     )
     batcher = Batcher(conversation, NO_BATCHING)
     return Tracked(QQChat(batcher), platform, batcher), downloader
@@ -1752,7 +1774,7 @@ async def test_quoted_elements_share_the_budget(
 async def test_failing_summary_does_not_block_the_chat(
     db: Database, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def broken(message: pyqbot.C2CMessage) -> str | None:
+    def broken(message: pyqbot.C2CMessage, hosts: Sequence[str] = ()) -> str | None:
         raise RuntimeError("异常文案里的秘密")
 
     monkeypatch.setattr(bot_module, "describe_non_text", broken)
@@ -1910,3 +1932,271 @@ async def test_drain_waits_for_a_cancelled_handler_to_record_what_the_gate_let_t
 
     rows = await db.fetch_all("SELECT user_id, role, content FROM messages")
     assert [tuple(row) for row in rows] == [(alice.id, "user", "关停时的一句")]
+
+
+# ---- 下载白名单可追加、白名单外的域名提醒管理员 ----
+
+EXTRA_HOSTS = download_hosts(("files.example.com",))
+
+
+def test_extra_hosts_are_appended_and_their_subdomains_are_allowed() -> None:
+    assert EXTRA_HOSTS[: len(PLATFORM_HOSTS)] == PLATFORM_HOSTS  # 追加，不替换
+    assert download_hosts(("qq.com", "files.example.com")) == EXTRA_HOSTS  # 重复的去掉
+    for url in ("https://files.example.com/a", "https://cdn.files.example.com/a", IMAGE_URL):
+        assert download_refusal(url, EXTRA_HOSTS) is None
+    assert download_refusal("https://files.example.com/a") == "主机不在下载白名单里"
+    assert download_refusal("https://notfiles.example.com/a", EXTRA_HOSTS) is not None
+
+
+def test_shape_log_shows_an_appended_host() -> None:
+    attachment = pyqbot.MessageAttachment(
+        content_type="image/png", url="https://cdn.files.example.com/p?token=SECRET"
+    )
+    message = pyqbot.C2CMessage(
+        id="ROBOT1.0_fake", author=pyqbot.C2CUser(user_openid=ALICE), attachments=(attachment,)
+    )
+
+    assert "url 有（主机 cdn.files.example.com）" in (describe_non_text(message, EXTRA_HOSTS) or "")
+    assert "url 有（其它主机）" in (describe_non_text(message) or "")
+
+
+@pytest.mark.parametrize(
+    ("url", "key", "is_host"),
+    [
+        ("https://evil.example.com:8443/a/b.png?token=SECRET#x", "evil.example.com", True),
+        ("https://EVIL.Example.com/a", "evil.example.com", True),
+        ("https://8.8.8.8/a?token=SECRET", texts.HOST_KIND_IP, False),
+        ("https://10.0.0.8/a", texts.HOST_KIND_IP, False),
+        ("https://[::1]/a", texts.HOST_KIND_IP, False),
+        ("https://localhost/a?token=SECRET", texts.HOST_KIND_UNRECOGNIZED, False),
+        ("https://bad_host.example.com/a", texts.HOST_KIND_UNRECOGNIZED, False),
+    ],
+)
+async def test_refused_hosts_are_reported_with_only_the_host_or_its_kind(
+    url: str, key: str, is_host: bool
+) -> None:
+    downloader, sent = downloader_with(lambda _: httpx2.Response(200, content=PNG_BYTES))
+
+    with pytest.raises(HostRefusedError) as info:
+        await read_all(downloader, url)
+
+    assert (info.value.key, info.value.shown, info.value.is_host) == (key, key, is_host)
+    assert sent == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ftp://evil.example.com/a",  # 协议不对
+        "https://user:pass@evil.example.com/a",  # 带用户信息
+        "https://multimedia.nt.qq.com.cn:bad/a",  # 地址不合法
+    ],
+)
+async def test_other_refusals_are_not_reported(url: str) -> None:
+    downloader, _ = downloader_with(lambda _: httpx2.Response(200, content=PNG_BYTES))
+
+    with pytest.raises(DownloadError) as info:
+        await read_all(downloader, url)
+
+    assert not isinstance(info.value, HostRefusedError)
+
+
+async def test_too_many_redirects_are_not_reported() -> None:
+    downloader, _ = downloader_with(lambda _: httpx2.Response(302, headers={"location": "/again"}))
+
+    with pytest.raises(DownloadError) as info:
+        await read_all(downloader, IMAGE_URL)
+
+    assert not isinstance(info.value, HostRefusedError)
+
+
+async def test_a_redirect_hop_to_an_unknown_host_is_reported() -> None:
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            302, headers={"location": "https://new-cdn.example.net/f/x.png?token=SECRET"}
+        )
+
+    downloader, sent = downloader_with(respond)
+
+    with pytest.raises(HostRefusedError) as info:
+        await read_all(downloader, IMAGE_URL)
+
+    assert info.value.key == "new-cdn.example.net"
+    assert [request.url.host for request in sent] == ["multimedia.nt.qq.com.cn"]
+
+
+async def test_appended_host_is_downloaded() -> None:
+    http_client = httpx2.AsyncClient(
+        transport=httpx2.MockTransport(lambda _: httpx2.Response(200, content=PNG_BYTES))
+    )
+    client = pyqbot.Client("fake-app-id", "fake-app-secret", http_client=http_client)
+
+    downloader = QQDownloader(client, hosts=EXTRA_HOSTS)
+
+    assert await read_all(downloader, "https://cdn.files.example.com/a") == PNG_BYTES
+
+
+class RecordingAlerts(Alerts):
+    def __init__(self) -> None:
+        async def never(text: str) -> None:
+            raise AssertionError("不该真的发出")
+
+        super().__init__(never)
+        self.notified: list[tuple[str, str]] = []
+        self.groups: list[AlertGroup | None] = []
+
+    def notify(self, key: str, text: str, *, group: AlertGroup | None = None) -> bool:
+        self.notified.append((key, text))
+        self.groups.append(group)
+        return True
+
+
+def test_alert_names_the_user_and_the_host_but_nothing_else() -> None:
+    alerts = RecordingAlerts()
+    alert = refused_host_alert(alerts)
+
+    alert(
+        "#3 小王",
+        HostRefusedError(
+            "拒绝下载：主机不在下载白名单里",
+            key="evil.example.com",
+            shown="evil.example.com",
+            is_host=True,
+        ),
+    )
+    alert(
+        "#3 小王",
+        HostRefusedError(
+            "拒绝下载：主机是 IP 地址",
+            key=texts.HOST_KIND_IP,
+            shown=texts.HOST_KIND_IP,
+            is_host=False,
+        ),
+    )
+
+    (host_key, host_text), (ip_key, ip_text) = alerts.notified
+    assert alerts.groups == [DOWNLOAD_HOST_ALERTS, DOWNLOAD_HOST_ALERTS]
+    assert host_key == f"{ALERT_KEY_PREFIX}evil.example.com"
+    assert host_text == texts.download_host_refused("#3 小王", "evil.example.com", is_host=True)
+    assert "#3 小王" in host_text
+    assert "evil.example.com" in host_text
+    assert "[attachments] extra_download_hosts" in host_text
+    assert ip_key == f"{ALERT_KEY_PREFIX}{texts.HOST_KIND_IP}"
+    assert texts.HOST_KIND_IP in ip_text
+    for text in (host_text, ip_text):
+        for leak in ("http", "/", "?", "token", ALICE, ADMIN):
+            assert leak not in text
+
+
+def admin_client(
+    respond: Callable[[httpx2.Request], httpx2.Response],
+) -> tuple[pyqbot.Client, list[httpx2.Request]]:
+    sent: list[httpx2.Request] = []
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == "/app/getAppAccessToken":
+            return httpx2.Response(200, json={"access_token": "fake-token", "expires_in": "7200"})
+        sent.append(request)
+        return respond(request)
+
+    http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
+    return pyqbot.Client("fake-app-id", "fake-app-secret", http_client=http_client), sent
+
+
+async def test_admin_alert_is_a_proactive_message_to_the_admin() -> None:
+    client, sent = admin_client(
+        lambda _: httpx2.Response(200, json={"id": "m1", "timestamp": "2026-11-18T10:00:00+08:00"})
+    )
+
+    await AdminAlertSender(client, ADMIN)("提醒的文字")
+
+    (request,) = sent
+    assert request.url.path == f"/v2/users/{ADMIN}/messages"
+    body = json.loads(request.content)
+    assert body["content"] == "提醒的文字"
+    assert "msg_id" not in body  # 主动消息，不是被动回复
+    assert "event_id" not in body
+
+
+async def test_rejected_admin_alert_raises_a_redacted_error() -> None:
+    client, _ = admin_client(
+        lambda _: httpx2.Response(400, json={"code": 22009, "message": "主动消息额度用尽"})
+    )
+
+    with pytest.raises(AlertSendError) as info:
+        await AdminAlertSender(client, ADMIN)("提醒的文字")
+
+    assert "err_code=22009" in str(info.value)
+    assert ADMIN not in str(info.value)
+
+
+@pytest.mark.parametrize("sending", ["ok", "rejected"])
+async def test_image_from_an_unknown_host_alerts_the_admin_and_the_chat_goes_on(
+    db: Database, tmp_path: Path, caplog: pytest.LogCaptureFixture, sending: str
+) -> None:
+    alice = await welcomed_alice(db)
+    url = "https://new-cdn.example.net:8443/download/我的秘密照片.png?fileid=SECRETTOKEN"
+    image = {"content_type": "image/png", "filename": "我的秘密照片.png", "url": url}
+    platform = Platform([c2c(ALICE, "看看这张", "ROBOT1.0_fake-1", attachments=[image])])
+    model = FakeModel(ANSWER)
+    sent: list[str] = []
+
+    async def send(text: str) -> None:
+        if sending == "rejected":
+            raise AlertSendError("APIError（err_code=22009，trace_id=t）")
+        sent.append(text)
+
+    alerts = Alerts(send)
+    chat, downloader = media_chat(db, model, platform, tmp_path, refused_host_alert(alerts))
+
+    with caplog.at_level(logging.INFO):
+        await run_until_handled(
+            platform,
+            db,
+            chat,
+            events=1,
+            sent=1,
+            until=lambda: chat.handled == 1,
+            on_bot=downloader.attach,
+        )
+        await alerts.aclose()
+
+    assert platform.downloads == []  # 白名单外的主机，没有发出下载请求
+    assert len(model.requests) == 1  # 回复照常
+    assert texts.ATTACHMENT_FAILED in [m.get("content") for m in platform.sent]
+    row = await db.fetch_one("SELECT status FROM attachments")
+    assert row is not None
+    assert row[0] == "failed"
+    if sending == "ok":
+        assert sent == [
+            texts.download_host_refused(f"#{alice.id} 小王", "new-cdn.example.net", is_host=True)
+        ]
+    else:
+        assert sent == []
+        assert "err_code=22009" in caplog.text
+    logs = formatted_logs(caplog)
+    for leak in ("SECRETTOKEN", "我的秘密照片", "/download", "8443", ALICE):
+        assert leak not in logs
+        assert all(leak not in text for text in sent)
+
+
+async def test_bursts_of_download_host_alerts_leave_room_for_other_alerts() -> None:
+    # 十个不同的子域名是十个不同的键：这一类每小时最多 3 条，全局的预算留给真正要紧的提醒。
+    sent: list[str] = []
+
+    async def send(text: str) -> None:
+        sent.append(text)
+
+    alerts = Alerts(send)
+    alert = refused_host_alert(alerts)
+    for n in range(10):
+        host = f"cdn{n}.example.net"
+        alert("#3 小王", HostRefusedError("拒绝下载", key=host, shown=host, is_host=True))
+    assert DOWNLOAD_HOST_ALERTS.hourly_limit == 3
+    assert alerts.notify("掉线", "机器人掉线了")
+    for _ in range(10):
+        await asyncio.sleep(0)  # 让排好的发送做完（aclose() 会取消还没发完的）
+    await alerts.aclose()
+
+    assert len(sent) == 4
+    assert sent[-1] == "机器人掉线了"

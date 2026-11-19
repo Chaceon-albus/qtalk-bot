@@ -1054,3 +1054,58 @@ def test_describe_provider_needs_its_key() -> None:
     with pytest.raises(ConfigError) as info:
         check_provider_secrets(settings, secrets)
     assert "GEMINI_API_KEY" in str(info.value)
+
+
+# ---- [attachments] extra_download_hosts ----
+
+
+def test_extra_download_hosts_default_to_none_and_are_lowercased(tmp_path: Path) -> None:
+    assert load_settings(write_config(tmp_path, "")).attachments.extra_download_hosts == ()
+    text = '[attachments]\nextra_download_hosts = ["Files.Example.COM", " cdn.qq-img.cn "]\n'
+    attachments = load_settings(write_config(tmp_path, text)).attachments
+    assert attachments.extra_download_hosts == ("files.example.com", "cdn.qq-img.cn")
+
+
+@pytest.mark.parametrize(
+    ("value", "problem"),
+    [
+        ('"https://files.example.com"', "只写域名，不能带协议"),
+        ('"files.example.com/path"', "只写域名，不能带路径"),
+        ('"files.example.com?x=1"', "只写域名，不能带路径"),
+        ('"files.example.com:8443"', "只写域名，不能带端口"),
+        ('"user@files.example.com"', "只写域名，不能带用户信息"),
+        ('"1.2.3.4"', "不能是 IP 地址"),
+        ('"[::1]"', "不能是 IP 地址"),
+        ('"localhost"', "应为合法的域名（至少两段，只含字母、数字和连字符，最后一段是字母）"),
+        ('"*.example.com"', "应为合法的域名（至少两段，只含字母、数字和连字符，最后一段是字母）"),
+        (
+            '"bad_label.example.com"',
+            "应为合法的域名（至少两段，只含字母、数字和连字符，最后一段是字母）",
+        ),
+        ('"-x.example.com"', "应为合法的域名（至少两段，只含字母、数字和连字符，最后一段是字母）"),
+        ('"example."', "应为合法的域名（至少两段，只含字母、数字和连字符，最后一段是字母）"),
+        ('"  "', "不能为空"),
+    ],
+)
+def test_invalid_extra_download_host(tmp_path: Path, value: str, problem: str) -> None:
+    text = f"[attachments]\nextra_download_hosts = [{value}]\n"
+    error = config_error(write_config(tmp_path, text))
+    assert error.problems == (f"attachments.extra_download_hosts[0]：{problem}",)
+    if raw := value.strip('" '):
+        assert raw not in str(error)  # 报错不回显取值
+
+
+def test_extra_download_hosts_must_be_unique_strings_and_few(tmp_path: Path) -> None:
+    duplicate = '[attachments]\nextra_download_hosts = ["a.example.com", "A.example.com"]\n'
+    assert config_error(write_config(tmp_path, duplicate)).problems == (
+        "attachments.extra_download_hosts[1]：与前面的项重复",
+    )
+    not_list = '[attachments]\nextra_download_hosts = "a.example.com"\n'
+    assert config_error(write_config(tmp_path, not_list)).problems == (
+        "attachments.extra_download_hosts：应为字符串的数组，实际是字符串",
+    )
+    hosts = ", ".join(f'"h{n}.example.com"' for n in range(33))
+    too_many = f"[attachments]\nextra_download_hosts = [{hosts}]\n"
+    assert config_error(write_config(tmp_path, too_many)).problems == (
+        "attachments.extra_download_hosts：最多 32 项",
+    )
