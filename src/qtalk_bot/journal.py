@@ -330,13 +330,18 @@ def add_reply(
     ending: Ending,
     delivery: ReplyDelivery,
     now: int,
+    process: str | None = None,
 ) -> int:
-    """把一次回复写进流水，返回它的编号。"""
+    """把一次回复写进流水，返回它的编号。
+
+    `process` 是这一轮处理过程的全文（思考摘要、调用工具前的说明、搜索的查询词，见 `process.py`），只存档供
+    排查：组装上下文、选模型的查询都不读这一列。没有过程时为 `None`。
+    """
     row = conn.execute(
         "INSERT INTO messages"
-        " (user_id, role, content, reply_to, model, finish, delivery, created_at)"
-        " VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?) RETURNING id",
-        (user_id, content, reply_to, model, ending.value, delivery.value, now),
+        " (user_id, role, content, reply_to, model, finish, delivery, created_at, process)"
+        " VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        (user_id, content, reply_to, model, ending.value, delivery.value, now, process),
     ).fetchone()
     message_id: int = row["id"]
     return message_id

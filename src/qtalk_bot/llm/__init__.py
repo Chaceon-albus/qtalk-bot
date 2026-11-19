@@ -8,9 +8,10 @@
   实际 MIME 类型，由适配器各自转换。适配器收到它不支持的内容时抛 `ModelError(kind=UNSUPPORTED)`；正常情况下
   调用方已按 `INPUT_LIMITS` 与模型声明的输入能力挡在前面。
 - 输出是一串 `ChatEvent`，是带标签的联合类型。现在有文字增量（`TextDelta`）、用量（`Usage`）、结束
-  （`Finished`），以及开了服务商内置搜索时的搜索进展（`SearchProgress`）与引用（`Citation`）；以后会加思考
-  摘要、调用工具前的说明等。**调用方必须忽略不认识的事件**（`match` 里留一个 `case _: pass`），这样加事件时
-  不必改已有的调用方。
+  （`Finished`），开了服务商内置搜索时的搜索进展（`SearchProgress`）与引用（`Citation`），以及处理过程：
+  思考摘要（`ThoughtSummary`，请求了才有）与调用工具前的说明（`Commentary`，OpenAI 的 `phase` 为
+  `commentary` 的消息）。后两者不是回答的正文。**调用方必须忽略不认识的事件**（`match` 里留一个
+  `case _: pass`），这样加事件时不必改已有的调用方。
 - 调用失败抛 `ModelError`。文案只有服务商、本地定义的错误分类（`ErrorKind`）与数字状态码，不含任何
   来自上游的文字（错误信息、错误码字段都可能回显正文或凭证），可以直接记日志。
 """
@@ -317,6 +318,31 @@ class CitationFilter:
         return Citation(*key)
 
 
+@dataclass(frozen=True, slots=True)
+class ThoughtSummary:
+    """思考摘要的一段增量（只在请求了思考摘要时出现）。
+
+    `segment` 区分同一次调用里的各段摘要（由适配器生成，如 OpenAI 的推理项编号加 `summary_index`）：同一段的
+    增量按顺序拼起来是这一段的全文，一段开始之后前面的段不会再有增量。摘要只用于展示处理过程，不是回答的
+    正文，不进之后的上下文；可能带出用户问的内容，不进 `repr`，也不要记日志。
+    """
+
+    segment: str
+    text: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class Commentary:
+    """调用工具前的说明（OpenAI 的消息输出项里 `phase` 为 `commentary` 的文字）的一段增量。
+
+    `segment` 与 `ThoughtSummary` 的同义（消息项编号加内容块下标）。它不是回答的正文：只用于展示处理过程，
+    不进之后的上下文。不进 `repr`，也不要记日志。
+    """
+
+    segment: str
+    text: str = field(repr=False)
+
+
 class FinishReason(StrEnum):
     COMPLETED = "completed"
     MAX_TOKENS = "max_tokens"  # 达到输出上限
@@ -330,7 +356,9 @@ class Finished:
     reason: FinishReason
 
 
-type ChatEvent = TextDelta | Usage | Finished | SearchProgress | Citation
+type ChatEvent = (
+    TextDelta | Usage | Finished | SearchProgress | Citation | ThoughtSummary | Commentary
+)
 """流式事件。以后会加新的种类，调用方要忽略不认识的事件。"""
 
 

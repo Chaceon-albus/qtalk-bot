@@ -744,7 +744,12 @@ async def test_version_4_database_gets_the_reply_index_and_faces_only(tmp_path: 
                 " VALUES (?, 'user', '问', 'qq-1', 0) RETURNING id",
                 (user.id,),
             ).fetchone()["id"]
-            reply(conn, user.id, first, "答")
+            conn.execute(
+                "INSERT INTO messages"
+                " (user_id, role, content, reply_to, model, finish, delivery, created_at)"
+                " VALUES (?, 'assistant', '答', ?, 'main', 'completed', 'streamed', 0)",
+                (user.id, first),
+            )
 
         await old.transaction(fill)
 

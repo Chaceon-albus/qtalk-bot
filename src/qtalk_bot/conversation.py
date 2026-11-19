@@ -47,6 +47,14 @@
 带上），只记选模型的决策与已有的用量，然后把取消传播出去。服务商内置的搜索在回答开始显示之前进行，所以搜索
 期间照常可以被打断；适配器每执行一次搜索就交出新的 `Usage`，被打断的那次调用里已经执行的搜索照常计数。
 
+**处理过程**（`process.py`）：模型配置了 `show_process` 时，它的思考摘要、调用工具前的说明与搜索进展经
+`process.ProcessPresenter` 写成单独的一条流式消息（经 `ReplyChannel.open_process()`）。过程消息不算「已开始
+显示」（不 `claim()`），所以只显示了过程时插话照常可以重来：被重来的一轮给过程消息写一行「收到补充，重新开始」
+再结束它，它留在 `TurnControl.earlier` 里，由重来的那一轮按同样的规则撤回、存档。回答的第一片交出之前（以及之后
+要发固定说明、纯文本时）结束过程消息；回答送达（含固定说明）之后，第一片发出不久的过程消息按 `[process].recall`
+撤回。过程的全文存进回复行的 `process` 列，不进之后的上下文。每条被回复的消息记下已用的被动回复次数
+（`ReplyChannel.budget`，经本模块的通道包装计数），不够给回答留余量时不发过程消息。
+
 **判断插话**（`judge()`）：在事务里复查授权、取出正在回答的消息与新消息的文字版（只有这个用户自己的），交给
 `routing.SteerJudge`；决策记录与用量挂在新消息里最后一条上，被取消时也照记。
 """
@@ -55,7 +63,7 @@ import asyncio
 import logging
 import sqlite3
 import time
-from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, aclosing, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -66,7 +74,7 @@ from zoneinfo import ZoneInfo
 from . import access, citations, faces, journal, texts
 from .access import User
 from .citations import Source
-from .config import AttachmentSettings, ChatSettings
+from .config import AttachmentSettings, ChatSettings, ProcessSettings
 from .context import (
     Built,
     RequestBuilder,
@@ -90,12 +98,15 @@ from .llm import (
     ChatModel,
     ChatRequest,
     Citation,
+    Commentary,
     Finished,
     FinishReason,
     Modality,
     ModelError,
     Provider,
+    SearchProgress,
     TextDelta,
+    ThoughtSummary,
     Usage,
     inline_size,
 )
@@ -113,6 +124,16 @@ from .media import (
     MediaStore,
     placeholders,
     skipped,
+)
+from .process import (
+    RECALL_TIMEOUT_SECONDS,
+    ProcessEvent,
+    ProcessPresenter,
+    ProcessSendError,
+    ProcessStream,
+    ReplyBudget,
+    Sleep,
+    Timer,
 )
 from .routing import LATEST_CHARS, DecisionRecord, Router, Selection, Steer, SteerJudge
 from .storage import Database
@@ -154,14 +175,23 @@ class TurnControl:
       `preempted`，之后 `claim()` 都不成功，被取消的这一轮按「重来」收尾：不写回复行，消息仍是待回复的。
     - `begin()`：回答一轮的一方从流水里取出这一轮实际带上的用户消息（`included`，含之前遗留的待回复消息）后
       调用，再调用 `notify`。要重来的一方据此判断重来的请求装不装得下新消息，插话判断的输入也用它。
+    - `previous`：重来时传入上一次的 `TurnControl`。被重来的几次的过程消息（`earlier`，与上一次共用同一个
+      列表）由最后答完的那一次按规则撤回、连同自己的过程一起存档。过程消息不算「已开始显示」。
     """
 
-    def __init__(self, *, typing: bool = True, notify: Callable[[], None] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        typing: bool = True,
+        notify: Callable[[], None] | None = None,
+        previous: TurnControl | None = None,
+    ) -> None:
         self.typing = typing
         self.displayed = False
         self.preempted = False
         self.included: tuple[int, ...] | None = None
         self._notify = notify
+        self.earlier: list[ProcessPresenter] = [] if previous is None else previous.earlier
 
     def begin(self, included: Sequence[int]) -> None:
         self.included = tuple(included)
@@ -181,8 +211,37 @@ class TurnControl:
         return True
 
 
+class ReplyStream(Protocol):
+    """回复一条消息的另一条流式消息（过程消息）。失败时抛 `SendRejectedError` 或 `SendUncertainError`。"""
+
+    async def append(self, text: str) -> None:
+        """把 `text` 作为下一片发出，等它发完才返回。第一次调用时开始这条流式消息。"""
+        ...
+
+    async def finish(self) -> None:
+        """结束这条流式消息；一片也没发过时什么也不做。"""
+        ...
+
+    async def recall(self) -> None:
+        """撤回这条流式消息（平台只允许撤回发出 2 分钟内的）。"""
+        ...
+
+
 class ReplyChannel(Protocol):
-    """回复一条消息的几种方式。失败时抛 `SendRejectedError` 或 `SendUncertainError`。"""
+    """回复一条消息的几种方式。失败时抛 `SendRejectedError` 或 `SendUncertainError`。
+
+    一个通道对应一条被回复的消息，`budget` 记着这条消息已用的被动回复次数（由本模块计数，实现方只要提供一个
+    长期存在的 `ReplyBudget`）。
+    """
+
+    @property
+    def budget(self) -> ReplyBudget:
+        """这条消息已用的被动回复次数。"""
+        ...
+
+    def open_process(self) -> ReplyStream:
+        """另起一条流式消息（过程消息），与 `stream()` 的回答是两条消息。不发请求，第一次 `append()` 时才发。"""
+        ...
 
     async def typing(self, seconds: int) -> None:
         """显示「正在输入」。"""
@@ -340,13 +399,21 @@ class _Turn:
         *,
         typing: bool = True,
         may_show: Callable[[], bool] = lambda: True,
+        open_process: Callable[[], ProcessStream | None] = lambda: None,
+        timer: Timer,
+        sleep: Sleep = asyncio.sleep,
     ) -> None:
         self.channel = channel
         self.user = user
         self.selection = selection
         # 不发「正在输入」时也放一个（立即结束的）任务，后面的流程不必区分。
         self.typing = asyncio.create_task(_typing(channel, user) if typing else _skip())
-        self.outbox = _Outbox(channel, self.typing, may_show)
+        self.process = ProcessPresenter(
+            open_process, before_first=self.typing, timer=timer, sleep=sleep
+        )
+        self.outbox = _Outbox(
+            channel, self.typing, may_show, self.process.make_way, self.process.seal
+        )
         self.attempts: list[_Attempt] = []
         self.run: _Run | None = None  # 正在进行的调用
         self.notices: list[str] = []  # 按实际组装出的请求要告诉用户的情况（各次组装合起来）
@@ -360,6 +427,7 @@ class _Turn:
             if task is not None:
                 _cancel_and_retrieve(task)
         self.outbox.cancel()
+        self.process.cancel()
 
 
 class Conversation:
@@ -378,12 +446,18 @@ class Conversation:
         fetcher: Fetcher | None = None,
         describer: Describer | None = None,
         steer: SteerJudge | None = None,
+        process: ProcessSettings | None = None,
         clock: Callable[[], float] = time.time,
+        timer: Timer | None = None,
+        sleep: Sleep = asyncio.sleep,
     ) -> None:
         """`models` 按内部名字给出配置里的全部对话模型，`router` 决定每条消息用哪一个。
 
         `fetcher` 为 `None` 时不下载附件（都按「没有下载」处理，只用文字版）；`describer` 为 `None` 时不给
         图片写描述、不给 PDF 写摘要；`steer` 为 `None` 时不判断插话，一律当作补充。
+
+        `clock` 是写进流水的时间（墙上时钟）；`timer` 与 `sleep` 是过程消息的节流与撤回时限用的单调时钟与等待
+        （默认是事件循环的），测试可以换成可控的。
         """
         self._db = db
         self._admin_openid = admin_openid
@@ -396,6 +470,9 @@ class Conversation:
         self._steer = SteerJudge() if steer is None else steer
         self._timezone = timezone
         self._clock = clock
+        self._process = ProcessSettings() if process is None else process
+        self._timer: Timer = timer or (lambda: asyncio.get_running_loop().time())
+        self._sleep = sleep
         self._locks = _UserLocks()
         self._media_slots = asyncio.Semaphore(MULTIMODAL_REQUESTS)
         self._in_flight: set[asyncio.Future[None]] = set()
@@ -501,7 +578,9 @@ class Conversation:
             images, files = counts
             if not images and not files:
                 return
-            await _send_notice(channel, texts.attachments_waiting(images, files), user)
+            await _send_notice(
+                _TurnChannel(channel), texts.attachments_waiting(images, files), user
+            )
             logger.info("用户 %s 发来的附件等不到下文，问了一句", user.label)
 
     async def handle(
@@ -525,7 +604,7 @@ class Conversation:
                 await self._respond(user, answered, channel, TurnControl())
 
     async def drain(self) -> None:
-        """关停时调用：等所有在途的轮次结束（含被取消后的收尾与记账）。"""
+        """关停时调用：等所有在途的轮次结束（含被取消后的收尾与记账），以及后台的过程消息撤回。"""
         while self._in_flight:
             await asyncio.wait(set(self._in_flight))
 
@@ -548,7 +627,7 @@ class Conversation:
         if not sticker and not message.has_usable_content:
             # 只有视频、卡片、转发的聊天记录这类不支持的内容：不下载、不进流水、不调用模型。
             if await self._db.transaction(self._allowed, user):
-                await _send_notice(channel, texts.UNSUPPORTED, user)
+                await _send_notice(_TurnChannel(channel), texts.UNSUPPORTED, user)
             return None
         attachments = message.attachments
         downloading = self._fetcher is not None and bool(attachments)
@@ -589,7 +668,7 @@ class Conversation:
     async def _respond(
         self, user: User, messages: Sequence[int], channel: ReplyChannel, control: TurnControl
     ) -> None:
-        channel = _ClaimingChannel(channel, control)
+        channel = _TurnChannel(channel, control)
         begun = await self._db.transaction(self._begin, user, messages)
         if begun is None:
             logger.info("用户 %s 已不能使用对话，不再回答", user.label)
@@ -629,15 +708,37 @@ class Conversation:
             announce=announce,
             max_size_mb=max_size_mb,
         )
+
+        def open_process() -> ProcessStream | None:
+            if control.preempted:
+                return None
+            if not channel.budget.affords_process():
+                logger.info(
+                    "用户 %s 这条消息的被动回复次数不够给回答留余量，不发过程消息", user.label
+                )
+                return None
+            return channel.open_process()
+
         # 「正在输入」在决策之前就发出
-        turn = _Turn(channel, user, selection, typing=control.typing, may_show=control.claim)
+        turn = _Turn(
+            channel,
+            user,
+            selection,
+            typing=control.typing,
+            may_show=control.claim,
+            open_process=open_process,
+            timer=self._timer,
+            sleep=self._sleep,
+        )
         cancelled: asyncio.CancelledError | None = None
         try:
             outcome = await self._generate(turn, builder, begun.current)
         except asyncio.CancelledError as exc:
             if control.preempted:
-                # 插话重来：什么都没交给 QQ，不写回复行，消息留给重新开始的那一轮；决策与用量照记。
-                await self._wind_down(turn, quiet=True)
+                # 插话重来：回答什么都没交给 QQ，不写回复行，消息留给重新开始的那一轮；决策与用量照记。过程
+                # 消息写上收尾的一行后结束，留给重来的那一轮撤回、存档。
+                await self._wind_down(turn, quiet=True, note=texts.PROCESS_RESTART)
+                control.earlier.append(turn.process)
                 await asyncio.shield(self._record_preempted(turn, begun.last_message_id))
                 raise
             cancelled = exc
@@ -645,16 +746,29 @@ class Conversation:
         except BaseException:
             turn.abandon()
             raise
+        if cancelled is None:
+            try:
+                await self._close_process(turn)
+            except asyncio.CancelledError as exc:  # 回答已经有了结局，照它记账
+                turn.process.cancel()
+                cancelled = exc
         # 正常结束与被取消共用这一次记账；shield 让写入不随取消撤掉（数据库线程正忙、事务还没执行时，
         # 直接 await 被取消会把它撤掉），即使这里再次被取消，事务也照常完成，且只写一次。
         turn_messages = [
             entry.message_id for entry in begun.current if entry.message_id is not None
         ]
-        await asyncio.shield(self._record(turn, begun.last_message_id, outcome, turn_messages))
+        processes = [*control.earlier, turn.process]
+        await asyncio.shield(
+            self._record(
+                turn, begun.last_message_id, outcome, turn_messages, _transcript(processes)
+            )
+        )
         if cancelled is not None:
             raise cancelled
         if outcome.delivery is not ReplyDelivery.WITHHELD:  # 结局 skipped 的也是 withheld
             self._schedule_descriptions(user, begun)
+        if outcome.delivery in _RECALL_AFTER:
+            self._recall_later(user, processes)
 
     async def _acquire(self, user: User, message: ChatInput) -> list[Acquired]:
         if self._fetcher is None:
@@ -694,7 +808,12 @@ class Conversation:
         self._describer.schedule(user, ids)
 
     async def _record(
-        self, turn: _Turn, message_id: int, outcome: _Outcome, turn_messages: Sequence[int]
+        self,
+        turn: _Turn,
+        message_id: int,
+        outcome: _Outcome,
+        turn_messages: Sequence[int],
+        process: str | None = None,
     ) -> None:
         """记账。`turn_messages` 是这一轮的全部用户消息（含并进来的），它们的附件按这一轮重记 `given`。"""
         # 没有调用过对话模型时（选完模型后发现已不能使用对话，或正在决策时被取消）没有调用结果：结局记成
@@ -722,15 +841,19 @@ class Conversation:
             turn.user,
             message_id,
             turn.selection.record,
-            _Reply(model, ending, turn.attempts, outcome, tuple(turn_messages), given),
+            _Reply(model, ending, turn.attempts, outcome, tuple(turn_messages), given, process),
         )
+        thoughts, commentaries, _ = turn.process.notes.counts
         logger.info(
-            "回复了用户 %s：模型 %s，结局 %s，送达 %s，搜索 %d 次",
+            "回复了用户 %s：模型 %s，结局 %s，送达 %s，搜索 %d 次，思考摘要 %d 段，说明 %d 段，过程消息 %d 片",
             turn.user.label,
             model,
             ending.value,
             outcome.delivery.value,
             sum(attempt.searches for attempt in turn.attempts),
+            thoughts,
+            commentaries,
+            turn.process.chunks,
         )
 
     async def _record_preempted(self, turn: _Turn, message_id: int) -> None:
@@ -840,6 +963,7 @@ class Conversation:
             ending=reply.ending,
             delivery=reply.outcome.delivery,
             now=now,
+            process=reply.process,
         )
         journal.set_given(conn, user.id, reply.messages, reply.given)
         _record_usage(conn, user.id, message_id, reply.attempts, now)
@@ -1064,6 +1188,16 @@ class Conversation:
         fresh = [notice for notice in notices if notice not in turn.tried_notices]
         if not fresh:
             return
+        if turn.attempts:
+            # 换备用模型时新出现的说明：之前可能已经发过说明与过程消息，发之前确认还给回答留着余量（回答本身，
+            # 加上被拒时改发的纯文本或固定说明），不够就不发这条说明，保证回答能发出。
+            if not turn.channel.budget.affords(1):
+                logger.info(
+                    "用户 %s 这条消息的被动回复次数不够给回答留余量，不发备用模型的附件说明",
+                    turn.user.label,
+                )
+                return
+            turn.process.seal()  # 说明排在过程消息之后
         result = await _try_send(turn.channel, "\n".join(fresh), turn.user)
         if result is not _SendResult.REJECTED:
             turn.tried_notices.update(fresh)
@@ -1080,12 +1214,16 @@ class Conversation:
     ) -> _Attempt:
         run = _Run(model, given)
         turn.run = run
+        show = self._router.model(model.name).show_process
 
         def sink(text: str) -> None:
             run.parts.append(text)
             turn.outbox.push(guard.feed(text))
 
-        consumer = asyncio.create_task(self._consume(model, request, run, sink))
+        def note(event: ProcessEvent) -> None:
+            turn.process.feed(event, show=show)
+
+        consumer = asyncio.create_task(self._consume(model, request, run, sink, note))
         turn.consumer = consumer
         broken = asyncio.create_task(turn.outbox.broken.wait())
         try:
@@ -1105,7 +1243,12 @@ class Conversation:
         return run.attempt()
 
     async def _consume(
-        self, model: ChatModel, request: ChatRequest, run: _Run, sink: Callable[[str], None]
+        self,
+        model: ChatModel,
+        request: ChatRequest,
+        run: _Run,
+        sink: Callable[[str], None],
+        note: Callable[[ProcessEvent], None] = lambda _: None,
     ) -> None:
         try:
             async with (
@@ -1122,6 +1265,8 @@ class Conversation:
                             run.usage = event
                         case Finished(reason=reason):
                             run.ending = _FINISH_ENDINGS[reason]
+                        case ThoughtSummary() | Commentary() | SearchProgress():
+                            note(event)
                         case _:
                             pass
         except ModelError as exc:
@@ -1138,7 +1283,9 @@ class Conversation:
         if outbox.error is None and outbox.has_content:
             if notice is not None:
                 outbox.push(f"\n\n{notice}", answer=False)
+            # 回答的第一片交出之前（`claim()` 成功之后）才结束过程消息：等过程消息第一片的那段时间仍可插话。
             await outbox.close()
+        turn.process.seal()  # 之后的固定说明、纯文本都排在过程消息之后
         if outbox.error is None:
             if not outbox.handed:  # 模型什么也没给，或只给了空白
                 outbox.discard()
@@ -1170,8 +1317,48 @@ class Conversation:
         delivery = ReplyDelivery.REJECTED if sent else ReplyDelivery.NOTICE_LOST
         return _Outcome(outbox.delivered_answer, delivery)
 
-    async def _wind_down(self, turn: _Turn, *, quiet: bool = False) -> _Outcome:
-        """被取消后的收尾：在 `GRACE_SECONDS` 内停下模型、等在途的分片、结束流式消息。
+    async def _close_process(self, turn: _Turn) -> None:
+        """一轮正常结束：结束过程消息（回答开始时已经结束的就等它发完），最多等 `GRACE_SECONDS`。"""
+        turn.process.seal()
+        deadline = asyncio.get_running_loop().time() + GRACE_SECONDS
+        await _within(turn.process.settle(), deadline, turn.process)
+
+    def _recall_later(self, user: User, processes: Sequence[ProcessPresenter]) -> None:
+        """回答送达之后，在后台撤回这一轮（含被重来的几次）发出过的过程消息，不占这个用户的轮次：用户马上追问时
+        不必等撤回。任务记进 `_in_flight`，由 `drain()` 等待（关停时在关闭 QQ 客户端之前，受同一个总时限约束）；
+        每条撤回最多等 `RECALL_TIMEOUT_SECONDS`。"""
+        shown = [process for process in processes if process.opened]
+        if not shown:
+            return
+        if not self._process.recall:
+            logger.info("用户 %s 的过程消息按配置留着，不撤回", user.label)
+            return
+        task = asyncio.create_task(self._recall(user, shown))
+        self._in_flight.add(task)
+        task.add_done_callback(self._in_flight.discard)
+        task.add_done_callback(_retrieve)
+
+    async def _recall(self, user: User, shown: Sequence[ProcessPresenter]) -> None:
+        """依次撤回：每条在发出撤回之前重新检查时限（前面的撤回可能等了很久），过了时限的留着。失败只记日志。"""
+        for process in shown:
+            if not process.recall_due(self._timer()):
+                logger.info("用户 %s 的一条过程消息发出已久，平台不再允许撤回，留着", user.label)
+                continue
+            try:
+                async with asyncio.timeout(RECALL_TIMEOUT_SECONDS):
+                    await process.recall()
+            except ProcessSendError as exc:
+                logger.warning("没能撤回用户 %s 的过程消息：%s", user.label, exc)
+            except TimeoutError:
+                logger.warning("撤回用户 %s 的过程消息超时", user.label)
+            else:
+                logger.info("撤回了用户 %s 的过程消息", user.label)
+
+    async def _wind_down(
+        self, turn: _Turn, *, quiet: bool = False, note: str | None = None
+    ) -> _Outcome:
+        """被取消后的收尾：在 `GRACE_SECONDS` 内停下模型、等在途的分片、结束流式消息与过程消息（发出过过程时
+        先写一行 `note`）。
 
         再次被取消时不再等，按已知的情况收尾。`quiet` 为真（插话重来）时不记「被取消」的日志。
         """
@@ -1190,6 +1377,7 @@ class Conversation:
                 _settle_stopped_consumer(consumer, turn.run.model if turn.run else None)
             turn.typing.cancel()
             await turn.outbox.wind_down(deadline)
+            await _within(turn.process.conclude(note), deadline, turn.process)
         except asyncio.CancelledError:
             turn.abandon()
         if turn.run is not None:
@@ -1212,6 +1400,7 @@ class _Reply:
     given: frozenset[int] = (
         frozenset()
     )  # 其中实际以原件交给了模型的附件（见 `journal.set_given()`）
+    process: str | None = field(default=None, repr=False)  # 处理过程的全文，只存档
 
 
 def _record_usage(
@@ -1282,6 +1471,39 @@ def _remaining(deadline: float) -> float:
     return max(0.0, deadline - asyncio.get_running_loop().time())
 
 
+async def _within(
+    step: Coroutine[object, object, None], deadline: float, process: ProcessPresenter
+) -> None:
+    """在 `deadline` 之前等过程消息的收尾，超时就放弃（取消它的后台任务）。"""
+    task = asyncio.ensure_future(step)
+    await asyncio.wait((task,), timeout=_remaining(deadline))
+    if not task.done():
+        _cancel_and_retrieve(task)
+        process.cancel()
+    elif not task.cancelled() and (exc := task.exception()) is not None:
+        logger.warning("过程消息收尾时出错：%s", _describe(exc))
+
+
+def _transcript(processes: Sequence[ProcessPresenter]) -> str | None:
+    """一轮（含被插话重来的几次）处理过程的全文；什么都没有时是 `None`。"""
+    parts = [text for process in processes if (text := process.notes.transcript())]
+    return _RESTART_MARK.join(parts) if parts else None
+
+
+_RESTART_MARK = "\n\n（插话重来）\n\n"
+# 回答（或固定说明）送达之后才撤回过程消息；用户什么都没收到时留着，好歹知道处理到了哪一步。
+_RECALL_AFTER = frozenset(
+    (
+        ReplyDelivery.STREAMED,
+        ReplyDelivery.INTERRUPTED,
+        ReplyDelivery.UNCLOSED,
+        ReplyDelivery.PLAIN,
+        ReplyDelivery.REJECTED,
+        ReplyDelivery.FAILED,
+    )
+)
+
+
 def _sources(cited: Sequence[Citation], model: str) -> tuple[Source, ...]:
     """整理一次调用引用的来源。引用来自上游、没有校验，整理时出了任何意外都只记日志、当作没有来源：正文可能已经
     流出、用量已经报告，不能因为它让这一轮丢掉回复与记账（被取消时的收尾也走这里）。"""
@@ -1335,26 +1557,36 @@ async def _skip() -> None:
     pass
 
 
-class _ClaimingChannel:
-    """回答一轮时用的通道：交给 QQ 之前先 `TurnControl.claim()`。
+class _TurnChannel:
+    """本模块经它使用通道：给这条被回复的消息的被动回复计数（`ReplyChannel.budget`，发出之前就计，平台的序号
+    失败也不回退），回答一轮时（给了 `control`）交给 QQ 之前先 `TurnControl.claim()`。
 
     回答一轮的任务被 `preempt()` 之后立即被取消，不会再走到发送，所以这里的拒绝只是兜底；流式回复的分片在
-    单独的任务里发，由 `_Outbox` 在第一片交出之前自己检查。
+    单独的任务里发，由 `_Outbox` 在第一片交出之前自己检查。过程消息不 `claim()`：它不算「已开始显示」。
     """
 
-    def __init__(self, channel: ReplyChannel, control: TurnControl) -> None:
+    def __init__(self, channel: ReplyChannel, control: TurnControl | None = None) -> None:
         self._channel = channel
         self._control = control
+        self._streamed = False  # 回答的流式消息已经开始（一条流式消息只算一次被动回复）
+
+    @property
+    def budget(self) -> ReplyBudget:
+        return self._channel.budget
 
     def _claim(self) -> None:
-        if not self._control.claim():
+        if self._control is not None and not self._control.claim():
             raise asyncio.CancelledError
 
     async def typing(self, seconds: int) -> None:
+        self.budget.typings += 1
         await self._channel.typing(seconds)
 
     async def stream(self, text: str) -> None:
         self._claim()
+        if not self._streamed:
+            self._streamed = True
+            self.budget.replies += 1
         await self._channel.stream(text)
 
     async def finish_stream(self) -> None:
@@ -1362,7 +1594,38 @@ class _ClaimingChannel:
 
     async def send(self, text: str) -> None:
         self._claim()
+        self.budget.replies += 1
         await self._channel.send(text)
+
+    def open_process(self) -> ProcessStream:
+        """开始一条过程消息（调用方在要发第一片时才调用，所以这时就计数）。"""
+        self.budget.replies += 1
+        return _ProcessChannel(self._channel.open_process())
+
+
+class _ProcessChannel:
+    """把通道的过程消息转成 `process.ProcessStream`：发送异常换成 `ProcessSendError`（文案本就已脱敏）。"""
+
+    def __init__(self, stream: ReplyStream) -> None:
+        self._stream = stream
+
+    async def append(self, text: str) -> None:
+        try:
+            await self._stream.append(text)
+        except SendError as exc:
+            raise ProcessSendError(str(exc)) from None
+
+    async def finish(self) -> None:
+        try:
+            await self._stream.finish()
+        except SendError as exc:
+            raise ProcessSendError(str(exc)) from None
+
+    async def recall(self) -> None:
+        try:
+            await self._stream.recall()
+        except SendError as exc:
+            raise ProcessSendError(str(exc)) from None
 
 
 async def _typing(channel: ReplyChannel, user: User) -> None:
@@ -1418,10 +1681,16 @@ class _Outbox:
         channel: ReplyChannel,
         before_first: asyncio.Task[None],
         may_show: Callable[[], bool] = lambda: True,
+        before_show: Callable[[], Awaitable[None]] = _skip,
+        on_show: Callable[[], None] = lambda: None,
     ) -> None:
         self._channel = channel
         self._before_first: asyncio.Task[None] | None = before_first
         self._may_show = may_show  # 第一片交出之前调用；返回假（这一轮已被插话重来）就不再发
+        # 第一片：先等 `before_show`（过程消息的第一片回来，见 `ProcessPresenter.make_way()`），`may_show` 成功
+        # 之后调用 `on_show`（结束过程消息）。
+        self._before_show = before_show
+        self._on_show = on_show
         self._pending = ""
         self._delivered: list[str] = []
         self._answer_length = 0  # 推进来的内容里，回答本身（不含固定说明）的长度
@@ -1531,9 +1800,15 @@ class _Outbox:
         while self._pending and self.error is None:
             if not self.handed and not self._pending.strip():
                 return  # 换模型时排队的正文被丢掉了，只剩空白
-            if not self.handed and not self._may_show():
-                self.stop()
-                return
+            if not self.handed:
+                # 先等过程消息的第一片回来，再 claim()：等待期间还没有任何正文交给 QQ，插话仍可以重来。
+                await self._before_show()
+                if self.error is not None or not self._pending.strip():
+                    return  # 等待期间被停下了，或排队的正文被丢掉了
+                if not self._may_show():
+                    self.stop()
+                    return
+                self._on_show()
             chunk, self._pending = self._pending, ""
             self.handed = True
             try:

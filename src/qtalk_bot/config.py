@@ -152,6 +152,9 @@ class ModelSettings:
             里选。OpenAI 的模型不能声明 `audio`（Responses API 不接受音频）。
         search: 调用时带上服务商内置的联网搜索工具（OpenAI 的 `web_search`，Gemini 的 `google_search`）。
             模型不支持或服务商拒绝时按普通的模型调用失败处理（会换备用模型）。
+        show_process: 调用时请求思考摘要（OpenAI 的 `reasoning.summary`，Gemini 的
+            `generation_config.thinking_summaries`），并把处理过程（思考摘要、调用工具前的说明、搜索进展）
+            以单独的一条消息展示给用户，见 `process.py`。
     """
 
     name: str
@@ -163,6 +166,19 @@ class ModelSettings:
     description: str | None = None
     inputs: frozenset[Modality] = frozenset()
     search: bool = False
+    show_process: bool = False
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ProcessSettings:
+    """`[process]` 表：处理过程的展示（展示与否由 `[[models]]` 的 `show_process` 决定）。
+
+    Attributes:
+        recall: 回答送达之后撤回过程消息（平台只允许撤回发出 2 分钟内的消息，超过就留着）；为 `False` 时一直
+            留着。
+    """
+
+    recall: bool = True
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -358,6 +374,7 @@ class Settings:
     attachments: AttachmentSettings = AttachmentSettings()
     describe: DescribeSettings | None = None
     turns: TurnSettings = TurnSettings()
+    process: ProcessSettings = ProcessSettings()
 
     @property
     def default_model(self) -> ModelSettings:
@@ -609,6 +626,8 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
     describe_ok, describe = _parse_describe(table)
     turns_table = table.table("turns")
     turns = None if turns_table is None else _parse_turns(turns_table)
+    process_table = table.table("process")
+    process = None if process_table is None else _parse_process(process_table)
     table.finish()
     if decisions is not None and models is not None and len(models) > MAX_OPTIONS:
         # 每个模型是选模型那道选择题的一个选项，两家接口都最多 255 个。
@@ -631,6 +650,7 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         or attachments is None
         or not describe_ok
         or turns is None
+        or process is None
     ):
         return None
     return Settings(
@@ -645,7 +665,16 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         attachments=attachments,
         describe=describe,
         turns=turns,
+        process=process,
     )
+
+
+def _parse_process(table: _Table) -> ProcessSettings | None:
+    recall = table.boolean("recall", True)
+    table.finish()
+    if recall is None:
+        return None
+    return ProcessSettings(recall=recall)
 
 
 def _parse_turns(table: _Table) -> TurnSettings | None:
@@ -967,6 +996,7 @@ class _ModelDraft:
     description: str | None
     inputs: frozenset[Modality]
     search: bool | None
+    show_process: bool | None
     ok: bool  # 这一项自身没有问题
 
 
@@ -1016,6 +1046,7 @@ def _parse_models(root: _Table) -> tuple[ModelSettings, ...] | None:
             description=d.description,
             inputs=d.inputs,
             search=cast(bool, d.search),
+            show_process=cast(bool, d.show_process),
         )
         for d in drafts
     )
@@ -1043,6 +1074,7 @@ def _parse_model(table: _Table) -> _ModelDraft:
         description_ok = description is not None
     inputs = _parse_inputs(table, provider)
     search = table.boolean("search", False)
+    show_process = table.boolean("show_process", False)
     table.finish()
     ok = (
         name is not None
@@ -1054,6 +1086,7 @@ def _parse_model(table: _Table) -> _ModelDraft:
         and description_ok
         and inputs is not None
         and search is not None
+        and show_process is not None
     )
     return _ModelDraft(
         table=table,
@@ -1067,6 +1100,7 @@ def _parse_model(table: _Table) -> _ModelDraft:
         description=description,
         inputs=inputs or frozenset(),
         search=search,
+        show_process=show_process,
         ok=ok,
     )
 

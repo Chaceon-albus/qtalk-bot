@@ -1,7 +1,9 @@
 """Gemini 的对话模型适配器：Interactions API，流式（`generateContent` 已被标为旧接口）。
 
 请求关掉服务端存储（`store=False`），历史每次以 `user_input` / `model_output` 步骤完整带上；配置了推理
-强度时放进 `generation_config.thinking_level`。
+强度时放进 `generation_config.thinking_level`；配置了 `show_process` 时请求思考摘要
+（`generation_config.thinking_summaries = "auto"`，默认关闭）。Gemini 的文字没有「调用工具前的说明」这种标记，
+一律算回答。
 
 附件都以 base64 内联（`data` 是不带 `data:` 前缀的 base64 字符串）：图片是
 `{"type": "image", "data": …, "mime_type": …}`，音频是 `{"type": "audio", …}`，PDF 是
@@ -22,7 +24,9 @@
 - `step.delta`：`model_output` 步骤里 `type == "text"` 的增量转成 `TextDelta`，`text_annotation_delta` 里的
   `url_citation` 标注转成 `Citation`（同一个来源只给一次）；`google_search_call` 增量里的
   `arguments.queries` 给出 `SearchProgress(UPDATED)`，新出现的查询词计入搜索次数，随即给出带最新累计值的
-  `Usage`。思考摘要等现在忽略。
+  `Usage`。`thought` 步骤里 `thought_summary` 增量的文字（`delta.content.text`）转成 `ThoughtSummary`，
+  `step.start` 时就带着的 `summary` 文字同样交出；段的编号是自动续写的第几跳加步骤的 `index`。文档说摘要可能
+  为空或没有（只有签名），没有就不交出。完成事件快照里的思考步骤不补发：摘要只用于展示，少一点不要紧。
 - `interaction.completed`：可能附带这一跳步骤的快照（`interaction.steps`）。其中 `google_search_call` 步骤的
   查询词并入整次调用的去重集合、补记次数；`model_output` 文本块的正文以这一跳已发出的正文开头时，补发其余
   部分（一段 `TextDelta`）并采用这些文本块上的标注，对不上时两样都不做（免得重复，或把来源挂到别的回答
@@ -86,6 +90,7 @@ from . import (
     SearchStage,
     TextDelta,
     TextPart,
+    ThoughtSummary,
     Usage,
     clean_text,
     items,
@@ -105,6 +110,8 @@ _LIMITS = INPUT_LIMITS[Provider.GEMINI]
 _FAILED_STATUSES = frozenset(("failed", "cancelled"))
 
 _GOOGLE_SEARCH: interactions.GoogleSearchParam = {"type": "google_search"}
+
+THINKING_SUMMARIES: interactions.ThinkingSummaries = "auto"
 
 
 def create_client(
@@ -149,12 +156,14 @@ class GeminiChatModel:
         model: str,
         reasoning: str | None = None,
         search: bool = False,
+        summaries: bool = False,
     ) -> None:
         self._client = client
         self._name = name
         self._model = model
         self._reasoning = reasoning
         self._search = search
+        self._summaries = summaries
 
     @property
     def name(self) -> str:
@@ -178,6 +187,8 @@ class GeminiChatModel:
         if self._reasoning is not None:
             # SDK 把取值写成 Literal，但各款模型接受的取值不同且会变，配置里只做宽松校验，原样透传。
             config["thinking_level"] = cast(interactions.ThinkingLevel, self._reasoning)
+        if self._summaries:
+            config["thinking_summaries"] = THINKING_SUMMARIES
         # `create` 的 `timeout` 参数类型来自 SDK 对 httpx 的可选导入，pyright 看作 Unknown；`model` 的类型是
         # 已知模型名的 Literal 加 SDK 自己的 str 子类，配置里的任意模型名只能 cast 过去。
         inputs = [_step(message) for message in request.messages]
@@ -210,6 +221,7 @@ class GeminiChatModel:
         usage = _UsageTotal(searches)
         texts = _Texts()
         steps: dict[int, str] = {}
+        hop = 0  # 自动续写的第几跳；各跳的步骤 index 可能重新编号
         finished = False
         failure: ModelError | None = None
         try:
@@ -219,6 +231,19 @@ class GeminiChatModel:
                         match event:
                             case interactions.InteractionCreatedEvent():
                                 texts.end_hop()  # 自动续写的新一跳开始
+                                hop += 1
+                            case interactions.StepStart(
+                                index=index, step=interactions.ThoughtStep() as step
+                            ):
+                                steps[index] = step.type
+                                for found in _tolerant(_started_thought, f"{hop}:{index}", step):
+                                    yield found
+                            case interactions.StepDelta(
+                                index=index, delta=interactions.ThoughtSummaryDelta() as d
+                            ):
+                                text = _summary_text(getattr(d, "content", None))
+                                if text:
+                                    yield ThoughtSummary(f"{hop}:{index}", text)
                             case interactions.StepStart(
                                 index=index, step=interactions.ModelOutputStep() as step
                             ):
@@ -446,6 +471,20 @@ def _started_output(
             found.append(TextDelta(text))
         found.extend(searches.citations(annotations))
     return found
+
+
+def _summary_text(content: object) -> str:
+    """思考摘要的一块内容里的文字（去掉孤立的代理码位）；图片等别的内容、类型不对的返回空串。"""
+    text: object = getattr(content, "text", None)
+    if getattr(content, "type", None) != "text" or not isinstance(text, str):
+        return ""
+    return clean_text(text)
+
+
+def _started_thought(segment: str, step: interactions.ThoughtStep) -> list[ChatEvent]:
+    """`step.start` 就带着摘要的 `thought` 步骤：摘要的文字交出。"""
+    text = "".join(_summary_text(content) for content in items(getattr(step, "summary", None)))
+    return [ThoughtSummary(segment, text)] if text else []
 
 
 def _snapshot(steps: object, texts: _Texts, searches: _Searches) -> list[ChatEvent]:

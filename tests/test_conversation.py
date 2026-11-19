@@ -84,6 +84,7 @@ from qtalk_bot.media import (
     IncomingAttachment,
     MediaStore,
 )
+from qtalk_bot.process import ReplyBudget
 from qtalk_bot.prompt import FORMAT_GUIDE
 from qtalk_bot.routing import QUESTION, STEER_QUESTION, Router, SteerJudge
 from qtalk_bot.storage import DATABASE_FILENAME, Database
@@ -219,6 +220,22 @@ class FakeChannel:
         self.stream_gate = stream_gate  # 给某一片返回一个事件时，这一片要等它置位才发完
         self.delivered = asyncio.Event()  # 成功发出过一片后置位
         self.failed = asyncio.Event()  # 流式回复的某一片失败后置位
+        self.budget = ReplyBudget()
+        self.processes: list[FakeProcess] = []  # 开过的过程消息
+        self.process_failure: Failure = never  # 过程消息的某一片是否失败
+        self.recall_failure: SendError | None = None
+        self.recall_gate: asyncio.Event | None = None  # 不为空时撤回要等它置位才完成
+        self.on_recall: Action | None = None  # 不为空时每次撤回之前调用（模拟撤回期间时间流逝）
+        self.process_gate: Callable[[str], asyncio.Event | None] = lambda _: None
+
+    def open_process(self) -> FakeProcess:
+        process = FakeProcess(self)
+        self.processes.append(process)
+        return process
+
+    @property
+    def process_text(self) -> str:
+        return "".join(text for kind, text in self.log if kind == "process")
 
     @property
     def streamed(self) -> str:
@@ -274,6 +291,37 @@ class FakeChannel:
         if (error := self.send_failure(text)) is not None:
             raise error
         self.log.append(("send", text))
+
+
+class FakeProcess:
+    """过程消息的替身：发出的片、结束与撤回都记进所属通道的 `log`（`process`、`process_finish`、`recall`）。"""
+
+    def __init__(self, channel: FakeChannel) -> None:
+        self.channel = channel
+        self.recalled = False
+
+    async def append(self, text: str) -> None:
+        await asyncio.sleep(0)
+        if (gate := self.channel.process_gate(text)) is not None:
+            await gate.wait()
+        if (error := self.channel.process_failure(text)) is not None:
+            raise error
+        self.channel.log.append(("process", text))
+
+    async def finish(self) -> None:
+        await asyncio.sleep(0)
+        self.channel.log.append(("process_finish", ""))
+
+    async def recall(self) -> None:
+        await asyncio.sleep(0)
+        if self.channel.on_recall is not None:
+            await self.channel.on_recall()
+        if self.channel.recall_gate is not None:
+            await self.channel.recall_gate.wait()
+        if self.channel.recall_failure is not None:
+            raise self.channel.recall_failure
+        self.recalled = True
+        self.channel.log.append(("recall", ""))
 
 
 def reject_if(marker: str) -> Failure:
@@ -2792,6 +2840,24 @@ async def test_fallback_sends_notices_that_are_new_for_its_request(
     assert any(isinstance(p, ImagePart) for p in primary.requests[0].messages[-1].parts)
     assert channel.sent == [texts.ATTACHMENT_FAILED, texts.ATTACHMENTS_OVER_BUDGET]
     assert channel.streamed == "收到"
+
+
+async def test_fallback_notice_is_skipped_when_the_answer_would_run_out_of_replies(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    chat, _, _ = fallback_over_budget_chat(db, tmp_path)
+    channel = FakeChannel(stream_failure=reject_if("收到"))  # 备用模型的流式回答被拒，要改发纯文本
+    channel.budget = ReplyBudget(replies=1)  # 这条消息之前已经用掉一次（例如过程消息）
+
+    await send(
+        chat, alice, "在吗", image_attachment(), image_attachment(MISSING_URL), channel=channel
+    )
+
+    # 「正在输入」、附件说明之后只剩两次：留给回答（被拒的流式回答与改发的纯文本），备用模型的说明不发。
+    assert channel.sent == [texts.ATTACHMENT_FAILED, "收到"]
+    assert channel.budget == ReplyBudget(typings=1, replies=4)
+    assert (await rows(db))[-1].delivery == "plain"
 
 
 # ---- 第四轮评审：在途轮次的排空、读原件期间占着名额、送达不明的说明不重发 ----

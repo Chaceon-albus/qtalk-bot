@@ -50,6 +50,7 @@ from .llm import (
     Message,
     Modality,
     Part,
+    Provider,
     Role,
     TextPart,
     inline_size,
@@ -380,7 +381,12 @@ class RequestBuilder:
                 parts = _merge((*previous.parts, TextPart("\n"), *parts))
             messages.append(Message(entry.role, parts))
         request = ChatRequest(
-            system=system_prompt(self._persona, self._now),
+            system=system_prompt(
+                self._persona,
+                self._now,
+                process=model.show_process,
+                preamble=model.provider is Provider.OPENAI and model.search,
+            ),
             messages=tuple(messages),
             max_output_tokens=self._max_output_tokens,
         )

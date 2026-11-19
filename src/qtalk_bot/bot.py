@@ -43,6 +43,7 @@ from .media import (
     HostRefusedHook,
     IncomingAttachment,
 )
+from .process import ReplyBudget
 
 logger = logging.getLogger(__name__)
 
@@ -101,18 +102,37 @@ async def fetch_bot_name(client: pyqbot.Client) -> str:
     return name
 
 
+class Recall(Protocol):
+    """撤回机器人发给某个用户的一条消息（`MessageRecaller` 符合它）。"""
+
+    def __call__(self, user_openid: str, message_id: str) -> Awaitable[None]: ...
+
+
+class MessageRecaller:
+    """用 `client.users.recall_message()` 撤回机器人发给用户的消息（平台只允许撤回发出 2 分钟内的）。"""
+
+    def __init__(self, client: pyqbot.Client) -> None:
+        self._client = client
+
+    async def __call__(self, user_openid: str, message_id: str) -> None:
+        await self._client.users.recall_message(user_openid, message_id)
+
+
 class QQChat:
     """对话处理器：把 pyqbot 的单聊消息交给 `Batcher`，回复经 `_QQReplyChannel` 发出。
 
     收下消息（复查授权、下载附件、写进流水）就返回，回答在 `Batcher` 自己的任务里进行，回复挂在这一轮的
-    最后一条上（被动回复用它的消息 ID）。
+    最后一条上（被动回复用它的消息 ID）。`recall` 用来撤回过程消息。
     """
 
-    def __init__(self, batcher: Batcher) -> None:
+    def __init__(self, batcher: Batcher, *, recall: Recall) -> None:
         self._batcher = batcher
+        self._recall = recall
 
     async def handle(self, user: User, message: pyqbot.C2CMessage) -> None:
-        await self._batcher.submit(user, chat_input(message), _QQReplyChannel(message))
+        await self._batcher.submit(
+            user, chat_input(message), _QQReplyChannel(message, self._recall)
+        )
 
 
 MAX_ATTACHMENTS = 16  # 一条消息（含被引用的图片）最多处理这么多个附件，多的不理会
@@ -428,12 +448,18 @@ class _QQReplyChannel:
     """用 pyqbot 被动回复一条单聊消息，符合 `conversation.ReplyChannel`。
 
     流式回复用 `coalesce=False`：每次调用发一片、等它发完，合并由 `Conversation` 自己做，这样才知道哪些
-    内容确实送达了。pyqbot 的异常按 `is_rejection()` 分成「确定没发出」与「说不准」。
+    内容确实送达了。pyqbot 的异常按 `is_rejection()` 分成「确定没发出」与「说不准」。`budget` 由
+    `Conversation` 计数，这里只是让它跟着这条消息。
     """
 
-    def __init__(self, message: pyqbot.C2CMessage) -> None:
+    def __init__(self, message: pyqbot.C2CMessage, recall: Recall) -> None:
         self._message = message
+        self._recall = recall
         self._stream: pyqbot.StreamMessage | None = None
+        self.budget = ReplyBudget()
+
+    def open_process(self) -> _QQProcessStream:
+        return _QQProcessStream(self._message, self._recall)
 
     async def typing(self, seconds: int) -> None:
         await _guarded(self._message.send_typing(seconds=seconds))
@@ -449,6 +475,34 @@ class _QQReplyChannel:
 
     async def send(self, text: str) -> None:
         await _guarded(self._message.reply(text))
+
+
+class _QQProcessStream:
+    """过程消息：另一条被动回复的流式消息（`coalesce=False`），符合 `conversation.ReplyStream`。
+
+    撤回用流式消息的 `stream_msg_id`（第一片的响应里给出，各分片相同）。平台是否允许撤回流式消息、2 分钟从哪一片
+    算起都还没有实测；没有拿到 ID（第一片没有成功）时当作说不准，不发撤回请求。
+    """
+
+    def __init__(self, message: pyqbot.C2CMessage, recall: Recall) -> None:
+        self._message = message
+        self._recall = recall
+        self._stream: pyqbot.StreamMessage | None = None
+
+    async def append(self, text: str) -> None:
+        if self._stream is None:
+            self._stream = self._message.reply_stream(coalesce=False)
+        await _guarded(self._stream.append(text))
+
+    async def finish(self) -> None:
+        if self._stream is not None:
+            await _guarded(self._stream.finish())
+
+    async def recall(self) -> None:
+        message_id = None if self._stream is None else self._stream.stream_msg_id
+        if message_id is None:
+            raise SendUncertainError("过程消息没有消息 ID，无法撤回")
+        await _guarded(self._recall(self._message.user_openid, message_id))
 
 
 async def _guarded(call: Awaitable[object]) -> None:

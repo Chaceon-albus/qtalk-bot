@@ -21,6 +21,7 @@ from qtalk_bot.llm import (
     ChatEvent,
     ChatRequest,
     Citation,
+    Commentary,
     ErrorKind,
     FilePart,
     Finished,
@@ -35,6 +36,7 @@ from qtalk_bot.llm import (
     SearchStage,
     TextDelta,
     TextPart,
+    ThoughtSummary,
     Usage,
 )
 from qtalk_bot.llm.openai_responses import OFFICIAL_BASE_URL, OpenAIChatModel, create_client
@@ -155,10 +157,24 @@ def streaming(events: list[Payload]) -> Server:
     )
 
 
-def model_on(server: Server, *, max_retries: int = 0, search: bool = False) -> OpenAIChatModel:
+def model_on(
+    server: Server,
+    *,
+    max_retries: int = 0,
+    search: bool = False,
+    summaries: bool = False,
+    reasoning: str | None = None,
+) -> OpenAIChatModel:
     http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(server.handle))
     client = openai.AsyncOpenAI(api_key=FAKE_KEY, http_client=http_client, max_retries=max_retries)
-    return OpenAIChatModel(client, name="main", model="gpt-fake", search=search)
+    return OpenAIChatModel(
+        client,
+        name="main",
+        model="gpt-fake",
+        search=search,
+        summaries=summaries,
+        reasoning=reasoning,
+    )
 
 
 async def collect(model: OpenAIChatModel) -> list[ChatEvent]:
@@ -205,7 +221,14 @@ async def test_request_shape_and_text_usage_finish() -> None:
 
     events = await collect(model_on(server))
 
-    assert events == [TextDelta("你好"), TextDelta("！"), Usage(50, 20), DONE]
+    # 思考摘要（这里没有请求，替身照样给出）作为 ThoughtSummary 交出，不算回答。
+    assert events == [
+        ThoughtSummary("rs_fake#0", "先想一想"),
+        TextDelta("你好"),
+        TextDelta("！"),
+        Usage(50, 20),
+        DONE,
+    ]
     (request,) = server.requests
     assert request.url.path == "/v1/responses"
     assert request.headers["authorization"] == f"Bearer {FAKE_KEY}"
@@ -1079,3 +1102,221 @@ async def test_snapshot_only_message_is_sent_once_with_its_citations() -> None:
         Usage(7, 6, 0),
         DONE,
     ]
+
+
+# ---- 处理过程（里程碑 7b）：思考摘要、phase 为 commentary 的说明 ----
+
+
+def summary_event(kind: str, seq: int, index: int, **fields: Any) -> Payload:
+    return {
+        "type": f"response.reasoning_summary_{kind}",
+        "sequence_number": seq,
+        "item_id": "rs_1",
+        "output_index": 0,
+        "summary_index": index,
+        **fields,
+    }
+
+
+def message_added(seq: int, item_id: str, output_index: int, phase: str | None) -> Payload:
+    item: Payload = {
+        "id": item_id,
+        "type": "message",
+        "status": "in_progress",
+        "role": "assistant",
+        "content": [],
+    }
+    if phase is not None:
+        item["phase"] = phase
+    return item_event("added", seq, output_index, item)
+
+
+def commentary_item(text: str) -> Payload:
+    return {**message_with("msg_c", [output_text(text)]), "phase": "commentary"}
+
+
+REASONING_ITEM: Payload = {"id": "rs_1", "type": "reasoning", "summary": []}
+PROCESS_STREAM: list[Payload] = [
+    CREATED,
+    item_event("added", 1, 0, REASONING_ITEM),
+    summary_event("part.added", 2, 0, part={"type": "summary_text", "text": ""}),
+    summary_event("text.delta", 3, 0, delta="**查一下天气**"),
+    summary_event("text.delta", 4, 0, delta="\n\n用户想知道上海"),
+    summary_event("text.done", 5, 0, text="**查一下天气**\n\n用户想知道上海的天气。"),
+    summary_event("part.done", 6, 0, part={"type": "summary_text", "text": "不对的全文"}),
+    item_event(
+        "done",
+        7,
+        0,
+        {
+            **REASONING_ITEM,
+            "summary": [
+                {"type": "summary_text", "text": "**查一下天气**\n\n用户想知道上海的天气。"}
+            ],
+        },
+    ),
+    message_added(8, "msg_c", 1, "commentary"),
+    {**delta_of(9, "msg_c", "我先查一下"), "output_index": 1},
+    {
+        **part_done(
+            10, "msg_c", "我先查一下上海今天的天气。", [url_citation(SHANGHAI, "上海天气")]
+        ),
+        "output_index": 1,
+    },
+    item_event("done", 11, 1, commentary_item("我先查一下上海今天的天气。")),
+    item_event("added", 12, 2, search_item("ws_1", {"type": "search"}, "in_progress")),
+    search_event("in_progress", 13, "ws_1", 2),
+    search_event("completed", 14, "ws_1", 2),
+    item_event("done", 15, 2, search_item("ws_1", SEARCH_ACTION)),
+    message_added(16, "msg_f", 3, "final_answer"),
+    {**delta_of(17, "msg_f", "今天晴。"), "output_index": 3},
+    {
+        **final(
+            commentary_item("我先查一下上海今天的天气。"),
+            message_with("msg_f", [output_text("今天晴。")]),
+        ),
+        "sequence_number": 18,
+    },
+]
+
+
+async def test_summaries_are_requested_and_commentary_is_not_part_of_the_answer() -> None:
+    server = streaming(PROCESS_STREAM)
+
+    events = await collect(model_on(server, search=True, summaries=True))
+
+    assert server.body["reasoning"] == {"summary": "auto"}
+    assert events == [
+        ThoughtSummary("rs_1#0", "**查一下天气**"),
+        ThoughtSummary("rs_1#0", "\n\n用户想知道上海"),
+        ThoughtSummary("rs_1#0", "的天气。"),  # 整段摘要的结束帧补上没发出的部分；对不上的全文不补
+        Commentary("msg_c#0", "我先查一下"),
+        Commentary("msg_c#0", "上海今天的天气。"),  # 结束帧补发的也是说明；说明里的标注不算来源
+        SearchProgress("ws_1", SearchStage.STARTED),
+        Usage(None, None, 1),
+        SearchProgress("ws_1", SearchStage.COMPLETED, ("上海 天气", "今天 日期")),
+        TextDelta("今天晴。"),  # 只有 final_answer 的文字是回答，快照里的说明不再补发
+        Usage(7, 6, 1),
+        DONE,
+    ]
+
+
+async def test_commentary_known_only_from_the_snapshot_is_not_answer_text() -> None:
+    server = streaming(
+        [CREATED, final(commentary_item("我先查一下。"), message_with("m", [output_text("答")]))]
+    )
+
+    events = await collect(model_on(server))
+
+    assert events == [Commentary("msg_c#0", "我先查一下。"), TextDelta("答"), Usage(7, 6), DONE]
+
+
+async def test_message_without_phase_is_still_the_answer() -> None:
+    server = streaming(
+        [CREATED, message_added(1, "msg_fake", 0, None), text_delta(2, "答"), COMPLETED]
+    )
+
+    events = await collect(model_on(server))
+
+    assert events == [TextDelta("答"), Usage(1, 1), DONE]
+
+
+async def test_summary_is_combined_with_the_effort_and_omitted_when_not_shown() -> None:
+    server = streaming([CREATED, COMPLETED])
+    await collect(model_on(server, summaries=True, reasoning="high"))
+    assert server.body["reasoning"] == {"effort": "high", "summary": "auto"}
+
+    plain = streaming([CREATED, COMPLETED])
+    await collect(model_on(plain))
+    assert "reasoning" not in plain.body
+
+
+def summary_refused(status: int) -> Callable[[httpx2.Request], httpx2.Response]:
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        body = json.loads(request.content)
+        if "summary" in body.get("reasoning", {}):
+            error = {
+                "message": f"Your organization must be verified. {SECRET_TEXT}",
+                "type": "invalid_request_error",
+                "param": "reasoning.summary",
+                "code": "unsupported_value",
+            }
+            return httpx2.Response(status, json={"error": error})
+        return httpx2.Response(
+            200, headers={"content-type": "text/event-stream"}, content=sse([CREATED, COMPLETED])
+        )
+
+    return respond
+
+
+async def test_refused_summary_is_retried_without_it_once_and_then_dropped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    server = Server(summary_refused(400))
+    model = model_on(server, summaries=True, reasoning="low")
+
+    with caplog.at_level(logging.WARNING):
+        assert await collect(model) == [Usage(1, 1), DONE]
+    bodies = [json.loads(request.content) for request in server.requests]
+    assert [body["reasoning"] for body in bodies] == [
+        {"effort": "low", "summary": "auto"},
+        {"effort": "low"},
+    ]
+    assert "模型 main 带思考摘要的请求被拒绝（状态码 400）" in caplog.text
+    assert SECRET_TEXT not in caplog.text
+
+    # 本次运行期间不再请求摘要：只发一次请求。
+    await collect(model)
+    assert json.loads(server.requests[-1].content)["reasoning"] == {"effort": "low"}
+    assert len(server.requests) == 3
+
+
+@pytest.mark.parametrize("status", [404, 409])
+async def test_other_client_errors_are_not_retried_and_keep_the_summary(status: int) -> None:
+    def always(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(status, json={"error": {"message": "暂时的错误"}})
+
+    server = Server(always)
+    model = model_on(server, summaries=True)
+
+    _, error = await failure(model)
+    assert error.status_code == status
+    await failure(model)
+    # 与摘要无关的错误：不重试，下一次照旧带着摘要请求。
+    assert [json.loads(r.content)["reasoning"] for r in server.requests] == [
+        {"summary": "auto"},
+        {"summary": "auto"},
+    ]
+
+
+async def test_summary_is_kept_when_the_retry_fails_after_the_stream_opens() -> None:
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        if "summary" in json.loads(request.content).get("reasoning", {}):
+            return httpx2.Response(403, json={"error": {"message": "被拒"}})
+        broken = {"type": "error", "sequence_number": 1, "code": "server_error", "message": "x"}
+        return httpx2.Response(
+            200, headers={"content-type": "text/event-stream"}, content=sse([CREATED, broken])
+        )
+
+    server = Server(respond)
+    model = model_on(server, summaries=True)
+
+    await failure(model)
+    await failure(model)
+    # 不带摘要的重试拿到了流、第一帧却报错：不能断定是摘要的问题，下一次照旧先带着摘要请求。
+    assert ["summary" in json.loads(r.content).get("reasoning", {}) for r in server.requests] == [
+        True,
+        False,
+        True,
+        False,
+    ]
+
+
+@pytest.mark.parametrize("status", [401, 429])
+async def test_auth_and_rate_limit_errors_are_not_retried_without_summary(status: int) -> None:
+    server = Server(summary_refused(status))
+
+    _, error = await failure(model_on(server, summaries=True))
+
+    assert error.status_code == status
+    assert len(server.requests) == 1

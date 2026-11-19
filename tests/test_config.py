@@ -18,6 +18,7 @@ from qtalk_bot.config import (
     DescribeSettings,
     InviteSettings,
     ModelSettings,
+    ProcessSettings,
     ProviderSettings,
     ProvidersSettings,
     QQSettings,
@@ -216,9 +217,9 @@ def test_invalid_value_is_not_echoed(tmp_path: Path) -> None:
 
 
 def test_unknown_keys_and_tables_are_reported(tmp_path: Path) -> None:
-    text = 'timezne = "UTC"\n[process]\nrecall = true\n'
+    text = 'timezne = "UTC"\n[reminders]\nenabled = true\n'
     error = config_error(write_config(tmp_path, text))
-    assert error.problems == ("timezne：未知的键", "process：未知的键")
+    assert error.problems == ("timezne：未知的键", "reminders：未知的键")
 
 
 def test_secret_in_config_file_is_rejected_without_echoing_value(tmp_path: Path) -> None:
@@ -680,6 +681,37 @@ def test_invalid_search(tmp_path: Path, value: object, kind: str) -> None:
     assert config_error(models_config(tmp_path, block)).problems == (
         f"models[0].search：应为布尔值，实际是{kind}",
     )
+
+
+# ---- show_process 与 [process]（里程碑 7b） ----
+
+
+def test_show_process_defaults_to_false_and_is_read_per_model(tmp_path: Path) -> None:
+    assert load_settings(write_config(tmp_path, "")).models[0].show_process is False
+    path = models_config(
+        tmp_path,
+        model_block(name="a", provider="openai", model="m", default=True, show_process=True),
+        model_block(name="b", provider="gemini", model="g", show_process=False),
+    )
+    assert [model.show_process for model in load_settings(path).models] == [True, False]
+
+
+def test_invalid_show_process(tmp_path: Path) -> None:
+    block = model_block(name="a", provider="openai", model="m", default=True, show_process="yes")
+    assert config_error(models_config(tmp_path, block)).problems == (
+        "models[0].show_process：应为布尔值，实际是字符串",
+    )
+
+
+def test_process_recall_defaults_to_true(tmp_path: Path) -> None:
+    assert load_settings(write_config(tmp_path, "")).process == ProcessSettings(recall=True)
+    off = load_settings(write_config(tmp_path, "[process]\nrecall = false\n"))
+    assert off.process == ProcessSettings(recall=False)
+
+
+def test_invalid_process_table(tmp_path: Path) -> None:
+    error = config_error(write_config(tmp_path, '[process]\nrecall = "no"\nfold = true\n'))
+    assert error.problems == ("process.recall：应为布尔值，实际是字符串", "process.fold：未知的键")
 
 
 # ---- [providers]（需求 18） ----

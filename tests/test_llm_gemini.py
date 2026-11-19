@@ -35,6 +35,7 @@ from qtalk_bot.llm import (
     SearchStage,
     TextDelta,
     TextPart,
+    ThoughtSummary,
     Usage,
 )
 from qtalk_bot.llm.gemini_interactions import (
@@ -138,13 +139,15 @@ def streaming(*hops: list[Payload]) -> Server:
     return Server(*(replying(events) for events in hops))
 
 
-def model_on(server: Server, *, search: bool = False) -> GeminiChatModel:
+def model_on(server: Server, *, search: bool = False, summaries: bool = False) -> GeminiChatModel:
     http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(server.handle))
     options = types.HttpOptions(
         httpx_async_client=http_client, retry_options=types.HttpRetryOptions(attempts=1)
     )
     client = genai.Client(api_key=FAKE_KEY, http_options=options)
-    return GeminiChatModel(client, name="main", model="gemini-fake", search=search)
+    return GeminiChatModel(
+        client, name="main", model="gemini-fake", search=search, summaries=summaries
+    )
 
 
 async def collect(model: GeminiChatModel) -> list[ChatEvent]:
@@ -187,7 +190,13 @@ async def test_request_shape_and_text_usage_finish() -> None:
     events = await collect(model_on(server))
 
     # 思考所用的 token 也按输出计费，计入 output_tokens。
-    assert events == [TextDelta("你好"), TextDelta("！"), Usage(40, 39), DONE]
+    assert events == [
+        ThoughtSummary("1:0", "先想一想"),
+        TextDelta("你好"),
+        TextDelta("！"),
+        Usage(40, 39),
+        DONE,
+    ]
     (request,) = server.requests
     assert request.url.path.endswith("/interactions")
     assert request.headers["accept"] == "text/event-stream"
@@ -712,6 +721,7 @@ async def test_search_tool_progress_citations_and_count() -> None:
 
     assert server.body()["tools"] == [{"type": "google_search"}]
     assert events == [
+        ThoughtSummary("1:0", "先想一想"),
         SearchProgress("gs_1", SearchStage.STARTED),
         SearchProgress("gs_1", SearchStage.UPDATED, ("上海 天气",)),
         Usage(None, None, 1),  # 查询一出现就计数并交出，被打断时也不丢
@@ -1072,3 +1082,75 @@ async def test_lone_surrogates_are_removed_from_every_text_path() -> None:
         TextDelta("中间"),
         TextDelta("结尾"),
     ]
+
+
+# ---- 处理过程（里程碑 7b）：思考摘要 ----
+
+
+def summary_delta(index: int, content: Payload) -> Payload:
+    return {
+        "event_type": "step.delta",
+        "index": index,
+        "delta": {"type": "thought_summary", "content": content},
+    }
+
+
+async def test_thought_summaries_are_requested_and_streamed() -> None:
+    usage = {"total_input_tokens": 40, "total_output_tokens": 9, "total_thought_tokens": 30}
+    first = [
+        created("v1_hop1"),
+        {
+            "event_type": "step.start",
+            "index": 0,
+            "step": {"type": "thought", "summary": [{"type": "text", "text": "**先想一想**"}]},
+        },
+        summary_delta(0, {"type": "text", "text": "\n\n要查天气"}),
+        summary_delta(0, {"type": "image", "data": "aGk=", "mime_type": "image/png"}),  # 不是文字
+        {
+            "event_type": "step.delta",
+            "index": 0,
+            "delta": {"type": "thought_signature", "signature": "c2ln"},
+        },
+        stop(0),
+        search_call(1, "gs_1"),
+        search_queries(1, "上海 天气"),
+        stop(1),
+        *search_result(2, "gs_1"),
+        start(3, "thought"),  # 只有签名、没有摘要的思考步骤
+        stop(3),
+        completed("requires_continuation", usage, continuation_token="fake-token"),
+    ]
+    second = [
+        created("v1_hop2"),
+        start(0, "thought"),
+        summary_delta(0, {"type": "text", "text": "**整理结果**"}),
+        stop(0),
+        start(1, "model_output"),
+        text(1, "今天晴。"),
+        stop(1),
+        completed("completed", usage),
+    ]
+    server = streaming(first, second)
+
+    events = await collect(model_on(server, search=True, summaries=True))
+
+    config = server.body()["generation_config"]
+    assert config["thinking_summaries"] == "auto"
+    process = [e for e in events if isinstance(e, ThoughtSummary | SearchProgress | TextDelta)]
+    assert process == [
+        ThoughtSummary("1:0", "**先想一想**"),
+        ThoughtSummary("1:0", "\n\n要查天气"),
+        SearchProgress("gs_1", SearchStage.STARTED),
+        SearchProgress("gs_1", SearchStage.UPDATED, ("上海 天气",)),
+        SearchProgress("gs_1", SearchStage.COMPLETED, ("上海 天气",)),
+        ThoughtSummary("2:0", "**整理结果**"),  # 续写的一跳里步骤重新编号，段的编号带上第几跳
+        TextDelta("今天晴。"),  # Gemini 的文字一律算回答
+    ]
+
+
+async def test_thought_summaries_are_not_requested_unless_shown() -> None:
+    server = streaming(
+        [created(), start(0, "model_output"), text(0, "好"), stop(0), completed("completed")]
+    )
+    await collect(model_on(server))
+    assert "thinking_summaries" not in server.body()["generation_config"]

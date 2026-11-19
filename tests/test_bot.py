@@ -41,6 +41,7 @@ from qtalk_bot.bot import (
     PLATFORM_HOSTS,
     AdminAlertSender,
     Handlers,
+    MessageRecaller,
     QQChat,
     QQDownloader,
     ShareLinks,
@@ -84,6 +85,8 @@ from qtalk_bot.llm import (
     Part,
     Provider,
     Role,
+    SearchProgress,
+    SearchStage,
     TextDelta,
     TextPart,
     Usage,
@@ -236,6 +239,7 @@ class Platform:
         self.changed = asyncio.Event()  # 每发出一条消息置位一次
         self.files = files or {}  # 附件的下载地址 → 内容
         self.downloads: list[httpx2.Request] = []
+        self.recalled: list[str] = []  # 撤回请求的路径
 
     async def handle(self, request: httpx2.Request) -> httpx2.Response:
         if str(request.url) in self.files:
@@ -246,6 +250,10 @@ class Platform:
             return httpx2.Response(200, json={"access_token": "fake-token", "expires_in": "7200"})
         if path == "/gateway":
             return httpx2.Response(200, json={"url": "wss://gateway.test/websocket"})
+        if request.method == "DELETE" and path.startswith("/v2/users/"):
+            self.recalled.append(path)
+            self.changed.set()
+            return httpx2.Response(200)
         body: Payload = json.loads(request.content)
         if path == "/v2/generate_url_link":
             self.share_links.append(body)
@@ -818,6 +826,10 @@ class FakeModel:
             yield event
 
 
+async def no_recall(user_openid: str, message_id: str) -> None:
+    raise AssertionError("这里的模型不给出过程，不会撤回")
+
+
 class Tracked:
     """包住对话处理器，记下处理完了几条消息，并唤醒 `run_until_handled` 的等待。
 
@@ -864,7 +876,7 @@ def real_chat(db: Database, model: FakeModel, platform: Platform) -> Tracked:
         timezone=ZoneInfo("Asia/Shanghai"),
     )
     batcher = Batcher(conversation, LONE_ATTACHMENTS_ANSWERED)
-    return Tracked(QQChat(batcher), platform, batcher)
+    return Tracked(QQChat(batcher, recall=no_recall), platform, batcher)
 
 
 # 单独的图片几乎不等就作为一轮去回答，让只带图片的消息也走完一轮（这里是真实的等待，所以取得很短）。
@@ -915,6 +927,84 @@ async def test_text_message_is_answered_with_a_stream_and_recorded(db: Database)
         "SELECT user_id, model, provider, provider_model, input_tokens, output_tokens FROM usage"
     )
     assert [tuple(row) for row in usage] == [(alice.id, "main", "openai", "gpt-fake", 30, 8)]
+
+
+class ProcessModel(FakeModel):
+    """先给出一次搜索的进展，等平台收到过程消息的第一片再回答。"""
+
+    def __init__(self, platform: Platform) -> None:
+        super().__init__(ANSWER)
+        self.platform = platform
+
+    async def stream(self, request: ChatRequest) -> AsyncGenerator[ChatEvent]:
+        self.requests.append(request)
+        yield SearchProgress("ws_1", SearchStage.STARTED, ("上海天气",))
+        while not self.platform.streamed:
+            self.platform.changed.clear()
+            await self.platform.changed.wait()
+        for event in self.events:
+            yield event
+
+
+class LateRecall:
+    """`QQChat` 要在 `Bot` 创建之前给出撤回的方式：创建后再接上 `MessageRecaller`。"""
+
+    def __init__(self) -> None:
+        self.inner: MessageRecaller | None = None
+
+    def attach(self, bot: pyqbot.Bot) -> None:
+        self.inner = MessageRecaller(bot)
+
+    async def __call__(self, user_openid: str, message_id: str) -> None:
+        assert self.inner is not None
+        await self.inner(user_openid, message_id)
+
+
+async def test_process_is_a_separate_stream_that_is_recalled_by_its_id(db: Database) -> None:
+    await welcomed_alice(db)
+    platform = Platform([c2c(ALICE, "上海天气", "ROBOT1.0_fake-1")])
+    model = ProcessModel(platform)
+    conversation = Conversation(
+        db,
+        admin_openid=ADMIN,
+        models={"main": model},
+        router=Router(
+            [
+                ModelSettings(
+                    name="main",
+                    provider=model.provider,
+                    model=model.model,
+                    default=True,
+                    show_process=True,
+                )
+            ]
+        ),
+        settings=ChatSettings(),
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )
+    batcher = Batcher(conversation, LONE_ATTACHMENTS_ANSWERED)
+    recall = LateRecall()
+    chat = Tracked(QQChat(batcher, recall=recall), platform, batcher)
+
+    await run_until_handled(
+        platform,
+        db,
+        chat,
+        events=1,
+        sent=0,
+        until=lambda: chat.handled == 1,
+        on_bot=recall.attach,
+    )
+
+    process = [chunk for chunk in platform.streamed if chunk["msg_seq"] == 2]
+    answer = [chunk for chunk in platform.streamed if chunk["msg_seq"] == 3]
+    assert [chunk["content_raw"] for chunk in process] == ["> 正在搜索：上海天气", ""]
+    assert process[-1]["input_state"] == 10  # 过程消息另有结束分片
+    assert "".join(chunk["content_raw"] for chunk in answer) == "你好，我是助手。"
+    assert platform.recalled == [f"/v2/users/{ALICE}/messages/STREAM_fake"]
+    row = await db.fetch_one("SELECT content, process FROM messages WHERE role = 'assistant'")
+    assert row is not None
+    assert tuple(row) == ("你好，我是助手。", "[搜索] 上海天气")
 
 
 async def test_rejected_stream_is_resent_as_plain_message(db: Database) -> None:
@@ -992,7 +1082,7 @@ def media_chat(
         ),
     )
     batcher = Batcher(conversation, LONE_ATTACHMENTS_ANSWERED)
-    return Tracked(QQChat(batcher), platform, batcher), downloader
+    return Tracked(QQChat(batcher, recall=no_recall), platform, batcher), downloader
 
 
 async def test_image_message_is_downloaded_shown_to_the_model_and_recorded(

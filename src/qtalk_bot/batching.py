@@ -33,6 +33,9 @@
 - 回答已经开始显示，或不能再重来：不判断，让它答完，新消息作为下一轮，答完后立即处理。
 - 单独的图片或文件不触发判断；重来时一并带上，否则留到下一轮按上面「空闲时」的规则等文字。
 
+只显示了过程消息（`process.py`）不算回答已开始显示，照常可以重来；重来时把上一次的 `TurnControl` 交给新的
+（`previous`），被重来的过程消息由最后答完的那一次处理。
+
 「正在输入」在一轮开始时发；重来时只有距上次发出已有 `TYPING_REFRESH_SECONDS` 才再发一次（每次都占用被动回复
 的名额）。回复挂在这一轮最后一条不是表情的消息上。
 
@@ -374,6 +377,7 @@ class Batcher:
         """回答一轮：等带上的消息都收完，交给 `Responder.respond()`；插话判为补充时带上新消息重来。"""
         user = state.user
         restarts = 0
+        control: TurnControl | None = None
         while True:
             recorded = await _recorded(taken)
             if not recorded:
@@ -384,7 +388,8 @@ class Batcher:
             typing = typing_due(state.typed_at, now, restarted=restarts > 0)
             if typing:
                 state.typed_at = now
-            control = TurnControl(typing=typing, notify=state.poke)
+            # 重来时接上上一次的：被重来的几次的过程消息由最后答完的那一次撤回、存档。
+            control = TurnControl(typing=typing, notify=state.poke, previous=control)
             ids = [item.message_id for item, _ in recorded]
             task = asyncio.create_task(self._responder.respond(user, ids, recorded[-1][1], control))
             try:

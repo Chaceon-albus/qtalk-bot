@@ -118,6 +118,7 @@ class ChatModels(Mapping[str, ChatModel]):
                     model=settings.model,
                     reasoning=settings.reasoning,
                     search=settings.search,
+                    summaries=settings.show_process,
                 )
             case Provider.GEMINI:
                 return GeminiChatModel(
@@ -126,6 +127,7 @@ class ChatModels(Mapping[str, ChatModel]):
                     model=settings.model,
                     reasoning=settings.reasoning,
                     search=settings.search,
+                    summaries=settings.show_process,
                 )
 
     def _create_decider(self, settings: DecisionSettings) -> DecisionModel:

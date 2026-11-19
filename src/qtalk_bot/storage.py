@@ -302,6 +302,12 @@ _V7_SEARCHES = """
 ALTER TABLE usage ADD COLUMN searches INTEGER CHECK (searches >= 0);
 """
 
+_V8_PROCESS = """
+-- process：助手回复那一轮的处理过程的全文（思考摘要、调用工具前的说明、搜索的查询词），只存档供排查，不进
+-- 之后的上下文。没有过程的回复、用户消息与升级前的行为空。
+ALTER TABLE messages ADD COLUMN process TEXT;
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     _V1_ACCESS,
     _V2_CHAT,
@@ -310,6 +316,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     _V5_BATCHING,
     _v6_faces_summaries_and_given,
     _V7_SEARCHES,
+    _V8_PROCESS,
 )
 """本程序的迁移列表。业务表由各里程碑在末尾追加，已发布的不能修改。"""
 

@@ -24,9 +24,10 @@ from qtalk_bot.batching import (
     typing_due,
 )
 from qtalk_bot.config import AttachmentTimeoutAction, TurnSettings
-from qtalk_bot.conversation import ChatInput, Received, ReplyChannel, TurnControl
+from qtalk_bot.conversation import ChatInput, Received, ReplyChannel, ReplyStream, TurnControl
 from qtalk_bot.journal import ROWS_PER_TURN
 from qtalk_bot.media import AttachmentKind, IncomingAttachment
+from qtalk_bot.process import ReplyBudget
 from qtalk_bot.routing import Steer
 
 HANG_GUARD = 5
@@ -180,11 +181,15 @@ class Channel:
 
     def __init__(self, name: str) -> None:
         self.name = name
+        self.budget = ReplyBudget()
 
     async def typing(self, seconds: int) -> None: ...
     async def stream(self, text: str) -> None: ...
     async def finish_stream(self) -> None: ...
     async def send(self, text: str) -> None: ...
+
+    def open_process(self) -> ReplyStream:
+        raise AssertionError("这里的替身不发过程消息")
 
 
 @dataclass
