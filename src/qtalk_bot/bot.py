@@ -103,37 +103,18 @@ async def fetch_bot_name(client: pyqbot.Client) -> str:
     return name
 
 
-class Recall(Protocol):
-    """撤回机器人发给某个用户的一条消息（`MessageRecaller` 符合它）。"""
-
-    def __call__(self, user_openid: str, message_id: str) -> Awaitable[None]: ...
-
-
-class MessageRecaller:
-    """用 `client.users.recall_message()` 撤回机器人发给用户的消息（平台只允许撤回发出 2 分钟内的）。"""
-
-    def __init__(self, client: pyqbot.Client) -> None:
-        self._client = client
-
-    async def __call__(self, user_openid: str, message_id: str) -> None:
-        await self._client.users.recall_message(user_openid, message_id)
-
-
 class QQChat:
     """对话处理器：把 pyqbot 的单聊消息交给 `Batcher`，回复经 `_QQReplyChannel` 发出。
 
     收下消息（复查授权、下载附件、写进流水）就返回，回答在 `Batcher` 自己的任务里进行，回复挂在这一轮的
-    最后一条上（被动回复用它的消息 ID）。`recall` 用来撤回过程消息。
+    最后一条上（被动回复用它的消息 ID）。
     """
 
-    def __init__(self, batcher: Batcher, *, recall: Recall) -> None:
+    def __init__(self, batcher: Batcher) -> None:
         self._batcher = batcher
-        self._recall = recall
 
     async def handle(self, user: User, message: pyqbot.C2CMessage) -> None:
-        await self._batcher.submit(
-            user, chat_input(message), _QQReplyChannel(message, self._recall)
-        )
+        await self._batcher.submit(user, chat_input(message), _QQReplyChannel(message))
 
 
 MAX_ATTACHMENTS = 16  # 一条消息（含被引用的图片）最多处理这么多个附件，多的不理会
@@ -173,8 +154,10 @@ def ref_msg_idx(message: pyqbot.C2CMessage) -> str | None:
 
     优先取 pyqbot 的 `message.ref_msg_idx`（`message_scene.ext` 里的 `ref_msg_idx=`；引用机器人的消息时它对应
     发送结果的 `ext_info.ref_idx`）。pyqbot 不回退到 `msg_elements`，这里自己回退：没有时取 `msg_elements`
-    第一项的 `msg_idx`。两处都取是推断：平台的真实形态还没有实测（pyqbot 的 `tests/live/test_live_quote.py`
-    会回答，结论以它的 `docs/errata.md` 为准），在那之前不确定哪一处一定会给。
+    第一项的 `msg_idx`。pyqbot 实测（`docs/errata.md`）四次都对上：引用机器人的普通消息时 `ref_msg_idx` 等于发送
+    结果的 `ext_info.ref_idx`，引用流式消息时等于 `StreamMessage.ref_idx`，引用用户自己的消息时等于那条消息的
+    `msg_idx`；`msg_elements` 只有被引用的那一项，它的 `msg_idx` 与 `ref_msg_idx` 相同。所以回退只是兜底，平台
+    哪天不给 `ref_msg_idx` 时仍能定位。
     """
     if message.ref_msg_idx is not None:
         return _ref_value(message.ref_msg_idx)
@@ -480,18 +463,17 @@ class _QQReplyChannel:
     内容确实送达了。pyqbot 的异常按 `is_rejection()` 分成「确定没发出」与「说不准」。`budget` 由
     `Conversation` 计数，这里只是让它跟着这条消息。
 
-    引用索引：流式回复取 `StreamMessage.ref_idx`（平台第一次在分片响应里给出的 `ext_info.ref_idx`，哪一片会带
-    还没有实测），纯文本取发送结果的 `ext_info.ref_idx`；超过 `MAX_REF_LENGTH` 的当作没有。
+    引用索引：流式回复取 `StreamMessage.ref_idx`（pyqbot 实测：每个分片的响应，含结束分片，都带同一个
+    `ext_info.ref_idx`），纯文本取发送结果的 `ext_info.ref_idx`；超过 `MAX_REF_LENGTH` 的当作没有。
     """
 
-    def __init__(self, message: pyqbot.C2CMessage, recall: Recall) -> None:
+    def __init__(self, message: pyqbot.C2CMessage) -> None:
         self._message = message
-        self._recall = recall
         self._stream: pyqbot.StreamMessage | None = None
         self.budget = ReplyBudget()
 
     def open_process(self) -> _QQProcessStream:
-        return _QQProcessStream(self._message, self._recall)
+        return _QQProcessStream(self._message)
 
     async def typing(self, seconds: int) -> None:
         await _guarded(self._message.send_typing(seconds=seconds))
@@ -516,13 +498,12 @@ class _QQReplyChannel:
 class _QQProcessStream:
     """过程消息：另一条被动回复的流式消息（`coalesce=False`），符合 `conversation.ReplyStream`。
 
-    撤回用流式消息的 `stream_msg_id`（第一片的响应里给出，各分片相同）。平台是否允许撤回流式消息、2 分钟从哪一片
-    算起都还没有实测；没有拿到 ID（第一片没有成功）时当作说不准，不发撤回请求。
+    pyqbot 实测（`docs/errata.md`）：同一条用户消息可以先后被动回复两条流式消息，两条都正常显示、正常结束；流式
+    消息撤回不了，所以过程消息结束后就留着。
     """
 
-    def __init__(self, message: pyqbot.C2CMessage, recall: Recall) -> None:
+    def __init__(self, message: pyqbot.C2CMessage) -> None:
         self._message = message
-        self._recall = recall
         self._stream: pyqbot.StreamMessage | None = None
 
     async def append(self, text: str) -> None:
@@ -533,12 +514,6 @@ class _QQProcessStream:
     async def finish(self) -> None:
         if self._stream is not None:
             await _guarded(self._stream.finish())
-
-    async def recall(self) -> None:
-        message_id = None if self._stream is None else self._stream.stream_msg_id
-        if message_id is None:
-            raise SendUncertainError("过程消息没有消息 ID，无法撤回")
-        await _guarded(self._recall(self._message.user_openid, message_id))
 
 
 async def _guarded[T](call: Awaitable[T]) -> T:

@@ -169,8 +169,9 @@ class ModelSettings:
             里选。OpenAI 的模型不能声明 `audio`（Responses API 不接受音频）。
         search: 调用时带上服务商内置的联网搜索工具（OpenAI 的 `web_search`，Gemini 的 `google_search`）。
             模型不支持或服务商拒绝时按普通的模型调用失败处理（会换备用模型）。
-        show_process: 把处理过程（调用工具前的说明、搜索进展）以单独的一条消息展示给用户，见 `process.py`。
-            不请求思考摘要（用户 2026-11-19 决定：实测里摘要稀疏且总是英文），服务商仍给了也不展示。
+        show_process: 把处理过程（调用工具前的说明、搜索进展）以单独的一条消息展示给用户，回答之后留着
+            （QQ 的流式消息撤回不了），见 `process.py`。不请求思考摘要（用户 2026-11-19 决定：实测里摘要稀疏
+            且总是英文），服务商仍给了也不展示。
     """
 
     name: str
@@ -183,18 +184,6 @@ class ModelSettings:
     inputs: frozenset[Modality] = frozenset()
     search: bool = False
     show_process: bool = False
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class ProcessSettings:
-    """`[process]` 表：处理过程的展示（展示与否由 `[[models]]` 的 `show_process` 决定）。
-
-    Attributes:
-        recall: 回答送达之后撤回过程消息（平台只允许撤回发出 2 分钟内的消息，超过就留着）；为 `False` 时一直
-            留着。
-    """
-
-    recall: bool = True
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -443,7 +432,6 @@ class Settings:
     describe: DescribeSettings | None = None
     memory: MemorySettings | None = None  # 只在 `decisions` 不为空时生效
     turns: TurnSettings = TurnSettings()
-    process: ProcessSettings = ProcessSettings()
 
     @property
     def default_model(self) -> ModelSettings:
@@ -701,8 +689,6 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
     memory_ok, memory = _parse_memory(table)
     turns_table = table.table("turns")
     turns = None if turns_table is None else _parse_turns(turns_table)
-    process_table = table.table("process")
-    process = None if process_table is None else _parse_process(process_table)
     table.finish()
     if decisions is not None and models is not None and len(models) > MAX_OPTIONS:
         # 每个模型是选模型那道选择题的一个选项，两家接口都最多 255 个。
@@ -727,7 +713,6 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         or not describe_ok
         or not memory_ok
         or turns is None
-        or process is None
     ):
         return None
     return Settings(
@@ -744,16 +729,7 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         describe=describe,
         memory=memory,
         turns=turns,
-        process=process,
     )
-
-
-def _parse_process(table: _Table) -> ProcessSettings | None:
-    recall = table.boolean("recall", True)
-    table.finish()
-    if recall is None:
-        return None
-    return ProcessSettings(recall=recall)
 
 
 def _parse_turns(table: _Table) -> TurnSettings | None:

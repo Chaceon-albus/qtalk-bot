@@ -372,7 +372,7 @@ class Batcher:
                 return  # 都没能写进流水
             if restarts == 0 and len(recorded) > 1:
                 logger.info("用户 %s 的 %d 条消息合成一轮", user.label, len(recorded))
-            # 重来时接上上一次的：被重来的几次的过程消息由最后答完的那一次撤回、存档，上次发「正在输入」的时刻
+            # 重来时接上上一次的：被重来的几次的过程全文由最后答完的那一次存档，上次发「正在输入」的时刻
             # 也接着用。
             control = TurnControl(notify=state.poke, previous=control)
             ids = [item.message_id for item, _ in recorded]

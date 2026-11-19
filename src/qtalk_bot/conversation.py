@@ -50,9 +50,9 @@
 **处理过程**（`process.py`）：模型配置了 `show_process` 时，它调用工具前的说明与搜索进展经
 `process.ProcessPresenter` 写成单独的一条流式消息（经 `ReplyChannel.open_process()`）。过程消息不算「已开始
 显示」（不 `claim()`），所以只显示了过程时插话照常可以重来：被重来的一轮给过程消息写一行「收到补充，重新开始」
-再结束它，它留在 `TurnControl.earlier` 里，由重来的那一轮按同样的规则撤回、存档。回答的第一片交出之前（以及之后
-要发固定说明、纯文本时）结束过程消息；回答送达（含固定说明）之后，第一片发出不久的过程消息按 `[process].recall`
-撤回。过程的全文存进回复行的 `process` 列，不进之后的上下文。每条被回复的消息记下已用的被动回复次数
+再结束它，它留在 `TurnControl.earlier` 里，由重来的那一轮连同自己的过程一起存档。回答的第一片交出之前（以及之后
+要发固定说明、纯文本时）结束过程消息；过程消息之后一直留着：QQ 的流式消息撤回不了（pyqbot `docs/errata.md`
+实测，用户 2026-11-19 决定留着）。过程的全文存进回复行的 `process` 列，不进之后的上下文。每条被回复的消息记下已用的被动回复次数
 （`ReplyChannel.budget`，经本模块的通道包装计数），不够给回答留余量时不发过程消息。思考摘要不展示、不存档。
 
 **「正在输入」像真人一样输一会、停一会**（用户 2026-11-19 决定）：每次只请求 `TYPING_PULSE_SECONDS`，在有进展时
@@ -99,7 +99,7 @@ from zoneinfo import ZoneInfo
 from . import access, citations, faces, journal, texts, topics
 from .access import User
 from .citations import Source
-from .config import AttachmentSettings, ChatSettings, ProcessSettings
+from .config import AttachmentSettings, ChatSettings
 from .context import (
     Built,
     RequestBuilder,
@@ -155,7 +155,6 @@ from .media import (
 )
 from .memory import Summarizer
 from .process import (
-    RECALL_TIMEOUT_SECONDS,
     ProcessEvent,
     ProcessPresenter,
     ProcessSendError,
@@ -222,7 +221,7 @@ class TurnControl:
     - `begin()`：回答一轮的一方从流水里取出这一轮实际带上的用户消息（`included`，含之前遗留的待回复消息）后
       调用，再调用 `notify`。要重来的一方据此判断重来的请求装不装得下新消息，插话判断的输入也用它。
     - `previous`：重来时传入上一次的 `TurnControl`。被重来的几次的过程消息（`earlier`，与上一次共用同一个
-      列表）由最后答完的那一次按规则撤回、连同自己的过程一起存档；上次发「正在输入」的时刻（`typed_at`）也接着
+      列表）由最后答完的那一次连同自己的过程一起存档；上次发「正在输入」的时刻（`typed_at`）也接着
       用，「正在输入」的间隔据此计算。过程消息不算「已开始显示」。
     """
 
@@ -269,10 +268,6 @@ class ReplyStream(Protocol):
         """结束这条流式消息；一片也没发过时什么也不做。"""
         ...
 
-    async def recall(self) -> None:
-        """撤回这条流式消息（平台只允许撤回发出 2 分钟内的）。"""
-        ...
-
 
 class ReplyChannel(Protocol):
     """回复一条消息的几种方式。失败时抛 `SendRejectedError` 或 `SendUncertainError`。
@@ -282,7 +277,7 @@ class ReplyChannel(Protocol):
 
     `stream()`、`finish_stream()`、`send()` 成功时返回发出的那条消息的引用索引（用户引用它时平台带回的索引，
     见 `ChatInput.ref_msg_idx`），平台没有给出时返回 `None`。回答送达后它存进回复行的 `msg_idx`，用户引用
-    机器人的回复时据此定位话题；过程消息会被撤回，不存。
+    机器人的回复时据此定位话题；过程消息不是回答，它的引用索引不存。
     """
 
     @property
@@ -633,7 +628,6 @@ class Conversation:
         describer: Describer | None = None,
         summarizer: Summarizer | None = None,
         steer: SteerJudge | None = None,
-        process: ProcessSettings | None = None,
         clock: Callable[[], float] = time.time,
         timer: Timer | None = None,
         sleep: Sleep = asyncio.sleep,
@@ -644,7 +638,7 @@ class Conversation:
         图片写描述、不给 PDF 写摘要；`summarizer` 为 `None` 时不给话题写标题与摘要（只在分话题时用到）；`steer` 为
         `None` 时不判断插话，一律当作补充。
 
-        `clock` 是写进流水的时间（墙上时钟）；`timer` 与 `sleep` 是过程消息的节流与撤回时限用的单调时钟与等待
+        `clock` 是写进流水的时间（墙上时钟）；`timer` 与 `sleep` 是过程消息的节流与「正在输入」的间隔用的单调时钟与等待
         （默认是事件循环的），测试可以换成可控的。
         """
         self._db = db
@@ -659,7 +653,6 @@ class Conversation:
         self._steer = SteerJudge() if steer is None else steer
         self._timezone = timezone
         self._clock = clock
-        self._process = ProcessSettings() if process is None else process
         self._timer: Timer = timer or (lambda: asyncio.get_running_loop().time())
         self._sleep = sleep
         self._locks = _UserLocks()
@@ -793,7 +786,7 @@ class Conversation:
                 await self._respond(user, answered, channel, TurnControl())
 
     async def drain(self) -> None:
-        """关停时调用：等所有在途的轮次结束（含被取消后的收尾与记账），以及后台的过程消息撤回。"""
+        """关停时调用：等所有在途的轮次结束（含被取消后的收尾与记账）。"""
         while self._in_flight:
             await asyncio.wait(set(self._in_flight))
 
@@ -930,7 +923,7 @@ class Conversation:
         except asyncio.CancelledError as exc:
             if control.preempted:
                 # 插话重来：回答什么都没交给 QQ，不写回复行，消息留给重新开始的那一轮；决策与用量照记。过程
-                # 消息写上收尾的一行后结束，留给重来的那一轮撤回、存档。
+                # 消息写上收尾的一行后结束，全文留给重来的那一轮存档。
                 await self._wind_down(turn, quiet=True, note=texts.PROCESS_RESTART)
                 control.earlier.append(turn.process)
                 await asyncio.shield(self._record_preempted(turn, begun.last_message_id))
@@ -968,8 +961,6 @@ class Conversation:
             self._schedule_descriptions(user, begun)
         if topic_id is not None and self._summarizer is not None:
             self._summarizer.schedule(user, topic_id)
-        if outcome.delivery in _RECALL_AFTER:
-            self._recall_later(user, processes)
 
     async def _acquire(self, user: User, message: ChatInput) -> list[Acquired]:
         if self._fetcher is None:
@@ -1701,37 +1692,6 @@ class Conversation:
         deadline = asyncio.get_running_loop().time() + GRACE_SECONDS
         await _within(turn.process.settle(), deadline, turn.process)
 
-    def _recall_later(self, user: User, processes: Sequence[ProcessPresenter]) -> None:
-        """回答送达之后，在后台撤回这一轮（含被重来的几次）发出过的过程消息，不占这个用户的轮次：用户马上追问时
-        不必等撤回。任务记进 `_in_flight`，由 `drain()` 等待（关停时在关闭 QQ 客户端之前，受同一个总时限约束）；
-        每条撤回最多等 `RECALL_TIMEOUT_SECONDS`。"""
-        shown = [process for process in processes if process.opened]
-        if not shown:
-            return
-        if not self._process.recall:
-            logger.info("用户 %s 的过程消息按配置留着，不撤回", user.label)
-            return
-        task = asyncio.create_task(self._recall(user, shown))
-        self._in_flight.add(task)
-        task.add_done_callback(self._in_flight.discard)
-        task.add_done_callback(_retrieve)
-
-    async def _recall(self, user: User, shown: Sequence[ProcessPresenter]) -> None:
-        """依次撤回：每条在发出撤回之前重新检查时限（前面的撤回可能等了很久），过了时限的留着。失败只记日志。"""
-        for process in shown:
-            if not process.recall_due(self._timer()):
-                logger.info("用户 %s 的一条过程消息发出已久，平台不再允许撤回，留着", user.label)
-                continue
-            try:
-                async with asyncio.timeout(RECALL_TIMEOUT_SECONDS):
-                    await process.recall()
-            except ProcessSendError as exc:
-                logger.warning("没能撤回用户 %s 的过程消息：%s", user.label, exc)
-            except TimeoutError:
-                logger.warning("撤回用户 %s 的过程消息超时", user.label)
-            else:
-                logger.info("撤回了用户 %s 的过程消息", user.label)
-
     async def _wind_down(
         self, turn: _Turn, *, quiet: bool = False, note: str | None = None
     ) -> _Outcome:
@@ -1893,17 +1853,6 @@ def _transcript(processes: Sequence[ProcessPresenter]) -> str | None:
 
 
 _RESTART_MARK = "\n\n（插话重来）\n\n"
-# 回答（或固定说明）送达之后才撤回过程消息；用户什么都没收到时留着，好歹知道处理到了哪一步。
-_RECALL_AFTER = frozenset(
-    (
-        ReplyDelivery.STREAMED,
-        ReplyDelivery.INTERRUPTED,
-        ReplyDelivery.UNCLOSED,
-        ReplyDelivery.PLAIN,
-        ReplyDelivery.REJECTED,
-        ReplyDelivery.FAILED,
-    )
-)
 
 
 def _sources(cited: Sequence[Citation], model: str) -> tuple[Source, ...]:
@@ -2023,12 +1972,6 @@ class _ProcessChannel:
         except SendError as exc:
             raise ProcessSendError(str(exc)) from None
 
-    async def recall(self) -> None:
-        try:
-            await self._stream.recall()
-        except SendError as exc:
-            raise ProcessSendError(str(exc)) from None
-
 
 async def _typing(channel: ReplyChannel, user: User) -> None:
     try:
@@ -2077,8 +2020,8 @@ class _Outbox:
     （`_delivered`）。出现非空白的正文之前不开始流式消息；第一片要等「正在输入」发完再发，交出之前先问
     `may_show`（`TurnControl.claim()`）。
 
-    `ref_idx` 记下通道在成功的分片与结束分片之后报告的引用索引（第一个不为空的为准，平台在哪一片给出还没有
-    实测），回答送达后存进回复行。
+    `ref_idx` 记下通道在成功的分片与结束分片之后报告的引用索引（第一个不为空的为准；pyqbot 实测每个分片的响应
+    都带同一个），回答送达后存进回复行。
 
     没有改用 pyqbot 的 `StreamMessage.sent_text` 记录已送达的内容：本模块不依赖 pyqbot，替身也要同样成立；
     这里仍要自己逐片发送（第一片之前的 `claim()`、送达不明时立即停读），还要把回答与接在后面的固定说明分开

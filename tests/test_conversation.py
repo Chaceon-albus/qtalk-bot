@@ -235,9 +235,6 @@ class FakeChannel:
         self.budget = ReplyBudget()
         self.processes: list[FakeProcess] = []  # 开过的过程消息
         self.process_failure: Failure = never  # 过程消息的某一片是否失败
-        self.recall_failure: SendError | None = None
-        self.recall_gate: asyncio.Event | None = None  # 不为空时撤回要等它置位才完成
-        self.on_recall: Action | None = None  # 不为空时每次撤回之前调用（模拟撤回期间时间流逝）
         self.process_gate: Callable[[str], asyncio.Event | None] = lambda _: None
 
     def open_process(self) -> FakeProcess:
@@ -309,11 +306,10 @@ class FakeChannel:
 
 
 class FakeProcess:
-    """过程消息的替身：发出的片、结束与撤回都记进所属通道的 `log`（`process`、`process_finish`、`recall`）。"""
+    """过程消息的替身：发出的片与结束都记进所属通道的 `log`（`process`、`process_finish`）。"""
 
     def __init__(self, channel: FakeChannel) -> None:
         self.channel = channel
-        self.recalled = False
 
     async def append(self, text: str) -> None:
         await asyncio.sleep(0)
@@ -326,17 +322,6 @@ class FakeProcess:
     async def finish(self) -> None:
         await asyncio.sleep(0)
         self.channel.log.append(("process_finish", ""))
-
-    async def recall(self) -> None:
-        await asyncio.sleep(0)
-        if self.channel.on_recall is not None:
-            await self.channel.on_recall()
-        if self.channel.recall_gate is not None:
-            await self.channel.recall_gate.wait()
-        if self.channel.recall_failure is not None:
-            raise self.channel.recall_failure
-        self.recalled = True
-        self.channel.log.append(("recall", ""))
 
 
 def reject_if(marker: str) -> Failure:

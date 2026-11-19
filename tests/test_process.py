@@ -1,4 +1,4 @@
-"""处理过程的展示（`process.py`）：步骤短句的提取与截断、合并与节流、结束与撤回的时机、被动回复次数的预算。
+"""处理过程的展示（`process.py`）：步骤短句的提取与截断、合并与节流、结束的时机、被动回复次数的预算。
 不碰网络，过程消息用替身，时钟可控。"""
 
 import asyncio
@@ -13,8 +13,6 @@ from qtalk_bot.process import (
     MAX_STEPS,
     MAX_TYPINGS,
     MIN_UPDATE_SECONDS,
-    RECALL_MARGIN_SECONDS,
-    RECALL_WINDOW_SECONDS,
     ProcessNotes,
     ProcessPresenter,
     ProcessSendError,
@@ -175,12 +173,11 @@ def test_render_puts_each_step_in_its_own_quote_paragraph() -> None:
 
 
 class FakeStream:
-    """过程消息的替身：记下发出的片、结束与撤回。`gate` 不为空时每片要等它置位。"""
+    """过程消息的替身：记下发出的片与结束。`gate` 不为空时每片要等它置位。"""
 
     def __init__(self, *, fail: bool = False) -> None:
         self.chunks: list[str] = []
         self.finished = 0
-        self.recalled = 0
         self.fail = fail
         self.gate: asyncio.Event | None = None
         self.sending = asyncio.Event()
@@ -197,10 +194,6 @@ class FakeStream:
     async def finish(self) -> None:
         await asyncio.sleep(0)
         self.finished += 1
-
-    async def recall(self) -> None:
-        await asyncio.sleep(0)
-        self.recalled += 1
 
 
 class Opener:
@@ -337,21 +330,6 @@ async def test_conclude_writes_the_restart_line_only_when_something_was_shown() 
     async with asyncio.timeout(HANG_GUARD):
         await quiet.conclude("收到补充，重新开始")
     assert opener.calls == 0
-
-
-async def test_recall_window() -> None:
-    clock = ManualClock()
-    stream = FakeStream()
-    shown, _ = presenter(clock, stream)
-    assert not shown.recall_due(0)  # 没发过
-    await clock.advance_to(10)
-    shown.feed(SearchProgress("s", STARTED), show=True)
-    await settle()
-    limit = RECALL_WINDOW_SECONDS - RECALL_MARGIN_SECONDS
-    assert shown.recall_due(10 + limit - 0.1)
-    assert not shown.recall_due(10 + limit)
-    await shown.recall()
-    assert stream.recalled == 1
 
 
 async def test_send_failure_only_stops_the_process(caplog: pytest.LogCaptureFixture) -> None:

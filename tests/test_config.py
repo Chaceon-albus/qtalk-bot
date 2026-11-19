@@ -19,7 +19,6 @@ from qtalk_bot.config import (
     InviteSettings,
     MemorySettings,
     ModelSettings,
-    ProcessSettings,
     ProviderSettings,
     ProvidersSettings,
     QQSettings,
@@ -731,15 +730,10 @@ def test_invalid_show_process(tmp_path: Path) -> None:
     )
 
 
-def test_process_recall_defaults_to_true(tmp_path: Path) -> None:
-    assert load_settings(write_config(tmp_path, "")).process == ProcessSettings(recall=True)
-    off = load_settings(write_config(tmp_path, "[process]\nrecall = false\n"))
-    assert off.process == ProcessSettings(recall=False)
-
-
-def test_invalid_process_table(tmp_path: Path) -> None:
-    error = config_error(write_config(tmp_path, '[process]\nrecall = "no"\nfold = true\n'))
-    assert error.problems == ("process.recall：应为布尔值，实际是字符串", "process.fold：未知的键")
+def test_process_table_was_removed(tmp_path: Path) -> None:
+    # 过程消息不再撤回（QQ 的流式消息撤回不了），`[process]` 表连同 `recall` 一起去掉：出现时按未知的表报错。
+    error = config_error(write_config(tmp_path, "[process]\nrecall = true\n"))
+    assert error.problems == ("process：未知的键",)
 
 
 # ---- [providers]（需求 18） ----

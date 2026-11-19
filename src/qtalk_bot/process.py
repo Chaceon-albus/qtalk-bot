@@ -23,9 +23,8 @@
 期间的变化合成一片。回答开始显示时（`make_way()` / `seal()`）结束过程消息：没发出的步骤丢掉，发出结束分片，
 之后的说明与搜索不再展示。插话重来时（`conclude()`）先写一行「收到补充，重新开始」再结束。
 
-**撤回**：回答送达之后，过程消息的第一片发出（交给通道）还不到 `RECALL_WINDOW_SECONDS - RECALL_MARGIN_SECONDS`
-秒、并且配置允许时撤回它（`recall_due()`），相当于折叠；平台只允许撤回 2 分钟内的消息，超过就留着。从第一片
-算起是因为还没有实测过 2 分钟从哪一片算起，这样最保守。撤回失败只记日志。
+**留着**：过程消息结束之后一直留着，不撤回。QQ 的流式消息撤回不了：pyqbot 实测（`docs/errata.md`）传
+`stream_msg_id` 报 40061001、传 `ref_idx` 报 40011002，都在发出后两分钟内；用户 2026-11-19 决定留着。
 
 **存档**：过程的全文（说明的原文、每次搜索的查询词，含回答开始之后的）由 `ProcessNotes.transcript()`
 给出，存进回复行，只供排查，不进之后的上下文。
@@ -58,15 +57,6 @@ MAX_STEPS = 12
 
 MIN_UPDATE_SECONDS = 2.0
 """过程消息两次更新之间的最短间隔（秒），期间的变化合成一片。"""
-
-RECALL_WINDOW_SECONDS = 120.0
-"""平台允许撤回的时限：消息发出 2 分钟内。"""
-
-RECALL_MARGIN_SECONDS = 15.0
-"""撤回时给时限留的余量：本地计时与平台的计时有出入，撤回请求本身也要时间。"""
-
-RECALL_TIMEOUT_SECONDS = 10.0
-"""撤回过程消息最多等这么久，超时就放弃（只记日志）。"""
 
 MAX_PASSIVE_REPLIES = 4
 """同一条消息最多被动回复几条（官方文档的说法；「正在输入」不算）。"""
@@ -343,7 +333,7 @@ class ProcessNotes:
 
 
 class ProcessSendError(Exception):
-    """过程消息没能发出（或撤回）。文案已脱敏（不含 openid 与正文）。"""
+    """过程消息没能发出。文案已脱敏（不含 openid 与正文）。"""
 
 
 class ProcessStream(Protocol):
@@ -357,10 +347,6 @@ class ProcessStream(Protocol):
         """结束这条消息。"""
         ...
 
-    async def recall(self) -> None:
-        """撤回这条消息。"""
-        ...
-
 
 def render(lines: list[str], *, first: bool) -> str:
     """把几步写成过程消息的一片：每步一段引用（段与段之间是只有 `>` 的一行，免得被并成一段）。"""
@@ -369,7 +355,7 @@ def render(lines: list[str], *, first: bool) -> str:
 
 
 class ProcessPresenter:
-    """一轮回答的过程消息：收事件（`feed()`）、节流地发出步骤、回答开始时结束它，回答送达后由调用方决定撤回。
+    """一轮回答的过程消息：收事件（`feed()`）、节流地发出步骤、回答开始时结束它；之后一直留着。
 
     `open_stream` 在要发第一片时调用，返回 `None` 表示不发过程消息（被动回复的次数不够、这一轮已被插话重来）。
     `before_first` 是第一片之前要等完的事（「正在输入」发完）。发送失败只记日志，过程消息就此停下，不影响回答。
@@ -447,18 +433,6 @@ class ProcessPresenter:
         """等后台的结束分片发完（调用方负责限时）。"""
         if self._finishing is not None:
             await asyncio.shield(self._finishing)
-
-    def recall_due(self, now: float) -> bool:
-        """现在撤回还来得及：第一片交出不到 `RECALL_WINDOW_SECONDS - RECALL_MARGIN_SECONDS` 秒。"""
-        return (
-            self.opened_at is not None
-            and now - self.opened_at < RECALL_WINDOW_SECONDS - RECALL_MARGIN_SECONDS
-        )
-
-    async def recall(self) -> None:
-        """撤回过程消息。没有发过时什么也不做；失败照常抛出，由调用方记日志。"""
-        if self._stream is not None:
-            await self._stream.recall()
 
     def cancel(self) -> None:
         """出了意外：直接取消后台任务。"""

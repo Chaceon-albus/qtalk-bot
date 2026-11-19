@@ -20,7 +20,6 @@ from .batching import Batcher
 from .bot import (
     AdminAlertSender,
     Handlers,
-    MessageRecaller,
     QQChat,
     QQDownloader,
     ShareLinks,
@@ -154,10 +153,9 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                     describer=describer,
                     summarizer=summarizer,
                     steer=SteerJudge(settings.decisions, models.decider),
-                    process=settings.process,
                 )
                 batcher = Batcher(conversation, settings.turns)
-                chat = QQChat(batcher, recall=MessageRecaller(bot))
+                chat = QQChat(batcher)
             handlers = register(bot, gate, chat, hosts=hosts)
             cleanup = asyncio.create_task(run_cleanup(db, store, settings.attachments))
             logger.info("机器人启动")

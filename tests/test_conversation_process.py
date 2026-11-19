@@ -1,4 +1,4 @@
-"""一轮对话里的处理过程（里程碑 7b）：过程消息的展示、结束、撤回、存档，与插话、被动回复次数的衔接。
+"""一轮对话里的处理过程（里程碑 7b）：过程消息的展示、结束（之后留着）、存档，与插话、被动回复次数的衔接。
 
 不碰网络：模型、回复通道与插话判断都用 `test_conversation.py` 的替身，数据库是真的，时钟可控。
 """
@@ -49,7 +49,6 @@ from qtalk_bot.config import (
     ChatSettings,
     DecisionSettings,
     ModelSettings,
-    ProcessSettings,
 )
 from qtalk_bot.conversation import Conversation, SendRejectedError
 from qtalk_bot.llm import (
@@ -64,8 +63,6 @@ from qtalk_bot.llm import (
 )
 from qtalk_bot.process import (
     MIN_UPDATE_SECONDS,
-    RECALL_MARGIN_SECONDS,
-    RECALL_WINDOW_SECONDS,
     ReplyBudget,
 )
 from qtalk_bot.prompt import PREAMBLE_GUIDE, PROCESS_GUIDE
@@ -88,7 +85,6 @@ def process_chat(
     *,
     show: bool = True,
     search: bool = False,
-    recall: bool = True,
     decider: FakeDecider | None = None,
     fallback: ScriptedModel | None = None,
     fallback_show: bool = False,
@@ -128,7 +124,6 @@ def process_chat(
         settings=ChatSettings(),
         timezone=SHANGHAI,
         steer=None if decider is None else SteerJudge(decisions, decider),
-        process=ProcessSettings(recall=recall),
         clock=lambda: START,
         timer=clock,
         sleep=clock.sleep,
@@ -192,10 +187,9 @@ async def run_turn(
     gate.set()
     async with asyncio.timeout(HANG_GUARD):
         await task
-        await chat.drain()  # 撤回在后台
 
 
-async def test_process_is_shown_then_ended_when_the_answer_starts_and_recalled(
+async def test_process_is_shown_then_ended_when_the_answer_starts_and_kept(
     db: Database,
 ) -> None:
     clock = ManualClock()
@@ -210,7 +204,8 @@ async def test_process_is_shown_then_ended_when_the_answer_starts_and_recalled(
     assert kinds[0] == "typing"
     assert kinds.index("process") < kinds.index("stream")  # 过程在前，回答另起一条
     assert kinds.count("process_finish") == 1
-    assert channel.log[-1] == ("recall", "")  # 回答送达之后撤回
+    # 回答之后过程消息留着（QQ 的流式消息撤回不了），通道上没有别的操作。
+    assert set(kinds) == {"typing", "process", "process_finish", "stream", "finish"}
     assert channel.streamed == "今天晴。"  # commentary 不进回答
     # 「正在输入」一次，过程消息与回答各算一条被动回复。
     assert channel.budget == ReplyBudget(typings=1, replies=2)
@@ -321,53 +316,6 @@ async def test_updates_after_the_first_are_throttled(db: Database) -> None:
         await task
 
 
-async def test_process_older_than_the_recall_window_is_kept(
-    db: Database, caplog: pytest.LogCaptureFixture
-) -> None:
-    clock = ManualClock()
-    model = ScriptedModel("main", [])
-    chat = process_chat(db, model, clock)
-    channel = FakeChannel()
-
-    async def late() -> None:
-        await clock.advance_to(RECALL_WINDOW_SECONDS - RECALL_MARGIN_SECONDS)
-
-    with caplog.at_level(logging.INFO):
-        await run_turn(chat, model, channel, await invited(db, ALICE, "小王"), before_answer=late)
-
-    assert "recall" not in channel.kinds
-    assert "process_finish" in channel.kinds
-    assert "平台不再允许撤回" in caplog.text
-
-
-async def test_recall_can_be_turned_off(db: Database) -> None:
-    clock = ManualClock()
-    model = ScriptedModel("main", [])
-    channel = FakeChannel()
-    chat = process_chat(db, model, clock, recall=False)
-    await run_turn(chat, model, channel, await invited(db, ALICE, "小王"))
-    assert channel.process_text == EXPECTED_PROCESS
-    assert "recall" not in channel.kinds
-
-
-async def test_recall_failure_does_not_affect_the_reply(
-    db: Database, caplog: pytest.LogCaptureFixture
-) -> None:
-    clock = ManualClock()
-    model = ScriptedModel("main", [])
-    channel = FakeChannel()
-    channel.recall_failure = SendRejectedError("已超过撤回时限")
-    with caplog.at_level(logging.WARNING):
-        chat = process_chat(db, model, clock)
-        await run_turn(chat, model, channel, await invited(db, ALICE, "小王"))
-    row = await db.fetch_one("SELECT content, delivery FROM messages WHERE role = 'assistant'")
-    assert row is not None
-    assert tuple(row) == ("今天晴。", "streamed")
-    assert "的过程消息：已超过撤回时限" in caplog.text
-    for secret in ("比较两个方案", "上海天气", "秘密"):
-        assert secret not in caplog.text
-
-
 async def test_process_send_failure_does_not_affect_the_reply(db: Database) -> None:
     clock = ManualClock()
     model = ScriptedModel("main", [])
@@ -378,9 +326,7 @@ async def test_process_send_failure_does_not_affect_the_reply(db: Database) -> N
     model.script = steps(gate, reached)
     chat = process_chat(db, model, clock)
     await say(chat, await invited(db, ALICE, "小王"), "天气", channel)
-    await chat.drain()
     assert channel.streamed == "今天晴。"
-    assert "recall" in channel.kinds  # 第一片可能已经到了：照样试着撤回
     row = await db.fetch_one("SELECT delivery FROM messages WHERE role = 'assistant'")
     assert row is not None
     assert row["delivery"] == "streamed"
@@ -430,18 +376,16 @@ async def test_steer_while_only_the_process_is_shown_restarts_with_a_new_process
     await finish(batcher)
     await chat.drain()
 
-    # 旧的过程消息写上收尾的一行后结束，回答送达之后和新的一起撤回。
+    # 旧的过程消息写上收尾的一行后结束，之后和新的一样留着。
     assert first.log == [
         ("typing", ""),
         ("process", "> 想想怎么排序"),
         ("process", "\n>\n> 收到补充，重新开始"),
         ("process_finish", ""),
-        ("recall", ""),
     ]
     assert second.process_text == "> 想想怎么排序"  # 重来的那一轮另起一条
     assert second.streamed == "合起来的回答"
     assert "process_finish" in second.kinds
-    assert second.log[-1] == ("recall", "")
     assert first.budget == ReplyBudget(typings=1, replies=1)
     assert second.budget == ReplyBudget(typings=0, replies=2)  # 刚发过「正在输入」，重来时不再发
     (archived,) = await process_column(db)
@@ -503,63 +447,6 @@ async def test_steer_is_still_possible_while_the_first_process_chunk_is_in_fligh
     assert first.streamed == ""  # 被重来的那次没有发出任何正文
     assert ("process", "\n>\n> 收到补充，重新开始") in first.log
     assert second.streamed == "答案"
-
-
-async def test_recall_runs_in_the_background_and_is_drained(db: Database) -> None:
-    clock = ManualClock()
-    model = ScriptedModel("main", [])
-    chat = process_chat(db, model, clock)
-    channel = FakeChannel()
-    channel.recall_gate = asyncio.Event()  # 撤回一直等不到响应
-
-    gate, reached = asyncio.Event(), asyncio.Event()
-    model.script = steps(gate, reached)
-    alice = await invited(db, ALICE, "小王")
-    task = asyncio.create_task(say(chat, alice, "天气", channel))
-    await wait_for(lambda: bool(channel.process_text))
-    gate.set()
-    async with asyncio.timeout(HANG_GUARD):
-        await task  # 这一轮（这个用户的轮次）不等撤回就结束
-    assert "recall" not in channel.kinds
-    # 下一轮马上就能开始，不被撤回挡住。
-    model.script = answer("再答")
-    await say(chat, alice, "再问", FakeChannel())
-
-    draining = asyncio.create_task(chat.drain())
-    await settle()
-    assert not draining.done()  # 关停时等后台的撤回
-    channel.recall_gate.set()
-    async with asyncio.timeout(HANG_GUARD):
-        await draining
-    assert channel.log[-1] == ("recall", "")
-
-
-async def test_each_recall_rechecks_the_window(db: Database) -> None:
-    alice = await invited(db, ALICE, "小王")
-    clock = ManualClock()
-    gate = asyncio.Event()
-    model = ScriptedModel("main", [Commentary("msg_c#0", "**想想**"), gate, *answer("答")])
-    decider = FakeDecider(steer_result(0.9))
-    chat = process_chat(db, model, clock, decider=decider)
-    batcher = batcher_of(chat, clock)
-    first, second = FakeChannel(), FakeChannel()
-
-    async def slow() -> None:  # 撤回旧的那条时，时间过去了很久
-        await clock.advance_to(RECALL_WINDOW_SECONDS)
-
-    first.on_recall = slow
-    await submit(batcher, alice, message("写个排序"), first)
-    await wait_for(lambda: bool(first.process_text))
-    await submit(batcher, alice, message("用 Python"), second)
-    await started(model, 2)
-    await wait_for(lambda: bool(second.process_text))
-    gate.set()
-    await finish(batcher)
-    async with asyncio.timeout(HANG_GUARD):
-        await chat.drain()
-
-    assert first.log[-1] == ("recall", "")
-    assert "recall" not in second.kinds  # 轮到它时已经过了时限：不发注定被拒的撤回
 
 
 async def test_a_turn_with_only_thoughts_sends_no_process_message(db: Database) -> None:
