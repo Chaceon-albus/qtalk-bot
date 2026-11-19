@@ -18,7 +18,8 @@
   它后面（第一次是「 查询词」，之后是「、新查询词」），之后已经发出过别的内容时另起一行「正在搜索🔍 新查询词」。
   不写「搜索完成」：完成时没有新的查询词就什么也不接。还没发出就完成、又始终没有查询词的动作（OpenAI 的打开网页
   等）整行去掉。每次写出的查询词经 `shorten()` 截断，已经写过的不再写。
-- 与上一行完全相同的不重复写；最多 `MAX_STEPS` 行，之后写一行「……」就不再增加。接在行末的文字不算行。
+- 说明与上一行完全相同时不重复写；搜索不去重，每次搜索各占一行（用户 2026-11-19 决定：不要几次搜索挤在一行里）。
+  最多 `MAX_STEPS` 行，之后写一行「……」就不再增加。接在行末的文字不算行。
 
 **怎么发**（`ProcessPresenter`）：用纯文本的流式消息（`content_type=text`，pyqbot 实测按原文显示）。不用
 Markdown 引用块：流式消息还没结束时客户端把 `>` 原样显示出来，而过程消息要一直开着到回答开始。因此动态内容
@@ -188,6 +189,8 @@ class _Step:
     text: str | None
     line: _Step | None = field(default=None, repr=False)
     """交出之后显示在哪一行：写出时是自己，与上一行相同而没写时是上一行，没写时为 None。"""
+    search: bool = False
+    """一次搜索的一行：不与上一行去重，每次搜索各占一行。"""
     tail: str = ""
     """已经定下、还没交出的、要接在这一行末尾的文字。"""
     queried: bool = False
@@ -259,7 +262,7 @@ class ProcessNotes:
             self._taken += 1
             if not text:
                 continue
-            if text == self._last:
+            if text == self._last and not step.search:
                 step.line = self._line
                 continue
             pieces.append(Piece(text))
@@ -328,6 +331,8 @@ class ProcessNotes:
             self._archive.append(search)
             if display:
                 search.step = self._append(texts.PROCESS_SEARCHING)
+                if search.step is not None:
+                    search.step.search = True
         if event.queries:
             search.queries = event.queries
         step = search.step
@@ -354,6 +359,7 @@ class ProcessNotes:
             # 这一行之后已经发出过别的内容：另起一行。
             fallback = self._append(_searching(fresh))
             if fallback is not None:
+                fallback.search = True
                 fallback.queried = True
                 search.step = fallback
                 search.before = set(search.displayed)

@@ -181,14 +181,29 @@ def test_unsent_search_without_queries_is_dropped() -> None:
     assert notes.take() == [Piece("先打开网页"), Piece("再找找关键字")]
 
 
-def test_identical_consecutive_lines_share_the_line() -> None:
+def test_each_search_gets_its_own_line() -> None:
+    # 每次搜索各占一行，不因与上一行相同而合并（用户 2026-11-19 决定）。
     notes = ProcessNotes()
     notes.add(SearchProgress("a", STARTED))
+    notes.add(SearchProgress("a", COMPLETED))  # 已发出前完成、没有查询词：整行去掉
     notes.add(SearchProgress("b", STARTED))
-    assert notes.take() == [Piece("正在搜索🔍")]  # 与上一行相同：不重复写
-    notes.add(SearchProgress("b", COMPLETED, ("上海天气",)))
-    notes.add(SearchProgress("a", COMPLETED, ("北京天气",)))
-    assert render(notes.take(), first=False) == " 上海天气、北京天气"
+    assert notes.take() == [Piece("正在搜索🔍")]
+    notes.add(SearchProgress("b", COMPLETED))  # 打开网页等：这一行已发出，留着「正在搜索🔍」
+    notes.add(SearchProgress("c", STARTED))
+    assert notes.take() == [Piece("正在搜索🔍")]  # 与上一行相同，照样另起一行
+    notes.add(SearchProgress("c", COMPLETED, ("上海天气",)))
+    assert notes.take() == [joined(" 上海天气")]  # 接在自己那一行后面，不接到前一行
+    notes.add(SearchProgress("d", STARTED, ("北京天气",)))
+    notes.add(SearchProgress("e", STARTED, ("北京天气",)))
+    assert notes.take() == [Piece("正在搜索🔍 北京天气"), Piece("正在搜索🔍 北京天气")]
+
+
+def test_identical_consecutive_comments_are_written_once() -> None:
+    notes = ProcessNotes()
+    notes.add(comment("m#0", "先查天气。"))
+    notes.add(comment("m#1", "先查天气。"))
+    notes.add(comment("m#2", "再查风力。"))
+    assert notes.take() == [Piece("先查天气"), Piece("再查风力")]
 
 
 def test_step_limit_counts_lines_only() -> None:
