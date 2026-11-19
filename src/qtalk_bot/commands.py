@@ -206,6 +206,8 @@ def _usage(conn: sqlite3.Connection, context: CommandContext, now: int) -> str |
             total=(s.total_calls, s.total_input, s.total_output, s.total_unreported),
             today_decisions=(s.today_decision_calls, s.today_decision_input),
             total_decisions=(s.total_decision_calls, s.total_decision_input),
+            today_searches=s.today_searches,
+            total_searches=s.total_searches,
         )
         for s in summaries
     ]

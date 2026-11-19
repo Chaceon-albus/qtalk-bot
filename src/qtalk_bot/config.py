@@ -150,6 +150,8 @@ class ModelSettings:
             配置了 `[decisions]` 且模型多于一个时必填，否则可以不写（写了也不用）。
         inputs: 文字之外这个模型能直接接收的输入；空集表示只接收文字。带附件的消息只在能处理它们的模型
             里选。OpenAI 的模型不能声明 `audio`（Responses API 不接受音频）。
+        search: 调用时带上服务商内置的联网搜索工具（OpenAI 的 `web_search`，Gemini 的 `google_search`）。
+            模型不支持或服务商拒绝时按普通的模型调用失败处理（会换备用模型）。
     """
 
     name: str
@@ -160,6 +162,7 @@ class ModelSettings:
     reasoning: str | None = None
     description: str | None = None
     inputs: frozenset[Modality] = frozenset()
+    search: bool = False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -963,6 +966,7 @@ class _ModelDraft:
     reasoning: str | None
     description: str | None
     inputs: frozenset[Modality]
+    search: bool | None
     ok: bool  # 这一项自身没有问题
 
 
@@ -1011,6 +1015,7 @@ def _parse_models(root: _Table) -> tuple[ModelSettings, ...] | None:
             reasoning=d.reasoning,
             description=d.description,
             inputs=d.inputs,
+            search=cast(bool, d.search),
         )
         for d in drafts
     )
@@ -1037,6 +1042,7 @@ def _parse_model(table: _Table) -> _ModelDraft:
         description = table.required_string("description")
         description_ok = description is not None
     inputs = _parse_inputs(table, provider)
+    search = table.boolean("search", False)
     table.finish()
     ok = (
         name is not None
@@ -1047,6 +1053,7 @@ def _parse_model(table: _Table) -> _ModelDraft:
         and reasoning_ok
         and description_ok
         and inputs is not None
+        and search is not None
     )
     return _ModelDraft(
         table=table,
@@ -1059,6 +1066,7 @@ def _parse_model(table: _Table) -> _ModelDraft:
         reasoning=reasoning,
         description=description,
         inputs=inputs or frozenset(),
+        search=search,
         ok=ok,
     )
 

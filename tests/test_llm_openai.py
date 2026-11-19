@@ -20,6 +20,7 @@ from qtalk_bot.llm import (
     AudioPart,
     ChatEvent,
     ChatRequest,
+    Citation,
     ErrorKind,
     FilePart,
     Finished,
@@ -30,6 +31,8 @@ from qtalk_bot.llm import (
     Part,
     Provider,
     Role,
+    SearchProgress,
+    SearchStage,
     TextDelta,
     TextPart,
     Usage,
@@ -152,10 +155,10 @@ def streaming(events: list[Payload]) -> Server:
     )
 
 
-def model_on(server: Server, *, max_retries: int = 0) -> OpenAIChatModel:
+def model_on(server: Server, *, max_retries: int = 0, search: bool = False) -> OpenAIChatModel:
     http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(server.handle))
     client = openai.AsyncOpenAI(api_key=FAKE_KEY, http_client=http_client, max_retries=max_retries)
-    return OpenAIChatModel(client, name="main", model="gpt-fake")
+    return OpenAIChatModel(client, name="main", model="gpt-fake", search=search)
 
 
 async def collect(model: OpenAIChatModel) -> list[ChatEvent]:
@@ -598,3 +601,481 @@ async def test_unsupported_input_fails_without_a_request(part: Part) -> None:
 
     assert info.value.kind is ErrorKind.UNSUPPORTED
     assert server.requests == []
+
+
+# ---- 联网搜索 ----
+# 事件与输出项的形状照 SDK 的 `response_web_search_call_*_event.py`、`response_function_web_search.py`、
+# `response_output_text_annotation_added_event.py` 与官方的搜索工具文档。
+
+WEB_SEARCH_TOOL = {"type": "web_search", "user_location": {"type": "approximate"}}
+SHANGHAI = "https://weather.example.cn/shanghai?src=openai"
+CALENDAR = "https://calendar.example.com/today"
+
+
+def search_event(kind: str, seq: int, item_id: str, output_index: int) -> Payload:
+    return {
+        "type": f"response.web_search_call.{kind}",
+        "sequence_number": seq,
+        "item_id": item_id,
+        "output_index": output_index,
+    }
+
+
+def search_item(item_id: str, action: Payload, status: str = "completed") -> Payload:
+    return {"id": item_id, "type": "web_search_call", "status": status, "action": action}
+
+
+def item_event(kind: str, seq: int, output_index: int, item: Payload) -> Payload:
+    return {
+        "type": f"response.output_item.{kind}",
+        "sequence_number": seq,
+        "output_index": output_index,
+        "item": item,
+    }
+
+
+def url_citation(url: str, title: str, start: int = 0, end: int = 2) -> Payload:
+    return {
+        "type": "url_citation",
+        "start_index": start,
+        "end_index": end,
+        "url": url,
+        "title": title,
+    }
+
+
+def annotation_added(seq: int, index: int, annotation: Payload | None) -> Payload:
+    return {
+        "type": "response.output_text.annotation.added",
+        "sequence_number": seq,
+        "item_id": "msg_fake",
+        "output_index": 2,
+        "content_index": 0,
+        "annotation_index": index,
+        "annotation": annotation,
+    }
+
+
+SEARCH_ACTION: Payload = {
+    "type": "search",
+    "query": "上海 天气",
+    "queries": ["上海 天气", "今天 日期", "  "],
+    "sources": [{"type": "url", "url": SHANGHAI}],
+}
+OPEN_PAGE_ACTION: Payload = {"type": "open_page", "url": SHANGHAI}
+
+SEARCH_STREAM: list[Payload] = [
+    CREATED,
+    item_event("added", 1, 0, search_item("ws_1", {"type": "search"}, "in_progress")),
+    search_event("in_progress", 2, "ws_1", 0),
+    search_event("searching", 3, "ws_1", 0),
+    search_event("completed", 4, "ws_1", 0),
+    item_event("done", 5, 0, search_item("ws_1", SEARCH_ACTION)),
+    search_event("in_progress", 6, "ws_2", 1),
+    search_event("completed", 7, "ws_2", 1),
+    item_event("done", 8, 1, search_item("ws_2", OPEN_PAGE_ACTION)),
+    {**ITEM_ADDED, "sequence_number": 9, "output_index": 2},
+    {**text_delta(10, "今天晴。"), "output_index": 2},
+    annotation_added(11, 0, url_citation(SHANGHAI, "上海天气")),
+    annotation_added(12, 1, url_citation(SHANGHAI, "上海天气")),  # 同一个来源再引一次
+    annotation_added(13, 2, {"type": "file_citation", "file_id": "f", "filename": "a", "index": 0}),
+    annotation_added(14, 3, None),
+    item_event(
+        "done",
+        15,
+        2,
+        {
+            "id": "msg_fake",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "phase": "final_answer",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "今天晴。",
+                    "annotations": [
+                        url_citation(SHANGHAI, "上海天气"),
+                        url_citation(CALENDAR, "日历", 2, 4),
+                    ],
+                    "logprobs": [],
+                }
+            ],
+        },
+    ),
+    {
+        "type": "response.completed",
+        "sequence_number": 16,
+        "response": response("completed", usage=usage(900, 40)),
+    },
+]
+
+
+async def test_search_tool_progress_citations_and_count() -> None:
+    server = streaming(SEARCH_STREAM)
+
+    events = await collect(model_on(server, search=True))
+
+    assert server.body["tools"] == [WEB_SEARCH_TOOL]
+    assert events == [
+        SearchProgress("ws_1", SearchStage.STARTED),
+        Usage(None, None, 1),  # 确认搜索完成就交出次数，被打断时也不丢
+        SearchProgress("ws_1", SearchStage.COMPLETED, ("上海 天气", "今天 日期")),  # 不重复计
+        SearchProgress("ws_2", SearchStage.STARTED),
+        SearchProgress("ws_2", SearchStage.COMPLETED),  # 打开网页：没有查询词，不计费
+        TextDelta("今天晴。"),
+        Citation(SHANGHAI, "上海天气"),
+        Citation(CALENDAR, "日历"),  # 输出项完成时才出现的标注也算，给过的不重复
+        Usage(900, 40, 1),
+        DONE,
+    ]
+
+
+def test_queries_are_hidden_from_repr() -> None:
+    progress = SearchProgress("ws_1", SearchStage.COMPLETED, (SECRET_TEXT,))
+    citation = Citation(f"https://example.com/{SECRET_TEXT}", SECRET_TEXT)
+    assert SECRET_TEXT not in repr(progress)
+    assert SECRET_TEXT not in repr(citation)
+
+
+async def test_search_without_start_event_and_without_action() -> None:
+    # 文档说 `action` 可以没有；也没收到 in_progress：补上开始，不计费。
+    item = {"id": "ws_9", "type": "web_search_call", "status": "completed"}
+    server = streaming([CREATED, item_event("done", 1, 0, item), COMPLETED])
+
+    events = await collect(model_on(server, search=True))
+
+    assert events[:2] == [
+        SearchProgress("ws_9", SearchStage.STARTED),
+        SearchProgress("ws_9", SearchStage.COMPLETED),
+    ]
+    assert events[-2] == Usage(1, 1, 0)  # 带了搜索工具、没有计费的搜索：0 次
+
+
+async def test_searches_before_an_interruption_are_reported() -> None:
+    server = streaming(SEARCH_STREAM[:6])  # 第一次搜索完成后流就断了
+
+    events, error = await failure(model_on(server, search=True))
+
+    assert error.kind is ErrorKind.MALFORMED
+    assert Usage(None, None, 1) in events
+
+
+async def test_no_search_tool_when_disabled() -> None:
+    server = streaming([CREATED, COMPLETED])
+
+    events = await collect(model_on(server))
+
+    assert "tools" not in server.body
+    assert events[-2] == Usage(1, 1, None)  # 没带搜索工具：搜索次数是空，不是 0
+
+
+async def test_search_rejected_by_the_provider_is_an_ordinary_failure() -> None:
+    server = Server(lambda _: httpx2.Response(400, json={"error": {"message": "no tools"}}))
+
+    _, error = await failure(model_on(server, search=True))
+
+    assert error.kind is ErrorKind.BAD_REQUEST
+    assert error.status_code == 400
+
+
+async def test_search_is_counted_as_soon_as_its_completion_is_confirmed() -> None:
+    # output_item.added 已给出 action 为 search，web_search_call.completed 之后、output_item.done 之前断流。
+    server = streaming(SEARCH_STREAM[:5])
+
+    events, error = await failure(model_on(server, search=True))
+
+    assert error.kind is ErrorKind.MALFORMED
+    assert events == [SearchProgress("ws_1", SearchStage.STARTED), Usage(None, None, 1)]
+
+
+async def test_completion_of_an_unknown_or_non_search_action_waits_for_the_item() -> None:
+    server = streaming(
+        [
+            CREATED,
+            item_event("added", 1, 0, search_item("ws_2", OPEN_PAGE_ACTION, "in_progress")),
+            search_event("completed", 2, "ws_2", 0),
+            search_event("completed", 3, "ws_3", 1),  # 没见过 added：不知道动作
+            item_event("done", 4, 1, search_item("ws_3", SEARCH_ACTION)),
+            COMPLETED,
+        ]
+    )
+
+    events = await collect(model_on(server, search=True))
+
+    usages = [event for event in events if isinstance(event, Usage)]
+    assert usages == [Usage(None, None, 1), Usage(1, 1, 1)]  # 只有 ws_3，在 done 时计
+
+
+def content_part_done(seq: int, *annotations: Payload) -> Payload:
+    return {
+        "type": "response.content_part.done",
+        "sequence_number": seq,
+        "item_id": "msg_fake",
+        "output_index": 0,
+        "content_index": 0,
+        "part": {
+            "type": "output_text",
+            "text": "今天晴。",
+            "annotations": list(annotations),
+            "logprobs": [],
+        },
+    }
+
+
+def message_item(*annotations: Payload) -> Payload:
+    return {
+        "id": "msg_fake",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [
+            {
+                "type": "output_text",
+                "text": "今天晴。",
+                "annotations": list(annotations),
+                "logprobs": [],
+            }
+        ],
+    }
+
+
+async def test_citations_from_the_content_part_done_frame_before_a_break() -> None:
+    server = streaming(
+        [
+            CREATED,
+            ITEM_ADDED,
+            text_delta(3, "今天晴。"),
+            content_part_done(4, url_citation(SHANGHAI, "上海天气")),
+        ]
+    )
+
+    events, _ = await failure(model_on(server, search=True))
+
+    assert events == [TextDelta("今天晴。"), Citation(SHANGHAI, "上海天气")]
+
+
+@pytest.mark.parametrize("kind", ["completed", "incomplete"])
+async def test_citations_and_searches_from_the_final_snapshot(kind: str) -> None:
+    output = [
+        search_item("ws_1", SEARCH_ACTION),
+        message_item(url_citation(SHANGHAI, "上海天气"), url_citation(CALENDAR, "日历")),
+    ]
+    extra: Payload = {"output": output, "usage": usage(9, 8)}
+    if kind == "incomplete":
+        extra["incomplete_details"] = {"reason": "max_output_tokens"}
+    server = streaming(
+        [
+            CREATED,
+            ITEM_ADDED,
+            text_delta(3, "今天晴。"),
+            content_part_done(4, url_citation(SHANGHAI, "上海天气")),
+            {"type": f"response.{kind}", "sequence_number": 5, "response": response(kind, **extra)},
+        ]
+    )
+
+    events = await collect(model_on(server, search=True))
+
+    assert events[:4] == [
+        TextDelta("今天晴。"),
+        Citation(SHANGHAI, "上海天气"),
+        Citation(CALENDAR, "日历"),  # 只在快照里的引用；给过的不重复
+        Usage(9, 8, 1),  # 快照里补上了流中没见到完成的搜索
+    ]
+
+
+async def test_failed_response_snapshot_still_reports_the_searches() -> None:
+    failed = response(
+        "failed", output=[search_item("ws_1", SEARCH_ACTION)], error={"code": "x", "message": "m"}
+    )
+    server = streaming(
+        [CREATED, {"type": "response.failed", "sequence_number": 1, "response": failed}]
+    )
+
+    events, error = await failure(model_on(server, search=True))
+
+    assert error.kind is ErrorKind.FAILED
+    assert events == [Usage(None, None, 1)]
+
+
+# ---- 终审：畸形字段、代理码位、沿用已知动作、引用对应已输出的正文 ----
+
+
+def message_with(item_id: str, content: object) -> Payload:
+    return {
+        "id": item_id,
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": content,
+    }
+
+
+def output_text(value: str, *annotations: Payload) -> Payload:
+    return {"type": "output_text", "text": value, "annotations": list(annotations)}
+
+
+def delta_of(seq: int, item_id: str, value: str) -> Payload:
+    return {**text_delta(seq, value), "item_id": item_id}
+
+
+def part_done(seq: int, item_id: str, value: str, annotations: object) -> Payload:
+    return {
+        "type": "response.content_part.done",
+        "sequence_number": seq,
+        "item_id": item_id,
+        "output_index": 1,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": value, "annotations": annotations, "logprobs": []},
+    }
+
+
+def final(*output: Payload) -> Payload:
+    return {
+        "type": "response.completed",
+        "sequence_number": 99,
+        "response": response("completed", output=list(output), usage=usage(7, 6)),
+    }
+
+
+async def test_malformed_extras_are_skipped_and_the_usage_of_the_frame_is_kept() -> None:
+    server = streaming(
+        [
+            CREATED,
+            text_delta(1, "今天晴。"),
+            part_done(2, "msg_fake", "今天晴。", 5),  # annotations 不是列表
+            final(
+                message_with(
+                    "msg_fake", [{"type": "output_text", "text": "今天晴。", "annotations": 7}]
+                ),
+                message_with("msg_other", 3),  # content 不是列表
+                {"id": "ws_x", "type": "web_search_call", "status": "completed", "action": 9},
+            ),
+        ]
+    )
+
+    events = await collect(model_on(server, search=True))
+
+    assert events == [TextDelta("今天晴。"), Usage(7, 6, 0), DONE]
+
+
+async def test_lone_surrogates_are_removed_from_streamed_and_patched_text() -> None:
+    server = streaming(
+        [
+            CREATED,
+            delta_of(1, "msg_a", "晴\ud800天"),
+            final(message_with("msg_b", [output_text("补\udc00发")])),
+        ]
+    )
+
+    events = await collect(model_on(server))
+
+    assert events[:2] == [TextDelta("晴天"), TextDelta("补发")]
+
+
+async def test_failed_search_keeps_the_action_known_from_the_added_item() -> None:
+    no_action = {"id": "ws_1", "type": "web_search_call", "status": "failed"}
+    server = streaming(
+        [
+            CREATED,
+            item_event("added", 1, 0, search_item("ws_1", {"type": "search"}, "in_progress")),
+            search_event("in_progress", 2, "ws_1", 0),
+            item_event("done", 3, 0, no_action),  # 失败，没有 completed，done 省略了 action
+            {
+                "type": "response.completed",
+                "sequence_number": 4,
+                "response": response("completed", output=[no_action], usage=usage(1, 1)),
+            },
+        ]
+    )
+
+    events = await collect(model_on(server, search=True))
+
+    usages = [event for event in events if isinstance(event, Usage)]
+    assert usages == [Usage(None, None, 1), Usage(1, 1, 1)]  # 按 ID 去重，快照里不再计
+
+
+async def test_failed_snapshot_keeps_the_known_action() -> None:
+    no_action = {"id": "ws_1", "type": "web_search_call", "status": "failed"}
+    failed = response("failed", output=[no_action], error={"code": "x", "message": "m"})
+    server = streaming(
+        [
+            CREATED,
+            item_event("added", 1, 0, search_item("ws_1", {"type": "search"}, "in_progress")),
+            {"type": "response.failed", "sequence_number": 2, "response": failed},
+        ]
+    )
+
+    events, _ = await failure(model_on(server, search=True))
+
+    assert events == [Usage(None, None, 1)]
+
+
+async def test_citations_belong_to_the_message_whose_text_was_output() -> None:
+    server = streaming(
+        [
+            CREATED,
+            delta_of(1, "msg_a", "我先查一下。"),
+            annotation_added(2, 0, url_citation(CALENDAR, "日历")),  # 属于 msg_fake，还没有正文
+            part_done(3, "msg_a", "别的内容", [url_citation(SHANGHAI, "上海天气")]),  # 对不上
+            part_done(4, "msg_b", "答案。", [url_citation(SHANGHAI, "上海天气")]),  # 只有结束帧
+        ]
+    )
+
+    events, _ = await failure(model_on(server, search=True))
+
+    assert events == [
+        TextDelta("我先查一下。"),
+        TextDelta("答案。"),  # 从没有增量的块整段补发
+        Citation(SHANGHAI, "上海天气"),  # 对应补发的正文，不挂在「我先查一下」后面
+    ]
+
+
+async def test_pending_annotation_is_released_when_its_text_appears() -> None:
+    server = streaming(
+        [
+            CREATED,
+            annotation_added(1, 0, url_citation(SHANGHAI, "上海天气")),
+            {**text_delta(2, "今天晴。"), "output_index": 2},
+            COMPLETED,
+        ]
+    )
+
+    events = await collect(model_on(server, search=True))
+
+    assert events[:2] == [TextDelta("今天晴。"), Citation(SHANGHAI, "上海天气")]
+
+
+async def test_snapshot_only_message_is_sent_once_with_its_citations() -> None:
+    server = streaming(
+        [
+            CREATED,
+            delta_of(1, "msg_a", "我先查一下。"),
+            part_done(2, "msg_a", "我先查一下。", []),
+            final(
+                message_with("msg_a", [output_text("我先查一下。")]),
+                message_with(
+                    "msg_b",
+                    [
+                        {
+                            "type": "output_text",
+                            "text": "答案。",
+                            "annotations": [url_citation(SHANGHAI, "上海天气")],
+                        }
+                    ],
+                ),
+            ),
+        ]
+    )
+
+    events = await collect(model_on(server, search=True))
+
+    assert events == [
+        TextDelta("我先查一下。"),
+        TextDelta("答案。"),
+        Citation(SHANGHAI, "上海天气"),
+        Usage(7, 6, 0),
+        DONE,
+    ]

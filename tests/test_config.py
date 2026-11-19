@@ -657,6 +657,31 @@ def test_invalid_reasoning(tmp_path: Path, value: str) -> None:
     assert config_error(models_config(tmp_path, block)).problems == (problem,)
 
 
+# ---- search（里程碑 7a） ----
+
+
+def test_search_defaults_to_false(tmp_path: Path) -> None:
+    assert load_settings(write_config(tmp_path, "")).models[0].search is False
+
+
+def test_search_is_read_per_model(tmp_path: Path) -> None:
+    path = models_config(
+        tmp_path,
+        model_block(name="a", provider="openai", model="m", default=True, search=True),
+        model_block(name="b", provider="gemini", model="g", search=True),
+        model_block(name="c", provider="gemini", model="g", search=False),
+    )
+    assert [model.search for model in load_settings(path).models] == [True, True, False]
+
+
+@pytest.mark.parametrize(("value", "kind"), [("yes", "字符串"), (1, "整数")])
+def test_invalid_search(tmp_path: Path, value: object, kind: str) -> None:
+    block = model_block(name="a", provider="openai", model="m", default=True, search=value)
+    assert config_error(models_config(tmp_path, block)).problems == (
+        f"models[0].search：应为布尔值，实际是{kind}",
+    )
+
+
 # ---- [providers]（需求 18） ----
 
 

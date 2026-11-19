@@ -7,12 +7,32 @@ PDF 是 `{"type": "input_file", "filename": "document.pdf", "file_data": "data:a
 Responses API 不接受音频（文档只在 Chat Completions 里写了音频输入，SDK 的 Responses 输入类型里也没有
 `input_audio`），收到 `AudioPart` 或 `INPUT_LIMITS` 之外的类型时不发请求，抛 `ModelError(UNSUPPORTED)`。
 
+联网搜索：模型配置了 `search` 时请求带上 `tools=[{"type": "web_search", "user_location": {"type":
+"approximate"}}]`（不写 `user_location` 时服务商默认用户在美国；只写 `type` 就不做这个假定）。模型不支持或
+服务商拒绝时按普通的调用失败处理。
+
 处理的流式事件：
 - `response.output_text.delta`、`response.refusal.delta`：回答（或拒答说明）的文字，转成 `TextDelta`。
-- `response.completed`：`Usage` 加 `Finished(COMPLETED)`。
-- `response.incomplete`：`Usage` 加 `Finished`，原因按 `incomplete_details.reason`。
-- `response.failed`、`error`：有用量时先给出 `Usage`，再抛 `ModelError`。
-其余事件（创建、输出项开始与结束、推理摘要等）现在忽略。
+- `response.web_search_call.in_progress`：一次搜索开始（`item_id`），给出 `SearchProgress(STARTED)`；这类
+  事件里没有查询词。
+- `response.output_item.added`：输出项是 `web_search_call` 时记下它的 `action` 是不是 `search`。
+- `response.web_search_call.completed`：动作已知是 `search` 的，这时就算一次计费的搜索，随即给出带最新搜索
+  次数的 `Usage`（token 数还不知道）。打开网页（`open_page`）、页面内查找（`find_in_page`）不计。
+- `response.output_item.done`：输出项是 `web_search_call` 时给出 `SearchProgress(COMPLETED)`，查询词取自
+  它的 `action`（`search` 动作的 `queries` 与 `query`）；还没计过数的 `search` 动作在这里补计，省略了
+  `action` 时沿用同一调用已知的动作。输出项是消息时，按内容块处理（见下）。
+- `response.output_text.annotation.added`：`url_citation` 标注转成 `Citation`，只交出已经输出过正文的那个
+  内容块（`item_id` 加 `content_index`）的；还没有正文的先存着，正文出现时再交出。
+- `response.content_part.done`：一个内容块的完整正文与标注：已发出的正文是它的开头时补发其余部分（从没有
+  增量的块整段补发），并采用它的标注；对不上时都不做。
+- `response.completed`：先按上面的规则读 `response.output` 快照里的消息、补上没计过的搜索，再给出 `Usage`
+  加 `Finished(COMPLETED)`。
+- `response.incomplete`：同上，`Finished` 的原因按 `incomplete_details.reason`。
+- `response.failed`、`error`：有用量（或快照里补上了搜索次数）时先给出 `Usage`，再抛 `ModelError`。
+其余事件（创建、`web_search_call.searching`、推理摘要等）现在忽略。
+
+正文与查询词都先去掉孤立的代理码位（`llm.clean_text()`）。快照、引用、结束帧里的正文、搜索的动作这些附加信息
+的字段类型不对时跳过那一项（`_tolerant()`），同一帧的用量照常读。
 
 环境变量：SDK 构造客户端时会读 `OPENAI_BASE_URL`（端点）、`OPENAI_ORG_ID`、`OPENAI_PROJECT_ID`（请求头）、
 `OPENAI_ADMIN_KEY`、`OPENAI_CUSTOM_HEADERS`（附加请求头，其中的 `Authorization` 会顶替 key 生成的鉴权头）
@@ -29,18 +49,21 @@ import asyncio
 import base64
 import logging
 import os
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from typing import cast
 
 import openai
 from openai.types.responses import (
     EasyInputMessageParam,
+    ResponseFunctionWebSearch,
     ResponseInputContentParam,
     ResponseInputFileParam,
     ResponseInputImageParam,
     ResponseInputItemParam,
     ResponseInputMessageContentListParam,
+    ResponseOutputMessage,
     ResponseUsage,
+    ToolParam,
 )
 from openai.types.shared_params import Reasoning, ReasoningEffort
 
@@ -49,6 +72,7 @@ from . import (
     AudioPart,
     ChatEvent,
     ChatRequest,
+    CitationFilter,
     ErrorKind,
     FilePart,
     Finished,
@@ -61,9 +85,13 @@ from . import (
     Part,
     Provider,
     Role,
+    SearchProgress,
+    SearchStage,
     TextDelta,
     TextPart,
     Usage,
+    clean_text,
+    items,
     kind_for_status,
 )
 
@@ -80,6 +108,9 @@ _LIMITS = INPUT_LIMITS[Provider.OPENAI]
 
 # 流里 `response.failed` 的错误码中认得的几种；其余归到 FAILED，不把上游的字符串带出去。
 _FAILED_CODES = {"server_error": ErrorKind.SERVER, "rate_limit_exceeded": ErrorKind.RATE_LIMIT}
+
+# 内置的联网搜索。`user_location` 只写 `type`：不写时服务商假定用户在美国。
+_WEB_SEARCH: ToolParam = {"type": "web_search", "user_location": {"type": "approximate"}}
 
 
 def create_client(
@@ -127,11 +158,13 @@ class OpenAIChatModel:
         name: str,
         model: str,
         reasoning: str | None = None,
+        search: bool = False,
     ) -> None:
         self._client = client
         self._name = name
         self._model = model
         self._reasoning = reasoning
+        self._search = search
 
     @property
     def name(self) -> str:
@@ -154,6 +187,7 @@ class OpenAIChatModel:
             # SDK 把取值写成 Literal，但各款模型接受的取值不同且会变，配置里只做宽松校验，原样透传。
             reasoning = {"effort": cast(ReasoningEffort, self._reasoning)}
         messages: list[ResponseInputItemParam] = [_message(m) for m in request.messages]
+        tools: list[ToolParam] | openai.Omit = [_WEB_SEARCH] if self._search else openai.omit
         try:
             events = await self._client.responses.create(
                 model=self._model,
@@ -161,11 +195,13 @@ class OpenAIChatModel:
                 input=messages,
                 max_output_tokens=request.max_output_tokens,
                 reasoning=reasoning,
+                tools=tools,
                 store=False,
                 stream=True,
             )
         except Exception as exc:  # noqa: BLE001  一律转成脱敏的 ModelError；取消是 BaseException，不拦
             raise _error(exc) from None
+        extras = _Extras(self._search)
         finished = False
         failure: ModelError | None = None
         try:
@@ -174,15 +210,45 @@ class OpenAIChatModel:
                     async for event in events:
                         match event.type:
                             case "response.output_text.delta" | "response.refusal.delta":
-                                if event.delta:
-                                    yield TextDelta(event.delta)
+                                for found in extras.text(
+                                    event.item_id, event.content_index, event.delta
+                                ):
+                                    yield found
+                            case "response.web_search_call.in_progress":
+                                if extras.start(event.item_id):
+                                    yield SearchProgress(event.item_id, SearchStage.STARTED)
+                            case "response.output_item.added":
+                                _tolerant(extras.item_added, event.item)
+                            case "response.web_search_call.completed":
+                                if extras.confirm(event.item_id):
+                                    yield Usage(None, None, extras.count)
+                            case "response.output_item.done":
+                                for found in _tolerant(extras.item_done, event.item):
+                                    yield found
+                            case "response.output_text.annotation.added":
+                                for found in _tolerant(
+                                    extras.annotation,
+                                    event.item_id,
+                                    event.content_index,
+                                    event.annotation,
+                                ):
+                                    yield found
+                            case "response.content_part.done":
+                                for found in _tolerant(
+                                    extras.block, event.item_id, event.content_index, event.part
+                                ):
+                                    yield found
                             case "response.completed":
-                                yield _usage(event.response.usage)
+                                for found in _tolerant(extras.snapshot, event.response.output):
+                                    yield found
+                                yield _usage(event.response.usage, extras.count)
                                 finished = True
                                 yield Finished(FinishReason.COMPLETED)
                                 return
                             case "response.incomplete":
-                                yield _usage(event.response.usage)
+                                for found in _tolerant(extras.snapshot, event.response.output):
+                                    yield found
+                                yield _usage(event.response.usage, extras.count)
                                 details = event.response.incomplete_details
                                 reason = None if details is None else details.reason
                                 finished = True
@@ -193,8 +259,13 @@ class OpenAIChatModel:
                                 )
                                 return
                             case "response.failed":
+                                counted = extras.count
+                                # 只为补上漏记的搜索次数：失败了，不再补发正文与引用。
+                                _tolerant(extras.snapshot, event.response.output, text=False)
                                 if event.response.usage is not None:
-                                    yield _usage(event.response.usage)
+                                    yield _usage(event.response.usage, extras.count)
+                                elif extras.count != counted:
+                                    yield Usage(None, None, extras.count)
                                 error = event.response.error
                                 code = None if error is None else str(error.code)
                                 kind = _FAILED_CODES.get(code or "", ErrorKind.FAILED)
@@ -266,10 +337,212 @@ def _data_url(mime_type: str, data: bytes) -> str:
     return f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"
 
 
-def _usage(usage: ResponseUsage | None) -> Usage:
+def _usage(usage: ResponseUsage | None, searches: int | None = None) -> Usage:
     if usage is None:
-        return Usage(None, None)
-    return Usage(usage.input_tokens, usage.output_tokens)
+        return Usage(None, None, searches)
+    return Usage(usage.input_tokens, usage.output_tokens, searches)
+
+
+class _Extras:
+    """一次调用里正文之外的东西：搜索（进展、计费的次数）、引用，以及只出现在结束帧里的正文。
+
+    **正文**按消息项编号与内容块下标（`item_id`, `content_index`）记下已经作为 `TextDelta` 发出的部分。内容块的
+    结束帧（`content_part.done`）、消息项的结束帧（`output_item.done`）与终止事件的 `response.output` 快照里都有
+    整块正文：已发出的是它的开头时补发其余部分（从没有增量的块整段补发）；对不上时不补，宁可少也不重复。
+
+    **引用**只交出对应着已经输出过正文的内容块的：`annotation.added` 到达时那一块还没有正文就先存着，等正文
+    出现再交出；结束帧与快照里的标注，只有那一块的正文对得上（已发出或刚补发）时才采用。全部共用一个
+    `CitationFilter` 去重。
+
+    **计数**：`web_search_call` 的动作是 `search` 的算一次。`output_item.added` 给出动作，随后同一 `item_id` 的
+    `web_search_call.completed` 一到就计数；`output_item.done` 与快照只补没计过的。之后的帧省略了 `action` 时，
+    沿用同一 `item_id` 已知的动作。
+
+    SDK 在流式解析时不校验，字段一律按 `getattr` 取、检查类型，不对的跳过那一项（见 `_tolerant()`）。
+    """
+
+    def __init__(self, enabled: bool) -> None:
+        self.count: int | None = 0 if enabled else None  # 没带搜索工具时是 None
+        self._citation = CitationFilter()
+        self._started: set[str] = set()
+        self._searching: set[str] = set()  # 已知动作是 search 的调用
+        self._counted: set[str] = set()
+        self._sent: dict[tuple[str, int], str] = {}  # 各内容块已发出的正文
+        self._pending: dict[tuple[str, int], list[object]] = {}  # 正文还没出现的内容块的标注
+
+    # ---- 正文与引用 ----
+
+    def text(self, item_id: object, index: object, delta: object) -> list[ChatEvent]:
+        """一段正文增量；先去掉孤立的代理码位。这一块之前存着的标注随它交出。"""
+        if not isinstance(delta, str):
+            return []
+        delta = clean_text(delta)
+        if not delta:
+            return []
+        key = _key(item_id, index)
+        self._sent[key] = self._sent.get(key, "") + delta
+        found: list[ChatEvent] = [TextDelta(delta)]
+        found.extend(self._citations(self._pending.pop(key, [])))
+        return found
+
+    def annotation(self, item_id: object, index: object, annotation: object) -> list[ChatEvent]:
+        key = _key(item_id, index)
+        if self._sent.get(key):
+            return self._citations([annotation])
+        self._pending.setdefault(key, []).append(annotation)
+        return []
+
+    def block(self, item_id: object, index: object, part: object) -> list[ChatEvent]:
+        """一个内容块的完整内容（结束帧或快照）：补发没发出的正文，采用对得上的标注。"""
+        match getattr(part, "type", None):
+            case "output_text":
+                full: object = getattr(part, "text", None)
+                annotations = items(getattr(part, "annotations", None))
+            case "refusal":
+                full, annotations = getattr(part, "refusal", None), []
+            case _:
+                return []
+        if not isinstance(full, str):
+            return []
+        full = clean_text(full)
+        key = _key(item_id, index)
+        sent = self._sent.get(key, "")
+        if not full or not full.startswith(sent):
+            return []  # 对不上已经发出的正文：不补发，这块的标注也不采用
+        found = self.text(item_id, index, full[len(sent) :])
+        found.extend(self._citations(annotations))
+        return found
+
+    def _message(self, item: ResponseOutputMessage) -> list[ChatEvent]:
+        item_id: object = getattr(item, "id", None)
+        found: list[ChatEvent] = []
+        for index, part in enumerate(items(getattr(item, "content", None))):
+            found.extend(_tolerant(self.block, item_id, index, part))
+        return found
+
+    def _citations(self, annotations: list[object]) -> list[ChatEvent]:
+        found: list[ChatEvent] = []
+        for annotation in annotations:
+            citation = self._citation(annotation)
+            if citation is not None:
+                found.append(citation)
+        return found
+
+    # ---- 搜索 ----
+
+    def start(self, call_id: str) -> bool:
+        """记下开始了一次搜索；已经记过的返回 `False`。"""
+        if call_id in self._started:
+            return False
+        self._started.add(call_id)
+        return True
+
+    def item_added(self, item: object) -> list[ChatEvent]:
+        """输出项开始：记下搜索调用的动作是不是 search。"""
+        if isinstance(item, ResponseFunctionWebSearch):
+            self._is_search(item)
+        return []
+
+    def confirm(self, call_id: str) -> bool:
+        """一次搜索执行完了：动作已知是 search 就计数；计了数返回 `True`。"""
+        return call_id in self._searching and self._count(call_id)
+
+    def item_done(self, item: object) -> list[ChatEvent]:
+        """一个输出项完成时要给出的事件。"""
+        if isinstance(item, ResponseFunctionWebSearch):
+            return self._search_done(item)
+        if isinstance(item, ResponseOutputMessage):
+            return self._message(item)
+        return []
+
+    def snapshot(self, output: object, *, text: bool = True) -> list[ChatEvent]:
+        """终止事件里 `response.output` 的快照：补上还没计过的搜索（不再给出进展事件）；`text` 为真时还补发
+        没发出的正文、交出对得上的引用。每一项单独处理，出问题的跳过。"""
+        found: list[ChatEvent] = []
+        for item in items(output):
+            if isinstance(item, ResponseFunctionWebSearch):
+                _tolerant(self._count_if_search, item)
+            elif text and isinstance(item, ResponseOutputMessage):
+                found.extend(self._message(item))
+        return found
+
+    def _is_search(self, item: ResponseFunctionWebSearch) -> bool:
+        """动作是不是 search；省略了 `action`（或它的 `type`）时沿用同一调用已知的动作。"""
+        call_id = _call_id(item)
+        kind: object = getattr(getattr(item, "action", None), "type", None)
+        if kind is None:
+            return call_id in self._searching
+        if kind == "search":
+            self._searching.add(call_id)
+            return True
+        self._searching.discard(call_id)
+        return False
+
+    def _count_if_search(self, item: ResponseFunctionWebSearch) -> list[ChatEvent]:
+        if self._is_search(item):
+            self._count(_call_id(item))
+        return []
+
+    def _count(self, call_id: str) -> bool:
+        """计费口径：`search` 动作的调用算一次（打开网页、页面内查找不算），同一个调用只算一次。"""
+        if self.count is None or call_id in self._counted:
+            return False
+        self._counted.add(call_id)
+        self.count += 1
+        return True
+
+    def _search_done(self, item: ResponseFunctionWebSearch) -> list[ChatEvent]:
+        call_id = _call_id(item)
+        found: list[ChatEvent] = []
+        if self.start(call_id):  # 没收到开始的事件：补一个，免得进展只有完成
+            found.append(SearchProgress(call_id, SearchStage.STARTED))
+        searched = self._is_search(item)
+        queries = _queries(getattr(item, "action", None)) if searched else ()
+        found.append(SearchProgress(call_id, SearchStage.COMPLETED, queries))
+        if searched and self._count(call_id):
+            found.append(Usage(None, None, self.count))
+        return found
+
+
+def _tolerant[**P](
+    produce: Callable[P, list[ChatEvent]], *args: P.args, **kwargs: P.kwargs
+) -> list[ChatEvent]:
+    """读正文之外的附加信息（快照、引用、结束帧里的正文、搜索的动作）。SDK 不校验响应，字段的类型可能不对；
+    出了意外就跳过这一项、记一条日志（只记异常类型），同一帧的其余内容（尤其是用量）照常处理。"""
+    try:
+        return produce(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001  见 docstring
+        logger.warning("OpenAI 流里有一项附加信息无法解析，已跳过：%s", type(exc).__name__)
+        return []
+
+
+def _key(item_id: object, index: object) -> tuple[str, int]:
+    return (
+        item_id if isinstance(item_id, str) else "",
+        index if isinstance(index, int) and not isinstance(index, bool) else 0,
+    )
+
+
+def _call_id(item: ResponseFunctionWebSearch) -> str:
+    call_id: object = getattr(item, "id", None)
+    return call_id if isinstance(call_id, str) else ""
+
+
+def _queries(action: object) -> tuple[str, ...]:
+    """`search` 动作的查询词：`queries` 与 `query` 合起来，去掉空白的与重复的，保持顺序。"""
+    candidates: list[object] = []
+    queries = cast(object, getattr(action, "queries", None))
+    if isinstance(queries, list):
+        candidates.extend(cast(list[object], queries))
+    candidates.append(cast(object, getattr(action, "query", None)))
+    result: list[str] = []
+    for query in candidates:
+        if not isinstance(query, str):
+            continue
+        query = clean_text(query)
+        if query.strip() and query not in result:
+            result.append(query)
+    return tuple(result)
 
 
 def _error(exc: Exception) -> ModelError:

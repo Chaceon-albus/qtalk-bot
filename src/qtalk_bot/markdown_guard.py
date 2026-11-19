@@ -12,13 +12,26 @@ QQ 的 Markdown 支持 LaTeX，`\\(...\\)` 会被当成行内公式。括号里�
 围栏要看清整行才判断开始与结束（结束行除了标记只能有空白；反引号围栏的信息串里不能有反引号）。行内代码
 按成对的反引号结束，可以跨行，但遇到空行就结束（不能跨段落），落单的反引号不会吞掉后文。
 
+列表项里的围栏（大致按 CommonMark）：列表标记（`-`、`+`、`*`，或 1–9 位数字加 `.` / `)`，后跟 1–4 个空格，可以
+嵌套）之后的围栏也算开头，列表项内容的缩进（标记连同其后空格的宽度）记为这个代码块的缩进；结束行要缩进到
+这个宽度，再加最多 3 个空格。缩进不到这个宽度的非空行意味着列表项结束，代码块也随之结束（没有结束行）；
+这样的行本身若是结束行的样子，也当作结束行，不当作新的开头。拿不准时宁可认为代码块已经结束，`closing_fence()`
+不补出多余的围栏。
+
 流式：`feed()` 只输出已经能确定怎么处理的部分，其余留到下一片；全部输入完后调用 `finish()` 取走剩下的。
 无论怎样切分输入，输出拼起来都与一次性处理全文相同。
 """
 
 import re
 
-_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+_LIST_MARKER = r"(?:[-+*]|[0-9]{1,9}[.)])"
+# 开头：最多 3 个空格，可以有（嵌套的）列表标记，然后是围栏标记。
+_OPEN = re.compile(rf"(?P<lead> {{0,3}}(?:{_LIST_MARKER} {{1,4}})*)(?P<marker>`{{3,}}|~{{3,}})")
+# 还没收全的一行可能成为开头：已有的部分是开头的前缀（含写了一半的列表标记）。
+_MAYBE_OPEN = re.compile(
+    rf"(?: {{0,3}}{_LIST_MARKER} {{1,4}})* {{0,3}}(?:[-+*]|[0-9]{{1,9}}[.)]?)? {{0,4}}(`*|~*)"
+)
+_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")  # 结束行（去掉列表项内容的缩进之后）
 _MAYBE_FENCE = re.compile(r" {0,3}(`*|~*)")
 _CODE = re.compile(r"[^`\n]+")
 _PLAIN = re.compile(r"[^\n`\]\\()]+")
@@ -33,6 +46,7 @@ class MarkdownGuard:
         self._pending = ""  # 还不能确定怎么处理的输入
         self._line_start = True
         self._fence: str | None = None  # 所在围栏代码块的开头标记，如 "```"
+        self._fence_indent = 0  # 所在代码块属于列表项时，列表项内容的缩进；否则是 0
         self._verbatim_line = False  # 这一行剩下的部分原样输出（围栏标记所在的行）
         self._ticks = 0  # 所在行内代码的反引号个数；0 表示不在行内代码里
         self._depth = 0  # 换成全角的左括号之后的括号层数；0 表示不在其中
@@ -43,6 +57,14 @@ class MarkdownGuard:
 
     def finish(self) -> str:
         return self._drain(final=True)
+
+    def closing_fence(self) -> str:
+        """`finish()` 之后调用：正文停在围栏代码块里（没写完就超时、断流或达到输出上限）时，返回闭合它的那一行
+        （不在行首时先换行），否则返回空串。要在正文后面接别的 Markdown（如「来源」）时先接上它，免得后面的
+        内容被渲染成代码。"""
+        if self._fence is None:
+            return ""
+        return ("" if self._line_start else "\n") + " " * self._fence_indent + self._fence
 
     def _drain(self, *, final: bool) -> str:
         s = self._pending
@@ -122,31 +144,55 @@ class MarkdownGuard:
         line_end = len(s) if newline < 0 else newline
         line = s[i:line_end]
         complete = newline >= 0 or final
-        if not line.strip(" \t\r"):
+        blank = not line.strip(" \t\r")
+        if blank:
             if not complete:
                 return None  # 可能是空行，也可能是缩进
             self._ticks = 0
-        fence = _FENCE.match(line)
-        if not complete and (fence is not None or _MAYBE_FENCE.fullmatch(line)):
+        if self._fence is not None:
+            indent = len(line) - len(line.lstrip(" "))
+            outdented = not blank and indent < self._fence_indent  # 列表项到此结束
+            fence = _FENCE.match(line[min(indent, self._fence_indent) :])
+            candidate = line[min(indent, self._fence_indent) :]
+            if not complete and (fence is not None or _MAYBE_FENCE.fullmatch(candidate)):
+                return None  # 要看清整行才能判断是不是结束行
+            if fence is not None and self._closes(fence.group(1), candidate[fence.end() :]):
+                self._line_start = False
+                self._verbatim_line = True
+                return line, line_end
+            if not outdented:
+                self._line_start = False
+                return "", i  # 代码块里的普通一行
+            self._fence = None  # 代码块随列表项结束；这一行按普通的行首处理
+            self._fence_indent = 0
+        opening = _OPEN.match(line)
+        if not complete and (opening is not None or _MAYBE_OPEN.fullmatch(line)):
             return None  # 要看清整行才能判断是不是围栏
         self._line_start = False
-        if fence is not None and self._toggles_fence(fence.group(1), line[fence.end() :]):
+        if opening is not None and self._opens(
+            opening.group("marker"), opening.group("lead"), line[opening.end() :]
+        ):
             self._verbatim_line = True
             return line, line_end
         return "", i
 
-    def _toggles_fence(self, marker: str, rest: str) -> bool:
-        """以 `marker` 开头、其余是 `rest` 的一行是否开始或结束围栏代码块；是的话更新状态。"""
-        if self._fence is None:
-            if marker[0] == "`" and "`" in rest:
-                return False  # 反引号围栏的信息串里不能有反引号：这是行内代码
-            self._fence = marker
-            self._ticks = 0  # 没配对的行内代码让位给代码块
-            return True
+    def _opens(self, marker: str, lead: str, rest: str) -> bool:
+        """以 `lead`、`marker` 开头、其余是 `rest` 的一行是否开始围栏代码块；是的话更新状态。"""
+        if marker[0] == "`" and "`" in rest:
+            return False  # 反引号围栏的信息串里不能有反引号：这是行内代码
+        self._fence = marker
+        self._fence_indent = len(lead) if lead.strip() else 0  # 有列表标记时才是列表项内容的缩进
+        self._ticks = 0  # 没配对的行内代码让位给代码块
+        return True
+
+    def _closes(self, marker: str, rest: str) -> bool:
+        """`marker` 加 `rest` 的一行是否结束所在的代码块；是的话更新状态。"""
+        assert self._fence is not None
         if marker[0] == self._fence[0] and len(marker) >= len(self._fence) and not rest.strip():
             self._fence = None
+            self._fence_indent = 0
             return True
-        return False  # 代码块里的普通一行
+        return False
 
     def _after_bracket(self, s: str, i: int, final: bool) -> tuple[str, int] | None:
         gap = _GAP.match(s, i + 1)

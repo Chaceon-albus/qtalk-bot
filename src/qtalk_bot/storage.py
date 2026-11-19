@@ -295,6 +295,13 @@ def _v6_faces_summaries_and_given(conn: sqlite3.Connection) -> None:
             )
 
 
+_V7_SEARCHES = """
+-- searches：这次调用里服务商内置的联网搜索实际执行的次数（按服务商的计费口径：OpenAI 是 action 为 search 的
+-- 调用数，Gemini 是不重复的非空查询数）。带了搜索工具的调用是整数（没搜就是 0）；没带搜索工具、没有报告用量的
+-- 调用，以及升级前的行为空。
+ALTER TABLE usage ADD COLUMN searches INTEGER CHECK (searches >= 0);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     _V1_ACCESS,
     _V2_CHAT,
@@ -302,6 +309,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     _V4_ATTACHMENTS,
     _V5_BATCHING,
     _v6_faces_summaries_and_given,
+    _V7_SEARCHES,
 )
 """本程序的迁移列表。业务表由各里程碑在末尾追加，已发布的不能修改。"""
 

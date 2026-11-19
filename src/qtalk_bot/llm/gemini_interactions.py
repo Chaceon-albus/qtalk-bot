@@ -7,10 +7,31 @@
 `{"type": "image", "data": …, "mime_type": …}`，音频是 `{"type": "audio", …}`，PDF 是
 `{"type": "document", …}`。类型不在 `INPUT_LIMITS` 里时不发请求，抛 `ModelError(UNSUPPORTED)`。
 
+联网搜索：模型配置了 `search` 时请求带上 `tools=[{"type": "google_search"}]`。模型不支持或服务商拒绝时按普通
+的调用失败处理。
+
+**已知与条款不符**：Gemini 的条款要求用了搜索的回答同时展示它给的「搜索建议」（`google_search_result` 步骤里
+`result[].search_suggestions`，一段 HTML/CSS）。QQ 渲染不了 HTML，用户已决定照常打开搜索，所以这段 HTML 一律
+忽略，不发给用户，也不保存。
+
 处理的流式事件：
-- `step.start`：记下每个步骤（按 `index`）的类型。
-- `step.delta`：`model_output` 步骤里 `type == "text"` 的增量转成 `TextDelta`；思考摘要等现在忽略。
-- `interaction.completed`：按 `interaction.status` 判断。`requires_continuation` 是 SDK 自动续写（默认开启）
+- `step.start`：记下每个步骤（按 `index`）的类型。`google_search_call` 步骤给出
+  `SearchProgress(STARTED)`（调用编号取步骤的 `id`；文档的示例里这时没有查询词）；`google_search_result`
+  步骤按 `call_id` 给出对应搜索的 `SearchProgress(COMPLETED)`；`model_output` 步骤若已带文本块，其中的正文
+  作为 `TextDelta` 发出（之后的增量接在后面），其上的 `url_citation` 标注随它转成 `Citation`。
+- `step.delta`：`model_output` 步骤里 `type == "text"` 的增量转成 `TextDelta`，`text_annotation_delta` 里的
+  `url_citation` 标注转成 `Citation`（同一个来源只给一次）；`google_search_call` 增量里的
+  `arguments.queries` 给出 `SearchProgress(UPDATED)`，新出现的查询词计入搜索次数，随即给出带最新累计值的
+  `Usage`。思考摘要等现在忽略。
+- `interaction.completed`：可能附带这一跳步骤的快照（`interaction.steps`）。其中 `google_search_call` 步骤的
+  查询词并入整次调用的去重集合、补记次数；`model_output` 文本块的正文以这一跳已发出的正文开头时，补发其余
+  部分（一段 `TextDelta`）并采用这些文本块上的标注，对不上时两样都不做（免得重复，或把来源挂到别的回答
+  后面）。然后按 `interaction.status` 判断。自动续写的每一跳以自己的 `interaction.created` 开始，各跳的交互
+  编号不同，所以「这一跳已发出的正文」在 `interaction.created` 与 `interaction.completed` 处各重置一次。
+
+正文（增量、`step.start` 里的文本块、快照补发的）与查询词都先去掉孤立的代理码位（`llm.clean_text()`）。快照、
+引用、`step.start` 里的文本块、搜索步骤这些附加信息的字段类型不对时跳过那一项（`_tolerant()`），同一帧的用量
+照常读。`requires_continuation` 是 SDK 自动续写（默认开启）
   的中间一跳，用量只是这一跳的，累加后先交出累计的 `Usage` 再继续读；`completed` 给出 `Finished(COMPLETED)`，`incomplete`、
   `budget_exceeded` 给出 `Finished(OTHER)`（流里没有具体原因），其余状态（`failed`、`cancelled` 等）抛
   `ModelError`。
@@ -19,7 +40,9 @@
 完成的跳是计费的。关闭响应流时的异常也转成 `ModelError`；取消与调用方的关闭照常传播。
 
 用量：输入取 `total_input_tokens`；输出取 `total_output_tokens` 加 `total_thought_tokens`（思考也按输出
-计费，与 OpenAI 的 `output_tokens` 含推理一致）。
+计费，与 OpenAI 的 `output_tokens` 含推理一致）。搜索次数按文档的计费口径（Gemini 3 及更新的模型「按模型
+决定执行的每个查询计费」，数不重复的查询时忽略空查询），数这次调用（含自动续写的各跳）里不重复的非空查询词；
+用量里的 `grounding_tool_count` 文档没有说明含义，没有采用。
 
 环境变量：SDK 会读 `GOOGLE_GEMINI_BASE_URL`（端点）、`GOOGLE_GENAI_USE_VERTEXAI` /
 `GOOGLE_GENAI_USE_ENTERPRISE`（改走 Vertex AI）、`GOOGLE_GENAI_API_VERSION`（接口版本）、
@@ -33,7 +56,8 @@
 
 import asyncio
 import base64
-from collections.abc import AsyncGenerator
+import logging
+from collections.abc import AsyncGenerator, Callable
 from typing import cast
 
 from google import genai
@@ -45,6 +69,7 @@ from . import (
     AudioPart,
     ChatEvent,
     ChatRequest,
+    CitationFilter,
     ErrorKind,
     FilePart,
     Finished,
@@ -57,12 +82,18 @@ from . import (
     Part,
     Provider,
     Role,
+    SearchProgress,
+    SearchStage,
     TextDelta,
     TextPart,
     Usage,
+    clean_text,
+    items,
     kind_for_status,
     token_count,
 )
+
+logger = logging.getLogger(__name__)
 
 OFFICIAL_BASE_URL = "https://generativelanguage.googleapis.com/"
 API_VERSION = "v1"  # SDK 的默认版本；固定下来，免得被 GOOGLE_GENAI_API_VERSION 改掉
@@ -72,6 +103,8 @@ _LIMITS = INPUT_LIMITS[Provider.GEMINI]
 
 # 流里的 interaction 状态中认得的失败；其余的归到 OTHER。
 _FAILED_STATUSES = frozenset(("failed", "cancelled"))
+
+_GOOGLE_SEARCH: interactions.GoogleSearchParam = {"type": "google_search"}
 
 
 def create_client(
@@ -115,11 +148,13 @@ class GeminiChatModel:
         name: str,
         model: str,
         reasoning: str | None = None,
+        search: bool = False,
     ) -> None:
         self._client = client
         self._name = name
         self._model = model
         self._reasoning = reasoning
+        self._search = search
 
     @property
     def name(self) -> str:
@@ -146,18 +181,34 @@ class GeminiChatModel:
         # `create` 的 `timeout` 参数类型来自 SDK 对 httpx 的可选导入，pyright 看作 Unknown；`model` 的类型是
         # 已知模型名的 Literal 加 SDK 自己的 str 子类，配置里的任意模型名只能 cast 过去。
         inputs = [_step(message) for message in request.messages]
+        # SDK 的 `create` 只认传了的关键字参数（没有表示「不传」的哨兵值），所以带不带工具分两种写法。
+        model = cast(interactions.Model, self._model)
+        interactions_api = self._client.aio.interactions
         try:
-            events = await self._client.aio.interactions.create(  # pyright: ignore[reportUnknownMemberType]
-                model=cast(interactions.Model, self._model),
-                input=inputs,
-                system_instruction=request.system,
-                generation_config=config,
-                store=False,
-                stream=True,
-            )
+            if self._search:
+                events = await interactions_api.create(  # pyright: ignore[reportUnknownMemberType]
+                    model=model,
+                    input=inputs,
+                    system_instruction=request.system,
+                    generation_config=config,
+                    tools=[_GOOGLE_SEARCH],
+                    store=False,
+                    stream=True,
+                )
+            else:
+                events = await interactions_api.create(  # pyright: ignore[reportUnknownMemberType]
+                    model=model,
+                    input=inputs,
+                    system_instruction=request.system,
+                    generation_config=config,
+                    store=False,
+                    stream=True,
+                )
         except Exception as exc:  # noqa: BLE001  SDK 的异常类在私有模块里，见模块 docstring
             raise _error(exc) from None
-        usage = _UsageTotal()
+        searches = _Searches(self._search)
+        usage = _UsageTotal(searches)
+        texts = _Texts()
         steps: dict[int, str] = {}
         finished = False
         failure: ModelError | None = None
@@ -166,20 +217,57 @@ class GeminiChatModel:
                 try:
                     async for event in events:
                         match event:
+                            case interactions.InteractionCreatedEvent():
+                                texts.end_hop()  # 自动续写的新一跳开始
+                            case interactions.StepStart(
+                                index=index, step=interactions.ModelOutputStep() as step
+                            ):
+                                # 开始时就可能带着完整的文本块（连同标注）：正文先发出，标注随它处理。
+                                steps[index] = step.type
+                                for found in _tolerant(_started_output, step, texts, searches):
+                                    yield found
                             case interactions.StepStart(index=index, step=step):
                                 steps[index] = step.type
+                                for found in _tolerant(searches.step_started, index, step):
+                                    yield found
+                                if searches.take_counted():
+                                    yield usage.event()
                             case interactions.StepDelta(
                                 index=index, delta=interactions.TextDelta() as d
                             ):
-                                if steps.get(index, "model_output") == "model_output" and d.text:
-                                    yield TextDelta(d.text)
+                                if steps.get(index, "model_output") == "model_output":
+                                    text = texts.add(d.text)
+                                    if text:
+                                        yield TextDelta(text)
+                            case interactions.StepDelta(
+                                index=index, delta=interactions.TextAnnotationDelta() as d
+                            ):
+                                if steps.get(index, "model_output") == "model_output":
+                                    for found in _tolerant(searches.citations, d.annotations):
+                                        yield found
+                            case interactions.StepDelta(
+                                index=index, delta=interactions.GoogleSearchCallDelta() as d
+                            ):
+                                for found in _tolerant(searches.call_delta, index, d):
+                                    yield found
+                                if searches.take_counted():
+                                    # 搜索已经执行、会计费：立即交出新的累计值，免得中途被打断时丢掉。
+                                    yield usage.event()
                             case interactions.InteractionCompletedEvent(interaction=interaction):
+                                # 完成事件可能附带这一跳的步骤：补发增量里没有的正文，读对得上的标注，补记
+                                # 查询词。出了问题只跳过它，照常读同一帧的用量。
+                                for found in _tolerant(
+                                    _snapshot, interaction.steps, texts, searches
+                                ):
+                                    yield found
+                                texts.end_hop()
+                                counted = searches.take_counted()  # 快照里补记了查询
                                 if interaction.usage is not None:
                                     usage.add(interaction.usage)
                                 match interaction.status:
                                     case "requires_continuation":
                                         # 这一跳已经计费：读下一跳之前就交出累计值，免得中途被打断时丢掉。
-                                        if usage.reported:
+                                        if usage.reported or counted:
                                             yield usage.event()
                                         continue
                                     case "completed":
@@ -193,6 +281,8 @@ class GeminiChatModel:
                                         yield Finished(FinishReason.OTHER)
                                         return
                                     case status:
+                                        if counted:
+                                            yield usage.event()
                                         kind = (
                                             ErrorKind.FAILED
                                             if status in _FAILED_STATUSES
@@ -221,10 +311,203 @@ class GeminiChatModel:
         raise failure
 
 
-class _UsageTotal:
-    """把各跳的用量累加起来；某项一直没有报告时是 `None`。"""
+class _Searches:
+    """一次调用（含自动续写的各跳）里的搜索与引用：转成事件、数计费的搜索次数、给引用去重。
+
+    SDK 在流式解析时不校验（文档示例里 `google_search_call` 步骤开始时就没有必填的 `arguments`），字段一律按
+    `getattr` 取、检查类型。
+    """
+
+    def __init__(self, enabled: bool) -> None:
+        self.count: int | None = 0 if enabled else None  # 没带搜索工具时是 None
+        self.citation = CitationFilter()
+        self._calls: dict[int, _Call] = {}  # 按步骤的 index
+        self._queries: set[str] = set()  # 计过费的查询词（去掉首尾空白）
+        self._counted = False  # 有还没交出去的新计数
+
+    def take_counted(self) -> bool:
+        """自上次调用以来搜索次数是否增加了。"""
+        counted, self._counted = self._counted, False
+        return counted
+
+    def step_started(self, index: int, step: object) -> list[ChatEvent]:
+        if isinstance(step, interactions.GoogleSearchCallStep):
+            step_id: object = getattr(step, "id", None)
+            call_id = step_id if isinstance(step_id, str) and step_id else f"step-{index}"
+            call = _Call(call_id)
+            self._calls[index] = call
+            self._merge(call, getattr(step, "arguments", None))
+            return [SearchProgress(call.call_id, SearchStage.STARTED, tuple(call.queries))]
+        if isinstance(step, interactions.GoogleSearchResultStep):
+            # 搜索建议（`result[].search_suggestions`）是 HTML，QQ 渲染不了，按模块 docstring 忽略。
+            call_id: object = getattr(step, "call_id", None)
+            for call in self._calls.values():
+                if call.call_id == call_id and not call.done:
+                    call.done = True
+                    return [
+                        SearchProgress(call.call_id, SearchStage.COMPLETED, tuple(call.queries))
+                    ]
+            return []
+        return []
+
+    def call_delta(self, index: int, delta: interactions.GoogleSearchCallDelta) -> list[ChatEvent]:
+        found: list[ChatEvent] = []
+        call = self._calls.get(index)
+        if call is None:  # 没收到开始的事件：补一个，免得进展只有增量
+            call = self._calls[index] = _Call(f"step-{index}")
+            found.append(SearchProgress(call.call_id, SearchStage.STARTED))
+        if self._merge(call, getattr(delta, "arguments", None)):
+            found.append(SearchProgress(call.call_id, SearchStage.UPDATED, tuple(call.queries)))
+        return found
+
+    def citations(self, annotations: object) -> list[ChatEvent]:
+        found: list[ChatEvent] = []
+        for annotation in items(annotations):
+            citation = self.citation(annotation)
+            if citation is not None:
+                found.append(citation)
+        return found
+
+    def count_snapshot(self, step: interactions.GoogleSearchCallStep) -> list[ChatEvent]:
+        """终止快照里的搜索步骤：增量里没给全的查询词并进整次调用的去重集合，补记次数（不再给出进展事件）。"""
+        for query in _query_list(getattr(step, "arguments", None)):
+            self._count(query)
+        return []
+
+    def _merge(self, call: _Call, arguments: object) -> bool:
+        """把 `arguments.queries` 里新的查询词并进这次搜索、计入搜索次数；有新的查询词时返回 `True`。"""
+        fresh = False
+        for query in _query_list(arguments):
+            if query in call.queries:
+                continue
+            call.queries.append(query)
+            fresh = True
+            self._count(query)
+        return fresh
+
+    def _count(self, query: str) -> None:
+        """计费口径：每个执行了的查询算一次，不重复的才算（去掉首尾空白后比较），空查询不算。"""
+        key = query.strip()
+        if self.count is not None and key not in self._queries:
+            self._queries.add(key)
+            self.count += 1
+            self._counted = True
+
+
+class _Texts:
+    """这一跳已经作为 `TextDelta` 发出的正文（已去掉孤立的代理码位），用来在完成事件附带的步骤快照里找出还没
+    发出的部分。
+
+    SDK 的自动续写逐跳转发事件：每一跳以自己的 `interaction.created` 开始、`interaction.completed` 结束（各跳的
+    交互编号不同），步骤事件不带编号，按到达的先后属于当前这一跳；完成事件附带的快照只含这一跳。所以只拿这一跳
+    发出的正文和它对照，两头各重置一次。
+    """
 
     def __init__(self) -> None:
+        self._hop: list[str] = []
+
+    def add(self, text: object) -> str:
+        """记下一段要发出的正文，返回去掉孤立代理码位后的样子（类型不对时是空串）。"""
+        if not isinstance(text, str):
+            return ""
+        text = clean_text(text)
+        if text:
+            self._hop.append(text)
+        return text
+
+    def end_hop(self) -> None:
+        self._hop.clear()
+
+    def missing(self, snapshot: str) -> str | None:
+        """快照里还没发出的部分；已发出的正文不是快照的开头（对不上）时返回 `None`。"""
+        sent = "".join(self._hop)
+        return snapshot[len(sent) :] if snapshot.startswith(sent) else None
+
+
+def _text_blocks(step: object) -> list[tuple[str, list[object]]]:
+    """`model_output` 步骤里的文本块：（去掉孤立代理码位的正文，标注）。类型不对的块跳过。"""
+    blocks: list[tuple[str, list[object]]] = []
+    for content in items(getattr(step, "content", None)):
+        text: object = getattr(content, "text", None)
+        if getattr(content, "type", None) != "text" or not isinstance(text, str):
+            continue
+        blocks.append((clean_text(text), items(getattr(content, "annotations", None))))
+    return blocks
+
+
+def _started_output(
+    step: interactions.ModelOutputStep, texts: _Texts, searches: _Searches
+) -> list[ChatEvent]:
+    """`step.start` 就带着文本块的 `model_output` 步骤：正文发出，标注随它转成引用。"""
+    found: list[ChatEvent] = []
+    for text, annotations in _text_blocks(step):
+        text = texts.add(text)
+        if text:
+            found.append(TextDelta(text))
+        found.extend(searches.citations(annotations))
+    return found
+
+
+def _snapshot(steps: object, texts: _Texts, searches: _Searches) -> list[ChatEvent]:
+    """完成事件附带的这一跳的步骤：
+
+    - 搜索步骤的查询词并入整次调用的去重集合，补记次数；
+    - `model_output` 文本块的正文对得上这一跳已发出的正文时，补发其余部分，并采用这些文本块上的标注；对不上
+      （或快照里没有正文）时既不补发正文，也不采用标注，免得来源挂到别的回答后面。
+    每一步单独处理，出问题的跳过。
+    """
+    blocks: list[tuple[str, list[object]]] = []
+    for step in items(steps):
+        if isinstance(step, interactions.GoogleSearchCallStep):
+            _tolerant(searches.count_snapshot, step)
+        elif isinstance(step, interactions.ModelOutputStep):
+            blocks.extend(_tolerant(_text_blocks, step))
+    snapshot = "".join(text for text, _ in blocks)
+    missing = texts.missing(snapshot)
+    if not snapshot or missing is None:
+        return []
+    found: list[ChatEvent] = []
+    if missing:
+        texts.add(missing)
+        found.append(TextDelta(missing))
+    for _, annotations in blocks:
+        found.extend(searches.citations(annotations))
+    return found
+
+
+def _tolerant[**P, T](produce: Callable[P, list[T]], *args: P.args, **kwargs: P.kwargs) -> list[T]:
+    """读正文之外的附加信息（快照、引用、步骤开始时带的文本块、搜索的查询词）。SDK 不校验响应，字段的类型可能
+    不对；出了意外就跳过这一项、记一条日志（只记异常类型），同一帧的其余内容（尤其是用量）照常处理。"""
+    try:
+        return produce(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001  见 docstring
+        logger.warning("Gemini 流里有一项附加信息无法解析，已跳过：%s", type(exc).__name__)
+        return []
+
+
+def _query_list(arguments: object) -> list[str]:
+    """`arguments.queries` 里的查询词：去掉孤立的代理码位，跳过不是字符串的与空的。"""
+    queries: list[str] = []
+    for query in items(getattr(arguments, "queries", None)):
+        if isinstance(query, str) and (query := clean_text(query)).strip():
+            queries.append(query)
+    return queries
+
+
+class _Call:
+    """一次搜索（一个 `google_search_call` 步骤）。"""
+
+    def __init__(self, call_id: str) -> None:
+        self.call_id = call_id
+        self.queries: list[str] = []
+        self.done = False
+
+
+class _UsageTotal:
+    """把各跳的用量累加起来；某项一直没有报告时是 `None`。搜索次数取自 `searches` 的当前值。"""
+
+    def __init__(self, searches: _Searches) -> None:
+        self._searches = searches
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None
         self.reported = False  # 有哪一跳报告过用量
@@ -249,7 +532,7 @@ class _UsageTotal:
 
     def event(self) -> Usage:
         self.unreported = False
-        return Usage(self.input_tokens, self.output_tokens)
+        return Usage(self.input_tokens, self.output_tokens, self._searches.count)
 
 
 def _step(message: Message) -> interactions.StepParam:

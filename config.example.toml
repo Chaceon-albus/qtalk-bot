@@ -38,12 +38,16 @@ timeout_seconds = 120      # 一次模型调用的时限，单位秒；换备用
 # inputs 是这个模型除文字外还能直接接收的输入："image"（图片）、"audio"（语音）、"file"（PDF），
 # 不写就是只收文字。带附件的消息只在能处理它们的模型之间选。
 # OpenAI 的模型不能写 "audio"：Responses API 不接受音频输入，语音会改用 QQ 自带的识别文本。
+# 打开 search 后，调用这个模型会带上服务商内置的联网搜索（OpenAI 的 web_search、Gemini 的 google_search），
+# 回答末尾会列出引用的来源；搜索按次计费，次数记在用量里。
+# Gemini 的条款要求同时展示它给的「搜索建议」（一段 HTML），QQ 显示不了，这里没有展示。
 [[models]]
 name = "sol"              # 内部名字，用于日志、用量和互相引用
 provider = "openai"
 model = "gpt-6.2-sol"     # 服务商那边的模型名
 description = "用户想解决一个具体问题：查资料、写代码、分析、做计划或做决定"
 inputs = ["image", "file"]
+search = true
 default = true
 fallback = "hydrogen"     # 可选：调用失败时改用的模型，写另一项的 name
 # reasoning = "high"      # 可选：推理强度，原样传给服务商；不写用服务商的默认值。
@@ -55,6 +59,7 @@ provider = "gemini"
 model = "gemini-4-hydrogen"
 description = "用户在倾诉、闲聊，或需要情感上的支持与陪伴"
 inputs = ["image", "audio", "file"]
+search = true
 # reasoning = "low"       # 这款模型默认的思考级别是 high，一句话的回答也会用掉几百个输出 token
 
 # 按消息选模型：每条消息先用 Decisions API 做一道选择题，选项就是上面的模型列表。

@@ -130,3 +130,27 @@ async def test_no_describer_without_the_table() -> None:
     settings = (ModelSettings(name="main", provider=Provider.OPENAI, model="m", default=True),)
     async with ChatModels(settings, SECRETS) as models:
         assert models.describer is None
+
+
+async def test_search_setting_reaches_each_model_and_the_describer_never_searches() -> None:
+    settings = (
+        ModelSettings(name="main", provider=Provider.OPENAI, model="m", default=True, search=True),
+        ModelSettings(name="alt", provider=Provider.GEMINI, model="g", search=True),
+        ModelSettings(name="plain", provider=Provider.OPENAI, model="m"),
+    )
+    describe = DescribeSettings(provider=Provider.GEMINI, model="gemini-lite")
+    async with ChatModels(settings, SECRETS, describe=describe) as models:
+        main, alt, plain, describer = (
+            models["main"],
+            models["alt"],
+            models["plain"],
+            models.describer,
+        )
+        assert isinstance(main, OpenAIChatModel)
+        assert isinstance(alt, GeminiChatModel)
+        assert isinstance(plain, OpenAIChatModel)
+        assert isinstance(describer, GeminiChatModel)
+        assert main._search is True  # pyright: ignore[reportPrivateUsage]
+        assert alt._search is True  # pyright: ignore[reportPrivateUsage]
+        assert plain._search is False  # pyright: ignore[reportPrivateUsage]
+        assert describer._search is False  # pyright: ignore[reportPrivateUsage]

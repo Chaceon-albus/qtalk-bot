@@ -128,3 +128,60 @@ def test_feed_holds_back_only_what_is_undecided() -> None:
 def test_plain_text_passes_through_immediately() -> None:
     guard = MarkdownGuard()
     assert guard.feed("没有任何特殊字符的一段话。") == "没有任何特殊字符的一段话。"
+
+
+@pytest.mark.parametrize(
+    ("text", "closing"),
+    [
+        ("```python\nprint(1)", "\n```"),
+        ("```python\nprint(1)\n", "```"),
+        ("前文\n~~~~\ncode", "\n~~~~"),
+        ("````\n```\nstill code", "\n````"),
+        ("```\ncode\n```\n后文", ""),
+        ("没有代码", ""),
+        ("行内 `code", ""),
+    ],
+)
+def test_closing_fence_after_finish(text: str, closing: str) -> None:
+    guard = MarkdownGuard()
+    guard.feed(text)
+    guard.finish()
+    assert guard.closing_fence() == closing
+
+
+LIST_FENCES = [
+    # （正文，finish() 之后 closing_fence() 的结果）
+    ("- ```text\n  code (x)\n  ```\n", ""),  # 列表项里已闭合的代码块：不补
+    ("- ```text\n  code\n  ```", ""),
+    ("1. ```python\n   print(1)\n   ```\n后文", ""),
+    ("- - ```\n    code\n    ```\n", ""),
+    ("- ```text\n  code", "\n  ```"),  # 没闭合：按列表项内容的缩进补
+    ("10) ~~~\n    code\n", "    ~~~"),
+    ("- ```\n  code\n不缩进的一行](x)\n", ""),  # 列表项结束，代码块随之结束
+    ("- ```\n  code\n```\n", ""),  # 结束行没缩进：仍当作结束，不当作新的开头
+    ("- ```\n  code\n\n  more\n", "  ```"),  # 空行不结束列表项
+]
+
+
+@pytest.mark.parametrize(("text", "closing"), LIST_FENCES)
+def test_fences_inside_list_items(text: str, closing: str) -> None:
+    guard = MarkdownGuard()
+    guard.feed(text)
+    guard.finish()
+    assert guard.closing_fence() == closing
+
+
+@pytest.mark.parametrize(("text", "closing"), LIST_FENCES)
+def test_fences_inside_list_items_do_not_depend_on_chunking(text: str, closing: str) -> None:
+    whole = MarkdownGuard()
+    expected = whole.feed(text) + whole.finish()
+    guard = MarkdownGuard()
+    output = "".join(guard.feed(c) for c in text) + guard.finish()
+    assert output == expected
+    assert guard.closing_fence() == closing
+
+
+def test_code_in_a_list_item_is_left_alone_and_text_after_it_is_guarded() -> None:
+    guard = MarkdownGuard()
+    text = "- ```\n  [a](b)\n  ```\n[c](d)\n"
+    assert guard.feed(text) + guard.finish() == "- ```\n  [a](b)\n  ```\n[c]（d）\n"

@@ -99,7 +99,7 @@ class UsageSummary:
     """一个用户的用量汇总。token 数只累加服务商返回了的；`*_unreported` 是没有返回用量的调用次数。
 
     `*_calls`、`*_input`、`*_output`、`*_unreported` 包括决策调用；`*_decision_calls`、`*_decision_input`
-    是其中决策调用的部分（决策没有输出 token）。
+    是其中决策调用的部分（决策没有输出 token）。`*_searches` 是服务商内置搜索的执行次数（只累加报告了的）。
     """
 
     user_id: int
@@ -116,6 +116,8 @@ class UsageSummary:
     today_decision_input: int = 0
     total_decision_calls: int = 0
     total_decision_input: int = 0
+    today_searches: int = 0
+    total_searches: int = 0
 
 
 def add_user_message(
@@ -548,12 +550,15 @@ def add_usage(
     output_tokens: int | None,
     now: int,
     purpose: UsagePurpose = UsagePurpose.CHAT,
+    searches: int | None = None,
 ) -> None:
     """记一次模型调用：`model` 是内部名字（决策调用是 `DECISION_USAGE_MODEL`），`provider` 与
-    `provider_model` 是实际调用的服务商与模型名。"""
+    `provider_model` 是实际调用的服务商与模型名。`searches` 是这次调用执行了的服务商内置搜索次数：带了搜索
+    工具的调用是整数（没搜就是 0），没带的（以及没有报告用量的）是 `None`。"""
     conn.execute(
         "INSERT INTO usage (user_id, message_id, model, provider, provider_model,"
-        " input_tokens, output_tokens, created_at, purpose) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " input_tokens, output_tokens, created_at, purpose, searches)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             user_id,
             message_id,
@@ -564,6 +569,7 @@ def add_usage(
             output_tokens,
             now,
             purpose.value,
+            searches,
         ),
     )
 
@@ -631,7 +637,10 @@ def usage_summary(conn: sqlite3.Connection, since: int) -> list[UsageSummary]:
             THEN u.input_tokens END) AS INTEGER) AS today_decision_input,
           SUM(u.purpose = 'decision') AS total_decision_calls,
           CAST(total(CASE WHEN u.purpose = 'decision' THEN u.input_tokens END) AS INTEGER)
-            AS total_decision_input
+            AS total_decision_input,
+          CAST(total(CASE WHEN u.created_at >= :since THEN u.searches END) AS INTEGER)
+            AS today_searches,
+          CAST(total(u.searches) AS INTEGER) AS total_searches
         FROM usage AS u JOIN users ON users.id = u.user_id
         GROUP BY u.user_id ORDER BY u.user_id
         """,
@@ -653,6 +662,8 @@ def usage_summary(conn: sqlite3.Connection, since: int) -> list[UsageSummary]:
             today_decision_input=row["today_decision_input"],
             total_decision_calls=row["total_decision_calls"],
             total_decision_input=row["total_decision_input"],
+            today_searches=row["today_searches"],
+            total_searches=row["total_searches"],
         )
         for row in rows
     ]

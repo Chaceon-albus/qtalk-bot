@@ -323,7 +323,12 @@ NO_USAGE = "还没有用量记录。"
 
 
 def _usage_part(
-    calls: int, input_tokens: int, output_tokens: int, unreported: int, decisions: tuple[int, int]
+    calls: int,
+    input_tokens: int,
+    output_tokens: int,
+    unreported: int,
+    decisions: tuple[int, int],
+    searches: int = 0,
 ) -> str:
     part = f"{calls} 次，输入 {input_tokens} / 输出 {output_tokens} token"
     if unreported:
@@ -331,6 +336,8 @@ def _usage_part(
     decision_calls, decision_input = decisions
     if decision_calls:
         part += f"，含决策 {decision_calls} 次、输入 {decision_input} token"
+    if searches:
+        part += f"，联网搜索 {searches} 次"
     return part
 
 
@@ -342,12 +349,14 @@ def usage_line(
     total: tuple[int, int, int, int],
     today_decisions: tuple[int, int] = (0, 0),
     total_decisions: tuple[int, int] = (0, 0),
+    today_searches: int = 0,
+    total_searches: int = 0,
 ) -> str:
     """`today`、`total` 都是（调用次数，输入 token，输出 token，没有用量数据的次数），包括决策调用；
-    `*_decisions` 是其中决策调用的（次数，输入 token）。"""
+    `*_decisions` 是其中决策调用的（次数，输入 token）；`*_searches` 是服务商内置搜索的执行次数，为 0 时不显示。"""
     return (
-        f"#{user_id} {name}：今天 {_usage_part(*today, today_decisions)}；"
-        f"累计 {_usage_part(*total, total_decisions)}"
+        f"#{user_id} {name}：今天 {_usage_part(*today, today_decisions, today_searches)}；"
+        f"累计 {_usage_part(*total, total_decisions, total_searches)}"
     )
 
 
@@ -365,13 +374,15 @@ class UsageRow:
     total: tuple[int, int, int, int]
     today_decisions: tuple[int, int] = (0, 0)
     total_decisions: tuple[int, int] = (0, 0)
+    today_searches: int = 0
+    total_searches: int = 0
 
 
 def usage_message(rows: Sequence[UsageRow]) -> Rich:
     blocks = [
         f"- `#{r.user_id}` {escape_markdown(r.name)}\n"
-        f"  - 今天：{_usage_part(*r.today, r.today_decisions)}\n"
-        f"  - 累计：{_usage_part(*r.total, r.total_decisions)}"
+        f"  - 今天：{_usage_part(*r.today, r.today_decisions, r.today_searches)}\n"
+        f"  - 累计：{_usage_part(*r.total, r.total_decisions, r.total_searches)}"
         for r in rows
     ]
     markdown = "**用量**（今天从本地时间 0 点算起）\n\n" + "\n".join(blocks)
@@ -384,6 +395,8 @@ def usage_message(rows: Sequence[UsageRow]) -> Rich:
                 total=r.total,
                 today_decisions=r.today_decisions,
                 total_decisions=r.total_decisions,
+                today_searches=r.today_searches,
+                total_searches=r.total_searches,
             )
             for r in rows
         ]

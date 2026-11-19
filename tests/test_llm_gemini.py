@@ -20,6 +20,7 @@ from qtalk_bot.llm import (
     AudioPart,
     ChatEvent,
     ChatRequest,
+    Citation,
     ErrorKind,
     FilePart,
     Finished,
@@ -30,6 +31,8 @@ from qtalk_bot.llm import (
     Part,
     Provider,
     Role,
+    SearchProgress,
+    SearchStage,
     TextDelta,
     TextPart,
     Usage,
@@ -135,13 +138,13 @@ def streaming(*hops: list[Payload]) -> Server:
     return Server(*(replying(events) for events in hops))
 
 
-def model_on(server: Server) -> GeminiChatModel:
+def model_on(server: Server, *, search: bool = False) -> GeminiChatModel:
     http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(server.handle))
     options = types.HttpOptions(
         httpx_async_client=http_client, retry_options=types.HttpRetryOptions(attempts=1)
     )
     client = genai.Client(api_key=FAKE_KEY, http_options=options)
-    return GeminiChatModel(client, name="main", model="gemini-fake")
+    return GeminiChatModel(client, name="main", model="gemini-fake", search=search)
 
 
 async def collect(model: GeminiChatModel) -> list[ChatEvent]:
@@ -608,3 +611,464 @@ async def test_image_type_outside_the_documented_list_fails_without_a_request() 
 
     assert info.value.kind is ErrorKind.UNSUPPORTED
     assert server.requests == []
+
+
+# ---- 联网搜索 ----
+# 形状照 SDK 的 `googlesearchcallstep.py`、`googlesearchcalldelta.py`、`googlesearchresultstep.py`、
+# `textannotationdelta.py`、`urlcitation.py` 与官方流式文档的示例：`google_search_call` 步骤开始时只有 `id`、
+# `signature`、`type`，查询词在 `step.delta` 的 `arguments.queries` 里。
+
+SHANGHAI = "https://weather.example.cn/shanghai"
+CALENDAR = "https://calendar.example.com/today"
+SUGGESTIONS_HTML = "<style>.chip{}</style><div class='chip'>上海 天气</div>"
+
+
+def search_call(index: int, call_id: str) -> Payload:
+    return {
+        "event_type": "step.start",
+        "index": index,
+        "step": {"id": call_id, "signature": "", "type": "google_search_call"},
+    }
+
+
+def search_queries(index: int, *queries: str) -> Payload:
+    return {
+        "event_type": "step.delta",
+        "index": index,
+        "delta": {"type": "google_search_call", "arguments": {"queries": list(queries)}},
+    }
+
+
+def search_result(index: int, call_id: str) -> list[Payload]:
+    return [
+        {
+            "event_type": "step.start",
+            "index": index,
+            "step": {"type": "google_search_result", "call_id": call_id},
+        },
+        {
+            "event_type": "step.delta",
+            "index": index,
+            "delta": {
+                "type": "google_search_result",
+                "is_error": False,
+                "result": [{"search_suggestions": SUGGESTIONS_HTML}],
+            },
+        },
+        stop(index),
+    ]
+
+
+def annotations(index: int, *items: Payload) -> Payload:
+    return {
+        "event_type": "step.delta",
+        "index": index,
+        "delta": {"type": "text_annotation_delta", "annotations": list(items)},
+    }
+
+
+def url_citation(url: str, title: str, start_byte: int = 0, end_byte: int = 6) -> Payload:
+    # 下标的单位按 SDK 的说明是字节（「今天」是 6 个字节）。
+    return {
+        "type": "url_citation",
+        "url": url,
+        "title": title,
+        "start_index": start_byte,
+        "end_index": end_byte,
+    }
+
+
+SEARCH_USAGE = {"total_input_tokens": 40, "total_output_tokens": 9, "total_thought_tokens": 30}
+
+
+async def test_search_tool_progress_citations_and_count() -> None:
+    server = streaming(
+        [
+            created(),
+            *THOUGHT,
+            search_call(1, "gs_1"),
+            search_queries(1, "上海 天气"),
+            search_queries(1, "上海 天气", "今天 日期"),  # 再给一次全部查询词，多了一个
+            stop(1),
+            *search_result(2, "gs_1"),
+            search_call(3, "gs_2"),
+            search_queries(3, " 上海 天气", ""),  # 重复与空的查询不计费
+            stop(3),
+            *search_result(4, "gs_2"),
+            start(5, "model_output"),
+            text(5, "今天晴。"),
+            annotations(5, url_citation(SHANGHAI, "weather.example.cn")),
+            annotations(
+                5,
+                url_citation(SHANGHAI, "weather.example.cn"),
+                url_citation(CALENDAR, "calendar.example.com", 6, 12),
+            ),
+            stop(5),
+            completed("completed", SEARCH_USAGE),
+        ]
+    )
+
+    events = await collect(model_on(server, search=True))
+
+    assert server.body()["tools"] == [{"type": "google_search"}]
+    assert events == [
+        SearchProgress("gs_1", SearchStage.STARTED),
+        SearchProgress("gs_1", SearchStage.UPDATED, ("上海 天气",)),
+        Usage(None, None, 1),  # 查询一出现就计数并交出，被打断时也不丢
+        SearchProgress("gs_1", SearchStage.UPDATED, ("上海 天气", "今天 日期")),
+        Usage(None, None, 2),
+        SearchProgress("gs_1", SearchStage.COMPLETED, ("上海 天气", "今天 日期")),
+        SearchProgress("gs_2", SearchStage.STARTED),
+        SearchProgress("gs_2", SearchStage.UPDATED, (" 上海 天气",)),
+        SearchProgress("gs_2", SearchStage.COMPLETED, (" 上海 天气",)),
+        TextDelta("今天晴。"),
+        Citation(SHANGHAI, "weather.example.cn"),
+        Citation(CALENDAR, "calendar.example.com"),
+        Usage(40, 39, 2),
+        DONE,
+    ]
+    # 搜索建议的 HTML 不出现在任何事件里。
+    assert all(SUGGESTIONS_HTML not in repr(event) for event in events)
+
+
+async def test_searches_are_counted_across_continuation_hops() -> None:
+    first_hop = [
+        created(),
+        search_call(0, "gs_1"),
+        search_queries(0, "上海 天气"),
+        stop(0),
+        completed(
+            "requires_continuation",
+            {"total_input_tokens": 10, "total_output_tokens": 100},
+            continuation_token="fake-token",
+        ),
+    ]
+    second_hop = [
+        created("v1_hop2"),
+        search_call(0, "gs_2"),
+        search_queries(0, "上海 天气", "上海 明天 天气"),
+        stop(0),
+        start(1, "model_output"),
+        text(1, "晴"),
+        stop(1),
+        completed("completed", {"total_input_tokens": 110, "total_output_tokens": 5}),
+    ]
+
+    events = await collect(model_on(streaming(first_hop, second_hop), search=True))
+
+    usages = [event for event in events if isinstance(event, Usage)]
+    assert usages == [
+        Usage(None, None, 1),
+        Usage(10, 100, 1),
+        Usage(10, 100, 2),
+        Usage(120, 105, 2),
+    ]
+
+
+async def test_searches_before_an_interruption_are_reported() -> None:
+    server = streaming([created(), search_call(0, "gs_1"), search_queries(0, "上海 天气")])
+
+    events, error = await failure(model_on(server, search=True))
+
+    assert error.kind is ErrorKind.MALFORMED
+    assert events[-1] == Usage(None, None, 1)
+
+
+async def test_query_delta_without_a_start_event() -> None:
+    server = streaming(
+        [created(), search_queries(0, "上海 天气"), completed("completed", SEARCH_USAGE)]
+    )
+
+    events = await collect(model_on(server, search=True))
+
+    assert events[:3] == [
+        SearchProgress("step-0", SearchStage.STARTED),
+        SearchProgress("step-0", SearchStage.UPDATED, ("上海 天气",)),
+        Usage(None, None, 1),
+    ]
+
+
+async def test_no_search_tool_when_disabled() -> None:
+    server = streaming([created(), completed("completed", SEARCH_USAGE)])
+
+    events = await collect(model_on(server))
+
+    assert "tools" not in server.body()
+    assert events == [Usage(40, 39, None), DONE]
+
+
+async def test_search_with_no_queries_counts_zero() -> None:
+    server = streaming([created(), completed("completed", SEARCH_USAGE)])
+
+    events = await collect(model_on(server, search=True))
+
+    assert events == [Usage(40, 39, 0), DONE]
+
+
+async def test_search_rejected_by_the_provider_is_an_ordinary_failure() -> None:
+    def rejected(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(400, json={"error": {"code": 400, "message": "no tools"}})
+
+    _, error = await failure(model_on(Server(rejected), search=True))
+
+    assert error.kind is ErrorKind.BAD_REQUEST
+    assert error.status_code == 400
+
+
+def model_output_start(index: int, *blocks: Payload) -> Payload:
+    return {
+        "event_type": "step.start",
+        "index": index,
+        "step": {"type": "model_output", "content": list(blocks)},
+    }
+
+
+def text_block(value: str, *cited: Payload) -> Payload:
+    block: Payload = {"type": "text", "text": value}
+    if cited:
+        block["annotations"] = list(cited)
+    return block
+
+
+def completed_with_steps(*steps: Payload) -> Payload:
+    return completed("completed", SEARCH_USAGE, steps=list(steps))
+
+
+async def test_text_in_step_start_is_sent_with_its_citations_before_the_deltas() -> None:
+    server = streaming(
+        [
+            created(),
+            model_output_start(0, text_block("第一段。", url_citation(SHANGHAI, "上海天气"))),
+            text(0, "第二段。"),
+            stop(0),
+            completed_with_steps(  # 快照里的正文都已发出：不重复
+                {"type": "user_input", "content": [{"type": "text", "text": "问"}]},
+                {
+                    "type": "model_output",
+                    "content": [text_block("第一段。第二段。", url_citation(SHANGHAI, "上海天气"))],
+                },
+            ),
+        ]
+    )
+
+    events = await collect(model_on(server, search=True))
+
+    assert events == [
+        TextDelta("第一段。"),
+        Citation(SHANGHAI, "上海天气"),
+        TextDelta("第二段。"),
+        Usage(40, 39, 0),
+        DONE,
+    ]
+
+
+async def test_citations_only_in_the_completed_snapshot_are_read() -> None:
+    server = streaming(
+        [
+            created(),
+            start(0, "model_output"),
+            text(0, "今天晴。"),
+            stop(0),
+            completed_with_steps(
+                {"type": "thought", "summary": [{"type": "text", "text": "想"}]},
+                {
+                    "type": "model_output",
+                    "content": [
+                        text_block(
+                            "今天晴。",
+                            url_citation(SHANGHAI, "weather.example.cn"),
+                            url_citation(CALENDAR, "calendar.example.com"),
+                        )
+                    ],
+                },
+            ),
+        ]
+    )
+
+    events = await collect(model_on(server, search=True))
+
+    assert events == [
+        TextDelta("今天晴。"),
+        Citation(SHANGHAI, "weather.example.cn"),
+        Citation(CALENDAR, "calendar.example.com"),
+        Usage(40, 39, 0),
+        DONE,
+    ]
+
+
+async def test_text_only_in_the_completed_snapshot_is_sent_once() -> None:
+    server = streaming(
+        [
+            created(),
+            start(0, "model_output"),
+            text(0, "前半，"),
+            completed_with_steps(
+                {"type": "model_output", "content": [text_block("前半，后半。")]},
+            ),
+        ]
+    )
+
+    events = await collect(model_on(server))
+
+    assert events == [TextDelta("前半，"), TextDelta("后半。"), Usage(40, 39), DONE]
+
+
+async def test_snapshot_that_does_not_match_what_was_sent_adds_no_text() -> None:
+    server = streaming(
+        [
+            created(),
+            start(0, "model_output"),
+            text(0, "已经发出的"),
+            completed_with_steps({"type": "model_output", "content": [text_block("别的内容")]}),
+        ]
+    )
+
+    events = await collect(model_on(server))
+
+    assert events == [TextDelta("已经发出的"), Usage(40, 39), DONE]
+
+
+async def test_snapshot_is_compared_with_the_text_of_its_own_hop() -> None:
+    # 第一跳发了「甲」；第二跳流出「甲」，这一跳的快照是「甲甲乙」：补「甲乙」，用户看到「甲甲甲乙」。
+    first_hop = [
+        created(),
+        start(0, "model_output"),
+        text(0, "甲"),
+        completed("requires_continuation", None, continuation_token="fake-token"),
+    ]
+    second_hop = [
+        created("v1_hop2"),
+        start(0, "model_output"),
+        text(0, "甲"),
+        completed_with_steps({"type": "model_output", "content": [text_block("甲甲乙")]}),
+    ]
+
+    events = await collect(model_on(streaming(first_hop, second_hop)))
+
+    assert [event for event in events if isinstance(event, TextDelta)] == [
+        TextDelta("甲"),
+        TextDelta("甲"),
+        TextDelta("甲乙"),
+    ]
+
+
+async def test_snapshot_text_that_does_not_match_brings_no_citations() -> None:
+    server = streaming(
+        [
+            created(),
+            start(0, "model_output"),
+            text(0, "北京下雨。"),
+            completed_with_steps(
+                {
+                    "type": "model_output",
+                    "content": [text_block("上海晴。", url_citation(SHANGHAI, "上海天气"))],
+                }
+            ),
+        ]
+    )
+
+    events = await collect(model_on(server, search=True))
+
+    assert events == [TextDelta("北京下雨。"), Usage(40, 39, 0), DONE]
+
+
+async def test_queries_only_in_the_snapshot_are_counted() -> None:
+    server = streaming(
+        [
+            created(),
+            search_call(0, "gs_1"),
+            search_queries(0, "上海 天气"),
+            stop(0),
+            completed_with_steps(
+                {
+                    "type": "google_search_call",
+                    "id": "gs_1",
+                    "arguments": {"queries": ["上海 天气", "今天 日期", ""]},
+                },
+                {"type": "google_search_call", "id": "gs_2", "arguments": {"queries": 5}},
+            ),
+        ]
+    )
+
+    events = await collect(model_on(server, search=True))
+
+    assert events[-2:] == [Usage(40, 39, 2), DONE]
+
+
+async def test_snapshot_queries_of_a_continuation_hop_are_handed_out_at_once() -> None:
+    first_hop = [
+        created(),
+        completed(
+            "requires_continuation",
+            None,
+            continuation_token="fake-token",
+            steps=[{"type": "google_search_call", "id": "gs_1", "arguments": {"queries": ["q"]}}],
+        ),
+    ]
+    second_hop = [created("v1_hop2"), start(0, "model_output"), text(0, "后")]
+
+    events, _ = await failure(model_on(streaming(first_hop, second_hop), search=True))
+
+    assert events == [Usage(None, None, 1), TextDelta("后")]
+
+
+async def test_malformed_snapshot_is_skipped_and_the_usage_of_the_frame_is_kept() -> None:
+    server = streaming(
+        [
+            created(),
+            start(0, "model_output"),
+            text(0, "今天晴。"),
+            annotations(0, url_citation(SHANGHAI, "上海天气")),
+            completed_with_steps(
+                {"type": "model_output", "content": 7},  # content 不是列表
+                {
+                    "type": "model_output",
+                    "content": [{"type": "text", "text": "今天晴。", "annotations": 3}],
+                },
+            ),
+        ]
+    )
+
+    events = await collect(model_on(server, search=True))
+
+    assert events == [TextDelta("今天晴。"), Citation(SHANGHAI, "上海天气"), Usage(40, 39, 0), DONE]
+
+
+async def test_malformed_step_start_content_is_skipped() -> None:
+    server = streaming(
+        [
+            created(),
+            {
+                "event_type": "step.start",
+                "index": 0,
+                "step": {"type": "model_output", "content": 7},
+            },
+            text(0, "晴"),
+            completed("completed", SEARCH_USAGE),
+        ]
+    )
+
+    events = await collect(model_on(server, search=True))
+
+    assert events == [TextDelta("晴"), Usage(40, 39, 0), DONE]
+
+
+async def test_lone_surrogates_are_removed_from_every_text_path() -> None:
+    server = streaming(
+        [
+            created(),
+            model_output_start(0, text_block("开\ud800头")),
+            text(0, "中\udc00间"),
+            completed_with_steps(
+                {"type": "model_output", "content": [text_block("开头中间结\ud83d尾")]}
+            ),
+        ]
+    )
+
+    events = await collect(model_on(server))
+
+    assert [event for event in events if isinstance(event, TextDelta)] == [
+        TextDelta("开头"),
+        TextDelta("中间"),
+        TextDelta("结尾"),
+    ]

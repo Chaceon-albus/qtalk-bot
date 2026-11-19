@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from tests.test_batching import ManualClock, settle
 
-from qtalk_bot import access, journal, routing, texts
+from qtalk_bot import access, citations, journal, routing, texts
 from qtalk_bot import conversation as conversation_module
 from qtalk_bot import describe as describe_module
 from qtalk_bot.access import User, UserStatus
@@ -46,6 +46,7 @@ from qtalk_bot.llm import (
     AudioPart,
     ChatEvent,
     ChatRequest,
+    Citation,
     ErrorKind,
     FilePart,
     Finished,
@@ -58,6 +59,8 @@ from qtalk_bot.llm import (
     Part,
     Provider,
     Role,
+    SearchProgress,
+    SearchStage,
     TextDelta,
     TextPart,
     Usage,
@@ -3877,3 +3880,274 @@ async def test_judgment_input_has_every_message_the_turn_carries(db: Database) -
     (request,) = decider.requests
     assert json.loads(request.input) == {"answering": ["遗留的问题", "新问题"], "latest": ["补充"]}
     assert user_texts(model.requests[1]) == ["遗留的问题\n新问题\n补充"]
+
+
+# ---- 联网搜索与「来源」（里程碑 7a） ----
+
+WEATHER = "https://weather.example.cn/shanghai"
+CALENDAR = "https://calendar.example.com/today"
+SEARCHED: list[Step] = [
+    SearchProgress("ws_1", SearchStage.STARTED),
+    SearchProgress("ws_1", SearchStage.COMPLETED, ("上海 天气",)),
+    Usage(None, None, 1),
+]
+
+
+async def searches(db: Database) -> list[tuple[str, str, int | None]]:
+    """用量行的（用途，内部名字，搜索次数）。"""
+    result = await db.fetch_all("SELECT purpose, model, searches FROM usage ORDER BY id")
+    return [(r["purpose"], r["model"], r["searches"]) for r in result]
+
+
+def sources_of(*items: Citation) -> list[citations.Source]:
+    return citations.collect(items)
+
+
+async def test_sources_follow_the_answer_and_count_as_what_the_user_saw(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel(
+        "main",
+        [
+            *SEARCHED,
+            TextDelta("今天晴，"),
+            Citation(WEATHER, "上海天气"),
+            TextDelta("周五。"),
+            Citation(WEATHER, "上海天气"),
+            Citation("javascript:alert(1)", "坏链接"),
+            Citation(CALENDAR, "日历"),
+            Usage(12, 34, 1),
+            DONE,
+        ],
+    )
+
+    channel = await say(conversation(db, model), alice, "今天的日期和上海的天气")
+
+    section = citations.markdown_section(
+        sources_of(Citation(WEATHER, "上海天气"), Citation(CALENDAR, "日历"))
+    )
+    assert section == (f"\n\n来源：\n1. [上海天气]({WEATHER})\n2. [日历]({CALENDAR})")
+    assert channel.kinds == ["typing", "stream", "finish"]
+    assert channel.streamed == "今天晴，周五。" + section
+    assert (await rows(db))[-1] == Row(
+        "assistant", "今天晴，周五。" + section, "main", "completed", "streamed"
+    )
+    assert await searches(db) == [("chat", "main", 1)]
+
+
+async def test_no_citations_no_sources_and_searches_stay_null_without_the_tool(
+    db: Database,
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    channel = await say(conversation(db, ScriptedModel("main", answer("你好"))), alice, "在吗")
+
+    assert channel.streamed == "你好"
+    assert await searches(db) == [("chat", "main", None)]
+
+
+async def test_citations_without_an_answer_add_nothing(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", [*SEARCHED, TextDelta("  "), Citation(WEATHER, "上海天气"), DONE])
+
+    channel = await say(conversation(db, model), alice, "上海天气")
+
+    assert "stream" not in channel.kinds
+    assert channel.sent == [texts.MODEL_FAILED]
+    assert (await rows(db))[-1] == Row("assistant", "", "main", "empty", "failed")
+    assert await searches(db) == [("chat", "main", 1)]  # 搜索照样计数
+
+
+async def test_sources_come_before_the_interruption_notice(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    channel = FakeChannel()
+    model = ScriptedModel(
+        "main",
+        [
+            *SEARCHED,
+            TextDelta("说到一半"),
+            Citation(WEATHER, "上海天气"),
+            channel.delivered,
+            ModelError(Provider.OPENAI, ErrorKind.SERVER),
+        ],
+    )
+
+    await say(conversation(db, model), alice, "上海天气", channel)
+
+    section = citations.markdown_section(sources_of(Citation(WEATHER, "上海天气")))
+    assert channel.streamed == f"说到一半{section}\n\n{texts.REPLY_INTERRUPTED}"
+    assert (await rows(db))[-1] == Row(
+        "assistant", "说到一半" + section, "main", "error", "interrupted"
+    )
+    assert await searches(db) == [("chat", "main", 1)]
+
+
+async def test_rejected_stream_with_sources_is_resent_as_plain_text(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    channel = FakeChannel(stream_failure=reject_if("来源"))
+    model = ScriptedModel(
+        "main", [*SEARCHED, TextDelta("今天晴。"), Citation(WEATHER, "上海天气"), *answer()]
+    )
+
+    await say(conversation(db, model), alice, "上海天气", channel)
+
+    plain = "今天晴。" + citations.plain_section(sources_of(Citation(WEATHER, "上海天气")))
+    assert plain == f"今天晴。\n\n来源：\n1. 上海天气 {WEATHER}"
+    assert channel.sent == [plain]
+    assert (await rows(db))[-1] == Row("assistant", plain, "main", "completed", "plain")
+
+
+async def test_searches_of_an_interrupted_hidden_answer_are_still_counted(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    model = ScriptedModel(
+        "main",
+        [
+            *SEARCHED,
+            gate,
+            TextDelta("合起来的回答"),
+            Citation(WEATHER, "上海天气"),
+            Usage(12, 34, 1),
+            DONE,
+        ],
+    )
+    chat = steering(db, model, FakeDecider(steer_result(0.9)))
+    batcher = batcher_of(chat, ManualClock())
+    first, second = FakeChannel(), FakeChannel()
+
+    await submit(batcher, alice, message("上海天气"), first)
+    await started(model, 1)
+    await settle()  # 搜索已经执行，回答还没开始显示
+    await submit(batcher, alice, message("还有明天的"), second)
+    await started(model, 2)
+    gate.set()
+    await finish(batcher)
+
+    assert first.kinds == ["typing"]  # 搜索期间什么都没显示，插话照常打断
+    assert second.streamed.startswith("合起来的回答\n\n来源：")
+    assert await searches(db) == [
+        ("decision", DECISION_USAGE_MODEL, None),
+        ("chat", "main", 1),  # 被打断的那次调用里执行的搜索照常计数
+        ("chat", "main", 1),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("tail", "ending", "notice"),
+    [
+        (
+            [Usage(12, 34, 1), Finished(FinishReason.MAX_TOKENS)],
+            "max_tokens",
+            texts.REPLY_CUT_SHORT,
+        ),
+        ([ModelError(Provider.OPENAI, ErrorKind.SERVER)], "error", texts.REPLY_INTERRUPTED),
+    ],
+    ids=["max_tokens", "error"],
+)
+async def test_unclosed_code_fence_is_closed_before_the_sources(
+    db: Database, tail: list[Step], ending: str, notice: str
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel(
+        "main",
+        [
+            *SEARCHED,
+            TextDelta("看代码：\n```python\nprint(1)"),
+            Citation(WEATHER, "上海天气"),
+            *tail,
+        ],
+    )
+
+    channel = await say(conversation(db, model), alice, "写段代码")
+
+    section = citations.markdown_section(sources_of(Citation(WEATHER, "上海天气")))
+    answer_text = "看代码：\n```python\nprint(1)\n```" + section
+    assert channel.streamed == f"{answer_text}\n\n{notice}"
+    assert (await rows(db))[-1] == Row(
+        "assistant", answer_text, "main", ending, "interrupted" if ending == "error" else "streamed"
+    )
+
+
+async def test_closed_code_fence_is_left_alone(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel(
+        "main", [TextDelta("```\ncode\n```\n完。"), Citation(WEATHER, "上海天气"), *answer()]
+    )
+
+    channel = await say(conversation(db, model), alice, "写段代码")
+
+    section = citations.markdown_section(sources_of(Citation(WEATHER, "上海天气")))
+    assert channel.streamed == "```\ncode\n```\n完。" + section
+
+
+async def test_unclosed_fence_does_not_change_the_plain_text_resend(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    channel = FakeChannel(stream_failure=reject_if("来源"))
+    model = ScriptedModel(
+        "main", [TextDelta("```\ncode"), Citation(WEATHER, "上海天气"), *answer()]
+    )
+
+    await say(conversation(db, model), alice, "写段代码", channel)
+
+    assert channel.sent == [
+        "```\ncode" + citations.plain_section(sources_of(Citation(WEATHER, "上海天气")))
+    ]
+
+
+async def test_failure_to_tidy_the_citations_keeps_the_reply_and_the_accounting(
+    db: Database, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def broken(*_: object, **__: object) -> list[citations.Source]:
+        raise UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogates not allowed")
+
+    monkeypatch.setattr(citations, "collect", broken)
+    alice = await invited(db, ALICE, "小王")
+    secret_url = f"{WEATHER}/秘密"
+    model = ScriptedModel(
+        "main",
+        [
+            *SEARCHED,
+            TextDelta("今天晴。"),
+            Citation(secret_url, "秘密"),
+            *answer(usage=Usage(12, 34, 1)),
+        ],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        channel = await say(conversation(db, model), alice, "上海天气")
+
+    assert channel.streamed == "今天晴。"  # 没有「来源」，但回答照常
+    assert (await rows(db))[-1] == Row("assistant", "今天晴。", "main", "completed", "streamed")
+    assert await searches(db) == [("chat", "main", 1)]
+    assert "UnicodeEncodeError" in caplog.text
+    assert secret_url not in caplog.text
+
+
+async def test_failure_to_tidy_the_citations_of_a_preempted_answer_keeps_the_accounting(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*_: object, **__: object) -> list[citations.Source]:
+        raise RuntimeError("意外")
+
+    monkeypatch.setattr(citations, "collect", broken)
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    model = ScriptedModel(
+        "main", [*SEARCHED, Citation(WEATHER, "上海天气"), gate, *answer("合起来的回答")]
+    )
+    chat = steering(db, model, FakeDecider(steer_result(0.9)))
+    batcher = batcher_of(chat, ManualClock())
+
+    await submit(batcher, alice, message("上海天气"), FakeChannel())
+    await started(model, 1)
+    await settle()
+    second = FakeChannel()
+    await submit(batcher, alice, message("还有明天的"), second)
+    await started(model, 2)
+    gate.set()
+    await finish(batcher)
+
+    assert second.streamed == "合起来的回答"
+    assert await searches(db) == [
+        ("decision", DECISION_USAGE_MODEL, None),
+        ("chat", "main", 1),
+        ("chat", "main", None),  # answer() 的用量没带搜索次数
+    ]

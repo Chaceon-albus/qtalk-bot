@@ -72,6 +72,7 @@ def test_example_config_shows_both_providers_and_a_fallback() -> None:
 
     assert {model.provider.value for model in example.models} == {"openai", "gemini"}
     assert example.default_model.fallback in {model.name for model in example.models}
+    assert all(model.search for model in example.models)
     # 可选项在示例里是注释掉的，照抄示例不会意外带上代理、改掉端点或指定推理强度。
     assert example.default_model.reasoning is None
     assert example.qq == QQSettings()

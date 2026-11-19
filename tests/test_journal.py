@@ -963,3 +963,69 @@ async def test_version_4_stickers_are_recognized_again_by_version_6(tmp_path: Pa
         assert result[ids[1]] == (1, "")
         assert [result[i][0] for i in ids[2:]] == [0, 0, 0, 0]
         assert result[ids[2]][1] == f"哈哈{raw}"  # 原文照留，组装时再清洗
+
+
+# ---- 里程碑 7a：联网搜索的次数 ----
+
+
+async def test_usage_summary_counts_searches_today_and_in_total(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+    bob = await new_user(db, "FAKE-OPENID-BOB", "小李")
+
+    def fill(conn: sqlite3.Connection) -> None:
+        rows = [
+            (alice, 3, 100),  # 昨天
+            (alice, 2, 1000),
+            (alice, 0, 1001),  # 带了搜索工具、没有搜
+            (alice, None, 1002),  # 没带搜索工具
+            (bob, None, 1000),
+        ]
+        for user_id, searches, now in rows:
+            journal.add_usage(
+                conn,
+                user_id=user_id,
+                message_id=None,
+                model="main",
+                provider=Provider.OPENAI,
+                provider_model="gpt-fake",
+                input_tokens=1,
+                output_tokens=1,
+                now=now,
+                searches=searches,
+            )
+
+    await db.transaction(fill)
+    alice_usage, bob_usage = await db.transaction(journal.usage_summary, 1000)
+
+    assert (alice_usage.today_searches, alice_usage.total_searches) == (2, 5)
+    assert (bob_usage.today_searches, bob_usage.total_searches) == (0, 0)
+    rows = await db.fetch_all("SELECT searches FROM usage ORDER BY id")
+    assert [row["searches"] for row in rows] == [3, 2, 0, None, None]  # 0 与空分开记
+
+
+async def test_negative_search_count_is_rejected_by_the_table(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.execute(
+            "INSERT INTO usage (user_id, model, provider, provider_model, created_at, searches)"
+            " VALUES (?, 'main', 'openai', 'gpt-fake', 0, -1)",
+            (alice,),
+        )
+
+
+async def test_version_6_database_gets_an_empty_searches_column(tmp_path: Path) -> None:
+    path = tmp_path / DATABASE_FILENAME
+    async with await Database.open(path, migrations=MIGRATIONS[:6]) as old:
+        user = await old.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+        await old.execute(
+            "INSERT INTO usage (user_id, model, provider, provider_model, input_tokens,"
+            " output_tokens, created_at) VALUES (?, 'main', 'openai', 'gpt-fake', 5, 6, 7)",
+            (user.id,),
+        )
+
+    async with await Database.open(path) as db:
+        row = await db.fetch_one("SELECT input_tokens, output_tokens, searches FROM usage")
+        assert row is not None
+        assert tuple(row) == (5, 6, None)
+        (summary,) = await db.transaction(journal.usage_summary, 0)
+        assert (summary.total_calls, summary.total_searches) == (1, 0)

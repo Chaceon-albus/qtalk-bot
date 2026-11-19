@@ -8,8 +8,9 @@
   实际 MIME 类型，由适配器各自转换。适配器收到它不支持的内容时抛 `ModelError(kind=UNSUPPORTED)`；正常情况下
   调用方已按 `INPUT_LIMITS` 与模型声明的输入能力挡在前面。
 - 输出是一串 `ChatEvent`，是带标签的联合类型。现在有文字增量（`TextDelta`）、用量（`Usage`）、结束
-  （`Finished`）三种；以后会加思考摘要、调用工具前的说明、搜索进展等。**调用方必须忽略不认识的事件**
-  （`match` 里留一个 `case _: pass`），这样加事件时不必改已有的调用方。
+  （`Finished`），以及开了服务商内置搜索时的搜索进展（`SearchProgress`）与引用（`Citation`）；以后会加思考
+  摘要、调用工具前的说明等。**调用方必须忽略不认识的事件**（`match` 里留一个 `case _: pass`），这样加事件时
+  不必改已有的调用方。
 - 调用失败抛 `ModelError`。文案只有服务商、本地定义的错误分类（`ErrorKind`）与数字状态码，不含任何
   来自上游的文字（错误信息、错误码字段都可能回显正文或凭证），可以直接记日志。
 """
@@ -17,7 +18,7 @@
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, cast
 
 
 class Provider(StrEnum):
@@ -185,9 +186,13 @@ class TextDelta:
 class Usage:
     """这次调用到目前为止的累计用量；服务商没给的项是 `None`。
 
-    可能出现多次（例如 Gemini 自动续写的每一跳结束时），后一次覆盖前一次：调用方取最后一次，不要相加。
-    这样调用中途被打断时，已经报告的部分不会丢。`output_tokens` 包括推理（思考）所用的 token，它们也按
-    输出计费。
+    可能出现多次（例如 Gemini 自动续写的每一跳结束时、每执行一次搜索之后），后一次覆盖前一次：调用方取最后
+    一次，不要相加。这样调用中途被打断时，已经报告的部分不会丢。`output_tokens` 包括推理（思考）所用的
+    token，它们也按输出计费。
+
+    `searches` 是这次调用里服务商实际执行、按它的口径计费的搜索次数（OpenAI 按 `action` 为 `search` 的调用数，
+    Gemini 按执行的不重复的非空查询数）：带了搜索工具的调用总是整数（没有搜索就是 0），没带搜索工具的是
+    `None`。搜索执行之后、token 用量出来之前给出的 `Usage` 里 token 数是 `None`（还不知道）。
 
     构造时把不可信的计数（不是整数、布尔值、负数、超过 `MAX_TOKENS_PER_CALL`）换成 `None`，当作服务商没有
     报告：两家 SDK 都不校验响应，原样留下的超大整数在 SQLite 绑定时会抛 `OverflowError`，让整轮记账一起回滚。
@@ -197,10 +202,12 @@ class Usage:
 
     input_tokens: int | None
     output_tokens: int | None
+    searches: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "input_tokens", token_count(self.input_tokens))
         object.__setattr__(self, "output_tokens", token_count(self.output_tokens))
+        object.__setattr__(self, "searches", search_count(self.searches))
 
 
 MAX_TOKENS_PER_CALL = 10**9
@@ -219,6 +226,97 @@ def token_count(value: object) -> int | None:
     return value
 
 
+MAX_SEARCHES_PER_CALL = 10_000
+"""单次调用的搜索次数的可信上限。两家一次回答一般只搜几次到几十次，超过一万一定是上游或计数出错。"""
+
+
+def search_count(value: object) -> int | None:
+    """搜索次数：0 到 `MAX_SEARCHES_PER_CALL` 之间的整数才采用，其余（含布尔值）返回 `None`。"""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= MAX_SEARCHES_PER_CALL
+    ):
+        return None
+    return value
+
+
+class SearchStage(StrEnum):
+    """一次内置搜索进行到哪一步。"""
+
+    STARTED = "started"  # 开始了；查询词可能还不知道
+    UPDATED = "updated"  # 还在进行，得知了（更多的）查询词（Gemini 在搜索过程中给出查询词）
+    COMPLETED = "completed"  # 完成了；`queries` 是能拿到的全部查询词（OpenAI 只在这时给出）
+
+
+@dataclass(frozen=True, slots=True)
+class SearchProgress:
+    """服务商内置搜索的一次进展。
+
+    同一次搜索的几个事件 `call_id` 相同（服务商给的调用编号；没有时由适配器按位置生成），依次是 STARTED、
+    零到多个 UPDATED、COMPLETED；流中途结束时可能没有 COMPLETED。`queries` 是到目前为止得知的这次搜索的全部
+    查询词（不是增量），可能为空（如 OpenAI 打开网页、在页面里查找的动作）。查询词可能带出用户问的内容，不进
+    `repr`，也不要记日志。
+
+    计费的搜索次数不从这里数，以 `Usage.searches` 为准。
+    """
+
+    call_id: str
+    stage: SearchStage
+    queries: tuple[str, ...] = field(default=(), repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class Citation:
+    """回答里引用的一个来源（服务商的 `url_citation` 标注）。
+
+    `url` 与 `title` 原样来自服务商，没有校验，展示前要经 `citations.py` 处理；`title` 可能为空。同一个来源
+    可能出现多次，由使用方去重。它们可能带出用户问的内容，不进 `repr`，也不要记日志。没有带标注在正文里的
+    位置：两家的下标单位不同（OpenAI 是字符，Gemini 的 SDK 写的是字节），现在也用不上。
+    """
+
+    url: str = field(repr=False)
+    title: str | None = field(default=None, repr=False)
+
+
+def clean_text(text: str) -> str:
+    """去掉孤立的 Unicode 代理码位。SDK 解析 JSON 时会原样留下 `"\\ud800"` 这类转义，它们编码不成 UTF-8，发给
+    QQ 时会出错；适配器交出的正文与查询词都先经过这里。"""
+    if text.isascii():
+        return text
+    return "".join(c for c in text if not 0xD800 <= ord(c) <= 0xDFFF)
+
+
+def items(value: object) -> list[object]:
+    """适配器共用：SDK 不校验响应，本该是列表的字段可能是别的类型；是列表时原样返回，否则当作空列表。"""
+    return cast(list[object], value) if isinstance(value, list) else []
+
+
+class CitationFilter:
+    """适配器共用：把服务商的 `url_citation` 标注转成 `Citation`，同一次调用里同一个来源只给一次。
+
+    两家的标注都是 `type == "url_citation"`、带 `url` 与 `title` 的对象。SDK 在流式解析时不校验，字段一律按
+    `getattr` 取、检查类型。
+    """
+
+    def __init__(self) -> None:
+        self._seen: set[tuple[str, str | None]] = set()
+
+    def __call__(self, annotation: object) -> Citation | None:
+        """别的标注、没有链接的、给过的同一个来源返回 `None`。"""
+        if getattr(annotation, "type", None) != "url_citation":
+            return None
+        url: object = getattr(annotation, "url", None)
+        title: object = getattr(annotation, "title", None)
+        if not isinstance(url, str) or not url:
+            return None
+        key = (url, title if isinstance(title, str) and title else None)
+        if key in self._seen:
+            return None
+        self._seen.add(key)
+        return Citation(*key)
+
+
 class FinishReason(StrEnum):
     COMPLETED = "completed"
     MAX_TOKENS = "max_tokens"  # 达到输出上限
@@ -232,7 +330,7 @@ class Finished:
     reason: FinishReason
 
 
-type ChatEvent = TextDelta | Usage | Finished
+type ChatEvent = TextDelta | Usage | Finished | SearchProgress | Citation
 """流式事件。以后会加新的种类，调用方要忽略不认识的事件。"""
 
 

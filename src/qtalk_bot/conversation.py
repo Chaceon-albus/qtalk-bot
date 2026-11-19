@@ -30,7 +30,8 @@
    的只用识别文本。
    调用过决策的话，调用对话模型之前在事务里再确认一次授权，已不能使用就停下，什么也不发。
 5. 按选出的模型的能力组装上下文（`context.RequestBuilder`），调用它，文字增量经 `MarkdownGuard` 处理后流式
-   回复。出现非空白的正文之前不开始流式消息。
+   回复。出现非空白的正文之前不开始流式消息。模型引用了来源（开了服务商内置搜索时的 `llm.Citation`）的，
+   回答写完后在末尾接上「来源」一段（`citations.py`），它也算回答的一部分；改发纯文本时用纯文本的写法。
 6. 出错时：还没有任何内容交给 QQ 发送、选出的模型又配置了备用模型、备用模型也能处理这一轮的附件，就在
    事务里再确认一次授权，然后按备用模型的能力重新组装上下文、重试一次；否则给用户固定的说明。流式回复被平台拒绝时，把全文改用纯文本的普通消息再发一次，
    仍然失败就发固定说明。发送分片时出了说不准是否送达的错误，立刻停止等模型。
@@ -43,7 +44,8 @@
 **插话时重来**：每一轮带一个 `TurnControl`。任何内容交给 QQ 之前（固定说明、流式回复的第一片、纯文本）都先
 `claim()`，从此这一轮算「已开始显示」；`batching.py` 要重来时先 `preempt()`（已开始显示就不成功），成功了再
 取消这一轮。被这样取消的一轮停下模型、不发任何东西，**不写回复行**（用户消息仍是待回复的，由重新开始的那一轮
-带上），只记选模型的决策与已有的用量，然后把取消传播出去。
+带上），只记选模型的决策与已有的用量，然后把取消传播出去。服务商内置的搜索在回答开始显示之前进行，所以搜索
+期间照常可以被打断；适配器每执行一次搜索就交出新的 `Usage`，被打断的那次调用里已经执行的搜索照常计数。
 
 **判断插话**（`judge()`）：在事务里复查授权、取出正在回答的消息与新消息的文字版（只有这个用户自己的），交给
 `routing.SteerJudge`；决策记录与用量挂在新消息里最后一条上，被取消时也照记。
@@ -61,8 +63,9 @@ from enum import Enum
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
-from . import access, faces, journal, texts
+from . import access, citations, faces, journal, texts
 from .access import User
+from .citations import Source
 from .config import AttachmentSettings, ChatSettings
 from .context import (
     Built,
@@ -86,6 +89,7 @@ from .llm import (
     AudioPart,
     ChatModel,
     ChatRequest,
+    Citation,
     Finished,
     FinishReason,
     Modality,
@@ -251,10 +255,16 @@ class _Attempt:
     ending: Ending
     text: str = field(repr=False)  # 模型生成的全部文字（未经 MarkdownGuard 处理）
     given: frozenset[int] = frozenset()  # 这次请求里实际以原件交给模型的、本轮的附件
+    sources: tuple[Source, ...] = ()  # 回答引用的来源，整理过（见 `citations.collect()`）
 
     @property
     def has_answer(self) -> bool:
         return self.ending in _ANSWERED and bool(self.text.strip())
+
+    @property
+    def searches(self) -> int:
+        """这次调用执行了的搜索次数（没有报告时按 0）。"""
+        return 0 if self.usage is None else self.usage.searches or 0
 
 
 _ANSWERED = frozenset((Ending.COMPLETED, Ending.MAX_TOKENS, Ending.INCOMPLETE))
@@ -277,6 +287,7 @@ class _Run:
         self.usage: Usage | None = None
         self.ending = Ending.ERROR  # 流没有给出 Finished 就结束，也按出错处理
         self.parts: list[str] = []
+        self.citations: list[Citation] = []  # 模型引用的来源，原样
 
     def attempt(self, ending: Ending | None = None) -> _Attempt:
         ending = self.ending if ending is None else ending
@@ -285,7 +296,14 @@ class _Run:
             ending = Ending.EMPTY
         model = self.model
         return _Attempt(
-            model.name, model.provider, model.model, self.usage, ending, text, self.given
+            model.name,
+            model.provider,
+            model.model,
+            self.usage,
+            ending,
+            text,
+            self.given,
+            _sources(self.citations, model.name),
         )
 
 
@@ -707,11 +725,12 @@ class Conversation:
             _Reply(model, ending, turn.attempts, outcome, tuple(turn_messages), given),
         )
         logger.info(
-            "回复了用户 %s：模型 %s，结局 %s，送达 %s",
+            "回复了用户 %s：模型 %s，结局 %s，送达 %s，搜索 %d 次",
             turn.user.label,
             model,
             ending.value,
             outcome.delivery.value,
+            sum(attempt.searches for attempt in turn.attempts),
         )
 
     async def _record_preempted(self, turn: _Turn, message_id: int) -> None:
@@ -719,10 +738,11 @@ class Conversation:
             self._finish_preempted, turn.user, message_id, turn.selection.record, turn.attempts
         )
         logger.info(
-            "用户 %s 插话：取消了还没开始显示的回答（模型 %s，调用 %d 次），不记回复",
+            "用户 %s 插话：取消了还没开始显示的回答（模型 %s，调用 %d 次，搜索 %d 次），不记回复",
             turn.user.label,
             turn.attempts[-1].model if turn.attempts else turn.selection.model,
             len(turn.attempts),
+            sum(attempt.searches for attempt in turn.attempts),
         )
 
     # ---- 事务：同步，在数据库线程里执行 ----
@@ -1027,6 +1047,11 @@ class Conversation:
                 )
                 continue
             turn.outbox.push(guard.finish())
+            section = citations.markdown_section(attempt.sources)
+            if section and attempt.text.strip():
+                # 回答写完之后接上「来源」：它也是回答的一部分（算进用户实际看到的内容），排在固定说明之前。
+                # 正文停在没闭合的代码围栏里时先闭合它，否则「来源」会被渲染成代码。
+                turn.outbox.push(guard.closing_fence() + section)
             break
         return False
 
@@ -1091,6 +1116,8 @@ class Conversation:
                     match event:
                         case TextDelta(text=text):
                             sink(text)
+                        case Citation():
+                            run.citations.append(event)
                         case Usage():
                             run.usage = event
                         case Finished(reason=reason):
@@ -1127,7 +1154,8 @@ class Conversation:
             return _Outcome(outbox.delivered_answer, ReplyDelivery.UNCERTAIN)
         # 流式回复被平台拒绝：全文改用纯文本再发一次。
         if last.text.strip():
-            plain = last.text if notice is None else f"{last.text}\n\n{notice}"
+            answer = last.text + citations.plain_section(last.sources)
+            plain = answer if notice is None else f"{answer}\n\n{notice}"
             try:
                 await channel.send(plain)
             except SendRejectedError as exc:
@@ -1137,7 +1165,7 @@ class Conversation:
                 return _Outcome(outbox.delivered_answer, ReplyDelivery.UNCERTAIN)
             else:
                 logger.info("用户 %s 的流式回复被平台拒绝，已改发纯文本", user.label)
-                return _Outcome(last.text, ReplyDelivery.PLAIN)
+                return _Outcome(answer, ReplyDelivery.PLAIN)
         sent = await _send_notice(channel, texts.REPLY_REJECTED, user)
         delivery = ReplyDelivery.REJECTED if sent else ReplyDelivery.NOTICE_LOST
         return _Outcome(outbox.delivered_answer, delivery)
@@ -1204,6 +1232,7 @@ def _record_usage(
             provider_model=attempt.provider_model,
             input_tokens=None if usage is None else usage.input_tokens,
             output_tokens=None if usage is None else usage.output_tokens,
+            searches=None if usage is None else usage.searches,
             now=now,
         )
 
@@ -1251,6 +1280,16 @@ async def _stop_consumer(turn: _Turn) -> None:
 
 def _remaining(deadline: float) -> float:
     return max(0.0, deadline - asyncio.get_running_loop().time())
+
+
+def _sources(cited: Sequence[Citation], model: str) -> tuple[Source, ...]:
+    """整理一次调用引用的来源。引用来自上游、没有校验，整理时出了任何意外都只记日志、当作没有来源：正文可能已经
+    流出、用量已经报告，不能因为它让这一轮丢掉回复与记账（被取消时的收尾也走这里）。"""
+    try:
+        return tuple(citations.collect(cited))
+    except Exception as exc:  # noqa: BLE001  见 docstring；文案可能带链接，只记类型
+        logger.warning("模型 %s 引用的来源没能整理，不附「来源」：%s", model, type(exc).__name__)
+        return ()
 
 
 def _describe(exc: BaseException) -> str:

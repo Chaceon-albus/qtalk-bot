@@ -265,6 +265,52 @@ async def test_admin_usage_lists_today_and_total_per_user(h: Harness) -> None:
     assert "/usage" in texts.HELP
 
 
+async def test_admin_usage_shows_searches_only_when_there_are_some(h: Harness) -> None:
+    assert await h.admin("/usage") == texts.NO_USAGE
+    admin = await h.user(ADMIN)
+    assert admin is not None
+
+    def record(conn: sqlite3.Connection) -> None:
+        for searches, now in [(3, START - 17 * HOUR), (2, START), (0, START), (None, START)]:
+            journal.add_usage(
+                conn,
+                user_id=admin.id,
+                message_id=None,
+                model="main",
+                provider=Provider.OPENAI,
+                provider_model="gpt-fake",
+                input_tokens=10,
+                output_tokens=1,
+                now=now,
+                searches=searches,
+            )
+
+    await h.db.transaction(record)
+
+    reply = await h.admin_reply("/usage")
+    assert reply.text == (
+        "**用量**（今天从本地时间 0 点算起）\n\n"
+        f"- `#{admin.id}` 管理员\n"
+        "  - 今天：3 次，输入 30 / 输出 3 token，联网搜索 2 次\n"
+        "  - 累计：4 次，输入 40 / 输出 4 token，联网搜索 5 次"
+    )
+    expected = (
+        f"#{admin.id} 管理员：今天 3 次，输入 30 / 输出 3 token，联网搜索 2 次；"
+        "累计 4 次，输入 40 / 输出 4 token，联网搜索 5 次"
+    )
+    assert reply.fallbacks == (texts.usage_list([expected]),)
+
+
+def test_usage_line_hides_zero_searches() -> None:
+    line = texts.usage_line(
+        user_id=1, name="小王", today=(1, 2, 3, 0), total=(4, 5, 6, 0), total_searches=7
+    )
+    assert (
+        line
+        == "#1 小王：今天 1 次，输入 2 / 输出 3 token；累计 4 次，输入 5 / 输出 6 token，联网搜索 7 次"
+    )
+
+
 async def test_admin_usage_counts_decision_calls(h: Harness) -> None:
     assert await h.admin("/usage") == texts.NO_USAGE  # 管理员发过消息后才有自己的一行
     admin = await h.user(ADMIN)
