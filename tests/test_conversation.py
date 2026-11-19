@@ -16,11 +16,14 @@ from zoneinfo import ZoneInfo
 import pytest
 from tests.test_batching import ManualClock, settle
 
-from qtalk_bot import access, journal, texts
+from qtalk_bot import access, journal, routing, texts
 from qtalk_bot import conversation as conversation_module
+from qtalk_bot import describe as describe_module
 from qtalk_bot.access import User, UserStatus
 from qtalk_bot.batching import Batcher
 from qtalk_bot.config import (
+    DEFAULT_FILE_INSTRUCTIONS,
+    DEFAULT_FILE_MAX_OUTPUT_TOKENS,
     DEFAULT_PERSONA,
     AttachmentSettings,
     BatchingSettings,
@@ -37,7 +40,7 @@ from qtalk_bot.conversation import (
     SendRejectedError,
     SendUncertainError,
 )
-from qtalk_bot.describe import Describer
+from qtalk_bot.describe import FILE_PROMPT, Describer
 from qtalk_bot.journal import DECISION_USAGE_MODEL
 from qtalk_bot.llm import (
     AudioPart,
@@ -48,6 +51,7 @@ from qtalk_bot.llm import (
     Finished,
     FinishReason,
     ImagePart,
+    InputLimits,
     Message,
     Modality,
     ModelError,
@@ -1044,17 +1048,21 @@ class FakeDecider:
     """决策模型的替身：依次给出 `outcomes` 里的结果（异常就抛出），记下请求。`gate` 不为空时先等它置位。"""
 
     def __init__(
-        self, *outcomes: DecisionResult | Exception, gate: asyncio.Event | None = None
+        self,
+        *outcomes: DecisionResult | Exception,
+        gate: asyncio.Event | None = None,
+        provider: Provider = Provider.GEMINI,
     ) -> None:
         self.outcomes = list(outcomes)
         self.gate = gate
+        self._provider = provider
         self.requests: list[DecisionRequest] = []
         self.started = asyncio.Event()
         self.finished = 0
 
     @property
     def provider(self) -> Provider:
-        return Provider.GEMINI
+        return self._provider
 
     @property
     def model(self) -> str:
@@ -1761,34 +1769,135 @@ async def test_each_users_attachments_stay_in_their_own_directory_and_context(
         assert other not in images
 
 
-async def test_voice_goes_as_audio_to_a_model_that_hears_and_as_text_otherwise(
-    db: Database, tmp_path: Path
-) -> None:
-    alice = await invited(db, ALICE, "小王")
-    wav = b"RIFF\x00\x00\x00\x00WAVEfmt "
-    wav_url = "https://qqbot.ugcimg.cn/wav"
-    voice = IncomingAttachment(
-        kind=AttachmentKind.VOICE, url=IMAGE_URL, wav_url=wav_url, asr_text="明天几点"
+WAV_BYTES = b"RIFF\x00\x00\x00\x00WAVEfmt "
+WAV_URL = "https://qqbot.ugcimg.cn/wav"
+
+
+def voice_attachment(asr_text: str | None = "明天几点") -> IncomingAttachment:
+    return IncomingAttachment(
+        kind=AttachmentKind.VOICE, url=IMAGE_URL, wav_url=WAV_URL, asr_text=asr_text
     )
+
+
+def hearing_and_deaf(
+    db: Database, tmp_path: Path, decider: FakeDecider | None
+) -> tuple[Conversation, GeminiScriptedModel, ScriptedModel]:
     hearing = GeminiScriptedModel("hearing", answer("八点"))
     deaf = ScriptedModel("deaf", answer("好的"))
     chat = media_chat(
         db,
         tmp_path,
-        FakeDownloader({wav_url: wav}),
+        FakeDownloader({WAV_URL: WAV_BYTES}),
         (deaf, BLIND),
         (hearing, frozenset({Modality.AUDIO})),
+        decider=decider,
     )
+    return chat, hearing, deaf
 
-    await send(chat, alice, None, voice)
-    assert deaf.requests == []  # 有能听的模型时优先选它
-    await send(chat, alice, "再说一遍")  # 只有文字：用默认模型
+
+async def test_voice_goes_to_the_decision_and_a_deaf_choice_gets_the_transcript(
+    db: Database, tmp_path: Path
+) -> None:
+    # 语音不影响候选：照常调用决策；选中收不了音频的模型，它拿到识别文本。
+    alice = await invited(db, ALICE, "小王")
+    decider = FakeDecider(chances(deaf=0.9, hearing=0.1))
+    chat, hearing, deaf = hearing_and_deaf(db, tmp_path, decider)
+
+    await send(chat, alice, None, voice_attachment())
+
+    (decision,) = decider.requests
+    assert "[语音] 明天几点" in decision.input  # 题目里保留识别文本
+    assert decision.media == (AudioPart(WAV_BYTES, "audio/wav"),)  # Gemini 的决策还拿到原声
+    assert hearing.requests == []
+    (request,) = deaf.requests
+    assert request.messages == (Message.text(Role.USER, "[语音] 明天几点"),)
+
+
+async def test_voice_goes_as_audio_when_the_decision_picks_a_model_that_hears(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    decider = FakeDecider(chances(deaf=0.1, hearing=0.9), chances(deaf=0.9, hearing=0.1))
+    chat, hearing, deaf = hearing_and_deaf(db, tmp_path, decider)
+
+    await send(chat, alice, None, voice_attachment())
+    await send(chat, alice, "再说一遍")
 
     (heard,) = hearing.requests
-    assert heard.messages[-1].parts == (TextPart("[语音：]"), AudioPart(wav, "audio/wav"))
-    # 历史里的语音只给识别文本。
+    assert heard.messages[-1].parts == (TextPart("[语音：]"), AudioPart(WAV_BYTES, "audio/wav"))
+    # 历史里的语音只给识别文本，并写清楚原声当时给过。
     (later,) = deaf.requests
-    assert later.messages[0] == Message.text(Role.USER, "[语音] 明天几点")
+    assert later.messages[0] == Message.text(
+        Role.USER, "[语音。原声在当时那一轮已经给过你，这里只保留自动识别的文字：明天几点]"
+    )
+    assert decider.requests[1].media == ()  # 只有文字的一轮不带媒体
+
+
+async def test_openai_decision_gets_only_the_transcript(db: Database, tmp_path: Path) -> None:
+    alice = await invited(db, ALICE, "小王")
+    decider = FakeDecider(chances(deaf=0.9, hearing=0.1), provider=Provider.OPENAI)
+    chat, _, deaf = hearing_and_deaf(db, tmp_path, decider)
+
+    await send(chat, alice, None, voice_attachment())
+
+    (decision,) = decider.requests
+    assert decision.media == ()
+    assert "[语音] 明天几点" in decision.input
+    assert len(deaf.requests) == 1
+
+
+async def test_voice_too_large_for_the_decision_goes_only_as_transcript(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tiny = InputLimits(
+        image_types=frozenset(),
+        audio_types=frozenset({"audio/wav"}),
+        file_types=frozenset(),
+        max_inline_bytes=8,
+    )
+    monkeypatch.setattr(routing, "DECISION_INPUT_LIMITS", {Provider.GEMINI: tiny})
+    alice = await invited(db, ALICE, "小王")
+    decider = FakeDecider(chances(deaf=0.9, hearing=0.1))
+    chat, _, _ = hearing_and_deaf(db, tmp_path, decider)
+
+    await send(chat, alice, None, voice_attachment())
+
+    (decision,) = decider.requests
+    assert decision.media == ()
+    assert "[语音] 明天几点" in decision.input
+
+
+async def test_voice_without_a_transcript_is_never_given_to_a_model_that_cannot_hear(
+    db: Database, tmp_path: Path
+) -> None:
+    # 只有能听的模型实际收得到可答的内容：候选只剩它，不调用决策，也不会拿「未识别出文字」去问别的模型。
+    alice = await invited(db, ALICE, "小王")
+    decider = FakeDecider(chances(deaf=0.9, hearing=0.1))
+    chat, hearing, deaf = hearing_and_deaf(db, tmp_path, decider)
+
+    await send(chat, alice, None, voice_attachment(None))
+
+    assert decider.requests == []
+    assert deaf.requests == []
+    assert len(hearing.requests) == 1
+
+
+async def test_decision_that_hears_gets_the_voice_even_when_no_chat_model_hears(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    first, second = ScriptedModel("first", answer("好")), ScriptedModel("second", answer("好"))
+    downloader = FakeDownloader({WAV_URL: WAV_BYTES})
+    decider = FakeDecider(chances(first=0.9, second=0.1))
+    chat = media_chat(db, tmp_path, downloader, (first, BLIND), (second, BLIND), decider=decider)
+
+    await send(chat, alice, None, voice_attachment())
+
+    assert downloader.fetched == [WAV_URL]  # 为决策下载原声
+    (decision,) = decider.requests
+    assert decision.media == (AudioPart(WAV_BYTES, "audio/wav"),)
+    (request,) = first.requests
+    assert request.messages == (Message.text(Role.USER, "[语音] 明天几点"),)
 
 
 # ---- 图片描述 ----
@@ -1872,6 +1981,359 @@ async def test_pending_descriptions_are_cancelled_on_shutdown(db: Database, tmp_
     assert describing.closed == 1
     (row,) = await attachment_rows(db)
     assert row[6] == "pending"
+
+
+# ---- PDF 摘要 ----
+
+SUMMARY = "这是一份季度报告：营收增长 12%，主要来自海外市场。"
+SUMMARY_PDF = b"%PDF-1.4\n%fake quarterly report"
+SUMMARY_PDF_URL = "https://grouptalk.c2c.qq.com/f/quarterly"
+SUMMARY_LABEL = f"报告.pdf，{len(SUMMARY_PDF)} B"
+
+
+def formatted_logs(caplog: pytest.LogCaptureFixture) -> str:
+    return "\n".join(caplog.handler.format(record) for record in caplog.records)
+
+
+def pdf_attachment() -> IncomingAttachment:
+    return IncomingAttachment(
+        kind=AttachmentKind.FILE, declared_type="file", url=SUMMARY_PDF_URL, filename="报告.pdf"
+    )
+
+
+def summarizing_chat(
+    db: Database, tmp_path: Path, describing: ScriptedModel, reader: ScriptedModel
+) -> tuple[Conversation, Describer]:
+    describer = describer_of(db, tmp_path, describing)
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({SUMMARY_PDF_URL: SUMMARY_PDF}),
+        (reader, READS),
+        describer=describer,
+    )
+    return chat, describer
+
+
+async def summary_rows(db: Database) -> list[tuple[object, ...]]:
+    result = await db.fetch_all(
+        "SELECT kind, text, description, describe_status FROM attachments ORDER BY id"
+    )
+    return [tuple(row) for row in result]
+
+
+async def test_pdf_summary_is_written_in_the_background_and_used_in_later_history(
+    db: Database, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    describing = ScriptedModel("describe", answer(SUMMARY, usage=Usage(36212, 80)))
+    reader = ScriptedModel("reader", answer("总结如下"))
+    chat, describer = summarizing_chat(db, tmp_path, describing, reader)
+
+    with caplog.at_level(logging.INFO):
+        await send(chat, alice, "总结一下", pdf_attachment())
+        await describer.wait_idle()
+        await send(chat, alice, "营收增长了多少")
+
+    (request,) = describing.requests
+    assert request.system == DEFAULT_FILE_INSTRUCTIONS
+    assert request.max_output_tokens == DEFAULT_FILE_MAX_OUTPUT_TOKENS
+    assert request.messages[0].parts == (
+        FilePart(SUMMARY_PDF, "application/pdf"),
+        TextPart(FILE_PROMPT),
+    )
+    assert await summary_rows(db) == [
+        ("file", f"[文件：报告.pdf，PDF，{len(SUMMARY_PDF)} B。摘要：{SUMMARY}]", SUMMARY, "done")
+    ]
+    # 本轮给了原件；之后的轮次里历史是「标签 + 摘要」，并写清楚原文当时给过。
+    first, later = reader.requests
+    assert FilePart(SUMMARY_PDF, "application/pdf") in first.messages[0].parts
+    assert later.messages[0] == Message.text(
+        Role.USER,
+        f"总结一下\n[PDF 文件：{SUMMARY_LABEL}。原文在当时那一轮已经给过你，这里只保留摘要："
+        f"{SUMMARY}]",
+    )
+    assert ("describe", "describe", 36212, 80) in await usage_by_purpose(db)
+    logs = formatted_logs(caplog)
+    assert SUMMARY not in logs
+    assert "报告.pdf" not in logs
+    assert "营收" not in logs
+
+
+async def test_without_a_summary_history_says_to_ask_again(db: Database, tmp_path: Path) -> None:
+    alice = await invited(db, ALICE, "小王")
+    describing = ScriptedModel("describe", [ModelError(Provider.OPENAI, ErrorKind.SERVER)])
+    reader = ScriptedModel("reader", answer("总结如下"))
+    chat, describer = summarizing_chat(db, tmp_path, describing, reader)
+
+    channel = await send(chat, alice, "总结一下", pdf_attachment())
+    await describer.wait_idle()
+    await send(chat, alice, "第三页写了什么")
+
+    assert channel.streamed == "总结如下"  # 摘要失败不影响回复
+    assert await summary_rows(db) == [
+        ("file", f"[文件：报告.pdf，PDF，{len(SUMMARY_PDF)} B]", None, "failed")
+    ]
+    assert reader.requests[-1].messages[0] == Message.text(
+        Role.USER,
+        f"总结一下\n[PDF 文件：{SUMMARY_LABEL}。原文在当时那一轮已经给过你，这里只保留这条说明，"
+        "细节记不清时如实告诉用户、请对方重新发送]",
+    )
+    assert ("describe", "describe", None, None) in await usage_by_purpose(db)
+
+
+async def test_no_summary_when_the_describe_provider_cannot_take_pdfs(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    no_files = InputLimits(
+        image_types=frozenset({"image/png"}),
+        audio_types=frozenset(),
+        file_types=frozenset(),
+        max_inline_bytes=1024 * 1024,
+    )
+    monkeypatch.setattr(describe_module, "INPUT_LIMITS", {Provider.OPENAI: no_files})
+    alice = await invited(db, ALICE, "小王")
+    describing = ScriptedModel("describe", answer("不该出现"))
+    reader = ScriptedModel("reader", answer("总结如下"))
+    chat, describer = summarizing_chat(db, tmp_path, describing, reader)
+
+    await send(chat, alice, "总结一下", pdf_attachment())
+    await describer.wait_idle()
+
+    assert describing.requests == []
+    assert await summary_rows(db) == [
+        ("file", f"[文件：报告.pdf，PDF，{len(SUMMARY_PDF)} B]", None, None)
+    ]
+
+
+async def test_no_summary_once_access_is_gone(db: Database, tmp_path: Path) -> None:
+    alice = await invited(db, ALICE, "小王")
+    describing = ScriptedModel("describe", answer("不该出现"))
+    reader = ScriptedModel("reader", answer("总结如下"))
+    chat, describer = summarizing_chat(db, tmp_path, describing, reader)
+    await describer.aclose()  # 先不让它写：只借这一轮把 PDF 存下、排成 pending
+    await send(chat, alice, "总结一下", pdf_attachment())
+    ((attachment_id,),) = [tuple(r) for r in await db.fetch_all("SELECT id FROM attachments")]
+    await db.transaction(access.set_user_status, alice.id, UserStatus.DISABLED)
+
+    queued = describer_of(db, tmp_path, describing)
+    queued.schedule(alice, [attachment_id])
+    await queued.wait_idle()
+
+    assert describing.requests == []
+    assert (await summary_rows(db))[0][3] == "pending"
+
+
+async def test_pending_summaries_are_cancelled_on_shutdown(db: Database, tmp_path: Path) -> None:
+    alice = await invited(db, ALICE, "小王")
+    describing = ScriptedModel("describe", [], hang=True)
+    reader = ScriptedModel("reader", answer("总结如下"))
+    chat, describer = summarizing_chat(db, tmp_path, describing, reader)
+
+    await send(chat, alice, "总结一下", pdf_attachment())
+    async with asyncio.timeout(HANG_GUARD):
+        await describing.started.wait()
+        assert describer.pending == 1
+        await describer.aclose()
+
+    assert describer.pending == 0
+    assert describing.closed == 1
+    assert (await summary_rows(db))[0][2:] == (None, "pending")
+
+
+# ---- 历史里「原件当时给过你」按记录，而不是按配置推断 ----
+
+BIG_PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * (8 * 1024 * 1024)  # base64 后约 10.7 MB
+OTHER_URL = "https://multimedia.nt.qq.com.cn/download?fileid=OTHER"
+GIVEN_NOTE = "这里只保留这条说明，细节记不清时如实告诉用户、请对方重新发送"
+
+
+async def given_flags(db: Database) -> list[int]:
+    return [row[0] for row in await db.fetch_all("SELECT given FROM attachments ORDER BY id")]
+
+
+async def test_original_given_to_the_chosen_model_is_recorded(db: Database, tmp_path: Path) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("是猫"))
+    chat = media_chat(
+        db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, SEES), image_turns=0
+    )
+
+    await send(chat, alice, "这是什么", image_attachment())
+    await send(chat, alice, "然后呢")
+
+    assert await given_flags(db) == [1]
+    assert model.requests[-1].messages[0] == Message.text(
+        Role.USER, f"这是什么\n[图片。原图在当时那一轮已经给过你，{GIVEN_NOTE}]"
+    )
+
+
+async def test_attachment_left_out_for_the_budget_is_not_claimed_as_given(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = GeminiScriptedModel("main", answer("看到一张"))
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({IMAGE_URL: BIG_PNG, OTHER_URL: BIG_PNG}),
+        (model, SEES),
+        image_turns=0,
+    )
+
+    await send(chat, alice, "看看", image_attachment(), image_attachment(OTHER_URL))
+    await send(chat, alice, "然后呢")
+
+    # Gemini 的 19 MiB 只放得下一张：第二张当时给的是文字版。
+    assert await given_flags(db) == [1, 0]
+    assert model.requests[-1].messages[0] == Message.text(
+        Role.USER, f"看看\n[图片。原图在当时那一轮已经给过你，{GIVEN_NOTE}]\n[图片]"
+    )
+
+
+async def test_after_switching_to_a_fallback_its_request_decides_what_was_given(
+    db: Database, tmp_path: Path
+) -> None:
+    # 主模型收到了原声但失败了，换到听不了的备用模型（它拿到识别文本）：以备用模型为准，不说原声给过。
+    alice = await invited(db, ALICE, "小王")
+    hearing = GeminiScriptedModel("hearing", [ModelError(Provider.GEMINI, ErrorKind.SERVER)])
+    deaf = ScriptedModel("deaf", answer("八点"))
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({WAV_URL: WAV_BYTES}),
+        (hearing, frozenset({Modality.AUDIO})),
+        (deaf, BLIND),
+        fallbacks={"hearing": "deaf"},
+    )
+
+    channel = await send(chat, alice, None, voice_attachment())
+    await send(chat, alice, "再说一遍")
+
+    assert channel.streamed == "八点"
+    assert hearing.requests[0].messages[-1].parts[-1] == AudioPart(WAV_BYTES, "audio/wav")
+    assert await given_flags(db) == [0]
+    assert deaf.requests[-1].messages[0] == Message.text(Role.USER, "[语音] 明天几点")
+
+
+async def test_cancelled_turn_with_nothing_delivered_is_not_claimed_as_given(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    hanging = ScriptedModel("main", [], hang=True)
+    chat = media_chat(
+        db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (hanging, SEES), image_turns=0
+    )
+    task = asyncio.create_task(send(chat, alice, "这是什么", image_attachment()))
+    async with asyncio.timeout(HANG_GUARD):
+        await hanging.started.wait()  # 模型已经收到原图
+        await db.execute("UPDATE attachments SET given = 1")  # 假设之前错记过
+        task.cancel()
+        await asyncio.wait({task})
+        await chat.drain()
+
+    assert (await rows(db))[-1] == Row("assistant", "", "main", "cancelled", "cancelled")
+    assert await given_flags(db) == [0]  # 没有结束这一轮：不算给过
+
+
+async def test_answer_delivered_before_cancellation_keeps_the_given_record(
+    db: Database, tmp_path: Path
+) -> None:
+    # 模型收到原图、正文已经送达，恰好在等结束分片时关停：这一轮已经结束，原图照记给过。
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("是猫"))
+    chat = media_chat(
+        db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, SEES), image_turns=0
+    )
+    channel = FakeChannel(finish_gate=asyncio.Event())
+    task = asyncio.create_task(send(chat, alice, "这是什么", image_attachment(), channel=channel))
+    async with asyncio.timeout(HANG_GUARD):
+        await channel.finish_started.wait()
+        task.cancel()
+        await asyncio.wait({task})
+        await chat.drain()
+    assert (await rows(db))[-1].content == "是猫"
+    assert await given_flags(db) == [1]
+
+    later = ScriptedModel("main", answer("好"))
+    restarted = media_chat(db, tmp_path, FakeDownloader({}), (later, SEES), image_turns=0)
+    await send(restarted, alice, "然后呢")
+    assert later.requests[0].messages[0] == Message.text(
+        Role.USER, f"这是什么\n[图片。原图在当时那一轮已经给过你，{GIVEN_NOTE}]"
+    )
+
+
+async def test_stale_given_is_cleared_by_the_turn_that_actually_ends(
+    db: Database, tmp_path: Path
+) -> None:
+    # 上一次调用带了原声、但送达不明（没有结束这一轮）；这条语音并进下一轮，由只拿到识别文本的模型答完。
+    alice = await invited(db, ALICE, "小王")
+    decider = FakeDecider(chances(deaf=0.1, hearing=0.9), chances(deaf=0.9, hearing=0.1))
+    chat, hearing, deaf = hearing_and_deaf(db, tmp_path, decider)
+
+    def uncertain(_: str) -> SendError | None:
+        return SendUncertainError("网络错误")
+
+    await send(chat, alice, None, voice_attachment(), channel=FakeChannel(stream_failure=uncertain))
+    assert hearing.requests[0].messages[-1].parts[-1] == AudioPart(WAV_BYTES, "audio/wav")
+    assert (await rows(db))[-1].delivery == "uncertain"
+    await db.execute("UPDATE attachments SET given = 1")  # 旧版会留下的记录
+
+    channel = await send(chat, alice, "听到了吗")
+
+    assert channel.streamed == "好的"
+    assert user_texts(deaf.requests[0]) == ["[语音] 明天几点\n听到了吗"]
+    assert await given_flags(db) == [0]
+
+
+async def test_text_in_the_batch_does_not_let_a_deaf_model_answer_a_silent_voice(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    decider = FakeDecider(chances(deaf=0.9, hearing=0.1))
+    chat, hearing, deaf = hearing_and_deaf(db, tmp_path, decider)
+
+    await send(chat, alice, "帮我回答语音里的问题", voice_attachment(None))
+
+    assert decider.requests == []  # 候选只剩能听的模型
+    assert deaf.requests == []
+    (request,) = hearing.requests
+    assert AudioPart(WAV_BYTES, "audio/wav") in request.messages[-1].parts
+
+
+async def test_voice_for_the_decision_holds_a_multimodal_slot(db: Database, tmp_path: Path) -> None:
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    decider = FakeDecider(chances(deaf=0.9, hearing=0.1), gate=gate)
+    chat, _, deaf = hearing_and_deaf(db, tmp_path, decider)
+    slots = chat._media_slots  # pyright: ignore[reportPrivateUsage]
+
+    task = asyncio.create_task(send(chat, alice, None, voice_attachment()))
+    async with asyncio.timeout(HANG_GUARD):
+        await decider.started.wait()
+        assert decider.requests[0].media  # 决策拿着原声
+        assert slots._value == conversation_module.MULTIMODAL_REQUESTS - 1  # pyright: ignore[reportPrivateUsage]
+        gate.set()
+        await task
+    assert slots._value == conversation_module.MULTIMODAL_REQUESTS  # pyright: ignore[reportPrivateUsage]
+    assert len(deaf.requests) == 1
+
+
+async def test_decision_without_voice_takes_no_multimodal_slot(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    decider = FakeDecider(chances(deaf=0.9, hearing=0.1), gate=gate)
+    chat, _, _ = hearing_and_deaf(db, tmp_path, decider)
+    slots = chat._media_slots  # pyright: ignore[reportPrivateUsage]
+
+    task = asyncio.create_task(send(chat, alice, "你好"))
+    async with asyncio.timeout(HANG_GUARD):
+        await decider.started.wait()
+        assert slots._value == conversation_module.MULTIMODAL_REQUESTS  # pyright: ignore[reportPrivateUsage]
+        gate.set()
+        await task
 
 
 # ---- 评审修正：授权复查、备用模型、未回复的消息、关停时的描述记账 ----
@@ -2285,28 +2747,46 @@ async def test_multimodal_slot_is_held_until_the_cancelled_request_has_stopped(
     assert model.seen_first_closed == [True]  # 小李开始时，小王的模型流已经停下
 
 
+class InflatingStore(MediaStore):
+    """读出来比记录的大：模拟本地文件与记录的大小不一致（如恢复了备份）。"""
+
+    def read(self, user_id: int, relative: str) -> bytes | None:
+        data = super().read(user_id, relative)
+        return None if data is None else data + b"\0" * (15 * 1024 * 1024)
+
+
+def fallback_over_budget_chat(
+    db: Database, tmp_path: Path
+) -> tuple[Conversation, ScriptedModel, GeminiScriptedModel]:
+    # 主模型（OpenAI，50 MB）放得下实际读到的图，备用模型（Gemini，19 MB）放不下：备用模型那次要补一句说明。
+    primary = ScriptedModel("primary", [ModelError(Provider.OPENAI, ErrorKind.SERVER)])
+    fallback = GeminiScriptedModel("fallback", answer("收到"))
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({IMAGE_URL: PNG_A}),
+        (primary, SEES),
+        (fallback, SEES),
+        fallbacks={"primary": "fallback"},
+        store=InflatingStore(MediaStore.under(tmp_path).root),
+    )
+    return chat, primary, fallback
+
+
+MISSING_URL = "https://multimedia.nt.qq.com.cn/download?fileid=GONE"
+
+
 async def test_fallback_sends_notices_that_are_new_for_its_request(
     db: Database, tmp_path: Path
 ) -> None:
     alice = await invited(db, ALICE, "小王")
-    wav_url = "https://qqbot.ugcimg.cn/wav"
-    missing = "https://multimedia.nt.qq.com.cn/download?fileid=GONE"
-    voice = IncomingAttachment(kind=AttachmentKind.VOICE, url=IMAGE_URL, wav_url=wav_url)
-    hearing = GeminiScriptedModel("hearing", [ModelError(Provider.GEMINI, ErrorKind.SERVER)])
-    deaf = ScriptedModel("deaf", answer("收到"))
-    chat = media_chat(
-        db,
-        tmp_path,
-        FakeDownloader({wav_url: b"RIFF\x00\x00\x00\x00WAVEfmt "}),
-        (hearing, frozenset({Modality.AUDIO, Modality.IMAGE})),
-        (deaf, BLIND),
-        fallbacks={"hearing": "deaf"},
-    )
+    chat, primary, _ = fallback_over_budget_chat(db, tmp_path)
 
-    channel = await send(chat, alice, "在吗", voice, image_attachment(missing))
+    channel = await send(chat, alice, "在吗", image_attachment(), image_attachment(MISSING_URL))
 
-    # 主模型前发过「附件没能下载」；备用模型收不了这条没有转写的语音，要补一句，不重复前一句。
-    assert channel.sent == [texts.ATTACHMENT_FAILED, texts.VOICE_UNRECOGNIZED]
+    # 主模型前发过「附件没能下载」；备用模型放不下那张图，要补一句，不重复前一句。
+    assert any(isinstance(p, ImagePart) for p in primary.requests[0].messages[-1].parts)
+    assert channel.sent == [texts.ATTACHMENT_FAILED, texts.ATTACHMENTS_OVER_BUDGET]
     assert channel.streamed == "收到"
 
 
@@ -2364,19 +2844,7 @@ async def test_notice_whose_delivery_is_unknown_is_not_resent_for_the_fallback(
     db: Database, tmp_path: Path
 ) -> None:
     alice = await invited(db, ALICE, "小王")
-    wav_url = "https://qqbot.ugcimg.cn/wav"
-    missing = "https://multimedia.nt.qq.com.cn/download?fileid=GONE"
-    voice = IncomingAttachment(kind=AttachmentKind.VOICE, url=IMAGE_URL, wav_url=wav_url)
-    hearing = GeminiScriptedModel("hearing", [ModelError(Provider.GEMINI, ErrorKind.SERVER)])
-    deaf = ScriptedModel("deaf", answer("收到"))
-    chat = media_chat(
-        db,
-        tmp_path,
-        FakeDownloader({wav_url: b"RIFF\x00\x00\x00\x00WAVEfmt "}),
-        (hearing, frozenset({Modality.AUDIO, Modality.IMAGE})),
-        (deaf, BLIND),
-        fallbacks={"hearing": "deaf"},
-    )
+    chat, _, _ = fallback_over_budget_chat(db, tmp_path)
     attempts: list[str] = []
 
     def uncertain_first(text: str) -> SendError | None:
@@ -2385,10 +2853,12 @@ async def test_notice_whose_delivery_is_unknown_is_not_resent_for_the_fallback(
 
     channel = FakeChannel(send_failure=uncertain_first)
 
-    await send(chat, alice, "在吗", voice, image_attachment(missing), channel=channel)
+    await send(
+        chat, alice, "在吗", image_attachment(), image_attachment(MISSING_URL), channel=channel
+    )
 
     # 第一条说明送达不明：可能已经送到，备用模型那次只补发新的那句。
-    assert attempts == [texts.ATTACHMENT_FAILED, texts.VOICE_UNRECOGNIZED]
+    assert attempts == [texts.ATTACHMENT_FAILED, texts.ATTACHMENTS_OVER_BUDGET]
 
 
 # ---- 终审：排队下载前复查授权、附件说明送达后这一轮算结束 ----
@@ -2611,7 +3081,7 @@ async def test_messages_during_generation_are_answered_as_the_next_batch(db: Dat
     assert [target for _, target in await reply_targets(db)] == [user_ids[0], user_ids[2]]
 
 
-async def test_lone_sticker_is_recorded_without_a_reply_and_joins_the_next_turn(
+async def test_lone_sticker_is_recorded_without_a_reply_and_never_reaches_the_model(
     db: Database, tmp_path: Path
 ) -> None:
     alice = await invited(db, ALICE, "小王")
@@ -2628,20 +3098,28 @@ async def test_lone_sticker_is_recorded_without_a_reply_and_joins_the_next_turn(
     assert model.requests == []
     assert sticker_channel.log == []
     assert downloader.fetched == []  # 表情包的图片不下载
-    assert await rows(db) == [Row("user", "[表情]", None, None, None)]  # 原始标记不进流水
+    assert await rows(db) == [Row("user", "", None, None, None)]  # 只留个记录，原始标记不进流水
     assert await attachment_rows(db) == []
     assert not batcher._workers  # pyright: ignore[reportPrivateUsage]
 
-    await submit(batcher, alice, message("今天好累"), text_channel)
+    # 隔了很久再问问题：请求里没有任何表情的痕迹，回复挂在问题上。
+    await submit(batcher, alice, message("上海天气怎么样"), text_channel)
     await clock.advance_to(62.5)
     await finish(batcher)
 
     (request,) = model.requests
-    assert user_texts(request) == ["[表情]\n今天好累"]
+    assert request.messages == (Message.text(Role.USER, "上海天气怎么样"),)
+    dumped = json.dumps([text_of(p) for m in request.messages for p in m.parts], ensure_ascii=False)
+    assert "表情" not in dumped
+    assert "faceType" not in dumped
     assert text_channel.streamed == "哈哈"
+    user_ids = [r["id"] for r in await db.fetch_all("SELECT id FROM messages WHERE role = 'user'")]
+    assert [target for _, target in await reply_targets(db)] == [user_ids[1]]
 
 
-async def test_sticker_inside_a_batch_is_part_of_it(db: Database) -> None:
+async def test_sticker_at_the_end_of_a_batch_is_left_out_and_the_reply_goes_before_it(
+    db: Database,
+) -> None:
     alice = await invited(db, ALICE, "小王")
     model = ScriptedModel("main", answer("嗯"))
     chat = conversation(db, model)
@@ -2656,8 +3134,72 @@ async def test_sticker_inside_a_batch_is_part_of_it(db: Database) -> None:
     await finish(batcher)
 
     (request,) = model.requests
-    assert user_texts(request) == ["考完试了\n[表情]"]
-    assert sticker_channel.streamed == "嗯"  # 回复挂在这一批的最后一条（表情包）上
+    assert user_texts(request) == ["考完试了"]
+    # 回复挂在这一批里最后一条不是表情包的消息上。
+    assert text_channel.streamed == "嗯"
+    assert sticker_channel.log == []
+    user_ids = [r["id"] for r in await db.fetch_all("SELECT id FROM messages WHERE role = 'user'")]
+    assert [target for _, target in await reply_targets(db)] == [user_ids[0]]
+
+    # 下一轮也不会把这个表情包并进来。
+    await submit(batcher, alice, message("然后呢"), FakeChannel())
+    await clock.advance_to(10.0)
+    await finish(batcher)
+    assert user_texts(model.requests[1]) == ["考完试了", "然后呢"]
+
+
+async def test_handle_skips_stickers_and_replies_on_the_last_other_message(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("好"))
+    chat = conversation(db, model)
+
+    async with asyncio.timeout(HANG_GUARD):
+        await chat.handle(alice, [message("你好"), message(STICKER_TEXT)], FakeChannel())
+        await chat.handle(alice, [message(STICKER_TEXT)], FakeChannel())  # 只有表情：不回答
+
+    (request,) = model.requests
+    assert user_texts(request) == ["你好"]
+    user_ids = [r["id"] for r in await db.fetch_all("SELECT id FROM messages WHERE role = 'user'")]
+    assert [target for _, target in await reply_targets(db)] == [user_ids[0]]
+
+
+async def test_respond_with_only_stickers_does_nothing(db: Database) -> None:
+    # 接线层与攒批已经滤掉表情包；直接交给 respond() 时 Conversation 也守住：不调用模型、不回复。
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("不该出现"))
+    chat = conversation(db, model)
+    channel = FakeChannel()
+
+    async with asyncio.timeout(HANG_GUARD):
+        question = await chat.receive(alice, message("问题"), FakeChannel())
+        sticker = await chat.receive(alice, message(STICKER_TEXT), FakeChannel())
+        assert question is not None
+        assert sticker is not None
+        assert sticker.sticker
+        await chat.respond(alice, [sticker.message_id], channel)
+
+    assert model.requests == []
+    assert channel.log == []
+    assert await reply_targets(db) == []
+
+
+async def test_stickers_never_reach_the_decision(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    first = ScriptedModel("first", answer("好"))
+    second = ScriptedModel("second", answer("不该出现"))
+    decider = FakeDecider(chances(first=0.9, second=0.1))
+    chat = deciding(db, decider, first, second)
+
+    await say(chat, alice, STICKER_TEXT)
+    await say(chat, alice, f"在吗{STICKER_TEXT}")
+    await say(chat, alice, STICKER_TEXT)
+    await say(chat, alice, "上海天气怎么样")
+
+    assert decider.requests
+    for request in decider.requests:
+        assert "表情" not in request.input
+        assert "faceType" not in request.input
+    assert '"text": ""' not in decider.requests[-1].input
 
 
 async def test_sticker_with_text_is_an_ordinary_message(db: Database, tmp_path: Path) -> None:
@@ -2669,12 +3211,12 @@ async def test_sticker_with_text_is_an_ordinary_message(db: Database, tmp_path: 
     await send(chat, alice, f"好的{STICKER_TEXT}", gif_attachment())
 
     assert downloader.fetched == [GIF_URL]  # 不是表情包：附件照常处理
-    assert (await rows(db))[0] == Row("user", "好的[表情]", None, None, None)
+    assert (await rows(db))[0] == Row("user", "好的", None, None, None)
     assert len(model.requests) == 1
     assert STICKER_TEXT not in json.dumps(user_texts(model.requests[0]), ensure_ascii=False)
 
 
-async def test_face_markers_inside_text_are_replaced_before_the_journal_and_the_model(
+async def test_face_markers_inside_text_are_removed_before_the_journal_and_the_model(
     db: Database,
 ) -> None:
     alice = await invited(db, ALICE, "小王")
@@ -2684,8 +3226,8 @@ async def test_face_markers_inside_text_are_replaced_before_the_journal_and_the_
 
     await say(chat, alice, f"你好{smile}呀{STICKER_TEXT}")
 
-    assert (await rows(db))[0].content == "你好[表情]呀[表情]"
-    assert user_texts(model.requests[0]) == ["你好[表情]呀[表情]"]
+    assert (await rows(db))[0].content == "你好呀"
+    assert user_texts(model.requests[0]) == ["你好呀"]
 
 
 async def test_attachment_notices_are_sent_once_per_batch_on_the_last_message(
@@ -2904,12 +3446,12 @@ async def test_pending_sticker_does_not_make_an_unviewable_image_answerable(
     await send(chat, alice, STICKER_TEXT, gif_attachment())  # 单发的表情包：只记进流水
     channel = await send(chat, alice, None, image_attachment())  # 一张谁都看不了的图
 
-    # 待回复的「[表情]」不算可答的内容：只说明看不了，不发起只有「[表情]」和「[图片]」的计费调用。
+    # 表情包不进输入：只说明看不了，不发起只有「[图片]」的计费调用。
     assert model.requests == []
     assert channel.sent == [texts.IMAGE_UNAVAILABLE]
 
 
-async def test_raw_marker_stored_before_the_upgrade_reaches_the_model_as_a_face(
+async def test_raw_marker_stored_before_the_upgrade_never_reaches_the_model(
     db: Database,
 ) -> None:
     alice = await invited(db, ALICE, "小王")
@@ -2932,7 +3474,8 @@ async def test_raw_marker_stored_before_the_upgrade_reaches_the_model_as_a_face(
     await db.transaction(legacy)
     await say(chat, alice, "今天怎么样")
 
-    assert model.requests[0].messages[0] == Message.text(Role.USER, "[表情]")
+    # 升级前存下的原始标记去掉后什么都不剩：这条用户消息不进请求，只剩那条回复。
+    assert model.requests[0].messages[0] == Message.text(Role.ASSISTANT, "哈哈")
     assert STICKER_TEXT not in json.dumps(
         [text_of(p) for m in model.requests[0].messages for p in m.parts], ensure_ascii=False
     )
@@ -2964,9 +3507,10 @@ async def test_real_sticker_is_recorded_as_faces_only(db: Database) -> None:
     chat = conversation(db, ScriptedModel("main", []))
 
     await say(chat, alice, STICKER_TEXT)
+    await say(chat, alice, f"  {STICKER_TEXT}\n{STICKER_TEXT} ")  # 去掉标记后只剩空白
     await say(chat, alice, f"哈哈{STICKER_TEXT}")
 
     result = await db.fetch_all(
         "SELECT content, faces_only FROM messages WHERE role = 'user' ORDER BY id"
     )
-    assert [tuple(r) for r in result] == [("[表情]", 1), ("哈哈[表情]", 0)]
+    assert [tuple(r) for r in result] == [("", 1), ("", 1), ("哈哈", 0)]

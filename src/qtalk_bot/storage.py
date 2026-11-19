@@ -13,6 +13,7 @@
 import asyncio
 import inspect
 import os
+import re
 import sqlite3
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -229,12 +230,78 @@ CREATE INDEX messages_replies ON messages (user_id, reply_to) WHERE role = 'assi
 ALTER TABLE messages ADD COLUMN faces_only INTEGER NOT NULL DEFAULT 0 CHECK (faces_only IN (0, 1));
 """
 
+_V6_COLUMNS = (
+    # description：模型写的图片描述或 PDF 摘要，只有内容本身，不带「[图片：」这样的标签。历史里的文字版按它
+    # 重新措辞。describe_status 从此也用于 PDF 的摘要。text 照旧是带标签的文字版。
+    "ALTER TABLE attachments ADD COLUMN description TEXT",
+    # 升级前写好的图片描述只存在 text 里，从中取出来（「[图片：」4 个字，「[被引用的图片：」8 个字，末尾一个「]」）。
+    (
+        "UPDATE attachments SET description = substr(text, 5, length(text) - 5)"
+        " WHERE kind = 'image' AND describe_status = 'done' AND text LIKE '[图片：%]'"
+    ),
+    (
+        "UPDATE attachments SET description = substr(text, 9, length(text) - 9)"
+        " WHERE kind = 'image' AND describe_status = 'done' AND text LIKE '[被引用的图片：%]'"
+    ),
+    # given：原件在结束那一轮的请求里实际交给过模型，与那一轮的回复写在同一个事务里（`journal.set_given()`）。
+    # 历史里只有它为 1 时才说「原件当时给过你」，其余照旧用当时的文字版。升级前的附件都是 0。
+    "ALTER TABLE attachments ADD COLUMN given INTEGER NOT NULL DEFAULT 0 CHECK (given IN (0, 1))",
+)
+
+# 第 5 版把表情标记换成的文字：「[表情]」或「[表情：说明]」（说明最多 16 字，不含括号类字符）。
+_V5_FACE_TEXT = re.compile(r"\[表情(?:：[^\[\]<>【】]{1,16})?\]")
+
+
+def _v6_faces_summaries_and_given(conn: sqlite3.Connection) -> None:
+    """第 6 版：附件的 `description`、`given` 两列，并按收紧后的含义重算 `faces_only`。
+
+    `faces_only` 从此是「整条消息只由表情组成」（`faces.is_sticker()`），这样的消息永远不进模型的输入：
+
+    - 第 5 版只看文字，表情标记加 PDF 这样的消息也记成了 1，正文是它生成的「[表情]」「[表情：…]」。表情包的
+      图片从不入库，所以有附件行的消息都不是只由表情组成：改回 0，并去掉正文里第 5 版生成的表情文字（只处理
+      这些行，别的行里的同样字样可能是用户手打的）。
+    - 第 4 版存的是原始标记，单独的表情包（可能还带图片附件）在第 5 版被填成 0：按现在的规则重新识别，是的
+      设成 1、正文清空。
+    """
+    from . import faces  # 避免循环导入：faces 经 media 导入了本模块
+    from .media import AttachmentKind, IncomingAttachment
+
+    for statement in _V6_COLUMNS:
+        conn.execute(statement)
+    reverted = conn.execute(
+        "SELECT id, content FROM messages WHERE role = 'user' AND faces_only = 1"
+        " AND id IN (SELECT message_id FROM attachments)"
+    ).fetchall()
+    for message_id, content in reverted:
+        cleaned = _V5_FACE_TEXT.sub("", content)
+        conn.execute(
+            "UPDATE messages SET faces_only = 0, content = ? WHERE id = ?",
+            ("" if not cleaned.strip() else cleaned, message_id),
+        )
+    legacy = conn.execute(
+        "SELECT id, content FROM messages WHERE role = 'user' AND faces_only = 0"
+        " AND instr(content, '<faceType=') > 0"
+    ).fetchall()
+    for message_id, content in legacy:
+        items = [
+            IncomingAttachment(kind=AttachmentKind(kind), quoted=bool(quoted))
+            for kind, quoted in conn.execute(
+                "SELECT kind, quoted FROM attachments WHERE message_id = ?", (message_id,)
+            )
+        ]
+        if faces.is_sticker(content, items):
+            conn.execute(
+                "UPDATE messages SET faces_only = 1, content = '' WHERE id = ?", (message_id,)
+            )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     _V1_ACCESS,
     _V2_CHAT,
     _V3_DECISIONS,
     _V4_ATTACHMENTS,
     _V5_BATCHING,
+    _v6_faces_summaries_and_given,
 )
 """本程序的迁移列表。业务表由各里程碑在末尾追加，已发布的不能修改。"""
 

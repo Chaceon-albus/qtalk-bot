@@ -207,6 +207,11 @@ class AttachmentRecord:
     size: int | None
     path: str | None
     text: str = field(repr=False)
+    filename: str | None = field(default=None, repr=False)
+    description: str | None = field(default=None, repr=False)
+    """模型写的图片描述或 PDF 摘要（只有内容本身，不带标签）；还没有时为空。"""
+    given: bool = False
+    """原件在回答它的那一轮实际交给过模型（`journal.set_given()`）。"""
 
 
 # ---- 文字版 ----
@@ -221,7 +226,10 @@ _UNSUPPORTED_LABELS = {
 }
 _FILENAME_CHARS = 80
 VOICE_UNRECOGNIZED = "[语音，未识别出文字]"
+VOICE_PREFIX = "[语音] "
 DESCRIPTION_CHARS = 300
+SUMMARY_CHARS = 600
+"""PDF 摘要的长度上限（字）。提示词要求 400 字以内，超出的截断。"""
 
 
 def image_label(quoted: bool) -> str:
@@ -259,32 +267,95 @@ def text_version(
                     return image_text(quoted)
         case AttachmentKind.VOICE:
             spoken = " ".join((asr_text or "").split())
-            return f"[语音] {spoken}" if spoken else VOICE_UNRECOGNIZED
+            return f"{VOICE_PREFIX}{spoken}" if spoken else VOICE_UNRECOGNIZED
         case AttachmentKind.FILE:
-            details = [_one_line(filename, _FILENAME_CHARS)] if filename else []
-            if mime_type == PDF:
-                details.append("PDF")
-            if size is not None:
-                details.append(human_size(size))
-            match status:
-                case AttachmentStatus.FAILED:
-                    details.append("没能下载")
-                case AttachmentStatus.TOO_LARGE:
-                    details.append("文件太大，没能查看")
-                case AttachmentStatus.STORED | AttachmentStatus.EXPIRED if mime_type == PDF:
-                    pass
-                case _:
-                    details.append("暂不支持查看这种文件")
-            return f"[文件：{'，'.join(details)}]" if details else "[文件]"
+            return file_text(filename=filename, mime_type=mime_type, size=size, status=status)
         case _:
             return f"[{_UNSUPPORTED_LABELS[kind]}，暂不支持查看]"
 
 
+def file_text(
+    *,
+    filename: str | None,
+    mime_type: str | None,
+    size: int | None,
+    status: AttachmentStatus,
+    summary: str | None = None,
+) -> str:
+    """文件的文字版，如「[文件：名字，PDF，1.2 MB]」；有摘要时在后面接上「。摘要：……」。"""
+    details = [_one_line(filename, _FILENAME_CHARS)] if filename else []
+    if mime_type == PDF:
+        details.append("PDF")
+    if size is not None:
+        details.append(human_size(size))
+    match status:
+        case AttachmentStatus.FAILED:
+            details.append("没能下载")
+        case AttachmentStatus.TOO_LARGE:
+            details.append("文件太大，没能查看")
+        case AttachmentStatus.STORED | AttachmentStatus.EXPIRED if mime_type == PDF:
+            pass
+        case _:
+            details.append("暂不支持查看这种文件")
+    label = f"文件：{'，'.join(details)}" if details else "文件"
+    return f"[{label}。摘要：{summary}]" if summary else f"[{label}]"
+
+
+# 历史里的附件说明：原件（或当时给的文字版）在那一轮已经交给过模型，历史里只带这条说明。写清楚这一点，模型才
+# 不会把「历史里只有标签」误当成「自己从没看过」，和它当时的回答自相矛盾。
+_GIVEN_BEFORE = "在当时那一轮已经给过你"
+_ONLY_THIS_NOTE = "这里只保留这条说明，细节记不清时如实告诉用户、请对方重新发送"
+
+
+def history_text(record: AttachmentRecord) -> str:
+    """历史里不给原件时，一个附件的文字版。
+
+    原件在回答它的那一轮实际交给过模型时（`record.given`，按那一轮最终的请求记下）：说明里写清楚这一点，这里只
+    保留描述、摘要或识别文本，没有时只保留这条说明。没有这个记录的（当时给的就是文字版、下载失败、太大、不支持、
+    那一轮被取消等）照旧用当时的文字版（`record.text`），不声称给过。
+    """
+    if not record.given:
+        return record.text
+    match record.kind:
+        case AttachmentKind.IMAGE:
+            head = f"{image_label(record.quoted)}。原图{_GIVEN_BEFORE}"
+            if record.description:
+                return f"[{head}，这里只保留描述：{record.description}]"
+            return f"[{head}，{_ONLY_THIS_NOTE}]"
+        case AttachmentKind.VOICE:
+            head = f"语音。原声{_GIVEN_BEFORE}"
+            if record.text.startswith(VOICE_PREFIX):
+                spoken = record.text.removeprefix(VOICE_PREFIX)
+                return f"[{head}，这里只保留自动识别的文字：{spoken}]"
+            return f"[{head}，{_ONLY_THIS_NOTE}]"
+        case AttachmentKind.FILE if record.mime_type == PDF:
+            details = [_one_line(record.filename, _FILENAME_CHARS)] if record.filename else []
+            if record.size is not None:
+                details.append(human_size(record.size))
+            label = f"PDF 文件：{'，'.join(details)}" if details else "PDF 文件"
+            head = f"{label}。原文{_GIVEN_BEFORE}"
+            if record.description:
+                return f"[{head}，这里只保留摘要：{record.description}]"
+            return f"[{head}，{_ONLY_THIS_NOTE}]"
+        case _:
+            return record.text
+
+
 def marker(record: AttachmentRecord) -> str:
-    """决策题目里的简短标记：图片只写「[图片]」（不带描述），其余用文字版（本来就短）。"""
-    if record.kind is AttachmentKind.IMAGE:
-        return f"[{image_label(record.quoted)}]"
-    return record.text
+    """决策题目里的简短标记：图片只写「[图片]」（不带描述），文件只写标签（不带摘要），其余用文字版（本来
+    就短）。"""
+    match record.kind:
+        case AttachmentKind.IMAGE:
+            return f"[{image_label(record.quoted)}]"
+        case AttachmentKind.FILE if record.description:
+            return file_text(
+                filename=record.filename,
+                mime_type=record.mime_type,
+                size=record.size,
+                status=record.status,
+            )
+        case _:
+            return record.text
 
 
 def human_size(size: int) -> str:
@@ -303,6 +374,11 @@ def _one_line(text: str, limit: int) -> str:
 def clean_description(text: str) -> str:
     """模型写的描述：压成一行，过长的截断。"""
     return _one_line(text, DESCRIPTION_CHARS)
+
+
+def clean_summary(text: str) -> str:
+    """模型写的 PDF 摘要：压成一行，过长的截断。"""
+    return _one_line(text, SUMMARY_CHARS)
 
 
 # ---- 本地存放 ----

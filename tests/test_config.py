@@ -6,6 +6,8 @@ import pytest
 from qtalk_bot.config import (
     DEFAULT_DECISION_INSTRUCTIONS,
     DEFAULT_DECISION_MODELS,
+    DEFAULT_FILE_INSTRUCTIONS,
+    DEFAULT_FILE_MAX_OUTPUT_TOKENS,
     DEFAULT_PERSONA,
     AttachmentSettings,
     BatchingSettings,
@@ -1021,6 +1023,18 @@ def test_describe_is_optional_and_read(tmp_path: Path) -> None:
     assert describe is not None
     assert describe.timeout_seconds == 60
     assert describe.max_output_tokens == 1024
+    assert describe.file_instructions == DEFAULT_FILE_INSTRUCTIONS
+    assert describe.file_max_output_tokens == DEFAULT_FILE_MAX_OUTPUT_TOKENS == 4096
+
+
+def test_describe_file_fields_can_be_overridden(tmp_path: Path) -> None:
+    text = (
+        '[describe]\nprovider = "openai"\nmodel = "gpt-6-luna"\n'
+        'file_instructions = "用三句话概括。"\nfile_max_output_tokens = 2048\n'
+    )
+    describe = load_settings(write_config(tmp_path, text)).describe
+    assert describe is not None
+    assert (describe.file_instructions, describe.file_max_output_tokens) == ("用三句话概括。", 2048)
 
 
 @pytest.mark.parametrize(
@@ -1029,6 +1043,10 @@ def test_describe_is_optional_and_read(tmp_path: Path) -> None:
         ('model = "m"', "describe.provider：缺少这个键"),
         ('provider = "openai"', "describe.model：缺少这个键"),
         ('provider = "openai"\nmodel = "m"\ninstructions = " "', "describe.instructions：不能为空"),
+        (
+            'provider = "openai"\nmodel = "m"\nfile_instructions = ""',
+            "describe.file_instructions：不能为空",
+        ),
         (
             'provider = "openai"\nmodel = "m"\ntimeout_seconds = 0',
             "describe.timeout_seconds：应大于 0、不大于 600",
@@ -1109,3 +1127,9 @@ def test_extra_download_hosts_must_be_unique_strings_and_few(tmp_path: Path) -> 
     assert config_error(write_config(tmp_path, too_many)).problems == (
         "attachments.extra_download_hosts：最多 32 项",
     )
+
+
+def test_invalid_describe_file_max_output_tokens(tmp_path: Path) -> None:
+    text = '[describe]\nprovider = "openai"\nmodel = "m"\nfile_max_output_tokens = 0\n'
+    (problem,) = config_error(write_config(tmp_path, text)).problems
+    assert problem.startswith("describe.file_max_output_tokens：")

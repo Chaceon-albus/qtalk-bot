@@ -13,18 +13,24 @@
 适配器平时会把概率之和偏离 1 超过 `PROBABILITY_SUM_TOLERANCE` 的响应当作坏响应。这里为了看清真实的和，
 测量期间临时放开这项检查，改为在超出时标注「超出容差」并在最后汇总，据此决定要不要调整这个容差。
 题目与 `routing` 里选模型的那道题相同（同样的题面写法与输入格式），输入是虚构的对话，不含任何用户数据。
+
+`test_gemini_decision_with_audio` 另外对 Gemini 的决策发一段代码生成的短 WAV（正弦波）加一道选择题，确认
+Decisions API 接受音频输入（`DecisionRequest.media`），打印耗时、概率与用量。只运行它：
+
+    uv run --env-file .env pytest -m live -s tests/live/test_live_decisions.py -k audio
 """
 
 import math
 import os
 import statistics
+import struct
 import time
 
 import pytest
 
 from qtalk_bot.config import DEFAULT_DECISION_INSTRUCTIONS
 from qtalk_bot.journal import HistoryEntry
-from qtalk_bot.llm import Role, decisions
+from qtalk_bot.llm import AudioPart, Role, decisions
 from qtalk_bot.llm.decisions import (
     ChoiceAnswer,
     ChoiceQuestion,
@@ -132,3 +138,65 @@ async def test_gemini_decision_latency(monkeypatch: pytest.MonkeyPatch) -> None:
     finally:
         await client.aio.aclose()
         client.close()
+
+
+def wav(seconds: float = 1.0, rate: int = 16000, frequency: float = 440.0) -> bytes:
+    """一段单声道 16 位的正弦波（与 `test_live_media.py` 的写法相同）。"""
+    samples = int(seconds * rate)
+    frames = b"".join(
+        struct.pack("<h", int(12000 * math.sin(2 * math.pi * frequency * n / rate)))
+        for n in range(samples)
+    )
+    fmt = struct.pack("<HHIIHH", 1, 1, rate, rate * 2, 2, 16)
+    return (
+        b"RIFF"
+        + struct.pack("<I", 36 + len(frames))
+        + b"WAVE"
+        + b"fmt "
+        + struct.pack("<I", len(fmt))
+        + fmt
+        + b"data"
+        + struct.pack("<I", len(frames))
+        + frames
+    )
+
+
+AUDIO_REQUEST = DecisionRequest(
+    input=decision_input([], "[语音] （这条语音没有识别出文字）"),
+    questions=(
+        ChoiceQuestion(
+            name=QUESTION,
+            instructions="附带的音频是什么声音？",
+            options=(
+                Option("tone", "单一音高的纯音、蜂鸣声或正弦波"),
+                Option("speech", "有人在说话"),
+                Option("music", "有旋律的音乐"),
+            ),
+        ),
+    ),
+    media=(AudioPart(wav(), "audio/wav"),),
+)
+
+
+async def test_gemini_decision_with_audio() -> None:
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        pytest.skip("没有设置 GEMINI_API_KEY")
+    client = create_gemini_client(key)
+    try:
+        name = os.environ.get("QTALK_LIVE_GEMINI_DECISION_MODEL", GEMINI_DEFAULT)
+        model = GeminiDecisionModel(client, model=name)
+        started = time.perf_counter()
+        result = await model.decide(AUDIO_REQUEST)
+        elapsed = (time.perf_counter() - started) * 1000
+    finally:
+        await client.aio.aclose()
+        client.close()
+    answer = result.answers[QUESTION]
+    print(f"\n{model.provider.value} / {model.model}，带 1 秒的 WAV：{elapsed:.0f} 毫秒")  # noqa: T201
+    if isinstance(answer, ChoiceAnswer):
+        shown = "，".join(f"{v} {p:.3f}" for v, p in answer.probabilities.items())
+        print(f"  {shown}；{result.usage}")  # noqa: T201
+    else:
+        print(f"  {type(answer).__name__}；{result.usage}")  # noqa: T201
+    assert isinstance(answer, ChoiceAnswer), "没有拿到选择题的概率"

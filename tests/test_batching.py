@@ -373,8 +373,21 @@ async def test_sticker_inside_a_batch_is_part_of_it_without_extending_the_wait(
     await submit(chat, ALICE, sticker(), "表情")
     await clock.advance_to(2.5)
 
-    # 表情包没有重启计时；它是这一批的最后一条，回复挂在它上面。
-    assert responder.answered == [Answered(ALICE.id, [1, 2], "表情", 2.5)]
+    # 表情包没有重启计时；它是这一批的最后一条，但不进模型的输入，回复挂在前一条上。
+    assert responder.answered == [Answered(ALICE.id, [1], "文字", 2.5)]
+
+
+async def test_stickers_between_messages_are_left_out_of_the_batch(clock: ManualClock) -> None:
+    responder = FakeResponder(clock)
+    chat = batcher_of(responder)
+
+    await submit(chat, ALICE, text("一"), "一")
+    await submit(chat, ALICE, sticker(), "表情1")
+    await submit(chat, ALICE, text("二"), "二")
+    await submit(chat, ALICE, sticker(), "表情2")
+    await clock.advance_to(2.5)
+
+    assert responder.answered == [Answered(ALICE.id, [1, 3], "二", 2.5)]
 
 
 async def test_batch_waits_for_messages_still_being_received(clock: ManualClock) -> None:

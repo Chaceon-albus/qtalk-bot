@@ -1062,7 +1062,7 @@ async def test_image_without_a_capable_model_gets_a_notice_and_no_model_call(
     assert [tuple(row) for row in rows] == [("image", "skipped")]
 
 
-async def test_sticker_is_recorded_as_a_face_and_gets_no_reply(
+async def test_sticker_is_only_recorded_and_gets_no_reply(
     db: Database, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     alice = await welcomed_alice(db)
@@ -1094,8 +1094,8 @@ async def test_sticker_is_recorded_as_a_face_and_gets_no_reply(
     assert model.requests == []
     assert platform.sent == []
     assert platform.downloads == []
-    messages = await db.fetch_all("SELECT user_id, role, content FROM messages")
-    assert [tuple(row) for row in messages] == [(alice.id, "user", "[表情]")]
+    messages = await db.fetch_all("SELECT user_id, role, content, faces_only FROM messages")
+    assert [tuple(row) for row in messages] == [(alice.id, "user", "", 1)]  # 只留个记录
     assert await db.fetch_all("SELECT id FROM attachments") == []
     assert "eyJ0ZXh0IjoiIn0" not in formatted_logs(caplog)
 

@@ -7,7 +7,8 @@
 - 题目只有一道选择题（题目名 `QUESTION`）：选项是候选模型（按配置的顺序），取值是内部名字，描述是
   `description`。
 - 题目的输入是 JSON 文本：`history` 是这个用户最近几轮的对话，`latest` 是当前这条消息（见
-  `decision_input()`）。只含这个用户自己的对话。
+  `decision_input()`）。只含这个用户自己的对话。决策接口收得下的媒体（现在是本轮语音的原声，见
+  `Router.decision_limits`）由调用方读好，经 `Selection.run()` 一并交给决策；文字里仍保留识别文本。
 - 选择规则见 `choose()`：取概率最高的；它和上一轮实际回答的模型不同时，要高出至少 `switch_margin` 才换。
   上一轮的模型不在候选里时这条不适用，直接取概率最高的。
 - 任何失败（超时、调用失败、拒答、坏响应、意外的异常）都不挡住回复：沿用上一轮的模型（它不在候选里时
@@ -24,11 +25,13 @@ from dataclasses import dataclass
 
 from .config import DecisionSettings, ModelSettings
 from .journal import HistoryEntry
-from .llm import ErrorKind, ModelError, Provider, Usage
+from .llm import ErrorKind, InputLimits, ModelError, Provider, Usage
 from .llm.decisions import (
+    DECISION_INPUT_LIMITS,
     ChoiceAnswer,
     ChoiceQuestion,
     DecisionError,
+    DecisionMedia,
     DecisionModel,
     DecisionRequest,
     Option,
@@ -154,6 +157,11 @@ class Router:
         return self._decider is not None
 
     @property
+    def decision_limits(self) -> InputLimits | None:
+        """决策接口能和文字一起收的媒体（`DECISION_INPUT_LIMITS`）；不调用决策时为 `None`。"""
+        return None if self._decider is None else DECISION_INPUT_LIMITS[self._decider.provider]
+
+    @property
     def history_turns(self) -> int:
         """题目输入里要带的历史轮数；不调用决策时是 0。"""
         return 0 if self._settings is None else self._settings.history_turns
@@ -243,13 +251,16 @@ class Selection:
         """`run()` 是否会调用决策。"""
         return self._plan is not None
 
-    async def run(self) -> str:
+    async def run(self, media: Sequence[DecisionMedia] = ()) -> str:
+        """选出模型。`media` 是和文字一起交给决策的媒体（调用方已按 `Router.decision_limits` 挑好）。"""
         plan = self._plan
         if plan is None:
             return self.model
         decider, settings, question = plan.decider, plan.settings, plan.question
         request = DecisionRequest(
-            input=decision_input(self._history, self._latest), questions=(question,)
+            input=decision_input(self._history, self._latest),
+            questions=(question,),
+            media=tuple(media),
         )
         started = plan.clock()
         usage: Usage | None = None

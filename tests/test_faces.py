@@ -33,68 +33,46 @@ def sticker_image(*, quoted: bool = False) -> IncomingAttachment:
     )
 
 
-def test_the_sample_from_qq_becomes_a_plain_face() -> None:
+def test_the_sample_from_qq_is_removed() -> None:
     parsed = faces.parse(SAMPLE)
-    assert parsed == faces.Parsed("[表情]", 1, "")
-    assert faces.clean(SAMPLE) == faces.FACE
-
-
-@pytest.mark.parametrize(
-    ("text", "label"),
-    [
-        ("捂脸", "[表情：捂脸]"),
-        ("[捂脸]", "[表情：捂脸]"),  # 去掉一层方括号
-        ("/捂脸", "[表情：捂脸]"),
-        ("  开\n心  ", "[表情：开 心]"),  # 空白压成一个空格
-        ("Doge", "[表情：Doge]"),
-    ],
-)
-def test_text_in_ext_is_used(text: str, label: str) -> None:
-    assert faces.clean(marker(ext_of({"text": text}))) == label
+    assert parsed == faces.Parsed("", 1, "")
+    assert faces.clean(SAMPLE) == ""
 
 
 @pytest.mark.parametrize(
     "ext",
     [
-        "",  # 空
+        ext_of({"text": "捂脸"}),  # ext 里的说明也不要
+        ext_of({"text": "[捂脸]"}),
+        "",
         "!!!不是base64!!!",
-        "eyJ0ZXh0Ijoi",  # 截断的 base64（长度不对）
         base64.b64encode(b"not json").decode(),
-        base64.b64encode(b"\xff\xfe\x00").decode(),  # 不是 UTF-8
-        ext_of(["text", "捂脸"]),  # 不是对象
-        ext_of({"text": 123}),
-        ext_of({"text": None}),
-        ext_of({"text": ["捂脸"]}),
-        ext_of({"name": "捂脸"}),  # 没有 text
-        ext_of({"text": ""}),
-        ext_of({"text": "   "}),
-        ext_of({"text": "[]"}),
-        ext_of({"text": "很" * (faces.MAX_FACE_TEXT + 1)}),
-        ext_of({"text": "a]b"}),  # 会弄乱方括号
-        ext_of({"text": "<faceType=1>"}),
-        ext_of({"text": "左\u202e右"}),  # 方向控制符
-        ext_of({"text": "零\u200b宽"}),
-        ext_of({"text": "响\x07铃"}),
-        base64.b64encode(b"[" * 600 + b"]" * 600).decode()[: faces.MAX_EXT],  # 嵌套很深
-        "A" * (faces.MAX_EXT + 4),  # 太长，不解码
+        "A" * 5000,  # 很长也照样去掉
     ],
 )
-def test_broken_or_unsuitable_ext_falls_back_to_a_plain_face(ext: str) -> None:
-    assert faces.clean(marker(ext)) == faces.FACE
+def test_marker_is_removed_whatever_its_ext(ext: str) -> None:
+    assert faces.clean(f"好{marker(ext)}的") == "好的"
 
 
 def test_marker_without_ext_or_with_other_attribute_order() -> None:
-    assert faces.clean(marker()) == faces.FACE
+    assert faces.clean(marker()) == ""
     reordered = f'<faceType=1,ext="{ext_of({"text": "微笑"})}",faceId="14",extra="x">'
-    assert faces.clean(reordered) == "[表情：微笑]"
+    assert faces.clean(f"嗯{reordered}") == "嗯"
 
 
 def test_several_markers_and_markers_between_words() -> None:
     text = f"早{marker(face_id='1')}上好{SAMPLE}{marker(ext_of({'text': '赞'}))}！"
     parsed = faces.parse(text)
-    assert parsed.text == "早[表情]上好[表情][表情：赞]！"
+    assert parsed.text == "早上好！"
     assert parsed.faces == 3
     assert parsed.rest == "早上好！"
+
+
+def test_only_whitespace_left_after_removing_markers() -> None:
+    parsed = faces.parse(f"  {SAMPLE}\n{SAMPLE} ")
+    assert parsed.faces == 2
+    assert parsed.rest == ""
+    assert not faces.clean(f"  {SAMPLE}\n").strip()
 
 
 @pytest.mark.parametrize(
@@ -147,11 +125,11 @@ def test_not_a_sticker(text: str | None, attachments: list[IncomingAttachment]) 
     assert not faces.is_sticker(text, attachments)
 
 
-def test_long_ext_is_still_recognized_and_falls_back_to_a_plain_face() -> None:
-    long_ext = ext_of({"text": "x" * 4000})  # 远超 MAX_EXT，也超过旧版正则的取值上限 2048
+def test_long_ext_is_still_recognized_and_removed() -> None:
+    long_ext = ext_of({"text": "x" * 4000})  # 超过旧版正则的取值上限 2048
     assert len(long_ext) > 2048
     text = marker(long_ext)
-    assert faces.parse(text) == faces.Parsed(faces.FACE, 1, "")
+    assert faces.parse(text) == faces.Parsed("", 1, "")
     assert faces.is_sticker(text, [sticker_image()])  # 单发的表情包照样不回复
 
 

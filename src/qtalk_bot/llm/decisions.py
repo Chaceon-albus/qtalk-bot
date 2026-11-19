@@ -4,7 +4,10 @@
 
 - 一次调用是一个 `DecisionRequest`：一段输入文本，加上若干道题。题型有选择题（`ChoiceQuestion`，若干选项，
   每个选项有取值和一句描述）与是非题（`YesNoQuestion`）。两家都还有打分题，现在用不到，没有接入。
-- 输入只收文本：两家取交集，对话历史由调用方序列化成文本再传（Gemini 不收消息数组）。
+- 输入是一段文本：对话历史由调用方序列化成文本再传（Gemini 不收消息数组）。另外可以带若干媒体（`media`），
+  各家决策接口能收什么写在 `DECISION_INPUT_LIMITS`，调用方按它挑，不在调用方写死服务商；适配器收到不支持的
+  媒体时不发请求，抛 `DecisionError(UNSUPPORTED)`。现在只用到语音：Gemini 的 Decisions API 收音频（SDK 的
+  `DecisionInputContentParam` 里有 `AudioContentParam`），OpenAI 的不收。
 - 结果是 `DecisionResult`：按题目名给出答案，选择题是每个选项的概率（`ChoiceAnswer`），是非题是「是」的
   概率（`YesNoAnswer`）；某一道题被服务商拒答时是 `Refusal`，同一次调用里的其它题照常有答案。
 - 调用失败抛 `DecisionError`（`ModelError` 的子类，文案规则相同：只有服务商、本地的错误分类与数字状态码）。
@@ -21,7 +24,17 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol, cast
 
-from . import ErrorKind, ModelError, Provider, Usage, token_count
+from . import (
+    AudioPart,
+    ErrorKind,
+    FilePart,
+    ImagePart,
+    InputLimits,
+    ModelError,
+    Provider,
+    Usage,
+    token_count,
+)
 
 MIN_OPTIONS = 2
 MAX_OPTIONS = 255
@@ -89,12 +102,40 @@ def _check_question(name: str, instructions: str) -> None:
         raise ValueError("题面不能为空")
 
 
+type DecisionMedia = ImagePart | AudioPart | FilePart
+"""决策输入里的一件媒体，类型与对话请求共用。"""
+
+_MIB = 1024 * 1024
+
+DECISION_INPUT_LIMITS: Mapping[Provider, InputLimits] = {
+    # Decisions API 的 `input` 只收字符串（SDK 3.55.1 的 `decision_create_params`）。
+    Provider.OPENAI: InputLimits(
+        image_types=frozenset(),
+        audio_types=frozenset(),
+        file_types=frozenset(),
+        max_inline_bytes=0,
+    ),
+    # Decisions API 的 `input` 可以是内容块的数组（google-genai 3.6.1 的 `DecisionInputContentParam`：文字、图片、
+    # 文档、音频、视频）。只接入了实际用到的音频（WAV）；内联数据时整个请求不超过 20 MB，与对话接口一样给文字留
+    # 1 MB。
+    Provider.GEMINI: InputLimits(
+        image_types=frozenset(),
+        audio_types=frozenset(("audio/wav",)),
+        file_types=frozenset(),
+        max_inline_bytes=19 * _MIB,
+    ),
+}
+"""各家决策接口对输入里的媒体的限制，规则同对话接口的 `llm.INPUT_LIMITS`。"""
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class DecisionRequest:
-    """一次决策调用：`input` 是所有题目共用的输入文本，`questions` 是题目（名字不重复）。"""
+    """一次决策调用：`input` 是所有题目共用的输入文本，`questions` 是题目（名字不重复），`media` 是和文本一起
+    交给决策模型的媒体（只能是这家在 `DECISION_INPUT_LIMITS` 里接受的）。"""
 
     input: str = field(repr=False)
     questions: tuple[Question, ...]
+    media: tuple[DecisionMedia, ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
         if not 1 <= len(self.questions) <= MAX_QUESTIONS:

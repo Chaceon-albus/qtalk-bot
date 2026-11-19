@@ -10,11 +10,11 @@
 下面说的「能处理」都指放得进，而不是单件能接收。
 
 **候选**（`plan_turn()`）：
-1. 「必须照顾」的附件是这一轮里已存下的图片与文件（PDF）。每个模型数一数它能处理其中几个，取能处理得最多的
-   那些模型；一个也处理不了时（包括这一轮没有图片和文件）就是全部模型。
-2. 语音总能退回识别文本，所以不强制要求音频能力；但上一步的候选里有能处理这一轮全部语音的模型时，只在它们
-   之中选。
+1. 「必须照顾」的附件是这一轮里已存下的图片与文件（PDF），以及原声已存下、却没有识别文本的语音。每个模型
+   数一数它能处理其中几个，取能处理得最多的那些模型；一个也处理不了时（包括这一轮没有这些附件）就是全部模型。
+2. 有识别文本的语音不影响候选：照常由决策按内容选模型，选中能收音频的就给原声，收不了的就给识别文本。
 3. 只留下实际能收到可答内容的模型（文字、放得进的原件、有识别文本的语音）；一个都没有时这一轮只发说明。
+   所以没有识别文本的语音只有能听的模型答得了。
 4. 候选按配置的顺序排列。只剩一个时不调用决策（见 `routing.Router.select()`）。
 
 **备用模型**（`fallback_allowed()`）：选出的模型能处理的必须照顾的附件，备用模型都要能处理；备用模型实际能
@@ -24,10 +24,16 @@
 `[attachments] history_turns` 轮的图片在模型能处理、本地文件还在时给原件，其余一律文字版（音频和文件在历史里
 只给文字版，免得每轮都重复花 token）。原件按「当前这一轮优先、历史从新到旧」占用服务商的内联上限，放不下的
 退回文字版。连续的同一角色的消息合成一条（攒批后一轮有多条用户消息）。
+
+历史里的文字版（`media.history_text()`）在原件当时确实交给过模型时（附件表的 `given`，回答那一轮记账时按实际
+的请求记下）写清楚这一点、这里只保留描述、摘要或识别文本，免得模型以为自己从没看过、和它当时的回答自相矛盾；
+没有这个记录的照旧用当时的文字版。本轮的原件与文字版不变。
+
+只由表情组成的消息在取流水时已经跳过（见 `journal.py`），表情标记也从所有文字里去掉（`faces.clean()`）。
 """
 
 import asyncio
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -55,6 +61,7 @@ from .media import (
     AttachmentRecord,
     AttachmentStatus,
     MediaStore,
+    history_text,
     marker,
 )
 from .prompt import system_prompt
@@ -86,11 +93,16 @@ def accepts(model: ModelSettings, record: AttachmentRecord) -> bool:
 
 
 def _required(current: Sequence[AttachmentRecord]) -> list[AttachmentRecord]:
+    """必须照顾的附件：已存下的图片与 PDF，以及原声已存下、却没有识别文本的语音（收不了音频的模型只能看到
+    「未识别出文字」，同批的文字不能替它作答）。有识别文本的语音不影响候选。"""
     return [
         r
         for r in current
         if r.status is AttachmentStatus.STORED
-        and r.kind in (AttachmentKind.IMAGE, AttachmentKind.FILE)
+        and (
+            r.kind in (AttachmentKind.IMAGE, AttachmentKind.FILE)
+            or (r.kind is AttachmentKind.VOICE and r.text == VOICE_UNRECOGNIZED)
+        )
     ]
 
 
@@ -116,13 +128,11 @@ def fit(model: ModelSettings, records: Sequence[AttachmentRecord]) -> frozenset[
 def _answerable(
     current: Sequence[HistoryEntry], records: Sequence[AttachmentRecord], given: Collection[int]
 ) -> bool:
-    """模型实际能收到的内容里有没有可以回答的：文字、给了原件的附件，或有识别文本的语音。
+    """模型实际能收到的内容里有没有可以回答的：文字（去掉表情标记之后）、给了原件的附件，或有识别文本的语音。
 
-    文字只由真实的表情标记转换而来的消息（`faces_only`，如单独的表情包换成的「[表情]」）不算：它可以随可答的
-    内容进上下文，但本身不让一轮变得可答。只看收消息时记下的这一项，不从显示的文字反推：用户手打的「[表情]」
-    是普通文字。
+    只由表情组成的消息（`faces_only`）在取流水时已经跳过，这里再守一道：它们不让一轮变得可答。
     """
-    if any(entry.content.strip() and not entry.faces_only for entry in current):
+    if any(clean(entry.content).strip() and not entry.faces_only for entry in current):
         return True
     return any(
         record.id in given
@@ -229,14 +239,7 @@ def plan_turn(
     scores = {m.name: len(fits[m.name] & required) for m in models}
     best = max(scores.values(), default=0)
     candidates = [m for m in models if scores[m.name] == best]
-    voices = [
-        r for r in records if r.kind is AttachmentKind.VOICE and r.status is AttachmentStatus.STORED
-    ]
-    if voices:
-        hearing = [m for m in candidates if all(r.id in fits[m.name] for r in voices)]
-        if hearing:
-            candidates = hearing
-    # 只留下实际收到的内容里有东西可答的模型（例如没有转写的纯语音，只有能听的模型答得了）。
+    # 语音不影响候选（由决策按内容选），但只留下实际收到的内容里有东西可答的模型（例如没有转写的纯语音，只有能听的模型答得了）。
     able = [m for m in candidates if _answerable(current, records, fits[m.name])]
     if able:
         candidates = able
@@ -269,7 +272,7 @@ def fallback_allowed(
 
 
 def decision_text(entry: HistoryEntry) -> str:
-    """决策题目里一条消息的文字：正文加上附件的简短标记，表情标记换成文字版（见 `_text()`）。"""
+    """决策题目里一条消息的文字：正文加上附件的简短标记，表情标记去掉（见 `_text()`）。"""
     pieces = [entry.content] if entry.content else []
     pieces.extend(marker(record) for record in entry.attachments)
     return clean("\n".join(pieces))
@@ -305,11 +308,13 @@ class Built:
         request: 请求。
         answerable: 请求里有没有可以回答的内容；没有时不该调用模型。
         notices: 按这个请求实际给了什么，要告诉用户的情况（只含这次新到的消息的附件）。
+        given: 这一轮的附件里实际以原件放进了请求的那些（附件编号）；历史里重新带上的图片不算。
     """
 
     request: ChatRequest
     answerable: bool
     notices: tuple[str, ...]
+    given: frozenset[int] = frozenset()
 
 
 class RequestBuilder:
@@ -356,9 +361,18 @@ class RequestBuilder:
 
     async def build(self, model: ModelSettings) -> Built:
         originals, missing = await self._originals(model)
+
+        def in_current(record: AttachmentRecord) -> str:
+            return record.text
+
         messages: list[Message] = []
-        for entry in (*self._history, *self._current):
-            parts = _parts(entry, originals)
+        for entry, render in (
+            *((e, history_text) for e in self._history),
+            *((e, in_current) for e in self._current),
+        ):
+            if entry.faces_only:
+                continue
+            parts = _parts(entry, originals, render)
             if not parts:
                 continue
             if messages and messages[-1].role is entry.role:
@@ -379,7 +393,8 @@ class RequestBuilder:
             missing=missing,
             max_size_mb=self._max_size_mb,
         )
-        return Built(request, _answerable(self._current, records, originals.keys()), notices)
+        given = frozenset(r.id for r in records if r.id in originals)
+        return Built(request, _answerable(self._current, records, originals.keys()), notices, given)
 
     def _current_records(self) -> list[AttachmentRecord]:
         return [r for entry in self._current for r in entry.attachments]
@@ -438,17 +453,23 @@ class RequestBuilder:
 
 
 def _text(text: str) -> TextPart:
-    """进入模型输入的一段文字。表情标记一律换成文字版：流水里保留实际收到、实际送达的原文，升级前的版本存过原始
+    """进入模型输入的一段文字。表情标记一律去掉：流水里保留实际收到、实际送达的原文，升级前的版本存过原始
     标记（用户消息、回显了标记的助手回复），附件的文字版（如文件名）里也可能有一个完整的标记。"""
     return TextPart(clean(text))
 
 
-def _parts(entry: HistoryEntry, originals: dict[int, bytes]) -> tuple[Part, ...]:
-    parts: list[Part] = [_text(entry.content)] if entry.content else []
+def _parts(
+    entry: HistoryEntry,
+    originals: dict[int, bytes],
+    render: Callable[[AttachmentRecord], str],
+) -> tuple[Part, ...]:
+    """一条消息的各部分。`render` 给出不给原件时附件的文字版（历史与本轮的措辞不同）。"""
+    content = clean(entry.content)
+    parts: list[Part] = [TextPart(content)] if content.strip() else []
     for record in entry.attachments:
         data = originals.get(record.id)
         if data is None or record.mime_type is None:
-            parts.append(_text(record.text))
+            parts.append(_text(render(record)))
             continue
         match record.kind:
             case AttachmentKind.IMAGE:

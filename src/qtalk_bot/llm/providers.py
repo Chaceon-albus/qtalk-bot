@@ -29,7 +29,7 @@ DESCRIBER_NAME = "describe"
 
 class ChatModels(Mapping[str, ChatModel]):
     """配置里的全部对话模型，按内部名字取用；配置了 `[decisions]` 时还有决策模型（`decider`），配置了
-    `[describe]` 时还有写图片描述的模型（`describer`，内部名字是 `DESCRIBER_NAME`）。
+    `[describe]` 时还有写图片描述、PDF 摘要的模型（`describer`，内部名字是 `DESCRIBER_NAME`）。
 
     用 `async with` 或 `aclose()` 关闭底层客户端。调用方要先用 `config.check_provider_secrets()` 确认用到的
     服务商都有密钥。

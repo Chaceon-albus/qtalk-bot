@@ -71,6 +71,9 @@ DEFAULT_DESCRIBE_INSTRUCTIONS = """用一句话客观地描述这张图片的内
 DEFAULT_DESCRIBE_TIMEOUT_SECONDS = 60
 MAX_DESCRIBE_TIMEOUT_SECONDS = 600
 DEFAULT_DESCRIBE_MAX_OUTPUT_TOKENS = 1024
+DEFAULT_FILE_INSTRUCTIONS = """用不超过 400 字概括这份文件，写成连贯的一段话：主题、主要内容，以及关键的事实、数字、结论和用户之后
+可能追问的细节。只输出摘要本身，不要加「这份文件」之类的开头。"""
+DEFAULT_FILE_MAX_OUTPUT_TOKENS = 4096
 
 # 下载白名单里的一个域名后缀：至少两段，每段 1–63 个字母、数字或连字符（不以连字符开头或结尾），最后一段是
 # 2–63 个字母，总长不超过 253。与 `bot.py` 判断主机名的规则一致，否则追加的后缀永远匹配不上。
@@ -228,15 +231,18 @@ class BatchingSettings:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class DescribeSettings:
-    """`[describe]` 表：给图片写一句话描述的模型。不写这个表就不生成描述，历史里一直是占位。
+    """`[describe]` 表：在后台给图片写一句话描述、给 PDF 写摘要的模型。不写这个表就不生成，历史里只有占位或
+    标签。这家服务商的接口收 PDF（`llm.INPUT_LIMITS`）、文件也在内联上限之内时才给 PDF 写摘要。
 
     Attributes:
         provider: 服务商；客户端与同一家的对话模型共用。
-        model: 服务商那边的模型名，要能接收图片。
+        model: 服务商那边的模型名，要能接收图片（写摘要时还要能接收 PDF）。
         reasoning: 推理强度，规则同 `[[models]]` 的 `reasoning`。
-        instructions: 写描述的提示词（作为系统提示词）。
-        timeout_seconds: 一次描述调用的时限（秒）。
-        max_output_tokens: 一次描述的输出上限（含推理）。
+        instructions: 写图片描述的提示词（作为系统提示词）。
+        timeout_seconds: 一次描述或摘要调用的时限（秒）。
+        max_output_tokens: 一次图片描述的输出上限（含推理）。
+        file_instructions: 写 PDF 摘要的提示词（作为系统提示词）。
+        file_max_output_tokens: 一次 PDF 摘要的输出上限（含推理）。
     """
 
     provider: Provider
@@ -245,6 +251,8 @@ class DescribeSettings:
     instructions: str = field(default=DEFAULT_DESCRIBE_INSTRUCTIONS, repr=False)
     timeout_seconds: float = DEFAULT_DESCRIBE_TIMEOUT_SECONDS
     max_output_tokens: int = DEFAULT_DESCRIBE_MAX_OUTPUT_TOKENS
+    file_instructions: str = field(default=DEFAULT_FILE_INSTRUCTIONS, repr=False)
+    file_max_output_tokens: int = DEFAULT_FILE_MAX_OUTPUT_TOKENS
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -745,6 +753,13 @@ def _parse_describe(root: _Table) -> tuple[bool, DescribeSettings | None]:
     max_output_tokens = _positive_int(
         table, "max_output_tokens", DEFAULT_DESCRIBE_MAX_OUTPUT_TOKENS, MAX_MAX_OUTPUT_TOKENS
     )
+    file_instructions = table.string("file_instructions", DEFAULT_FILE_INSTRUCTIONS)
+    if file_instructions is not None and not file_instructions.strip():
+        table.problem("file_instructions", "不能为空")
+        file_instructions = None
+    file_max_output_tokens = _positive_int(
+        table, "file_max_output_tokens", DEFAULT_FILE_MAX_OUTPUT_TOKENS, MAX_MAX_OUTPUT_TOKENS
+    )
     table.finish()
     if (
         provider is None
@@ -753,6 +768,8 @@ def _parse_describe(root: _Table) -> tuple[bool, DescribeSettings | None]:
         or instructions is None
         or timeout is None
         or max_output_tokens is None
+        or file_instructions is None
+        or file_max_output_tokens is None
     ):
         return False, None
     return True, DescribeSettings(
@@ -762,6 +779,8 @@ def _parse_describe(root: _Table) -> tuple[bool, DescribeSettings | None]:
         instructions=instructions,
         timeout_seconds=timeout,
         max_output_tokens=max_output_tokens,
+        file_instructions=file_instructions,
+        file_max_output_tokens=file_max_output_tokens,
     )
 
 

@@ -76,6 +76,9 @@ def record(
     size: int = 100,
     text: str | None = None,
     quoted: bool = False,
+    filename: str | None = None,
+    description: str | None = None,
+    given: bool = False,
 ) -> AttachmentRecord:
     if mime is None:
         mime = {AttachmentKind.IMAGE: PNG, AttachmentKind.FILE: PDF, AttachmentKind.VOICE: WAV}.get(
@@ -96,7 +99,12 @@ def record(
         path=path,
         text=text
         if text is not None
-        else text_version(kind=kind, status=status, quoted=quoted, mime_type=mime, size=size),
+        else text_version(
+            kind=kind, status=status, quoted=quoted, mime_type=mime, size=size, filename=filename
+        ),
+        filename=filename,
+        description=description,
+        given=given,
     )
 
 
@@ -159,12 +167,17 @@ def test_image_and_pdf_prefer_a_model_that_handles_both() -> None:
     assert candidates([SEES, READS], record(IMAGE), record(IMAGE), record(FILE)) == ("sees",)
 
 
-def test_voice_does_not_require_audio_but_prefers_it() -> None:
-    assert candidates([TEXT_ONLY, SEES], record(VOICE)) == ("text", "sees")
-    assert candidates([TEXT_ONLY, ALL], record(VOICE)) == ("all",)
-    # 图片优先：能看图的里面没有能听的，就不强求音频。
+def test_voice_does_not_affect_candidates() -> None:
+    # 有识别文本的语音：不偏向能听的模型，照常由决策按内容选（选中收不了音频的就给识别文本）。
+    heard = record(VOICE, text="[语音] 上海天气怎么样")
+    assert candidates([TEXT_ONLY, SEES], heard) == ("text", "sees")
+    assert candidates([TEXT_ONLY, ALL], heard) == ("text", "all")
+    assert candidates([ALL, TEXT_ONLY], heard, text="还有") == ("all", "text")
+    # 图片照常要照顾。
     hears = replace(ALL, name="hears", inputs=frozenset({Modality.AUDIO}))
-    assert candidates([SEES, hears], record(IMAGE), record(VOICE)) == ("sees",)
+    assert candidates([SEES, hears], record(IMAGE), heard) == ("sees",)
+    # 没有识别文本的：只有能听的模型实际收得到可答的内容。
+    assert candidates([TEXT_ONLY, ALL], record(VOICE)) == ("all",)
 
 
 def test_no_capable_model_falls_back_to_every_model_with_a_notice() -> None:
@@ -231,9 +244,23 @@ def test_fallback_must_handle_what_the_chosen_model_handles() -> None:
     assert fallback_allowed(TEXT_ONLY, SEES, [user("只有文字")])
     # 语音不算必须照顾的：备用模型听不了就退回识别文本。
     assert fallback_allowed(SEES, ALL, [user("", record(VOICE, text="[语音] 明天见"))])
-    # 但没有转写的纯语音，听不了的备用模型什么也收不到：不换它。
+    # 但没有转写的语音（原声已存下）是必须照顾的：听不了的备用模型不换它，同批有文字也一样。
     assert not fallback_allowed(SEES, ALL, [user("", record(VOICE))])
-    assert fallback_allowed(SEES, ALL, [user("说说看", record(VOICE))])
+    assert not fallback_allowed(SEES, ALL, [user("说说看", record(VOICE))])
+    # 原声没能存下的：谁都收不到原声，不算必须照顾。
+    failed = record(VOICE, AttachmentStatus.FAILED, text="[语音，未识别出文字]")
+    assert fallback_allowed(SEES, ALL, [user("说说看", failed)])
+
+
+def test_text_in_the_same_batch_does_not_cover_a_voice_without_a_transcript() -> None:
+    silent = record(VOICE)  # 原声已存下，没有识别文本
+    assert silent.text == "[语音，未识别出文字]"
+    plan = plan_turn([TEXT_ONLY, ALL], [user("帮我回答语音里的问题", silent)], max_size_mb=20)
+    assert plan.candidates == ("all",)
+    # 没有能听的模型时照常（只能退回，靠文字回答并说明）。
+    plan = plan_turn([TEXT_ONLY, SEES], [user("帮我回答语音里的问题", silent)], max_size_mb=20)
+    assert plan.candidates == ("text", "sees")
+    assert plan.notices == (texts.VOICE_UNRECOGNIZED,)
 
 
 def test_budget_decides_what_counts_as_handled() -> None:
@@ -290,7 +317,7 @@ def stored_image(
     store: MediaStore, *, user_id: int = 1, data: bytes = PNG_BYTES
 ) -> AttachmentRecord:
     path = store.save(user_id, data, PNG)
-    return record(IMAGE, path=path, size=len(data), text="[图片：一只猫]")
+    return record(IMAGE, path=path, size=len(data), text="[图片：一只猫]", description="一只猫")
 
 
 def kinds(message: Message) -> list[str]:
@@ -311,7 +338,7 @@ async def test_current_image_goes_as_original_only_to_a_model_that_sees(tmp_path
 
 async def test_history_images_are_originals_only_for_the_recent_turns(tmp_path: Path) -> None:
     store = MediaStore.under(tmp_path)
-    old, recent = stored_image(store), stored_image(store)
+    old, recent = replace(stored_image(store), given=True), stored_image(store)
     history = [
         user("旧图", old, turns_ago=3),
         reply("旧答", turns_ago=3),
@@ -328,7 +355,9 @@ async def test_history_images_are_originals_only_for_the_recent_turns(tmp_path: 
         ["TextPart"],
         ["TextPart"],
     ]
-    assert request.messages[0].parts == (TextPart("旧图\n[图片：一只猫]"),)
+    assert request.messages[0].parts == (
+        TextPart("旧图\n[图片。原图在当时那一轮已经给过你，这里只保留描述：一只猫]"),
+    )
 
 
 async def test_purged_file_falls_back_to_the_text_version(tmp_path: Path) -> None:
@@ -344,14 +373,22 @@ async def test_purged_file_falls_back_to_the_text_version(tmp_path: Path) -> Non
 
 async def test_audio_and_files_in_history_are_always_text(tmp_path: Path) -> None:
     store = MediaStore.under(tmp_path)
-    voice = record(VOICE, path=store.save(1, b"RIFF\0\0\0\0WAVE", WAV), text="[语音] 你好")
-    pdf = record(FILE, path=store.save(1, b"%PDF-1.4", PDF), text="[文件：a.pdf，PDF，8 B]")
+    voice = record(
+        VOICE, path=store.save(1, b"RIFF\0\0\0\0WAVE", WAV), text="[语音] 你好", given=True
+    )
+    pdf = record(FILE, path=store.save(1, b"%PDF-1.4", PDF), size=8, filename="a.pdf", given=True)
+    assert pdf.text == "[文件：a.pdf，PDF，8 B]"
     history = [user("", voice, pdf, turns_ago=0), reply("收到")]
 
     past = (await builder(store, history, [user("然后呢")]).build(ALL)).request
     now = (await builder(store, [], [user("", voice, pdf)]).build(ALL)).request
 
-    assert past.messages[0] == Message.text(Role.USER, "[语音] 你好\n[文件：a.pdf，PDF，8 B]")
+    assert past.messages[0] == Message.text(
+        Role.USER,
+        "[语音。原声在当时那一轮已经给过你，这里只保留自动识别的文字：你好]\n"
+        "[PDF 文件：a.pdf，8 B。原文在当时那一轮已经给过你，这里只保留这条说明，"
+        "细节记不清时如实告诉用户、请对方重新发送]",
+    )
     parts: tuple[Part, ...] = now.messages[0].parts
     assert [type(p) for p in parts] == [TextPart, AudioPart, TextPart, FilePart]
     assert parts[2] == TextPart("[文件：a.pdf，PDF，8 B]")
@@ -481,21 +518,126 @@ async def test_every_text_in_the_request_has_face_markers_cleaned(tmp_path: Path
     texts_sent = [
         p.text for m in built.request.messages for p in m.parts if isinstance(p, TextPart)
     ]
-    assert texts_sent == ["早[表情]", "你也[表情]", "看看\n[文件：[表情].pdf，没能下载]"]
+    assert texts_sent == ["早", "你也", "看看\n[文件：.pdf，没能下载]"]
     assert all(RAW_FACE not in text for text in texts_sent)
 
 
 def test_decision_input_has_face_markers_cleaned() -> None:
     file = record(FILE, AttachmentStatus.FAILED, text=f"[文件：{RAW_FACE}，没能下载]")
-    assert decision_text(user(f"哈{RAW_FACE}", file)) == "哈[表情]\n[文件：[表情]，没能下载]"
-    assert decision_text(reply(RAW_FACE)) == "[表情]"
+    assert decision_text(user(f"哈{RAW_FACE}", file)) == "哈\n[文件：，没能下载]"
+    assert decision_text(reply(RAW_FACE)) == ""
 
 
-def test_only_real_face_markers_do_not_make_a_turn_answerable() -> None:
+def test_faces_only_entries_never_make_a_turn_answerable() -> None:
     blind_image = record(IMAGE)  # 只收文字的模型看不了
-    sticker = HistoryEntry(Role.USER, "[表情]", faces_only=True)
+    sticker = HistoryEntry(Role.USER, "[表情]", faces_only=True)  # 升级前存下的
     typed = HistoryEntry(Role.USER, "[表情：你好]")  # 用户手打的，是普通文字
+    raw = HistoryEntry(Role.USER, RAW_FACE)  # 升级前存下的原始标记，去掉后什么都不剩
 
     assert not plan_turn([TEXT_ONLY], [sticker, user("", blind_image)], max_size_mb=20).answerable
+    assert not plan_turn([TEXT_ONLY], [raw], max_size_mb=20).answerable
     assert plan_turn([TEXT_ONLY], [typed], max_size_mb=20).answerable
     assert plan_turn([TEXT_ONLY], [sticker, typed], max_size_mb=20).answerable
+
+
+async def test_faces_only_entries_are_left_out_of_the_request(tmp_path: Path) -> None:
+    sticker = HistoryEntry(Role.USER, "[表情]", faces_only=True)
+    built = await builder(
+        MediaStore.under(tmp_path), [sticker, reply("嗯")], [sticker, user("上海天气怎么样")]
+    ).build(TEXT_ONLY)
+    assert built.request.messages == (
+        Message.text(Role.ASSISTANT, "嗯"),
+        Message.text(Role.USER, "上海天气怎么样"),
+    )
+
+
+# ---- 历史里附件的文字版：只在原件当时确实给过模型（given）时这样说 ----
+
+GIVEN_NOTE = "这里只保留这条说明，细节记不清时如实告诉用户、请对方重新发送"
+
+
+@pytest.mark.parametrize(
+    ("item", "expected"),
+    [
+        (
+            record(IMAGE, description="一只猫", given=True),
+            "[图片。原图在当时那一轮已经给过你，这里只保留描述：一只猫]",
+        ),
+        (
+            record(IMAGE, AttachmentStatus.EXPIRED, quoted=True, given=True),
+            f"[被引用的图片。原图在当时那一轮已经给过你，{GIVEN_NOTE}]",
+        ),
+        (
+            record(VOICE, text="[语音] 明天见", given=True),
+            "[语音。原声在当时那一轮已经给过你，这里只保留自动识别的文字：明天见]",
+        ),
+        (
+            record(VOICE, text="[语音，未识别出文字]", given=True),
+            f"[语音。原声在当时那一轮已经给过你，{GIVEN_NOTE}]",
+        ),
+        (
+            record(
+                FILE,
+                size=800 * 1024,
+                filename="报告.pdf",
+                description="讲了三件事。",
+                text="[文件：报告.pdf，PDF，800 KB。摘要：讲了三件事。]",
+                given=True,
+            ),
+            "[PDF 文件：报告.pdf，800 KB。原文在当时那一轮已经给过你，这里只保留摘要：讲了三件事。]",
+        ),
+        (
+            record(
+                FILE, AttachmentStatus.EXPIRED, size=800 * 1024, filename="报告.pdf", given=True
+            ),
+            f"[PDF 文件：报告.pdf，800 KB。原文在当时那一轮已经给过你，{GIVEN_NOTE}]",
+        ),
+        # 没有「给过」的记录：当时给的就是文字版，照旧，不声称给过。
+        (record(IMAGE, description="一只猫", text="[图片：一只猫]"), "[图片：一只猫]"),
+        (record(VOICE, text="[语音] 明天见"), "[语音] 明天见"),
+        (record(FILE, filename="a.pdf", size=8), "[文件：a.pdf，PDF，8 B]"),
+        (record(IMAGE, AttachmentStatus.FAILED), "[图片，没能下载]"),
+    ],
+)
+async def test_history_text_says_the_original_was_given_only_when_recorded(
+    tmp_path: Path, item: AttachmentRecord, expected: str
+) -> None:
+    store = MediaStore.under(tmp_path)
+    history = [user("", item), reply("好的")]
+    # 用能接收一切的模型：说法只看记录，不看模型的能力。
+    built = await builder(store, history, [user("然后呢")], image_turns=0).build(ALL)
+    assert built.request.messages[0] == Message.text(Role.USER, expected)
+
+
+async def test_current_turn_keeps_the_plain_text_version(tmp_path: Path) -> None:
+    # 本轮给不了原件时的文字版不变（不说「当时给过你」）。
+    pdf = record(FILE, AttachmentStatus.EXPIRED, size=8, filename="a.pdf", given=True)
+    built = await builder(MediaStore.under(tmp_path), [], [user("", pdf)]).build(TEXT_ONLY)
+    assert built.request.messages == (Message.text(Role.USER, "[文件：a.pdf，PDF，8 B]"),)
+
+
+async def test_built_request_reports_which_current_attachments_went_as_originals(
+    tmp_path: Path,
+) -> None:
+    store = MediaStore.under(tmp_path)
+    big = b"\x89PNG\r\n\x1a\n" + b"\0" * (8 * 1024 * 1024)
+    first, second = stored_image(store, data=big), stored_image(store, data=big)
+    old = stored_image(store)
+    history = [user("", old), reply("好")]
+
+    built = await builder(store, history, [user("", first, second)]).build(ALL)
+
+    # Gemini 的预算只放得下一张；历史里重新带上的图片不算这一轮给的。
+    assert built.given == {first.id}
+    assert (await builder(store, [], [user("", first)]).build(TEXT_ONLY)).given == frozenset()
+
+
+def test_decision_marker_leaves_out_the_summary() -> None:
+    pdf = record(
+        FILE,
+        size=8,
+        filename="a.pdf",
+        description="很长的摘要",
+        text="[文件：a.pdf，PDF，8 B。摘要：很长的摘要]",
+    )
+    assert decision_text(user("总结一下", pdf)) == "总结一下\n[文件：a.pdf，PDF，8 B]"

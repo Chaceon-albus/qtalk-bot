@@ -763,15 +763,17 @@ async def test_version_4_database_gets_the_reply_index_and_faces_only(tmp_path: 
         assert not any(entry.faces_only for entry in history)  # 升级前的消息都是 0
 
 
-async def test_journal_keeps_the_original_text_and_the_faces_only_flag(db: Database) -> None:
-    # 流水保留实际收到的原文（升级前存下的原始标记也原样留着），清洗在组装模型输入时做（见 context.py）。
+async def test_journal_keeps_the_original_text_and_skips_faces_only_messages(db: Database) -> None:
+    # 流水保留实际存下的原文（升级前存下的原始标记也原样留着），清洗在组装模型输入时做（见 context.py）。
+    # 只由表情组成的消息只留个记录：不进历史，也不并进这一轮。
     alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
     raw = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
 
     def fill(conn: sqlite3.Connection) -> int:
         old = journal.add_user_message(conn, alice, f"哈哈{raw}", "qq-1", 0)
-        reply(conn, alice, old, "答")
-        journal.add_user_message(conn, alice, "[表情]", "qq-2", 0, faces_only=True)
+        journal.add_user_message(conn, alice, "", "qq-1b", 0, faces_only=True)  # 同一轮里的表情包
+        reply(conn, alice, old + 1, "答")  # 升级前的回复可能挂在表情包上
+        journal.add_user_message(conn, alice, "", "qq-2", 0, faces_only=True)
         return journal.add_user_message(conn, alice, "[表情]", "qq-3", 0)  # 用户手打的
 
     current = await db.transaction(fill)
@@ -779,6 +781,185 @@ async def test_journal_keeps_the_original_text_and_the_faces_only_flag(db: Datab
     history = await db.transaction(journal.recent_history, alice, current, 10)
     assert [(e.content, e.faces_only) for e in history] == [(f"哈哈{raw}", False), ("答", False)]
     pending = await db.transaction(journal.pending_messages, alice, current + 1)
-    assert [(e.content, e.faces_only) for e in pending] == [("[表情]", True), ("[表情]", False)]
+    assert [(e.content, e.faces_only) for e in pending] == [("[表情]", False)]
     (entry,) = await db.transaction(journal.current_entries, alice, [current - 1])
     assert entry.faces_only
+    kept = await db.transaction(journal.not_faces_only, alice, [current - 1, current])
+    assert kept == (current,)
+
+
+async def test_many_stickers_do_not_crowd_out_pending_messages(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> int:
+        question = journal.add_user_message(conn, alice, "问", "qq-0", 0)
+        for index in range(journal.ROWS_PER_TURN + 5):
+            journal.add_user_message(conn, alice, "", f"qq-{index + 1}", 0, faces_only=True)
+        return question
+
+    question = await db.transaction(fill)
+    pending = await db.transaction(journal.pending_messages, alice, question + 100)
+    assert [entry.message_id for entry in pending] == [question]
+
+
+async def test_version_5_database_gets_descriptions_and_narrower_faces_only(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / DATABASE_FILENAME
+    async with await Database.open(path, migrations=MIGRATIONS[:5]) as old:
+        user = await old.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+
+        def fill(conn: sqlite3.Connection) -> tuple[int, int]:
+            # 第 5 版：表情标记加 PDF 的消息也记成了 faces_only；描述只在 text 里。
+            sticker = journal.add_user_message(conn, user.id, "[表情]", "qq-1", 0, faces_only=True)
+            mixed = journal.add_user_message(
+                conn, user.id, "[表情：捂脸] [表情]", "qq-2", 0, faces_only=True
+            )
+            typed = journal.add_user_message(conn, user.id, "看看[表情]", "qq-3", 0)  # 用户手打的
+            conn.execute(
+                "INSERT INTO attachments (user_id, message_id, position, quoted, kind, status,"
+                " text, created_at) VALUES (?, ?, 0, 0, 'file', 'skipped', '[文件]', 0)",
+                (user.id, typed),
+            )
+            for position, (kind, text, status) in enumerate(
+                [
+                    ("image", "[图片：一只猫]", "done"),
+                    ("image", "[被引用的图片：一条狗]", "done"),
+                    ("image", "[图片]", "failed"),
+                    ("file", "[文件：a.pdf，PDF，8 B]", None),
+                ]
+            ):
+                conn.execute(
+                    "INSERT INTO attachments (user_id, message_id, position, quoted, kind, status,"
+                    " text, describe_status, created_at) VALUES (?, ?, ?, 0, ?, 'skipped', ?, ?, 0)",
+                    (user.id, mixed, position, kind, text, status),
+                )
+            return sticker, mixed
+
+        sticker, mixed = await old.transaction(fill)
+
+    async with await Database.open(path) as db:
+        rows = await db.fetch_all("SELECT id, faces_only, content FROM messages ORDER BY id")
+        # 被改回普通消息的那条去掉第 5 版生成的表情文字；别的行（含手打的）不碰。
+        assert [tuple(row) for row in rows] == [
+            (sticker, 1, "[表情]"),
+            (mixed, 0, ""),
+            (sticker + 2, 0, "看看[表情]"),
+        ]
+        rows = await db.fetch_all(
+            "SELECT description, given FROM attachments WHERE message_id = ? ORDER BY position",
+            (mixed,),
+        )
+        assert [tuple(row) for row in rows] == [("一只猫", 0), ("一条狗", 0), (None, 0), (None, 0)]
+
+
+async def test_set_description_keeps_the_description_apart_from_the_text(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> int:
+        message = journal.add_user_message(conn, alice, "", "qq-1", 0)
+        record = journal.add_attachment(
+            conn,
+            user_id=alice,
+            message_id=message,
+            item=attachment(path="1/a.png"),
+            describe=True,
+            now=0,
+        )
+        journal.set_description(
+            conn,
+            alice,
+            record.id,
+            status=DescribeStatus.DONE,
+            text="[图片：一只猫]",
+            description="一只猫",
+        )
+        return message
+
+    message = await db.transaction(fill)
+    (entry,) = await db.transaction(journal.current_entries, alice, [message])
+    (record,) = entry.attachments
+    assert (record.text, record.description) == ("[图片：一只猫]", "一只猫")
+
+
+async def test_set_given_rewrites_the_turns_attachments_for_this_user_only(
+    db: Database,
+) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+    bob = await new_user(db, "FAKE-OPENID-BOB", "小李")
+
+    def add(conn: sqlite3.Connection, user_id: int, path: str) -> tuple[int, int]:
+        message = journal.add_user_message(conn, user_id, "", f"qq-{path}", 0)
+        record = journal.add_attachment(
+            conn,
+            user_id=user_id,
+            message_id=message,
+            item=attachment(path=path),
+            describe=False,
+            now=0,
+        )
+        return message, record.id
+
+    def fill(conn: sqlite3.Connection) -> tuple[int, int, int, int, int, int]:
+        m1, a1 = add(conn, alice, "1/a.png")
+        m2, a2 = add(conn, alice, "1/b.png")
+        mb, ab = add(conn, bob, "2/c.png")
+        # 别人的消息与附件编号混进来也改不了。
+        journal.set_given(conn, alice, [m1, m2, mb], {a1, ab})
+        return m1, m2, a1, a2, mb, ab
+
+    m1, m2, a1, a2, _, ab = await db.transaction(fill)
+
+    async def flags() -> dict[int, int]:
+        rows = await db.fetch_all("SELECT id, given FROM attachments")
+        return {row[0]: row[1] for row in rows}
+
+    assert await flags() == {a1: 1, a2: 0, ab: 0}
+    # 上次记的 1 不会留下：这一轮结束时没有以原件给出的，重记为 0。
+    await db.transaction(journal.set_given, alice, [m1, m2], frozenset({a2}))
+    assert await flags() == {a1: 0, a2: 1, ab: 0}
+    await db.transaction(journal.set_given, alice, [m1, m2], frozenset())
+    assert await flags() == {a1: 0, a2: 0, ab: 0}
+
+
+async def test_version_4_stickers_are_recognized_again_by_version_6(tmp_path: Path) -> None:
+    path = tmp_path / DATABASE_FILENAME
+    raw = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
+    async with await Database.open(path, migrations=MIGRATIONS[:4]) as old:
+        user = await old.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+
+        def fill(conn: sqlite3.Connection) -> list[int]:
+            ids: list[int] = []
+            for index, (content, attachments) in enumerate(
+                [
+                    (raw, [("image", 0)]),  # 第 4 版的表情包：原始标记加表情图片
+                    (f" {raw}{raw} ", []),  # 单独的小黄脸
+                    (f"哈哈{raw}", [("image", 0)]),  # 有别的文字
+                    (raw, [("image", 1)]),  # 被引用的图片不是表情图片
+                    (raw, [("image", 0), ("image", 0)]),  # 图片比标记多
+                    (raw, [("file", 0)]),
+                ]
+            ):
+                message = conn.execute(
+                    "INSERT INTO messages (user_id, role, content, qq_message_id, created_at)"
+                    " VALUES (?, 'user', ?, ?, 0) RETURNING id",
+                    (user.id, content, f"qq-{index}"),
+                ).fetchone()["id"]
+                for position, (kind, quoted) in enumerate(attachments):
+                    conn.execute(
+                        "INSERT INTO attachments (user_id, message_id, position, quoted, kind,"
+                        " status, text, created_at) VALUES (?, ?, ?, ?, ?, 'skipped', '[图片]', 0)",
+                        (user.id, message, position, quoted, kind),
+                    )
+                ids.append(message)
+            return ids
+
+        ids = await old.transaction(fill)
+
+    async with await Database.open(path) as db:
+        rows = await db.fetch_all("SELECT id, faces_only, content FROM messages ORDER BY id")
+        result = {row[0]: (row[1], row[2]) for row in rows}
+        assert result[ids[0]] == (1, "")
+        assert result[ids[1]] == (1, "")
+        assert [result[i][0] for i in ids[2:]] == [0, 0, 0, 0]
+        assert result[ids[2]][1] == f"哈哈{raw}"  # 原文照留，组装时再清洗

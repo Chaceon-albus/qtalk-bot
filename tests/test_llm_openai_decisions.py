@@ -13,8 +13,9 @@ import httpx2
 import openai
 import pytest
 
-from qtalk_bot.llm import ErrorKind, Provider, Usage
+from qtalk_bot.llm import AudioPart, ErrorKind, Modality, Provider, Usage
 from qtalk_bot.llm.decisions import (
+    DECISION_INPUT_LIMITS,
     PROBABILITY_SUM_TOLERANCE,
     ChoiceAnswer,
     ChoiceQuestion,
@@ -384,3 +385,16 @@ async def test_absurd_token_counts_are_reported_as_missing(
         request(DAMAGED)
     )
     assert result.usage == expected
+
+
+async def test_media_is_not_supported_and_nothing_is_sent() -> None:
+    # 这个接口不收媒体（DECISION_INPUT_LIMITS）；调用方本来就不会给，给了也不发请求。
+    assert not DECISION_INPUT_LIMITS[Provider.OPENAI].accepts(Modality.AUDIO, "audio/wav")
+    server = replying(decision(choice("model", solve=0.7, chat=0.3)))
+    voice = DecisionRequest(
+        input="题目", questions=(ROUTE,), media=(AudioPart(b"RIFF....WAVE", "audio/wav"),)
+    )
+    with pytest.raises(DecisionError) as info:
+        await model_on(server).decide(voice)
+    assert info.value.kind is ErrorKind.UNSUPPORTED
+    assert server.requests == []

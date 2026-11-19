@@ -2,7 +2,7 @@
 
 客户端与对话模型共用（见 `providers.py`），端点、代理与环境变量的处理都沿用 `openai_responses.create_client()`。
 
-请求：`input` 是一段文本；`questions` 是数组，每道题带 `name`。选择题是 `{"type": "choice", "choices":
+请求：`input` 是一段文本（这个接口不收媒体，请求带着 `media` 时不发请求，抛 `UNSUPPORTED`）；`questions` 是数组，每道题带 `name`。选择题是 `{"type": "choice", "choices":
 [{"value", "description"}]}`，是非题是 `{"type": "predicate"}`。
 
 响应（SDK 3.55.1 的 `types/decision.py`）：`answers` 是数组，按题目的顺序，每项带回题目的 `name`；类型有
@@ -62,6 +62,8 @@ class OpenAIDecisionModel:
         return f"OpenAIDecisionModel(model={self._model!r})"
 
     async def decide(self, request: DecisionRequest) -> DecisionResult:
+        if request.media:  # 调用方按 DECISION_INPUT_LIMITS 挑媒体，正常不会走到这里
+            raise DecisionError(Provider.OPENAI, ErrorKind.UNSUPPORTED)
         try:
             # 用原始响应接口：要按原始的 JSON 校验，SDK 解析时会把布尔值的概率转成 1.0 / 0.0。
             response = await self._client.decisions.with_raw_response.create(

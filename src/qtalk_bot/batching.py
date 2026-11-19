@@ -6,7 +6,8 @@
 **每条消息**到达时立刻交给 `Responder.receive()`：复查授权、下载附件、写进流水，不等计时结束。等待的时间被下载
 利用起来；进程意外退出时消息也已经在流水里，重启后是待回复的消息。
 
-**计时**（`first_batch()`）：消息分三种（`classify()`）：带文字或语音的、只有图片或文件的、单独的表情包。一批里每来
+**计时**（`first_batch()`）：消息分三种（`classify()`）：带文字或语音的、只有图片或文件的、只由表情组成的
+（表情包、单独的小黄脸，下面统称表情包）。一批里每来
 一条（表情包除外），就按它的种类重新开始计时：前一种等 `text_wait_seconds`，后一种等
 `attachment_wait_seconds`（等用户补上问题）；但从这一批的第一条算起不超过 `max_wait_seconds`。单独的表情包
 不开始一批，也不重启计时；落在一批之中的就是这一批的一部分。
@@ -16,11 +17,11 @@
 把截止之后才到的消息并进去。一批最多 `MAX_BATCH` 条。复查授权没通过（没写进流水）的消息从计时里撤掉。
 
 **一批的结束**：到点后取出这一批，等它们都收完（下载、写进流水），交给 `Responder.respond()` 回答一轮，回复挂在
-其中最后一条写进了流水的消息上。都是表情包（或其余几条没能写进流水）时不回答。同一个用户的批次在一个任务里
-依次处理，不同用户的互不影响。
+其中最后一条写进了流水、不是表情包的消息上（表情包不进模型的输入，也不交给 `respond()`）。都是表情包（或其余
+几条没能写进流水）时不回答。同一个用户的批次在一个任务里依次处理，不同用户的互不影响。
 
 **不攒批**：两种等待都是 0、或上限是 0 时（`BatchingSettings.enabled` 为假），来一条处理一条：一批只有一条不是
-表情包的消息（它之前的表情包一并带上）。
+表情包的消息（它之前的表情包一并取出，但不交给回答）。
 
 **关停**：`stop()` 放弃所有还在计时的批次、取消正在回答的轮次（对话自己收尾记账），`drain()` 等这些任务结束。
 被放弃的消息已经在流水里，重启后是待回复的消息。
@@ -199,8 +200,7 @@ class Batcher:
             batches = self._users[user.id] = _UserBatches(user)
         batches.user = user
         arrival = _Arrival(self._now(), kind, channel)
-        # 单独的表情包不开始一批；没有一批在计时时也不必跟踪它：它照样按到达的顺序写进流水，下一批的消息
-        # 写进流水时它已经在了，到时作为待回复的消息并进去。
+        # 表情包不开始一批；没有一批在计时时也不必跟踪它：它照样写进流水留个记录，但永远不进模型的输入。
         if kind is not InputKind.STICKER or batches.open:
             batches.arrivals.append(arrival)
             batches.poke()  # 计时可能提前了（例如只有图片的一批来了文字）
@@ -264,13 +264,14 @@ class Batcher:
                 waiting = [a.received for a in taken if not a.received.done()]
                 if waiting:
                     await asyncio.wait(waiting)  # 等这一批都收完（下载、写进流水）
+                # 表情包不进模型的输入，回复挂在最后一条不是表情包的消息上。
                 received = [
                     (item, arrival.channel)
                     for arrival in taken
-                    if (item := arrival.received.result()) is not None
+                    if (item := arrival.received.result()) is not None and not item.sticker
                 ]
-                if all(item.sticker for item, _ in received):
-                    continue  # 单独的表情包（或别的几条没能写进流水）：不回答
+                if not received:
+                    continue  # 只有表情包（或别的几条没能写进流水）：不回答
                 await self._answer(batches.user, received)
         finally:
             batches.worker = None

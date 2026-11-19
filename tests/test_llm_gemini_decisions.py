@@ -5,6 +5,7 @@
 （安全拦截是 HTTP 400，`error.code` 为 `safety` 等）。
 """
 
+import base64
 import json
 import traceback
 from collections.abc import Callable
@@ -15,12 +16,14 @@ import pytest
 from google import genai
 from google.genai import types
 
-from qtalk_bot.llm import ErrorKind, Provider, Usage
+from qtalk_bot.llm import AudioPart, ErrorKind, FilePart, ImagePart, Modality, Provider, Usage
 from qtalk_bot.llm.decisions import (
+    DECISION_INPUT_LIMITS,
     PROBABILITY_SUM_TOLERANCE,
     ChoiceAnswer,
     ChoiceQuestion,
     DecisionError,
+    DecisionMedia,
     DecisionRequest,
     DecisionResult,
     Option,
@@ -346,3 +349,49 @@ async def test_absurd_token_counts_are_reported_as_missing(
 ) -> None:
     result = await model_on(replying(decision(used, damaged=noul(0.5)))).decide(request(DAMAGED))
     assert result.usage == expected
+
+
+# ---- 带语音的输入 ----
+
+WAV_BYTES = b"RIFF\x00\x00\x00\x00WAVEfmt fake"
+
+
+async def test_audio_goes_after_the_text_as_an_audio_content_block() -> None:
+    server = replying(decision(model=choice(solve=0.7, chat=0.3)))
+    voice = DecisionRequest(
+        input='{"latest": "[语音] 上海天气怎么样"}',
+        questions=(ROUTE,),
+        media=(AudioPart(WAV_BYTES, "audio/wav"),),
+    )
+
+    result = await model_on(server).decide(voice)
+
+    assert result.answers["model"] == ChoiceAnswer({"solve": 0.7, "chat": 0.3})
+    assert server.body["input"] == [
+        {"type": "text", "text": '{"latest": "[语音] 上海天气怎么样"}'},
+        {
+            "type": "audio",
+            "data": base64.b64encode(WAV_BYTES).decode("ascii"),
+            "mime_type": "audio/wav",
+        },
+    ]
+    assert DECISION_INPUT_LIMITS[Provider.GEMINI].accepts(Modality.AUDIO, "audio/wav")
+
+
+@pytest.mark.parametrize(
+    "media",
+    [
+        AudioPart(WAV_BYTES, "audio/mpeg"),  # 不在限制表里
+        ImagePart(b"\x89PNG\r\n\x1a\n", "image/png"),  # 只接入了音频
+        FilePart(b"%PDF-1.4\n", "application/pdf"),
+        AudioPart(b"\0" * (DECISION_INPUT_LIMITS[Provider.GEMINI].max_inline_bytes), "audio/wav"),
+    ],
+)
+async def test_unsupported_or_oversized_media_is_not_sent(media: DecisionMedia) -> None:
+    server = replying(decision(model=choice(solve=0.7, chat=0.3)))
+    with pytest.raises(DecisionError) as info:
+        await model_on(server).decide(
+            DecisionRequest(input="题目", questions=(ROUTE,), media=(media,))
+        )
+    assert info.value.kind is ErrorKind.UNSUPPORTED
+    assert server.requests == []

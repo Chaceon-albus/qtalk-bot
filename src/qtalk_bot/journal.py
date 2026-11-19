@@ -6,12 +6,15 @@ Unix 秒。查询一律按 `user_id` 过滤：一个用户的对话与附件不�
 一轮是若干条用户消息（攒成的一批）加上之后的回复，回复挂在其中最后一条上（`reply_to`）。没有回复的用户
 消息并进下一轮。轮次的边界以回复的 `reply_to` 为准，而不是行的先后：一轮还在生成时到达的消息编号比这一轮的
 回复小，但仍是待回复的（见 `_last_boundary()`）。
+
+只由表情组成的用户消息（`faces_only`，见 `faces.py`）照常记进流水，但取历史与这一轮的输入时一律跳过：表情不进
+模型的输入，也不影响轮次。
 """
 
 import json
 import sqlite3
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -58,14 +61,14 @@ class UsagePurpose(StrEnum):
 
     CHAT = "chat"  # 对话模型
     DECISION = "decision"  # 决策调用
-    DESCRIBE = "describe"  # 给图片写描述
+    DESCRIBE = "describe"  # 给图片写描述、给 PDF 写摘要
 
 
 DECISION_USAGE_MODEL = "decisions"
 """决策调用的用量行在 `model` 列（内部名字）里记的固定值：决策模型不在 `[[models]]` 里，没有内部名字。"""
 
 DESCRIBE_USAGE_MODEL = "describe"
-"""给图片写描述的调用在用量表 `model` 列里记的固定值。"""
+"""给图片写描述、给 PDF 写摘要的调用在用量表 `model` 列里记的固定值。"""
 
 ROWS_PER_TURN = 32
 """取历史时每轮最多看的用户消息数，用来给查询设上限；也是当前这一轮最多取的待回复消息数。攒批的一轮一般远到
@@ -87,7 +90,8 @@ class HistoryEntry:
     turns_ago: int = field(default=0, compare=False)
     message_id: int | None = field(default=None, compare=False)
     faces_only: bool = field(default=False, compare=False)
-    """用户消息的文字只由真实的表情标记转换而来（流水的 `faces_only` 列）：本身不让一轮变得可答。"""
+    """用户消息只由表情组成（流水的 `faces_only` 列）。取历史与这一轮的输入时已经跳过这样的消息，这一项只为
+    防御：它不让一轮变得可答。"""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -125,7 +129,7 @@ def add_user_message(
     faces_only: bool = False,
 ) -> int:
     """把用户发来的文字（没有文字时是空串）写进流水，返回它的编号。`msg_idx` 是平台的引用索引；`faces_only`
-    表示文字只由真实的表情标记转换而来。"""
+    表示这条消息只由表情组成（`faces.is_sticker()`），它只留个记录，永远不进模型的输入。"""
     row = conn.execute(
         "INSERT INTO messages (user_id, role, content, qq_message_id, created_at, msg_idx,"
         " faces_only) VALUES (?, 'user', ?, ?, ?, ?, ?) RETURNING id",
@@ -176,6 +180,7 @@ def add_attachment(
         size=item.size,
         path=item.path,
         text=item.text,
+        filename=item.filename,
     )
 
 
@@ -201,7 +206,10 @@ def update_attachment(
     )
 
 
-_ATTACHMENT_COLUMNS = "id, message_id, kind, status, quoted, mime_type, size, path, text"
+_ATTACHMENT_COLUMNS = (
+    "id, message_id, kind, status, quoted, mime_type, size, path, text, filename, description,"
+    " given"
+)
 
 
 def _record(row: sqlite3.Row) -> AttachmentRecord:
@@ -215,6 +223,9 @@ def _record(row: sqlite3.Row) -> AttachmentRecord:
         size=row["size"],
         path=row["path"],
         text=row["text"],
+        filename=row["filename"],
+        description=row["description"],
+        given=bool(row["given"]),
     )
 
 
@@ -240,10 +251,10 @@ def message_attachments(
 def pending_description(
     conn: sqlite3.Connection, user_id: int, attachment_id: int
 ) -> AttachmentRecord | None:
-    """这个用户的一个等着写描述、文件还在的图片；不是时返回 `None`。"""
+    """这个用户的一个等着写描述（图片）或摘要（文件）、文件还在的附件；不是时返回 `None`。"""
     row = conn.execute(
         f"SELECT {_ATTACHMENT_COLUMNS} FROM attachments WHERE id = ? AND user_id = ?"
-        " AND kind = 'image' AND status = 'stored' AND describe_status = 'pending'",
+        " AND kind IN ('image', 'file') AND status = 'stored' AND describe_status = 'pending'",
         (attachment_id, user_id),
     ).fetchone()
     return None if row is None else _record(row)
@@ -256,18 +267,35 @@ def set_description(
     *,
     status: DescribeStatus,
     text: str | None = None,
+    description: str | None = None,
 ) -> None:
-    """记下描述的结果；`text` 不为空时同时换掉文字版。"""
-    if text is None:
-        conn.execute(
-            "UPDATE attachments SET describe_status = ? WHERE id = ? AND user_id = ?",
-            (status.value, attachment_id, user_id),
-        )
-    else:
-        conn.execute(
-            "UPDATE attachments SET describe_status = ?, text = ? WHERE id = ? AND user_id = ?",
-            (status.value, text, attachment_id, user_id),
-        )
+    """记下描述（或摘要）的结果；`text` 不为空时同时换掉文字版，`description` 不为空时记下描述本身。"""
+    conn.execute(
+        "UPDATE attachments SET describe_status = ?, text = coalesce(?, text),"
+        " description = coalesce(?, description) WHERE id = ? AND user_id = ?",
+        (status.value, text, description, attachment_id, user_id),
+    )
+
+
+def set_given(
+    conn: sqlite3.Connection,
+    user_id: int,
+    message_ids: Iterable[int],
+    given: Collection[int],
+) -> None:
+    """一轮记账时，把这一轮全部用户消息（`message_ids`）的附件重记 `given`：在结束这一轮的那次请求里以原件给出的
+    （`given`）设 1，其余设 0。上一轮带了原件却没有结束的（如送达不明），并进这一轮后以这一轮为准。只改这个
+    用户的。"""
+    ids = sorted(set(message_ids))
+    if not ids:
+        return
+    marks = ", ".join("?" * len(ids))
+    chosen = sorted(set(given))
+    value = f"(id IN ({', '.join('?' * len(chosen))}))" if chosen else "0"
+    conn.execute(
+        f"UPDATE attachments SET given = {value} WHERE user_id = ? AND message_id IN ({marks})",
+        (*chosen, user_id, *ids),
+    )
 
 
 def referenced_paths(conn: sqlite3.Connection) -> set[str]:
@@ -359,7 +387,7 @@ def recent_history(
     所以连来再多待回复的消息也挤不掉已完成的历史。正文为空的回复（只发了固定说明）不带，但算作一轮的结尾。
 
     回复排在它所回答的那条用户消息（`reply_to`）之后，而不是按它自己的编号：生成期间到达的下一批消息编号比
-    回复小，却属于下一轮。
+    回复小，却属于下一轮。只由表情组成的消息（`faces_only`）不带。
     """
     if turns <= 0:
         return []
@@ -368,7 +396,8 @@ def recent_history(
         return []
     users = conn.execute(
         "SELECT id, role, content, faces_only, NULL AS reply_to, NULL AS delivery FROM messages"
-        " WHERE user_id = ? AND role = 'user' AND id <= ? ORDER BY id DESC LIMIT ?",
+        " WHERE user_id = ? AND role = 'user' AND faces_only = 0 AND id <= ?"
+        " ORDER BY id DESC LIMIT ?",
         (user_id, boundary, turns * ROWS_PER_TURN),
     ).fetchall()
     if not users:
@@ -426,12 +455,13 @@ def pending_messages(conn: sqlite3.Connection, user_id: int, before: int) -> lis
     附件），按时间排列。
 
     它们属于当前这一轮（攒成一批的几条消息、只收到固定说明的消息、回复前关停留下的消息、上一轮生成期间到达的
-    消息等），`turns_ago` 是 `CURRENT_TURN`。最多取最近的 `ROWS_PER_TURN` 条。
+    消息等），`turns_ago` 是 `CURRENT_TURN`。最多取最近的 `ROWS_PER_TURN` 条。只由表情组成的消息（`faces_only`）
+    跳过，不并进这一轮，也不占条数。
     """
     boundary = _last_boundary(conn, user_id, before) or 0
     rows = conn.execute(
         "SELECT id, content, faces_only FROM messages WHERE user_id = ? AND role = 'user'"
-        " AND id > ? AND id < ?"
+        " AND faces_only = 0 AND id > ? AND id < ?"
         " ORDER BY id DESC LIMIT ?",
         (user_id, boundary, before, ROWS_PER_TURN),
     ).fetchall()
@@ -448,6 +478,22 @@ def pending_messages(conn: sqlite3.Connection, user_id: int, before: int) -> lis
         )
         for row in rows
     ]
+
+
+def not_faces_only(
+    conn: sqlite3.Connection, user_id: int, message_ids: Sequence[int]
+) -> tuple[int, ...]:
+    """这些消息里属于这个用户、不只由表情组成的那些（保持原来的顺序）。"""
+    if not message_ids:
+        return ()
+    placeholders = ", ".join("?" * len(message_ids))
+    rows = conn.execute(
+        f"SELECT id FROM messages WHERE user_id = ? AND role = 'user' AND faces_only = 0"
+        f" AND id IN ({placeholders})",
+        (user_id, *message_ids),
+    ).fetchall()
+    kept = {int(row["id"]) for row in rows}
+    return tuple(message_id for message_id in message_ids if message_id in kept)
 
 
 def current_entries(

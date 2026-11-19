@@ -5,8 +5,13 @@
 `gemini_interactions.create_client()`。那里把接口版本固定成了 `v1`，而 Decisions 只在 `v1beta` 下，所以每次
 调用单独传 `api_version="v1beta"`（SDK 的 `create()` 有这个参数，只影响这一次请求的路径）。
 
-请求：`input` 是一段文本；`questions` 是以题目名为键的对象。选择题是 `{"type": "choice", "criteria":
-{取值: 描述}}`，是非题是 `{"type": "noul"}`。
+请求：`input` 是一段文本；带媒体（`DecisionRequest.media`，现在只有语音）时是内容块的数组：先是
+`{"type": "text", "text": …}`，再是 `{"type": "audio", "data": base64, "mime_type": "audio/wav"}`（SDK 的
+`DecisionInputContentParam`，音频块的写法与 Interactions 的 `AudioContentParam` 相同）。媒体不在
+`DECISION_INPUT_LIMITS` 里、或合计超过内联上限时不发请求，抛 `UNSUPPORTED`。
+
+`questions` 是以题目名为键的对象。选择题是 `{"type": "choice", "criteria": {取值: 描述}}`，是非题是
+`{"type": "noul"}`。
 
 响应（google-genai 3.6.1 的 `google.genai.decisions`）：`answers` 是以题目名为键的对象，选择题的
 `probabilities` 是 `{取值: 概率}`，是非题的 `noul` 是成立的概率；`usage` 有 `total_input_tokens`、
@@ -27,16 +32,20 @@ SDK 解析时不校验（`validate=False`），还会做宽松的转换：缺了
 不是 JSON 时按 `MALFORMED` 处理（`json()` 抛 `ValueError`；SDK 自己解析失败时抛的异常带着状态码 200）。
 """
 
+import base64
 from typing import cast
 
 from google import genai
 from google.genai import decisions as genai_decisions
+from google.genai import interactions as genai_interactions
 
-from . import ErrorKind, Provider, Usage, kind_for_status
+from . import AudioPart, ErrorKind, Modality, Provider, Usage, inline_size, kind_for_status
 from .decisions import (
+    DECISION_INPUT_LIMITS,
     Answer,
     ChoiceQuestion,
     DecisionError,
+    DecisionMedia,
     DecisionRequest,
     DecisionResult,
     Question,
@@ -76,12 +85,13 @@ class GeminiDecisionModel:
 
     async def decide(self, request: DecisionRequest) -> DecisionResult:
         questions = {question.name: _question(question) for question in request.questions}
+        content = _input(request)
         try:
             # 用原始响应接口：要按原始的 JSON 校验，见模块 docstring。`create` 的 `timeout` 参数类型来自
             # SDK 对 httpx 的可选导入，pyright 看作 Unknown。
             response = await self._client.aio.decisions.with_raw_response.create(  # pyright: ignore[reportUnknownMemberType]
                 model=self._model,
-                input=request.input,
+                input=content,
                 questions=questions,
                 api_version=API_VERSION,
             )
@@ -89,6 +99,33 @@ class GeminiDecisionModel:
         except Exception as exc:  # noqa: BLE001  SDK 的异常类在私有模块里，见模块 docstring
             raise _error(exc) from None
         return _result(request, body)
+
+
+def _input(request: DecisionRequest) -> genai_decisions.InputParam:
+    """请求的 `input`：没有媒体时就是文本，有时是内容块的数组（文本在前）。"""
+    if not request.media:
+        return request.input
+    limits = DECISION_INPUT_LIMITS[Provider.GEMINI]
+    if sum(inline_size(len(item.data)) for item in request.media) > limits.max_inline_bytes:
+        raise DecisionError(Provider.GEMINI, ErrorKind.UNSUPPORTED)
+    text: genai_decisions.DecisionInputContentParam = {"type": "text", "text": request.input}
+    return [text, *(_media(item) for item in request.media)]
+
+
+def _media(item: DecisionMedia) -> genai_decisions.DecisionInputContentParam:
+    match item:
+        case AudioPart(data=data, mime_type=mime) if DECISION_INPUT_LIMITS[Provider.GEMINI].accepts(
+            Modality.AUDIO, mime
+        ):
+            # SDK 把 mime_type 写成已知取值的 Literal 加它自己的 str 子类；这里的取值已对照过限制表。
+            audio: genai_interactions.AudioContentParam = {
+                "type": "audio",
+                "data": base64.b64encode(data).decode("ascii"),
+                "mime_type": cast(genai_interactions.AudioContentMimeType, mime),
+            }
+            return audio
+        case _:
+            raise DecisionError(Provider.GEMINI, ErrorKind.UNSUPPORTED)
 
 
 def _question(question: Question) -> genai_decisions.QuestionParam:
