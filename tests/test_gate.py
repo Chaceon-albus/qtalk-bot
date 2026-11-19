@@ -142,7 +142,7 @@ class Harness:
         return invite
 
     async def count(self, table: str) -> int:
-        row = await self.db.fetch_one(f"SELECT count(*) FROM {table}")
+        row = await self.db.fetch_one(f"SELECT count(*) FROM {table}")  # noqa: S608  表名来自测试代码
         assert row is not None
         return row[0]
 

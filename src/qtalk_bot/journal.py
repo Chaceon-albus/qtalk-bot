@@ -238,7 +238,7 @@ def message_attachments(
         return {}
     placeholders = ", ".join("?" * len(ids))
     rows = conn.execute(
-        f"SELECT {_ATTACHMENT_COLUMNS} FROM attachments"
+        f"SELECT {_ATTACHMENT_COLUMNS} FROM attachments"  # noqa: S608  只拼列名常量与 ? 占位符
         f" WHERE user_id = ? AND message_id IN ({placeholders}) ORDER BY message_id, position",
         (user_id, *ids),
     ).fetchall()
@@ -253,7 +253,7 @@ def pending_description(
 ) -> AttachmentRecord | None:
     """这个用户的一个等着写描述（图片）或摘要（文件）、文件还在的附件；不是时返回 `None`。"""
     row = conn.execute(
-        f"SELECT {_ATTACHMENT_COLUMNS} FROM attachments WHERE id = ? AND user_id = ?"
+        f"SELECT {_ATTACHMENT_COLUMNS} FROM attachments WHERE id = ? AND user_id = ?"  # noqa: S608  只拼列名常量
         " AND kind IN ('image', 'file') AND status = 'stored' AND describe_status = 'pending'",
         (attachment_id, user_id),
     ).fetchone()
@@ -293,7 +293,7 @@ def set_given(
     chosen = sorted(set(given))
     value = f"(id IN ({', '.join('?' * len(chosen))}))" if chosen else "0"
     conn.execute(
-        f"UPDATE attachments SET given = {value} WHERE user_id = ? AND message_id IN ({marks})",
+        f"UPDATE attachments SET given = {value} WHERE user_id = ? AND message_id IN ({marks})",  # noqa: S608  只拼 ? 占位符
         (*chosen, user_id, *ids),
     )
 
@@ -369,7 +369,7 @@ def _last_boundary(conn: sqlite3.Connection, user_id: int, before: int) -> int |
     回复小，但这一轮并没有看到它们。被某条回复覆盖的只是编号不大于它的 `reply_to` 的那些消息。
     """
     row = conn.execute(
-        "SELECT reply_to FROM messages WHERE user_id = ? AND role = 'assistant' AND reply_to < ?"
+        "SELECT reply_to FROM messages WHERE user_id = ? AND role = 'assistant' AND reply_to < ?"  # noqa: S608  只拼代码里的常量条件
         f" AND {_ENDS_TURN_SQL} ORDER BY reply_to DESC LIMIT 1",
         (user_id, before),
     ).fetchone()
@@ -406,7 +406,7 @@ def recent_history(
     # 回复的编号总比它回答的消息大，所以 `id > oldest` 限定了扫描的范围。不算边界的回复行（正文为空、没给
     # 用户任何东西的）直接排除，几十条这样的行也挤不掉较早的问答；它们回复的用户消息照常留着。
     replies = conn.execute(
-        "SELECT id, role, content, faces_only, reply_to, delivery FROM messages"
+        "SELECT id, role, content, faces_only, reply_to, delivery FROM messages"  # noqa: S608  只拼代码里的常量条件
         " WHERE user_id = ? AND role = 'assistant' AND id > ? AND reply_to >= ? AND reply_to <= ?"
         f" AND {_ENDS_TURN_SQL}",
         (user_id, oldest, oldest, boundary),
@@ -488,7 +488,7 @@ def not_faces_only(
         return ()
     placeholders = ", ".join("?" * len(message_ids))
     rows = conn.execute(
-        f"SELECT id FROM messages WHERE user_id = ? AND role = 'user' AND faces_only = 0"
+        f"SELECT id FROM messages WHERE user_id = ? AND role = 'user' AND faces_only = 0"  # noqa: S608  只拼 ? 占位符
         f" AND id IN ({placeholders})",
         (user_id, *message_ids),
     ).fetchall()
@@ -504,7 +504,7 @@ def current_entries(
         return []
     placeholders = ", ".join("?" * len(message_ids))
     rows = conn.execute(
-        f"SELECT id, content, faces_only FROM messages WHERE user_id = ? AND role = 'user'"
+        f"SELECT id, content, faces_only FROM messages WHERE user_id = ? AND role = 'user'"  # noqa: S608  只拼 ? 占位符
         f" AND id IN ({placeholders}) ORDER BY id",
         (user_id, *message_ids),
     ).fetchall()

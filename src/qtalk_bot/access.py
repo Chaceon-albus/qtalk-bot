@@ -115,17 +115,17 @@ def _user(row: sqlite3.Row) -> User:
 
 
 def get_user(conn: sqlite3.Connection, user_id: int) -> User | None:
-    row = conn.execute(f"SELECT {_USER_COLUMNS} FROM users WHERE id = ?", (user_id,)).fetchone()
+    row = conn.execute(f"SELECT {_USER_COLUMNS} FROM users WHERE id = ?", (user_id,)).fetchone()  # noqa: S608  只拼列名常量
     return None if row is None else _user(row)
 
 
 def get_user_by_openid(conn: sqlite3.Connection, openid: str) -> User | None:
-    row = conn.execute(f"SELECT {_USER_COLUMNS} FROM users WHERE openid = ?", (openid,)).fetchone()
+    row = conn.execute(f"SELECT {_USER_COLUMNS} FROM users WHERE openid = ?", (openid,)).fetchone()  # noqa: S608  只拼列名常量
     return None if row is None else _user(row)
 
 
 def list_users(conn: sqlite3.Connection) -> list[User]:
-    rows = conn.execute(f"SELECT {_USER_COLUMNS} FROM users ORDER BY id").fetchall()
+    rows = conn.execute(f"SELECT {_USER_COLUMNS} FROM users ORDER BY id").fetchall()  # noqa: S608  只拼列名常量
     return [_user(row) for row in rows]
 
 
@@ -231,7 +231,7 @@ def create_invite(
     conn: sqlite3.Connection, *, code: str, note: str, max_uses: int, expires_at: int, now: int
 ) -> Invite:
     row = conn.execute(
-        "INSERT INTO invites (code, note, max_uses, expires_at, created_at) VALUES (?, ?, ?, ?, ?)"
+        "INSERT INTO invites (code, note, max_uses, expires_at, created_at) VALUES (?, ?, ?, ?, ?)"  # noqa: S608  只拼列名常量
         f" RETURNING {_INVITE_COLUMNS}",
         (code, note, max_uses, expires_at, now),
     ).fetchone()
@@ -240,19 +240,20 @@ def create_invite(
 
 def get_invite(conn: sqlite3.Connection, invite_id: int) -> Invite | None:
     row = conn.execute(
-        f"SELECT {_INVITE_COLUMNS} FROM invites WHERE id = ?", (invite_id,)
+        f"SELECT {_INVITE_COLUMNS} FROM invites WHERE id = ?",  # noqa: S608  只拼列名常量
+        (invite_id,),
     ).fetchone()
     return None if row is None else _invite(row)
 
 
 def get_invite_by_code(conn: sqlite3.Connection, code: str) -> Invite | None:
-    row = conn.execute(f"SELECT {_INVITE_COLUMNS} FROM invites WHERE code = ?", (code,)).fetchone()
+    row = conn.execute(f"SELECT {_INVITE_COLUMNS} FROM invites WHERE code = ?", (code,)).fetchone()  # noqa: S608  只拼列名常量
     return None if row is None else _invite(row)
 
 
 def list_usable_invites(conn: sqlite3.Connection, now: int) -> list[Invite]:
     rows = conn.execute(
-        f"SELECT {_INVITE_COLUMNS} FROM invites"
+        f"SELECT {_INVITE_COLUMNS} FROM invites"  # noqa: S608  只拼列名常量
         " WHERE revoked_at IS NULL AND expires_at > ? AND used_count < max_uses ORDER BY id",
         (now,),
     ).fetchall()
@@ -281,14 +282,14 @@ def redeem_invite(conn: sqlite3.Connection, code: str, openid: str, now: int) ->
     existing = get_user_by_openid(conn, openid)
     if existing is None:
         row = conn.execute(
-            "INSERT INTO users (openid, name, invite_id, joined_at) VALUES (?, ?, ?, ?)"
+            "INSERT INTO users (openid, name, invite_id, joined_at) VALUES (?, ?, ?, ?)"  # noqa: S608  只拼列名常量
             f" RETURNING {_USER_COLUMNS}",
             (openid, invite.note, invite.id, now),
         ).fetchone()
     else:
         assert existing.invite_id is None, "调用方应先确认这个用户还没有经邀请加入"
         row = conn.execute(
-            "UPDATE users SET invite_id = ?, name = ?, status = 'active', disabled_notice_sent = 0,"
+            "UPDATE users SET invite_id = ?, name = ?, status = 'active', disabled_notice_sent = 0,"  # noqa: S608  只拼列名常量
             f" welcomed_at = NULL WHERE id = ? RETURNING {_USER_COLUMNS}",
             (invite.id, invite.note, existing.id),
         ).fetchone()

@@ -31,6 +31,7 @@ extend-select = [
     "ASYNC", # async 误用
     "PT",    # pytest 写法
     "T20",   # 禁止遗留 print
+    "S608",  # 用字符串拼出来的 SQL；只允许拼代码里的常量，并在 noqa 后写明理由
     "RUF",
 ]
 ignore = [
