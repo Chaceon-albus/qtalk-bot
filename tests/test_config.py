@@ -8,6 +8,7 @@ from qtalk_bot.config import (
     DEFAULT_DECISION_MODELS,
     DEFAULT_PERSONA,
     AttachmentSettings,
+    BatchingSettings,
     ChatSettings,
     ConfigError,
     DecisionSettings,
@@ -471,6 +472,68 @@ def test_chat_values_are_read(tmp_path: Path) -> None:
     ],
 )
 def test_invalid_chat(tmp_path: Path, text: str, problem: str) -> None:
+    assert config_error(write_config(tmp_path, text)).problems == (problem,)
+
+
+# ---- [batching] ----
+
+
+def test_batching_defaults(tmp_path: Path) -> None:
+    batching = load_settings(write_config(tmp_path, "")).batching
+    assert batching == BatchingSettings()
+    assert (
+        batching.text_wait_seconds,
+        batching.attachment_wait_seconds,
+        batching.max_wait_seconds,
+    ) == (2.5, 12.0, 20.0)
+    assert batching.enabled
+
+
+def test_batching_values_are_read(tmp_path: Path) -> None:
+    text = (
+        "[batching]\ntext_wait_seconds = 1\nattachment_wait_seconds = 7.5\nmax_wait_seconds = 30\n"
+    )
+    batching = load_settings(write_config(tmp_path, text)).batching
+    assert batching == BatchingSettings(
+        text_wait_seconds=1.0, attachment_wait_seconds=7.5, max_wait_seconds=30.0
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "enabled"),
+    [
+        ("text_wait_seconds = 0\nattachment_wait_seconds = 0\nmax_wait_seconds = 0\n", False),
+        ("text_wait_seconds = 0\nattachment_wait_seconds = 0\n", False),
+        ("max_wait_seconds = 0\n", False),
+        ("text_wait_seconds = 0\n", True),  # 只有图片或文件时仍然等
+    ],
+)
+def test_zero_waits_turn_batching_off(tmp_path: Path, text: str, enabled: bool) -> None:
+    batching = load_settings(write_config(tmp_path, "[batching]\n" + text)).batching
+    assert batching.enabled is enabled
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        (
+            "[batching]\ntext_wait_seconds = -1\n",
+            "batching.text_wait_seconds：应不小于 0、不大于 300",
+        ),
+        (
+            "[batching]\nattachment_wait_seconds = 301\n",
+            "batching.attachment_wait_seconds：应不小于 0、不大于 300",
+        ),
+        ("[batching]\nmax_wait_seconds = nan\n", "batching.max_wait_seconds：应为有限的数字"),
+        (
+            '[batching]\nmax_wait_seconds = "20"\n',
+            "batching.max_wait_seconds：应为数字，实际是字符串",
+        ),
+        ("[batching]\nwait = 3\n", "batching.wait：未知的键"),
+        ("batching = 3\n", "batching：应为表，实际是整数"),
+    ],
+)
+def test_invalid_batching(tmp_path: Path, text: str, problem: str) -> None:
     assert config_error(write_config(tmp_path, text)).problems == (problem,)
 
 

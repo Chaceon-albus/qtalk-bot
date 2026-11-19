@@ -647,3 +647,138 @@ async def test_replies_that_gave_nothing_do_not_use_up_the_history_query(db: Dat
     contents = [entry.content for entry in history]
     assert contents[:2] == ["问1", "答1"]  # 较早的完整问答没被挤掉
     assert contents[-2:] == ["问2", "答2"]
+
+
+# ---- 里程碑 5b：轮次的边界以回复的 reply_to 为准 ----
+
+
+def reply(conn: sqlite3.Connection, user_id: int, reply_to: int, content: str) -> int:
+    return journal.add_reply(
+        conn,
+        user_id=user_id,
+        reply_to=reply_to,
+        content=content,
+        model="main",
+        ending=Ending.COMPLETED,
+        delivery=ReplyDelivery.STREAMED,
+        now=0,
+    )
+
+
+async def test_messages_that_arrived_while_a_turn_was_generating_stay_pending(
+    db: Database,
+) -> None:
+    # 第一轮还在生成时，下一批的消息已经写进流水：它们的编号比第一轮的回复小，但第一轮没有看到它们。
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> tuple[int, int, int]:
+        first = journal.add_user_message(conn, alice, "问1", "qq-1", 0)
+        during_a = journal.add_user_message(conn, alice, "生成期间a", "qq-2", 0)
+        during_b = journal.add_user_message(conn, alice, "生成期间b", "qq-3", 0)
+        reply(conn, alice, first, "答1")
+        return first, during_a, during_b
+
+    first, during_a, during_b = await db.transaction(fill)
+    before = during_b + 1
+
+    pending = await db.transaction(journal.pending_messages, alice, before)
+    assert [entry.message_id for entry in pending] == [during_a, during_b]
+    history = await db.transaction(journal.recent_history, alice, before, 10)
+    assert [(entry.role, entry.content) for entry in history] == [
+        (Role.USER, "问1"),
+        (Role.ASSISTANT, "答1"),
+    ]
+    assert history[0].message_id == first
+    assert await db.transaction(journal.last_answered_model, alice, before) == "main"
+
+
+async def test_replies_follow_the_message_they_answered_in_history(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> int:
+        first = journal.add_user_message(conn, alice, "问1", "qq-1", 0)
+        second = journal.add_user_message(conn, alice, "问2", "qq-2", 0)  # 第一轮生成期间到达
+        reply(conn, alice, first, "答1")
+        reply(conn, alice, second, "答2")
+        return journal.add_user_message(conn, alice, "问3", "qq-3", 0)
+
+    current = await db.transaction(fill)
+
+    history = await db.transaction(journal.recent_history, alice, current, 10)
+    assert [(entry.content, entry.turns_ago) for entry in history] == [
+        ("问1", 1),
+        ("答1", 1),
+        ("问2", 0),
+        ("答2", 0),
+    ]
+    one = await db.transaction(journal.recent_history, alice, current, 1)
+    assert [entry.content for entry in one] == ["问2", "答2"]
+    assert await db.transaction(journal.pending_messages, alice, current) == []
+
+
+async def test_reply_covers_only_messages_up_to_its_reply_to(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> tuple[int, int]:
+        first = journal.add_user_message(conn, alice, "问1", "qq-1", 0)
+        later = journal.add_user_message(conn, alice, "问2", "qq-2", 0)
+        reply(conn, alice, first, "答1")
+        return first, later
+
+    first, later = await db.transaction(fill)
+    # 在第一轮自己的范围里（编号不大于 reply_to）没有待回复的消息。
+    assert await db.transaction(journal.pending_messages, alice, first + 1) == []
+    pending = await db.transaction(journal.pending_messages, alice, later + 1)
+    assert [entry.content for entry in pending] == ["问2"]
+
+
+async def test_version_4_database_gets_the_reply_index_and_faces_only(tmp_path: Path) -> None:
+    path = tmp_path / DATABASE_FILENAME
+    async with await Database.open(path, migrations=MIGRATIONS[:4]) as old:
+        user = await old.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+
+        def fill(conn: sqlite3.Connection) -> None:
+            # 第 4 版的表还没有 faces_only 列，照当时的写法插入。
+            first = conn.execute(
+                "INSERT INTO messages (user_id, role, content, qq_message_id, created_at)"
+                " VALUES (?, 'user', '问', 'qq-1', 0) RETURNING id",
+                (user.id,),
+            ).fetchone()["id"]
+            reply(conn, user.id, first, "答")
+
+        await old.transaction(fill)
+
+    async with await Database.open(path) as db:
+        index = await db.fetch_one(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'messages_replies'"
+        )
+        assert index is not None
+
+        def query(conn: sqlite3.Connection) -> list[HistoryEntry]:
+            current = journal.add_user_message(conn, user.id, "又问", "qq-2", 0)
+            return journal.recent_history(conn, user.id, current, 10)
+
+        history = await db.transaction(query)
+        assert [entry.content for entry in history] == ["问", "答"]
+        assert not any(entry.faces_only for entry in history)  # 升级前的消息都是 0
+
+
+async def test_journal_keeps_the_original_text_and_the_faces_only_flag(db: Database) -> None:
+    # 流水保留实际收到的原文（升级前存下的原始标记也原样留着），清洗在组装模型输入时做（见 context.py）。
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+    raw = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
+
+    def fill(conn: sqlite3.Connection) -> int:
+        old = journal.add_user_message(conn, alice, f"哈哈{raw}", "qq-1", 0)
+        reply(conn, alice, old, "答")
+        journal.add_user_message(conn, alice, "[表情]", "qq-2", 0, faces_only=True)
+        return journal.add_user_message(conn, alice, "[表情]", "qq-3", 0)  # 用户手打的
+
+    current = await db.transaction(fill)
+
+    history = await db.transaction(journal.recent_history, alice, current, 10)
+    assert [(e.content, e.faces_only) for e in history] == [(f"哈哈{raw}", False), ("答", False)]
+    pending = await db.transaction(journal.pending_messages, alice, current + 1)
+    assert [(e.content, e.faces_only) for e in pending] == [("[表情]", True), ("[表情]", False)]
+    (entry,) = await db.transaction(journal.current_entries, alice, [current - 1])
+    assert entry.faces_only

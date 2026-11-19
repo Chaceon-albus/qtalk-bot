@@ -546,6 +546,21 @@ def skipped(attachments: Sequence[IncomingAttachment]) -> list[Acquired]:
     ]
 
 
+def placeholders(attachments: Sequence[IncomingAttachment]) -> list[Acquired]:
+    """下载之前先写进流水的占位：能处理的种类记成 `failed`（没有下载完就关停或出错时，它就停在这个状态，
+    按下载失败处理），其余 `unsupported`。下载完再按结果改写（`journal.update_attachment()`）。"""
+    return [
+        _acquired(
+            item,
+            position,
+            AttachmentStatus.FAILED
+            if item.kind in SUPPORTED_KINDS
+            else AttachmentStatus.UNSUPPORTED,
+        )
+        for position, item in enumerate(attachments)
+    ]
+
+
 _VISUAL = frozenset((AttachmentKind.IMAGE, AttachmentKind.FILE))
 
 

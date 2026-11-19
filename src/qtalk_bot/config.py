@@ -59,6 +59,11 @@ MAX_RETENTION_DAYS = 3650
 DEFAULT_ATTACHMENT_HISTORY_TURNS = 3
 MAX_ATTACHMENT_HISTORY_TURNS = 20
 
+DEFAULT_TEXT_WAIT_SECONDS = 2.5
+DEFAULT_ATTACHMENT_WAIT_SECONDS = 12.0
+DEFAULT_MAX_WAIT_SECONDS = 20.0
+MAX_BATCH_WAIT_SECONDS = 300.0  # 攒批的各个时长的上限：再长用户就以为机器人没反应了
+
 DEFAULT_DESCRIBE_INSTRUCTIONS = """用一句话客观地描述这张图片的内容，不超过 80 个字。图里有文字时摘录关键的文字。
 只输出描述本身，不要加「这张图片」之类的开头。"""
 DEFAULT_DESCRIBE_TIMEOUT_SECONDS = 60
@@ -189,6 +194,31 @@ class AttachmentSettings:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class BatchingSettings:
+    """`[batching]` 表：把同一个用户短时间内连发的几条消息合成一轮。
+
+    一批里每来一条消息（单独的表情包除外），就按它的种类重新开始计时，但从这一批的第一条算起最多等
+    `max_wait_seconds`；计时到了就把这一批作为一轮回答。
+
+    Attributes:
+        text_wait_seconds: 带文字或语音的消息之后等多久（秒）。
+        attachment_wait_seconds: 只有图片或文件、没有文字的消息之后等多久（秒），等用户补上问题。
+        max_wait_seconds: 从这一批的第一条消息算起最多等多久（秒）。
+    """
+
+    text_wait_seconds: float = DEFAULT_TEXT_WAIT_SECONDS
+    attachment_wait_seconds: float = DEFAULT_ATTACHMENT_WAIT_SECONDS
+    max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS
+
+    @property
+    def enabled(self) -> bool:
+        """是否攒批。两种等待都是 0，或上限是 0 时不攒批：来一条处理一条。"""
+        return self.max_wait_seconds > 0 and (
+            self.text_wait_seconds > 0 or self.attachment_wait_seconds > 0
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class DescribeSettings:
     """`[describe]` 表：给图片写一句话描述的模型。不写这个表就不生成描述，历史里一直是占位。
 
@@ -289,6 +319,7 @@ class Settings:
     decisions: DecisionSettings | None = None
     attachments: AttachmentSettings = AttachmentSettings()
     describe: DescribeSettings | None = None
+    batching: BatchingSettings = BatchingSettings()
 
     @property
     def default_model(self) -> ModelSettings:
@@ -538,6 +569,8 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
     attachments_table = table.table("attachments")
     attachments = None if attachments_table is None else _parse_attachments(attachments_table)
     describe_ok, describe = _parse_describe(table)
+    batching_table = table.table("batching")
+    batching = None if batching_table is None else _parse_batching(batching_table)
     table.finish()
     if decisions is not None and models is not None and len(models) > MAX_OPTIONS:
         # 每个模型是选模型那道选择题的一个选项，两家接口都最多 255 个。
@@ -559,6 +592,7 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         or not decisions_ok
         or attachments is None
         or not describe_ok
+        or batching is None
     ):
         return None
     return Settings(
@@ -572,6 +606,30 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         decisions=decisions,
         attachments=attachments,
         describe=describe,
+        batching=batching,
+    )
+
+
+def _parse_batching(table: _Table) -> BatchingSettings | None:
+    values: list[float | None] = []
+    for key, default in (
+        ("text_wait_seconds", DEFAULT_TEXT_WAIT_SECONDS),
+        ("attachment_wait_seconds", DEFAULT_ATTACHMENT_WAIT_SECONDS),
+        ("max_wait_seconds", DEFAULT_MAX_WAIT_SECONDS),
+    ):
+        value = table.number(key, default)
+        if value is not None and not 0 <= value <= MAX_BATCH_WAIT_SECONDS:
+            table.problem(key, f"应不小于 0、不大于 {MAX_BATCH_WAIT_SECONDS:g}")
+            value = None
+        values.append(value)
+    table.finish()
+    text_wait, attachment_wait, max_wait = values
+    if text_wait is None or attachment_wait is None or max_wait is None:
+        return None
+    return BatchingSettings(
+        text_wait_seconds=text_wait,
+        attachment_wait_seconds=attachment_wait,
+        max_wait_seconds=max_wait,
     )
 
 

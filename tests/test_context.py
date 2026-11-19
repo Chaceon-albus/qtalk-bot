@@ -463,3 +463,39 @@ def test_decision_input_keeps_the_new_question_ahead_of_old_pending_messages() -
         len(decision_latest([HistoryEntry(Role.USER, "新" * 5000, (), message_id=2)], {2}, 4000))
         == 4000
     )
+
+
+# ---- 5b 终审：进入模型输入的文字统一清洗表情标记，可答性只看 faces_only ----
+
+RAW_FACE = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
+
+
+async def test_every_text_in_the_request_has_face_markers_cleaned(tmp_path: Path) -> None:
+    # 流水保留原文：升级前的用户消息与回显过标记的助手回复、文件名里的完整标记都可能带原始标记。
+    file = record(FILE, AttachmentStatus.FAILED, text=f"[文件：{RAW_FACE}.pdf，没能下载]")
+    history = [user(f"早{RAW_FACE}"), reply(f"你也{RAW_FACE}")]
+    current = [user("看看", file)]
+
+    built = await builder(MediaStore.under(tmp_path), history, current).build(TEXT_ONLY)
+
+    texts_sent = [
+        p.text for m in built.request.messages for p in m.parts if isinstance(p, TextPart)
+    ]
+    assert texts_sent == ["早[表情]", "你也[表情]", "看看\n[文件：[表情].pdf，没能下载]"]
+    assert all(RAW_FACE not in text for text in texts_sent)
+
+
+def test_decision_input_has_face_markers_cleaned() -> None:
+    file = record(FILE, AttachmentStatus.FAILED, text=f"[文件：{RAW_FACE}，没能下载]")
+    assert decision_text(user(f"哈{RAW_FACE}", file)) == "哈[表情]\n[文件：[表情]，没能下载]"
+    assert decision_text(reply(RAW_FACE)) == "[表情]"
+
+
+def test_only_real_face_markers_do_not_make_a_turn_answerable() -> None:
+    blind_image = record(IMAGE)  # 只收文字的模型看不了
+    sticker = HistoryEntry(Role.USER, "[表情]", faces_only=True)
+    typed = HistoryEntry(Role.USER, "[表情：你好]")  # 用户手打的，是普通文字
+
+    assert not plan_turn([TEXT_ONLY], [sticker, user("", blind_image)], max_size_mb=20).answerable
+    assert plan_turn([TEXT_ONLY], [typed], max_size_mb=20).answerable
+    assert plan_turn([TEXT_ONLY], [sticker, typed], max_size_mb=20).answerable

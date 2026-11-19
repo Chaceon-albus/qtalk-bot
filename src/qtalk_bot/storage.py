@@ -218,7 +218,24 @@ CREATE INDEX attachments_by_user ON attachments (user_id, message_id);
 CREATE INDEX attachments_by_time ON attachments (created_at) WHERE path IS NOT NULL;
 """
 
-MIGRATIONS: tuple[Migration, ...] = (_V1_ACCESS, _V2_CHAT, _V3_DECISIONS, _V4_ATTACHMENTS)
+_V5_BATCHING = """
+-- 攒批之后，轮次的边界按回复的 reply_to 判断（一轮生成期间到达的消息编号比这一轮的回复小）：按用户、
+-- reply_to 给回复建索引，找最近一个边界时不必扫这个用户的全部流水。
+CREATE INDEX messages_replies ON messages (user_id, reply_to) WHERE role = 'assistant';
+
+-- faces_only：用户消息的文字是否只由真实的表情标记转换而来（如单独的表情包换成的「[表情]」）。只有表情的
+-- 消息可以随可答的内容进上下文，但本身不让一轮变得可答；这个判断只看这一列，不从显示的文字反推（用户手打的
+-- 「[表情]」是普通文字）。升级前的消息与回复都是 0。
+ALTER TABLE messages ADD COLUMN faces_only INTEGER NOT NULL DEFAULT 0 CHECK (faces_only IN (0, 1));
+"""
+
+MIGRATIONS: tuple[Migration, ...] = (
+    _V1_ACCESS,
+    _V2_CHAT,
+    _V3_DECISIONS,
+    _V4_ATTACHMENTS,
+    _V5_BATCHING,
+)
 """本程序的迁移列表。业务表由各里程碑在末尾追加，已发布的不能修改。"""
 
 

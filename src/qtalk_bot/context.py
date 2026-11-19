@@ -33,6 +33,7 @@ from datetime import datetime
 
 from . import texts
 from .config import ModelSettings
+from .faces import clean
 from .journal import HistoryEntry
 from .llm import (
     INPUT_LIMITS,
@@ -115,8 +116,13 @@ def fit(model: ModelSettings, records: Sequence[AttachmentRecord]) -> frozenset[
 def _answerable(
     current: Sequence[HistoryEntry], records: Sequence[AttachmentRecord], given: Collection[int]
 ) -> bool:
-    """模型实际能收到的内容里有没有可以回答的：文字、给了原件的附件，或有识别文本的语音。"""
-    if any(entry.content.strip() for entry in current):
+    """模型实际能收到的内容里有没有可以回答的：文字、给了原件的附件，或有识别文本的语音。
+
+    文字只由真实的表情标记转换而来的消息（`faces_only`，如单独的表情包换成的「[表情]」）不算：它可以随可答的
+    内容进上下文，但本身不让一轮变得可答。只看收消息时记下的这一项，不从显示的文字反推：用户手打的「[表情]」
+    是普通文字。
+    """
+    if any(entry.content.strip() and not entry.faces_only for entry in current):
         return True
     return any(
         record.id in given
@@ -263,10 +269,10 @@ def fallback_allowed(
 
 
 def decision_text(entry: HistoryEntry) -> str:
-    """决策题目里一条消息的文字：正文加上附件的简短标记。"""
+    """决策题目里一条消息的文字：正文加上附件的简短标记，表情标记换成文字版（见 `_text()`）。"""
     pieces = [entry.content] if entry.content else []
     pieces.extend(marker(record) for record in entry.attachments)
-    return "\n".join(pieces)
+    return clean("\n".join(pieces))
 
 
 def decision_latest(current: Sequence[HistoryEntry], announce: Collection[int], limit: int) -> str:
@@ -431,12 +437,18 @@ class RequestBuilder:
         return originals, missing
 
 
+def _text(text: str) -> TextPart:
+    """进入模型输入的一段文字。表情标记一律换成文字版：流水里保留实际收到、实际送达的原文，升级前的版本存过原始
+    标记（用户消息、回显了标记的助手回复），附件的文字版（如文件名）里也可能有一个完整的标记。"""
+    return TextPart(clean(text))
+
+
 def _parts(entry: HistoryEntry, originals: dict[int, bytes]) -> tuple[Part, ...]:
-    parts: list[Part] = [TextPart(entry.content)] if entry.content else []
+    parts: list[Part] = [_text(entry.content)] if entry.content else []
     for record in entry.attachments:
         data = originals.get(record.id)
         if data is None or record.mime_type is None:
-            parts.append(TextPart(record.text))
+            parts.append(_text(record.text))
             continue
         match record.kind:
             case AttachmentKind.IMAGE:
@@ -448,10 +460,10 @@ def _parts(entry: HistoryEntry, originals: dict[int, bytes]) -> tuple[Part, ...]
                 parts.append(AudioPart(data, record.mime_type))
             case AttachmentKind.FILE if record.mime_type == PDF:
                 # 文字版里有文件名与大小，放在文件前面当作标签。
-                parts.append(TextPart(record.text))
+                parts.append(_text(record.text))
                 parts.append(FilePart(data, record.mime_type))
             case _:
-                parts.append(TextPart(record.text))
+                parts.append(_text(record.text))
     return _merge(parts)
 
 

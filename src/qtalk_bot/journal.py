@@ -3,8 +3,9 @@
 与 `access.py` 一样，函数都是同步的，第一个参数是连接，由调用方放进 `Database.transaction()`；时间是
 Unix 秒。查询一律按 `user_id` 过滤：一个用户的对话与附件不会被取进另一个用户的上下文。
 
-一轮是若干条用户消息加上之后的回复（现在总是一条用户消息；以后攒批时一轮可以有多条），回复挂在其中最后
-一条上。没有回复的用户消息并进下一轮。
+一轮是若干条用户消息（攒成的一批）加上之后的回复，回复挂在其中最后一条上（`reply_to`）。没有回复的用户
+消息并进下一轮。轮次的边界以回复的 `reply_to` 为准，而不是行的先后：一轮还在生成时到达的消息编号比这一轮的
+回复小，但仍是待回复的（见 `_last_boundary()`）。
 """
 
 import json
@@ -67,7 +68,8 @@ DESCRIBE_USAGE_MODEL = "describe"
 """给图片写描述的调用在用量表 `model` 列里记的固定值。"""
 
 ROWS_PER_TURN = 32
-"""取历史时每轮最多看的行数，用来给查询设上限；攒批的一轮也远到不了这么多条。"""
+"""取历史时每轮最多看的用户消息数，用来给查询设上限；也是当前这一轮最多取的待回复消息数。攒批的一轮一般远到
+不了这么多条。"""
 
 
 CURRENT_TURN = -1
@@ -84,6 +86,8 @@ class HistoryEntry:
     attachments: tuple[AttachmentRecord, ...] = ()
     turns_ago: int = field(default=0, compare=False)
     message_id: int | None = field(default=None, compare=False)
+    faces_only: bool = field(default=False, compare=False)
+    """用户消息的文字只由真实的表情标记转换而来（流水的 `faces_only` 列）：本身不让一轮变得可答。"""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -118,12 +122,14 @@ def add_user_message(
     now: int,
     *,
     msg_idx: str | None = None,
+    faces_only: bool = False,
 ) -> int:
-    """把用户发来的文字（没有文字时是空串）写进流水，返回它的编号。`msg_idx` 是平台的引用索引。"""
+    """把用户发来的文字（没有文字时是空串）写进流水，返回它的编号。`msg_idx` 是平台的引用索引；`faces_only`
+    表示文字只由真实的表情标记转换而来。"""
     row = conn.execute(
-        "INSERT INTO messages (user_id, role, content, qq_message_id, created_at, msg_idx)"
-        " VALUES (?, 'user', ?, ?, ?, ?) RETURNING id",
-        (user_id, content, qq_message_id, now, msg_idx),
+        "INSERT INTO messages (user_id, role, content, qq_message_id, created_at, msg_idx,"
+        " faces_only) VALUES (?, 'user', ?, ?, ?, ?, ?) RETURNING id",
+        (user_id, content, qq_message_id, now, msg_idx, int(faces_only)),
     ).fetchone()
     message_id: int = row["id"]
     return message_id
@@ -170,6 +176,28 @@ def add_attachment(
         size=item.size,
         path=item.path,
         text=item.text,
+    )
+
+
+def update_attachment(
+    conn: sqlite3.Connection, *, user_id: int, message_id: int, item: Acquired, describe: bool
+) -> None:
+    """按下载的结果改写先写进去的占位（`media.placeholders()`），按（消息，位置）找到那一行。"""
+    conn.execute(
+        "UPDATE attachments SET kind = ?, status = ?, mime_type = ?, size = ?, path = ?, text = ?,"
+        " describe_status = ? WHERE user_id = ? AND message_id = ? AND position = ?",
+        (
+            item.kind.value,
+            item.status.value,
+            item.mime_type,
+            item.size,
+            item.path,
+            item.text,
+            DescribeStatus.PENDING.value if describe else None,
+            user_id,
+            message_id,
+            item.position,
+        ),
     )
 
 
@@ -306,13 +334,18 @@ def ends_turn(content: str, delivery: ReplyDelivery) -> bool:
 
 
 def _last_boundary(conn: sqlite3.Connection, user_id: int, before: int) -> int | None:
-    """这个用户在消息 `before` 之前、最近一条真正结束了一轮的回复的编号；没有时返回 `None`。"""
+    """这个用户在消息 `before` 之前、最近一个轮次边界：真正结束了一轮的回复（`ends_turn()`）所回答的用户消息里
+    编号最大的那条（回复的 `reply_to`）；没有时返回 `None`。
+
+    边界按 `reply_to` 而不是回复行自己的编号来定：一轮还在生成时，下一批消息已经写进流水，它们的编号比这一轮的
+    回复小，但这一轮并没有看到它们。被某条回复覆盖的只是编号不大于它的 `reply_to` 的那些消息。
+    """
     row = conn.execute(
-        f"SELECT MAX(id) AS id FROM messages WHERE user_id = ? AND id < ? AND {_ENDS_TURN_SQL}",
+        "SELECT reply_to FROM messages WHERE user_id = ? AND role = 'assistant' AND reply_to < ?"
+        f" AND {_ENDS_TURN_SQL} ORDER BY reply_to DESC LIMIT 1",
         (user_id, before),
     ).fetchone()
-    boundary: int | None = row["id"]
-    return boundary
+    return None if row is None else int(row["reply_to"])
 
 
 def recent_history(
@@ -321,29 +354,40 @@ def recent_history(
     """这个用户在消息 `before` 之前最近 `turns` 轮已经完成的原文与附件，按时间排列。
 
     一轮是连续的若干条用户消息加上结束这一轮的回复（`ends_turn()`）；没有结束一轮的回复行不带，也不算边界。
-    最近一个边界之后还没有回复的用户消息属于当前这一轮，不在这里返回，由 `pending_messages()` 取出。先定下
-    边界、只对边界之前的部分限量（每轮最多看 `ROWS_PER_TURN` 行），所以连来再多待回复的消息也挤不掉已完成
-    的历史。正文为空的回复（只发了固定说明）不带，但算作一轮的结尾。
+    最近一个边界（`_last_boundary()`）之后还没有回复的用户消息属于当前这一轮，不在这里返回，由
+    `pending_messages()` 取出。先定下边界、只对边界之前的部分限量（每轮最多看 `ROWS_PER_TURN` 条用户消息），
+    所以连来再多待回复的消息也挤不掉已完成的历史。正文为空的回复（只发了固定说明）不带，但算作一轮的结尾。
+
+    回复排在它所回答的那条用户消息（`reply_to`）之后，而不是按它自己的编号：生成期间到达的下一批消息编号比
+    回复小，却属于下一轮。
     """
     if turns <= 0:
         return []
     boundary = _last_boundary(conn, user_id, before)
     if boundary is None:
         return []
-    # 不算边界的回复行（正文为空、没给用户任何东西的）在限量之前就排除，几十条这样的行也挤不掉较早的问答；
-    # 它们回复的用户消息照常留着，并进下一个边界那一轮。
-    rows = conn.execute(
-        "SELECT id, role, content, delivery FROM messages WHERE user_id = ? AND id <= ?"
-        f" AND (role = 'user' OR {_ENDS_TURN_SQL}) ORDER BY id DESC LIMIT ?",
+    users = conn.execute(
+        "SELECT id, role, content, faces_only, NULL AS reply_to, NULL AS delivery FROM messages"
+        " WHERE user_id = ? AND role = 'user' AND id <= ? ORDER BY id DESC LIMIT ?",
         (user_id, boundary, turns * ROWS_PER_TURN),
     ).fetchall()
+    if not users:
+        return []
+    oldest = min(row["id"] for row in users)
+    # 回复的编号总比它回答的消息大，所以 `id > oldest` 限定了扫描的范围。不算边界的回复行（正文为空、没给
+    # 用户任何东西的）直接排除，几十条这样的行也挤不掉较早的问答；它们回复的用户消息照常留着。
+    replies = conn.execute(
+        "SELECT id, role, content, faces_only, reply_to, delivery FROM messages"
+        " WHERE user_id = ? AND role = 'assistant' AND id > ? AND reply_to >= ? AND reply_to <= ?"
+        f" AND {_ENDS_TURN_SQL}",
+        (user_id, oldest, oldest, boundary),
+    ).fetchall()
+    rows = sorted([*users, *replies], key=_position, reverse=True)
     picked: list[tuple[sqlite3.Row, int]] = []  # （行，往前数第几轮），从新到旧
     age = 0
     seen_user = False
     for row in rows:
         if row["role"] == Role.ASSISTANT.value:
-            if not ends_turn(row["content"], ReplyDelivery(row["delivery"])):
-                continue
             if seen_user:
                 age += 1  # 比这一组用户消息更早的一条回复：往前的又一轮
                 seen_user = False
@@ -363,22 +407,31 @@ def recent_history(
             attachments.get(row["id"], ()),
             turns_ago=age,
             message_id=row["id"],
+            faces_only=bool(row["faces_only"]),
         )
         for row, age in picked
         if row["role"] == Role.USER.value or row["content"] != ""
     ]
 
 
+def _position(row: sqlite3.Row) -> tuple[int, int, int]:
+    """一行在对话里的位置：用户消息按自己的编号，回复紧跟在它回答的那条消息之后。"""
+    if row["reply_to"] is None:
+        return (row["id"], 0, row["id"])
+    return (row["reply_to"], 1, row["id"])
+
+
 def pending_messages(conn: sqlite3.Connection, user_id: int, before: int) -> list[HistoryEntry]:
-    """这个用户在消息 `before` 之前、最近一个轮次边界（`ends_turn()`）之后还没有回复的用户消息（与它们的
+    """这个用户在消息 `before` 之前、最近一个轮次边界（`_last_boundary()`）之后还没有回复的用户消息（与它们的
     附件），按时间排列。
 
-    它们属于当前这一轮（只收到固定说明的消息、回复前关停留下的消息等），`turns_ago` 是 `CURRENT_TURN`。
-    最多取最近的 `ROWS_PER_TURN` 条。
+    它们属于当前这一轮（攒成一批的几条消息、只收到固定说明的消息、回复前关停留下的消息、上一轮生成期间到达的
+    消息等），`turns_ago` 是 `CURRENT_TURN`。最多取最近的 `ROWS_PER_TURN` 条。
     """
     boundary = _last_boundary(conn, user_id, before) or 0
     rows = conn.execute(
-        "SELECT id, content FROM messages WHERE user_id = ? AND role = 'user' AND id > ? AND id < ?"
+        "SELECT id, content, faces_only FROM messages WHERE user_id = ? AND role = 'user'"
+        " AND id > ? AND id < ?"
         " ORDER BY id DESC LIMIT ?",
         (user_id, boundary, before, ROWS_PER_TURN),
     ).fetchall()
@@ -391,6 +444,7 @@ def pending_messages(conn: sqlite3.Connection, user_id: int, before: int) -> lis
             attachments.get(row["id"], ()),
             turns_ago=CURRENT_TURN,
             message_id=row["id"],
+            faces_only=bool(row["faces_only"]),
         )
         for row in rows
     ]
@@ -404,7 +458,7 @@ def current_entries(
         return []
     placeholders = ", ".join("?" * len(message_ids))
     rows = conn.execute(
-        f"SELECT id, content FROM messages WHERE user_id = ? AND role = 'user'"
+        f"SELECT id, content, faces_only FROM messages WHERE user_id = ? AND role = 'user'"
         f" AND id IN ({placeholders}) ORDER BY id",
         (user_id, *message_ids),
     ).fetchall()
@@ -416,6 +470,7 @@ def current_entries(
             attachments.get(row["id"], ()),
             turns_ago=CURRENT_TURN,
             message_id=row["id"],
+            faces_only=bool(row["faces_only"]),
         )
         for row in rows
     ]
@@ -424,11 +479,12 @@ def current_entries(
 def last_answered_model(conn: sqlite3.Connection, user_id: int, before: int) -> str | None:
     """这个用户在消息 `before` 之前、最近一次让他看到了回答的模型（内部名字）；没有时返回 `None`。
 
-    没有送达任何文字的回复（`content` 为空，如调用失败只发了固定说明）不算。
+    「之前」按回复所回答的消息（`reply_to`）算，同 `_last_boundary()`。没有送达任何文字的回复（`content` 为空，
+    如调用失败只发了固定说明）不算。
     """
     row = conn.execute(
-        "SELECT model FROM messages WHERE user_id = ? AND id < ? AND role = 'assistant'"
-        " AND content != '' AND model IS NOT NULL ORDER BY id DESC LIMIT 1",
+        "SELECT model FROM messages WHERE user_id = ? AND role = 'assistant' AND reply_to < ?"
+        " AND content != '' AND model IS NOT NULL ORDER BY reply_to DESC, id DESC LIMIT 1",
         (user_id, before),
     ).fetchone()
     return None if row is None else row["model"]

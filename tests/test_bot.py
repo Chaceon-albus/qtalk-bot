@@ -23,10 +23,12 @@ from httpx2.websockets import ASGIWebSocketTransport
 from qtalk_bot import access, texts
 from qtalk_bot import bot as bot_module
 from qtalk_bot.access import User
+from qtalk_bot.batching import Batcher
 from qtalk_bot.bot import (
     MAX_ATTACHMENTS_DESCRIBED,
     MAX_ELEMENTS_DESCRIBED,
     MAX_REDIRECTS,
+    Handlers,
     QQChat,
     QQDownloader,
     ShareLinks,
@@ -39,9 +41,23 @@ from qtalk_bot.bot import (
     register,
 )
 from qtalk_bot.chat import ChatHandler
-from qtalk_bot.config import AttachmentSettings, ChatSettings, InviteSettings, ModelSettings
+from qtalk_bot.config import (
+    AttachmentSettings,
+    BatchingSettings,
+    ChatSettings,
+    InviteSettings,
+    ModelSettings,
+)
 from qtalk_bot.conversation import TYPING_SECONDS, Conversation
-from qtalk_bot.gate import Delivery, FriendAdded, Gate, IncomingMessage, Outcome, Reply
+from qtalk_bot.gate import (
+    Delivery,
+    FriendAdded,
+    Gate,
+    IncomingMessage,
+    Outcome,
+    Reply,
+    ShareLinkError,
+)
 from qtalk_bot.llm import (
     ChatEvent,
     ChatRequest,
@@ -786,16 +802,26 @@ class FakeModel:
 
 
 class Tracked:
-    """包住对话处理器，记下处理完了几条消息，并唤醒 `run_until_handled` 的等待。"""
+    """包住对话处理器，记下处理完了几条消息，并唤醒 `run_until_handled` 的等待。
 
-    def __init__(self, inner: ChatHandler, platform: Platform) -> None:
+    给了 `batcher` 时，处理函数收下消息就返回，回答在攒批的任务里进行：等这些任务都结束才算处理完。
+    """
+
+    def __init__(
+        self, inner: ChatHandler, platform: Platform, batcher: Batcher | None = None
+    ) -> None:
         self.inner = inner
         self.platform = platform
+        self.batcher = batcher
         self.handled = 0
 
     async def handle(self, user: User, message: pyqbot.C2CMessage) -> None:
         try:
             await self.inner.handle(user, message)
+            if self.batcher is not None:
+                workers = self.batcher._workers  # pyright: ignore[reportPrivateUsage]
+                while workers:
+                    await asyncio.wait(set(workers))
         finally:
             self.handled += 1
             self.platform.changed.set()
@@ -820,7 +846,11 @@ def real_chat(db: Database, model: FakeModel, platform: Platform) -> Tracked:
         settings=ChatSettings(),
         timezone=ZoneInfo("Asia/Shanghai"),
     )
-    return Tracked(QQChat(conversation), platform)
+    batcher = Batcher(conversation, NO_BATCHING)
+    return Tracked(QQChat(batcher), platform, batcher)
+
+
+NO_BATCHING = BatchingSettings(text_wait_seconds=0, attachment_wait_seconds=0, max_wait_seconds=0)
 
 
 ANSWER: list[ChatEvent] = [
@@ -935,7 +965,8 @@ def media_chat(
         attachments=settings,
         fetcher=Fetcher(MediaStore.under(tmp_path), downloader, settings),
     )
-    return Tracked(QQChat(conversation), platform), downloader
+    batcher = Batcher(conversation, NO_BATCHING)
+    return Tracked(QQChat(batcher), platform, batcher), downloader
 
 
 async def test_image_message_is_downloaded_shown_to_the_model_and_recorded(
@@ -1007,6 +1038,89 @@ async def test_image_without_a_capable_model_gets_a_notice_and_no_model_call(
     assert [m["content"] for m in platform.sent] == [texts.IMAGE_UNAVAILABLE]
     rows = await db.fetch_all("SELECT kind, status FROM attachments")
     assert [tuple(row) for row in rows] == [("image", "skipped")]
+
+
+async def test_sticker_is_recorded_as_a_face_and_gets_no_reply(
+    db: Database, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    alice = await welcomed_alice(db)
+    # 照实测：文字是一个表情标记，附件是 image/gif、扩展名 png 的图片。
+    content = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
+    gif = {
+        "content_type": "image/gif",
+        "filename": "sticker.png",
+        "size": 2_800_000,
+        "width": 250,
+        "height": 334,
+        "url": IMAGE_URL,
+    }
+    platform = Platform([c2c(ALICE, content, "ROBOT1.0_fake-1", attachments=[gif])])
+    model = FakeModel(ANSWER)
+    chat, downloader = media_chat(db, model, platform, tmp_path)
+
+    with caplog.at_level(logging.INFO):
+        await run_until_handled(
+            platform,
+            db,
+            chat,
+            events=1,
+            sent=0,
+            until=lambda: chat.handled == 1,
+            on_bot=downloader.attach,
+        )
+
+    assert model.requests == []
+    assert platform.sent == []
+    assert platform.downloads == []
+    messages = await db.fetch_all("SELECT user_id, role, content FROM messages")
+    assert [tuple(row) for row in messages] == [(alice.id, "user", "[表情]")]
+    assert await db.fetch_all("SELECT id FROM attachments") == []
+    assert "eyJ0ZXh0IjoiIn0" not in formatted_logs(caplog)
+
+
+async def test_message_let_through_while_the_handler_is_cancelled_is_still_recorded(
+    db: Database,
+) -> None:
+    # 关停时处理函数被取消，Gate 的事务却已经提交了去重记录：放行的消息仍要写进流水，否则重启后它既不是
+    # 待回复的消息，平台重推也会被丢弃。
+    alice = await welcomed_alice(db)
+    platform = Platform([c2c(ALICE, "关停时的一句", "ROBOT1.0_fake-1")])
+    model = FakeModel(ANSWER)
+    chat = real_chat(db, model, platform)
+    assert chat.batcher is not None
+    decided, hold = asyncio.Event(), asyncio.Event()
+
+    class SlowGate(CountingGate):
+        async def on_message(self, message: IncomingMessage) -> Outcome:
+            outcome = await super().on_message(message)  # 去重记录已提交
+            decided.set()
+            await hold.wait()
+            return outcome
+
+    async with asyncio.timeout(HANG_GUARD), bot_on(platform) as bot:
+        gate = SlowGate(
+            db,
+            admin_openid=ADMIN,
+            timezone=ZoneInfo("Asia/Shanghai"),
+            invites=InviteSettings(),
+            share_link=ShareLinks(bot),
+            bot_name=BOT_NAME,
+        )
+        gate.changed = platform.changed
+        gate.settled = []
+        register(bot, gate, chat)
+        running = asyncio.create_task(bot.start())
+        await decided.wait()
+        chat.batcher.stop()  # 与关停一样：先停攒批
+        closing = asyncio.create_task(bot.close())  # 取消还卡在 Gate 里的处理函数
+        await asyncio.sleep(0.05)
+        hold.set()
+        await closing
+        await running
+
+    rows = await db.fetch_all("SELECT user_id, role, content FROM messages")
+    assert [tuple(row) for row in rows] == [(alice.id, "user", "关停时的一句")]
+    assert model.requests == []  # 攒批已停：只收下，不回答
 
 
 class CapturingChat:
@@ -1746,3 +1860,53 @@ async def test_stuck_response_close_does_not_hold_the_download_slot(
         assert fetcher.busy == 0  # 槽位还了，没被卡住的关闭挡住
         await fetcher.aclose()  # 关停时只限时等那个关闭任务
     release.set()
+
+
+async def test_drain_waits_for_a_cancelled_handler_to_record_what_the_gate_let_through(
+    db: Database,
+) -> None:
+    # 关停时 pyqbot 只等处理函数 5 秒；数据库的队列堵着时，受保护的 Gate 事务可能在那之后才提交去重记录，
+    # 处理函数接着才写流水。drain() 要等到这一步做完，应用才能关库。
+    alice = await welcomed_alice(db)
+    chat = real_chat(db, FakeModel(ANSWER), Platform([]))
+    assert chat.batcher is not None
+    chat.batcher.stop()  # 与关停一样：攒批先停
+    decided, hold = asyncio.Event(), asyncio.Event()
+
+    async def no_link(code: str) -> str:
+        raise ShareLinkError
+
+    class SlowGate(Gate):
+        async def on_message(self, message: IncomingMessage) -> Outcome:
+            outcome = await super().on_message(message)  # 去重记录已提交
+            decided.set()
+            await hold.wait()  # 决定迟迟回不来（例如数据库的队列堵着）
+            return outcome
+
+    gate = SlowGate(
+        db,
+        admin_openid=ADMIN,
+        timezone=ZoneInfo("Asia/Shanghai"),
+        invites=InviteSettings(),
+        share_link=no_link,
+        bot_name=BOT_NAME,
+    )
+    handlers = Handlers(gate, chat)
+    message = pyqbot.C2CMessage(
+        id="ROBOT1.0_fake-1", author=pyqbot.C2CUser(user_openid=ALICE), content="关停时的一句"
+    )
+
+    async with asyncio.timeout(HANG_GUARD):
+        handling = asyncio.create_task(handlers.on_c2c_message(message))
+        await decided.wait()
+        handling.cancel()  # pyqbot 关闭时取消处理函数，然后不再等它
+        draining = asyncio.create_task(handlers.drain())
+        await asyncio.sleep(0.05)
+        assert not draining.done()  # 放行的消息还没写进流水
+        hold.set()
+        await draining
+        with pytest.raises(asyncio.CancelledError):
+            await handling
+
+    rows = await db.fetch_all("SELECT user_id, role, content FROM messages")
+    assert [tuple(row) for row in rows] == [(alice.id, "user", "关停时的一句")]

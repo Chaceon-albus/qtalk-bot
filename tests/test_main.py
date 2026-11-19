@@ -12,6 +12,8 @@ import pyqbot
 import pytest
 
 from qtalk_bot import __main__ as entry
+from qtalk_bot.batching import Batcher
+from qtalk_bot.bot import Handlers
 from qtalk_bot.config import AttachmentSettings, DescribeSettings, load_secrets, load_settings
 from qtalk_bot.conversation import Conversation
 from qtalk_bot.describe import Describer
@@ -300,8 +302,8 @@ async def test_second_cancellation_does_not_cut_the_shutdown_short(
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    # 前台的轮次在 Bot 关闭之后、数据库关闭之前排空。
-    assert events == ["bot", "conversation", "describer", "db"]
+    # 在途的轮次在关闭 Bot（及它的 HTTP 客户端）之前排空，数据库最后才关。
+    assert events == ["conversation", "bot", "describer", "db"]
 
 
 async def test_shutdown_steps_have_a_time_limit(
@@ -370,6 +372,65 @@ async def test_stop_requests_are_sent_even_when_the_budget_is_used_up(
     assert stopped == ["fetcher"]
 
 
+async def test_batcher_stops_before_the_bot_closes_and_is_drained_after() -> None:
+    # 先放弃计时中的批次、等回答收尾（含结束分片与记账），最后才关闭 Bot：回答在 Batcher 自己的任务里，
+    # Bot.close() 不等它们，QQ 的 HTTP 客户端先关的话结束分片就发不出去了。
+    order: list[str] = []
+
+    class RecordingBot:
+        async def close(self) -> None:
+            order.append("bot")
+
+    class RecordingBatcher:
+        def stop(self) -> None:
+            order.append("stop")
+
+        async def drain(self) -> None:
+            order.append("drain")
+
+    await entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+        cast(pyqbot.Bot, RecordingBot()),
+        None,
+        None,
+        None,
+        None,
+        cast(Batcher, RecordingBatcher()),
+    )
+
+    assert order == ["stop", "drain", "bot"]
+
+
+async def test_bot_close_keeps_its_share_of_the_budget_when_replies_take_too_long(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(entry, "SHUTDOWN_GRACE_SECONDS", 0.3)
+    monkeypatch.setattr(entry, "BOT_CLOSE_SECONDS", 0.2)
+    closed: list[bool] = []
+
+    class StuckBatcher:
+        def stop(self) -> None: ...
+
+        async def drain(self) -> None:
+            await asyncio.Event().wait()  # 收尾一直不结束
+
+    class RecordingBot:
+        async def close(self) -> None:
+            await asyncio.sleep(0.05)
+            closed.append(True)
+
+    async with asyncio.timeout(5):
+        await entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+            cast(pyqbot.Bot, RecordingBot()),
+            None,
+            None,
+            None,
+            None,
+            cast(Batcher, StuckBatcher()),
+        )
+
+    assert closed == [True]  # 收尾超时了，Bot 仍有时间关闭
+
+
 def test_signal_handler_starts_one_orderly_shutdown(caplog: pytest.LogCaptureFixture) -> None:
     async def scenario() -> None:
         task = asyncio.create_task(_forever())
@@ -404,3 +465,45 @@ async def test_supervisor_returns_normally_after_a_signal_and_restores_handlers(
 
     assert finished == ["收尾"]
     assert not asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM)  # 已经卸下
+
+
+async def test_handlers_are_drained_after_the_bot_closes_and_before_the_background_stops(
+    tmp_path: Path,
+) -> None:
+    # Bot.close() 只等处理函数 5 秒：之后仍在把放行的消息写进流水的处理，要在关库之前等完。
+    order: list[str] = []
+
+    class RecordingBot:
+        async def close(self) -> None:
+            order.append("bot")
+
+    class RecordingHandlers:
+        async def drain(self) -> None:
+            await asyncio.sleep(0.01)
+            order.append("handlers")
+
+    real_stop = Fetcher.stop
+
+    class RecordingFetcher(Fetcher):
+        def stop(self) -> None:
+            order.append("fetcher")
+            real_stop(self)
+
+    fetcher = RecordingFetcher(
+        MediaStore.under(tmp_path), cast(Downloader, _NoDownloads()), AttachmentSettings()
+    )
+    await entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+        cast(pyqbot.Bot, RecordingBot()),
+        None,
+        None,
+        None,
+        fetcher,
+        None,
+        cast(Handlers, RecordingHandlers()),
+    )
+
+    assert order[:3] == ["bot", "handlers", "fetcher"]  # aclose() 还会再调一次 stop()
+
+
+class _NoDownloads:
+    async def aclose(self) -> None: ...

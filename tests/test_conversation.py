@@ -14,13 +14,16 @@ from typing import cast
 from zoneinfo import ZoneInfo
 
 import pytest
+from tests.test_batching import ManualClock, settle
 
 from qtalk_bot import access, journal, texts
 from qtalk_bot import conversation as conversation_module
 from qtalk_bot.access import User, UserStatus
+from qtalk_bot.batching import Batcher
 from qtalk_bot.config import (
     DEFAULT_PERSONA,
     AttachmentSettings,
+    BatchingSettings,
     ChatSettings,
     DecisionSettings,
     DescribeSettings,
@@ -1722,7 +1725,9 @@ async def test_files_of_users_who_lost_access_meanwhile_are_removed(
 
     assert model.requests == []
     assert channel.log == []
-    assert await rows(db) == []
+    # 放行时消息已先入库（Gate 已提交去重记录，不能丢）；下载期间失去授权，附件停在占位的 failed。
+    assert await rows(db) == [Row("user", "", None, None, None)]
+    assert [row[2:5] for row in await attachment_rows(db)] == [("failed", None, None)]
     store = MediaStore.under(tmp_path)
     assert not any(store.user_dir(alice.id).iterdir())
 
@@ -2449,3 +2454,519 @@ async def test_turn_whose_attachment_notice_was_delivered_counts_as_finished(
     (last,) = await db.fetch_all("SELECT MAX(id) FROM messages")
     pending = await db.transaction(journal.pending_messages, alice.id, last[0] + 1)
     assert pending == []  # 下一轮不会把它重新并入
+
+
+# ---- 里程碑 5b：收消息与回答一轮分开、攒批、表情包 ----
+
+STICKER_TEXT = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'  # 实测的样本
+GIF_URL = "https://multimedia.nt.qq.com.cn/download?fileid=STICKER"
+
+
+def gif_attachment() -> IncomingAttachment:
+    # 实测：表情包以 image/gif 的图片附件到达，扩展名却是 png。
+    return IncomingAttachment(
+        kind=AttachmentKind.IMAGE,
+        declared_type="image/gif",
+        extension="png",
+        size=2_800_000,
+        url=GIF_URL,
+    )
+
+
+def message(text: str | None, *attachments: IncomingAttachment) -> ChatInput:
+    return ChatInput(
+        message_id=f"qq-{secrets.token_hex(4)}", text=text, attachments=tuple(attachments)
+    )
+
+
+def batcher_of(chat: Conversation, clock: ManualClock) -> Batcher:
+    return Batcher(chat, BatchingSettings(), clock=clock, sleep=clock.sleep)
+
+
+async def submit(batcher: Batcher, user: User, item: ChatInput, channel: FakeChannel) -> None:
+    async with asyncio.timeout(HANG_GUARD):
+        await batcher.submit(user, item, channel)
+    await settle()
+
+
+async def finish(batcher: Batcher) -> None:
+    """等到点的批次都回答完（不停下 batcher）：时钟已拨过所有批次的结束时刻，处理批次的任务回答完就退出。"""
+    workers = batcher._workers  # pyright: ignore[reportPrivateUsage]
+    async with asyncio.timeout(HANG_GUARD):
+        while workers:
+            await asyncio.wait(set(workers))
+
+
+async def started(model: ScriptedModel, count: int) -> None:
+    """等模型收到第 `count` 个请求。"""
+    async with asyncio.timeout(HANG_GUARD):
+        while len(model.requests) < count:
+            model.started.clear()
+            await model.started.wait()
+
+
+async def reply_targets(db: Database) -> list[tuple[int, int]]:
+    """每条回复的（编号，reply_to）。"""
+    result = await db.fetch_all(
+        "SELECT id, reply_to FROM messages WHERE role = 'assistant' ORDER BY id"
+    )
+    return [(r["id"], r["reply_to"]) for r in result]
+
+
+def user_texts(request: ChatRequest) -> list[str]:
+    return [text_of(p) for m in request.messages if m.role is Role.USER for p in m.parts]
+
+
+async def test_message_received_while_a_turn_is_generating_stays_pending_for_the_next(
+    db: Database,
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    model = ScriptedModel("main", answer("答一"), gate=gate)
+    chat = conversation(db, model)
+
+    first = asyncio.create_task(say(chat, alice, "问一"))
+    async with asyncio.timeout(HANG_GUARD):
+        await model.started.wait()
+        # 第一轮还在生成：下一条消息照样收下、写进流水，编号比第一轮的回复小。
+        received = await chat.receive(alice, message("问二"), FakeChannel())
+        assert received is not None
+        gate.set()
+        await first
+
+    ((reply_id, reply_to),) = await reply_targets(db)
+    assert reply_to < received.message_id < reply_id
+    pending = await db.transaction(journal.pending_messages, alice.id, received.message_id + 1)
+    assert [entry.content for entry in pending] == ["问二"]
+
+    model.script = answer("答二")
+    channel = FakeChannel()
+    async with asyncio.timeout(HANG_GUARD):
+        await chat.respond(alice, [received.message_id], channel)
+
+    assert channel.streamed == "答二"
+    assert model.requests[-1].messages == (
+        Message.text(Role.USER, "问一"),
+        Message.text(Role.ASSISTANT, "答一"),
+        Message.text(Role.USER, "问二"),
+    )
+    assert (await reply_targets(db))[-1][1] == received.message_id
+
+
+async def test_batched_messages_are_one_turn_and_the_reply_is_on_the_last(
+    db: Database,
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("好的"))
+    chat = conversation(db, model)
+    clock = ManualClock()
+    batcher = batcher_of(chat, clock)
+    first, second = FakeChannel(), FakeChannel()
+
+    await submit(batcher, alice, message("帮我看个问题"), first)
+    await clock.advance_to(1.0)
+    await submit(batcher, alice, message("Python 怎么排序"), second)
+    # 消息到达时就已经写进流水，不等计时结束。
+    assert [row.content for row in await rows(db)] == ["帮我看个问题", "Python 怎么排序"]
+    await clock.advance_to(3.4)
+    assert model.requests == []
+    await clock.advance_to(3.5)
+    await finish(batcher)
+
+    (request,) = model.requests
+    assert request.messages == (Message.text(Role.USER, "帮我看个问题\nPython 怎么排序"),)
+    assert first.log == []
+    assert second.kinds == ["typing", "stream", "finish"]
+    user_ids = [r["id"] for r in await db.fetch_all("SELECT id FROM messages WHERE role = 'user'")]
+    assert [target for _, target in await reply_targets(db)] == [user_ids[-1]]
+
+
+async def test_messages_during_generation_are_answered_as_the_next_batch(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    model = ScriptedModel("main", answer("答"), gate=gate)
+    chat = conversation(db, model)
+    clock = ManualClock()
+    batcher = batcher_of(chat, clock)
+    channels = [FakeChannel() for _ in range(3)]
+
+    await submit(batcher, alice, message("一"), channels[0])
+    await clock.advance_to(2.5)
+    await started(model, 1)
+    await submit(batcher, alice, message("二"), channels[1])
+    await submit(batcher, alice, message("三"), channels[2])
+    await clock.advance_to(5.0)  # 下一批到点了，但上一轮还在生成
+    assert len(model.requests) == 1
+    gate.set()
+    await finish(batcher)
+
+    assert model.requests[1].messages == (
+        Message.text(Role.USER, "一"),
+        Message.text(Role.ASSISTANT, "答"),
+        Message.text(Role.USER, "二\n三"),
+    )
+    assert channels[1].log == []
+    assert channels[2].streamed == "答"
+    user_ids = [r["id"] for r in await db.fetch_all("SELECT id FROM messages WHERE role = 'user'")]
+    assert [target for _, target in await reply_targets(db)] == [user_ids[0], user_ids[2]]
+
+
+async def test_lone_sticker_is_recorded_without_a_reply_and_joins_the_next_turn(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("哈哈"))
+    downloader = FakeDownloader({GIF_URL: b"GIF89a" + b"\x00" * 16, IMAGE_URL: PNG_A})
+    chat = media_chat(db, tmp_path, downloader, (model, SEES))
+    clock = ManualClock()
+    batcher = batcher_of(chat, clock)
+    sticker_channel, text_channel = FakeChannel(), FakeChannel()
+
+    await submit(batcher, alice, message(STICKER_TEXT, gif_attachment()), sticker_channel)
+    await clock.advance_to(60.0)
+
+    assert model.requests == []
+    assert sticker_channel.log == []
+    assert downloader.fetched == []  # 表情包的图片不下载
+    assert await rows(db) == [Row("user", "[表情]", None, None, None)]  # 原始标记不进流水
+    assert await attachment_rows(db) == []
+    assert not batcher._workers  # pyright: ignore[reportPrivateUsage]
+
+    await submit(batcher, alice, message("今天好累"), text_channel)
+    await clock.advance_to(62.5)
+    await finish(batcher)
+
+    (request,) = model.requests
+    assert user_texts(request) == ["[表情]\n今天好累"]
+    assert text_channel.streamed == "哈哈"
+
+
+async def test_sticker_inside_a_batch_is_part_of_it(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("嗯"))
+    chat = conversation(db, model)
+    clock = ManualClock()
+    batcher = batcher_of(chat, clock)
+    text_channel, sticker_channel = FakeChannel(), FakeChannel()
+
+    await submit(batcher, alice, message("考完试了"), text_channel)
+    await clock.advance_to(1.0)
+    await submit(batcher, alice, message(STICKER_TEXT, gif_attachment()), sticker_channel)
+    await clock.advance_to(2.5)  # 表情包没有重启计时
+    await finish(batcher)
+
+    (request,) = model.requests
+    assert user_texts(request) == ["考完试了\n[表情]"]
+    assert sticker_channel.streamed == "嗯"  # 回复挂在这一批的最后一条（表情包）上
+
+
+async def test_sticker_with_text_is_an_ordinary_message(db: Database, tmp_path: Path) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("收到"))
+    downloader = FakeDownloader({GIF_URL: b"GIF89a" + b"\x00" * 16})
+    chat = media_chat(db, tmp_path, downloader, (model, SEES))
+
+    await send(chat, alice, f"好的{STICKER_TEXT}", gif_attachment())
+
+    assert downloader.fetched == [GIF_URL]  # 不是表情包：附件照常处理
+    assert (await rows(db))[0] == Row("user", "好的[表情]", None, None, None)
+    assert len(model.requests) == 1
+    assert STICKER_TEXT not in json.dumps(user_texts(model.requests[0]), ensure_ascii=False)
+
+
+async def test_face_markers_inside_text_are_replaced_before_the_journal_and_the_model(
+    db: Database,
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("你好"))
+    chat = conversation(db, model)
+    smile = '<faceType=1,faceId="14">'
+
+    await say(chat, alice, f"你好{smile}呀{STICKER_TEXT}")
+
+    assert (await rows(db))[0].content == "你好[表情]呀[表情]"
+    assert user_texts(model.requests[0]) == ["你好[表情]呀[表情]"]
+
+
+async def test_attachment_notices_are_sent_once_per_batch_on_the_last_message(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("看不到图"))
+    chat = media_chat(db, tmp_path, FakeDownloader({}), (model, SEES))  # 下载都失败
+    clock = ManualClock()
+    batcher = batcher_of(chat, clock)
+    channels = [FakeChannel() for _ in range(3)]
+
+    await submit(batcher, alice, message(None, image_attachment()), channels[0])
+    await submit(batcher, alice, message(None, image_attachment()), channels[1])
+    await submit(batcher, alice, message("这两张图是什么"), channels[2])
+    assert all(channel.log == [] for channel in channels)  # 收消息时不发说明
+    await clock.advance_to(2.5)
+    await finish(batcher)
+
+    assert channels[0].log == channels[1].log == []
+    assert channels[2].sent == [texts.ATTACHMENT_FAILED]  # 只说一次
+    assert channels[2].kinds == ["send", "typing", "stream", "finish"]
+
+
+async def test_messages_are_recorded_on_arrival_in_order_before_downloads_finish(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    fetching, downloading = asyncio.Event(), asyncio.Event()
+
+    async def slow() -> None:
+        fetching.set()
+        await downloading.wait()
+
+    model = ScriptedModel("main", answer("是猫"))
+    chat = media_chat(db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}, before=slow), (model, SEES))
+
+    async with asyncio.timeout(HANG_GUARD):
+        picture = asyncio.create_task(
+            chat.receive(alice, message(None, image_attachment()), FakeChannel())
+        )
+        await fetching.wait()
+        second = await chat.receive(alice, message("这是什么"), FakeChannel())
+        # 先入库：图还在下载，两条已经按到达的顺序在流水里，图的附件是占位。
+        assert [row.content for row in await rows(db)] == ["", "这是什么"]
+        assert [row[2] for row in await attachment_rows(db)] == ["failed"]
+        downloading.set()
+        first = await picture
+
+    assert first is not None
+    assert second is not None
+    assert first.message_id < second.message_id
+    assert [row[2:4] for row in await attachment_rows(db)] == [("stored", "image/png")]
+
+
+async def test_message_cancelled_mid_download_stays_in_the_journal_as_a_failed_download(
+    db: Database, tmp_path: Path
+) -> None:
+    # 关停时前台的处理函数被取消：Gate 已提交了去重记录，消息必须已经在流水里，附件按下载失败处理。
+    alice = await invited(db, ALICE, "小王")
+    fetching = asyncio.Event()
+
+    async def hang() -> None:
+        fetching.set()
+        await asyncio.Event().wait()
+
+    model = ScriptedModel("main", answer("看不到图"))
+    chat = media_chat(db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}, before=hang), (model, SEES))
+    async with asyncio.timeout(HANG_GUARD):
+        stuck = asyncio.create_task(
+            chat.receive(alice, message("看看这张", image_attachment()), FakeChannel())
+        )
+        await fetching.wait()
+        later = await chat.receive(alice, message("还在吗"), FakeChannel())
+        stuck.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stuck
+
+    assert later is not None
+    assert [row.content for row in await rows(db)] == ["看看这张", "还在吗"]
+    assert [row[2:5] for row in await attachment_rows(db)] == [("failed", None, None)]
+    store = MediaStore.under(tmp_path)
+    assert not any(store.user_dir(alice.id).iterdir())  # 没有留下下载到一半的文件
+
+    # 重启后两条都是待回复的，下一轮带上它们，图片按「没能下载」说明。
+    channel = await send(chat, alice, "总结一下")
+    assert user_texts(model.requests[-1]) == ["看看这张\n[图片，没能下载]\n还在吗\n总结一下"]
+    assert channel.sent == []  # 之前的消息不是这一批的，不再说明
+
+
+async def test_message_is_recorded_even_if_cancelled_while_its_write_is_queued(
+    db: Database,
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    chat = conversation(db, ScriptedModel("main", []))
+    busy, release = threading.Event(), threading.Event()
+
+    def block(conn: sqlite3.Connection) -> None:
+        busy.set()
+        release.wait(HANG_GUARD)
+
+    async with asyncio.timeout(HANG_GUARD):
+        blocker = asyncio.create_task(db.transaction(block))
+        await asyncio.to_thread(busy.wait, HANG_GUARD)  # 数据库线程正忙，写入只能排队
+        receiving = asyncio.create_task(chat.receive(alice, message("关停时的一句"), FakeChannel()))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        receiving.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await receiving
+        release.set()
+        await blocker
+
+    # 数据库线程按提交的顺序执行：排在后面的这次查询能看到排在前面的写入。
+    assert await rows(db) == [Row("user", "关停时的一句", None, None, None)]
+
+
+async def test_message_of_a_user_who_lost_access_never_enters_a_batch(db: Database) -> None:
+    # AGENTS.md 的第一条不变量：放行之后才被停用的用户，消息不进流水、不进批次、不触发模型调用。
+    alice = await invited(db, ALICE, "小王")
+    await db.transaction(access.set_user_status, alice.id, UserStatus.DISABLED)
+    model = ScriptedModel("main", answer("不该出现"))
+    clock = ManualClock()
+    batcher = batcher_of(conversation(db, model), clock)
+    channel = FakeChannel()
+
+    await submit(batcher, alice, message("你好"), channel)
+    await clock.advance_to(60.0)
+
+    assert model.requests == []
+    assert channel.log == []
+    assert await rows(db) == []
+    assert not batcher._workers  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_batches_of_different_users_stay_apart(db: Database) -> None:
+    # AGENTS.md 的第二条不变量：同时在攒的两个人的消息不会进入对方的一轮。
+    alice = await invited(db, ALICE, "小王")
+    bob = await invited(db, BOB, "小李")
+    model = ScriptedModel("main", answer("好"))
+    clock = ManualClock()
+    batcher = batcher_of(conversation(db, model), clock)
+
+    await submit(batcher, alice, message("小王一"), FakeChannel())
+    await clock.advance_to(0.5)
+    await submit(batcher, bob, message("小李一"), FakeChannel())
+    await clock.advance_to(1.0)
+    await submit(batcher, alice, message("小王二"), FakeChannel())
+    await clock.advance_to(3.0)
+    await started(model, 1)
+    await settle()
+    assert [user_texts(r) for r in model.requests] == [["小李一"]]  # 小王的还在等
+    await clock.advance_to(3.5)
+    await finish(batcher)
+
+    assert [user_texts(r) for r in model.requests] == [["小李一"], ["小王一\n小王二"]]
+
+
+async def test_shutdown_abandons_waiting_batches_and_their_messages_stay_pending(
+    db: Database,
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("好"))
+    clock = ManualClock()
+    batcher = batcher_of(conversation(db, model), clock)
+    before = asyncio.all_tasks()
+
+    await submit(batcher, alice, message("关停前的一句"), FakeChannel())
+    batcher.stop()
+    async with asyncio.timeout(HANG_GUARD):
+        await batcher.drain()
+    await settle()
+
+    assert asyncio.all_tasks() == before  # 不留下没人管的任务
+    assert model.requests == []
+    (last,) = await db.fetch_all("SELECT MAX(id) FROM messages")
+    pending = await db.transaction(journal.pending_messages, alice.id, last[0] + 1)
+    assert [entry.content for entry in pending] == ["关停前的一句"]
+
+    # 重启后，下一批把它并进来。
+    clock = ManualClock()
+    batcher = batcher_of(conversation(db, model), clock)
+    await submit(batcher, alice, message("重启后的一句"), FakeChannel())
+    await clock.advance_to(2.5)
+    await finish(batcher)
+    assert [user_texts(r) for r in model.requests] == [["关停前的一句\n重启后的一句"]]
+
+
+async def test_shutdown_during_a_batched_reply_records_what_was_delivered(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", [TextDelta("说到一半")], hang=True)
+    chat = conversation(db, model)
+    clock = ManualClock()
+    batcher = batcher_of(chat, clock)
+    channel = FakeChannel()
+
+    await submit(batcher, alice, message("讲个故事"), channel)
+    await clock.advance_to(2.5)
+    async with asyncio.timeout(HANG_GUARD):
+        await channel.delivered.wait()
+        batcher.stop()
+        await batcher.drain()
+        await chat.drain()
+
+    assert (await rows(db))[-1] == Row("assistant", "说到一半", "main", "cancelled", "cancelled")
+    assert not batcher._workers  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_pending_sticker_does_not_make_an_unviewable_image_answerable(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("不该出现"))
+    chat = media_chat(db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, BLIND))
+
+    await send(chat, alice, STICKER_TEXT, gif_attachment())  # 单发的表情包：只记进流水
+    channel = await send(chat, alice, None, image_attachment())  # 一张谁都看不了的图
+
+    # 待回复的「[表情]」不算可答的内容：只说明看不了，不发起只有「[表情]」和「[图片]」的计费调用。
+    assert model.requests == []
+    assert channel.sent == [texts.IMAGE_UNAVAILABLE]
+
+
+async def test_raw_marker_stored_before_the_upgrade_reaches_the_model_as_a_face(
+    db: Database,
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("好"))
+    chat = conversation(db, model)
+
+    def legacy(conn: sqlite3.Connection) -> None:
+        old = journal.add_user_message(conn, alice.id, STICKER_TEXT, "qq-old", START)
+        journal.add_reply(
+            conn,
+            user_id=alice.id,
+            reply_to=old,
+            content="哈哈",
+            model="main",
+            ending=journal.Ending.COMPLETED,
+            delivery=journal.ReplyDelivery.STREAMED,
+            now=START,
+        )
+
+    await db.transaction(legacy)
+    await say(chat, alice, "今天怎么样")
+
+    assert model.requests[0].messages[0] == Message.text(Role.USER, "[表情]")
+    assert STICKER_TEXT not in json.dumps(
+        [text_of(p) for m in model.requests[0].messages for p in m.parts], ensure_ascii=False
+    )
+
+
+@pytest.mark.parametrize("typed", ["[表情]", "[表情：你好]"])
+async def test_hand_typed_face_text_is_ordinary_text_and_gets_an_answer(
+    db: Database, typed: str
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("你好呀"))
+    clock = ManualClock()
+    batcher = batcher_of(conversation(db, model), clock)
+    channel = FakeChannel()
+
+    await submit(batcher, alice, message(typed), channel)
+    await clock.advance_to(2.5)
+    await finish(batcher)
+
+    assert user_texts(model.requests[0]) == [typed]
+    assert channel.streamed == "你好呀"
+    row = await db.fetch_one("SELECT faces_only FROM messages WHERE role = 'user'")
+    assert row is not None
+    assert row[0] == 0
+
+
+async def test_real_sticker_is_recorded_as_faces_only(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    chat = conversation(db, ScriptedModel("main", []))
+
+    await say(chat, alice, STICKER_TEXT)
+    await say(chat, alice, f"哈哈{STICKER_TEXT}")
+
+    result = await db.fetch_all(
+        "SELECT content, faces_only FROM messages WHERE role = 'user' ORDER BY id"
+    )
+    assert [tuple(r) for r in result] == [("[表情]", 1), ("哈哈[表情]", 0)]

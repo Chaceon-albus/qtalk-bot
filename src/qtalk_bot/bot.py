@@ -5,7 +5,7 @@
 日志不记 openid 与消息正文。pyqbot 的异常文案里可能带 openid（请求路径），所以这里只记异常类型、
 `err_code` 与 `trace_id`。
 
-已授权用户的消息转成 `ChatInput`（`chat_input()`）：附件转成本项目自己的 `media.IncomingAttachment`，被引用的
+已授权用户的消息转成 `ChatInput`（`chat_input()`）交给攒批（`batching.Batcher`）：附件转成本项目自己的 `media.IncomingAttachment`，被引用的
 消息（`msg_elements`）里的图片也带上，卡片与转发的聊天记录记成不支持的内容。附件经 `QQDownloader` 用 pyqbot
 的 HTTP 客户端（`bot.http_client`）下载，不另建客户端；以后 pyqbot 加上代理参数，下载会自动走代理。
 
@@ -29,19 +29,21 @@ import pyqbot
 
 from . import texts
 from .access import User
+from .batching import Batcher
 from .chat import ChatHandler
-from .conversation import ChatInput, Conversation, SendError, SendRejectedError, SendUncertainError
+from .conversation import ChatInput, SendError, SendRejectedError, SendUncertainError
 from .gate import Chat, Delivery, FriendAdded, Gate, IncomingMessage, Reply, ShareLinkError
 from .media import AttachmentKind, DownloadError, DownloadTooLargeError, IncomingAttachment
 
 logger = logging.getLogger(__name__)
 
 
-def register(bot: pyqbot.Bot, gate: Gate, chat: ChatHandler) -> None:
-    """在 `bot` 上注册单聊消息与加好友的处理函数。"""
-    handlers = _Handlers(gate, chat)
+def register(bot: pyqbot.Bot, gate: Gate, chat: ChatHandler) -> Handlers:
+    """在 `bot` 上注册单聊消息与加好友的处理函数。关停时要在关数据库之前等返回值的 `drain()`。"""
+    handlers = Handlers(gate, chat)
     bot.on_c2c_message(handlers.on_c2c_message)
     bot.on_friend_add(handlers.on_friend_add)
+    return handlers
 
 
 class ShareLinks:
@@ -73,13 +75,17 @@ async def fetch_bot_name(client: pyqbot.Client) -> str:
 
 
 class QQChat:
-    """对话处理器：把 pyqbot 的单聊消息交给 `Conversation`，回复经 `_QQReplyChannel` 发出。"""
+    """对话处理器：把 pyqbot 的单聊消息交给攒批（`Batcher`），回复经 `_QQReplyChannel` 发出。
 
-    def __init__(self, conversation: Conversation) -> None:
-        self._conversation = conversation
+    收下消息（复查授权、下载附件、写进流水）就返回，回答一批消息在 `Batcher` 自己的任务里进行，回复挂在这一批的
+    最后一条上（被动回复用它的消息 ID）。
+    """
+
+    def __init__(self, batcher: Batcher) -> None:
+        self._batcher = batcher
 
     async def handle(self, user: User, message: pyqbot.C2CMessage) -> None:
-        await self._conversation.handle(user, [chat_input(message)], _QQReplyChannel(message))
+        await self._batcher.submit(user, chat_input(message), _QQReplyChannel(message))
 
 
 MAX_ATTACHMENTS = 16  # 一条消息（含被引用的图片）最多处理这么多个附件，多的不理会
@@ -384,19 +390,71 @@ class _KeyedLock:
                 del self._locks[key]
 
 
-class _Handlers:
+class Handlers:
+    """前台的处理函数（单聊消息、加好友）。
+
+    每次处理从 Gate 的决定开始，到对话处理器把放行的消息写进流水（或回复链收尾）为止，都由这里跟踪，关停时
+    `drain()` 在关数据库之前等它们。pyqbot 关闭时只等处理函数 5 秒：数据库的队列堵着时，受保护的 Gate 事务
+    可能在那之后才提交去重记录，处理函数接着才写流水；不等它的话数据库先关，这条消息既不在待回复的消息里，
+    平台重推也会被丢弃。
+    """
+
     def __init__(self, gate: Gate, chat: ChatHandler) -> None:
         self._gate = gate
         self._chat = chat
         # 同一个人的回复链成组发出：管理员连发两条 /invite 时，两组「状态 + 邀请」不会交叉，免得把
         # 不带备注的邀请转发错人。只锁回复链的发送，对话处理器不在锁里。
         self._reply_locks = _KeyedLock()
+        self._active: set[asyncio.Future[None]] = set()
+
+    async def drain(self) -> None:
+        """关停时调用（在 `Bot.close()` 之后、关数据库之前）：等所有还在进行的处理结束，包括被取消之后仍在等
+        Gate 的决定、把放行的消息写进流水的那些。"""
+        while self._active:
+            await asyncio.wait(set(self._active))
+
+    @contextlib.asynccontextmanager
+    async def _tracking(self) -> AsyncGenerator[None]:
+        finished: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._active.add(finished)
+        try:
+            yield
+        finally:
+            finished.set_result(None)
+            self._active.discard(finished)
 
     async def on_c2c_message(self, message: pyqbot.C2CMessage) -> None:
+        async with self._tracking():
+            await self._on_c2c_message(message)
+
+    async def on_friend_add(self, event: pyqbot.FriendAdd) -> None:
+        async with self._tracking():
+            await self._on_friend_add(event)
+
+    async def _on_c2c_message(self, message: pyqbot.C2CMessage) -> None:
         incoming = IncomingMessage(
             openid=message.user_openid, message_id=message.id, content=message.content
         )
-        match await self._gate.on_message(incoming):
+        deciding = asyncio.ensure_future(self._gate.on_message(incoming))
+        try:
+            outcome = await asyncio.shield(deciding)
+        except asyncio.CancelledError:
+            # 关停时处理函数被取消，Gate 的事务却可能已经提交了去重记录（平台重推会被丢弃）：等放行的决定出来，
+            # 放行了就照样交给对话处理器，它先把消息写进流水；然后再把取消传出去。
+            await asyncio.wait((deciding,))
+            if not deciding.cancelled() and deciding.exception() is None:
+                decided = deciding.result()
+                if isinstance(decided, Chat):
+                    try:
+                        await self._chat.handle(decided.user, message)
+                    except Exception as exc:  # noqa: BLE001  关停中，只记类型；取消照样传出去
+                        logger.warning(
+                            "关停时收下用户 %s 的消息出错：%s",
+                            decided.user.label,
+                            type(exc).__name__,
+                        )
+            raise
+        match outcome:
             case Reply() as reply:
                 await self._deliver(message.user_openid, message.reply, reply)
             case Chat(user=user):
@@ -408,7 +466,7 @@ class _Handlers:
             case None:
                 pass
 
-    async def on_friend_add(self, event: pyqbot.FriendAdd) -> None:
+    async def _on_friend_add(self, event: pyqbot.FriendAdd) -> None:
         added = FriendAdded(
             openid=event.openid, event_id=event.event_id, scene_param=event.scene_param
         )
@@ -498,6 +556,8 @@ _ARK_NAMES = frozenset(
 )
 _HOST_SUFFIXES = (
     # 形态日志与附件下载共用这份白名单（`_known_host()`）。
+    # 这些域名是按 2026-11-18 的实测样本和官方文档示例整理的，不是固定值：平台的下载主机随时可能变化。下载因
+    # 「主机不在下载白名单里」失败时，先核实新域名确实属于 QQ 平台，再补进这里。
     "qq.com",  # 文件的下载地址（实测 grouptalk.c2c.qq.com）
     "qq.com.cn",  # 图片、语音的下载地址（实测 multimedia.nt.qq.com.cn）
     "ugcimg.cn",  # 语音转出的 WAV（实测 qqbot.ugcimg.cn）

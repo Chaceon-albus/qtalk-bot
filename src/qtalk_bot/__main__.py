@@ -1,6 +1,7 @@
 """启动入口：`python -m qtalk_bot`。
 
-读配置与密钥、打开数据库、创建对话模型、决策模型与写图片描述的模型、构造 `pyqbot.Bot`、注册处理函数并运行；
+读配置与密钥、打开数据库、创建对话模型、决策模型与写图片描述的模型、构造 `pyqbot.Bot`、注册处理函数（经攒批交给
+对话）并运行；
 运行期间在后台定期清理过期的附件。退出时先取消后台的描述与清理任务，再关闭模型的客户端与数据库。配置或数据库有误、连不上平台时打印原因并以非零状态退出，不打印 traceback。
 """
 
@@ -13,7 +14,16 @@ from collections.abc import Awaitable, Callable
 
 import pyqbot
 
-from .bot import QQChat, QQDownloader, ShareLinks, fetch_bot_name, refuse_cookies, register
+from .batching import Batcher
+from .bot import (
+    Handlers,
+    QQChat,
+    QQDownloader,
+    ShareLinks,
+    fetch_bot_name,
+    refuse_cookies,
+    register,
+)
 from .chat import ChatHandler
 from .config import (
     ConfigError,
@@ -57,6 +67,8 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
         describer: Describer | None = None
         fetcher: Fetcher | None = None
         conversation: Conversation | None = None
+        batcher: Batcher | None = None
+        handlers: Handlers | None = None
         cleanup: asyncio.Task[None] | None = None
         # 从这里起无论怎样结束（取名字时被取消、后面准备失败、正常停止），都经 `_shut_down()` 关闭 Bot 的
         # HTTP 连接并等后台收尾。
@@ -91,21 +103,26 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                     fetcher=fetcher,
                     describer=describer,
                 )
-                chat = QQChat(conversation)
-            register(bot, gate, chat)
+                batcher = Batcher(conversation, settings.batching)
+                chat = QQChat(batcher)
+            handlers = register(bot, gate, chat)
             cleanup = asyncio.create_task(run_cleanup(db, store, settings.attachments))
             logger.info("机器人启动")
             await bot.start()
         except BaseException:
-            await _shut_down(bot, conversation, cleanup, describer, fetcher)
+            await _shut_down(bot, conversation, cleanup, describer, fetcher, batcher, handlers)
             raise
-        if await _shut_down(bot, conversation, cleanup, describer, fetcher):
+        if await _shut_down(bot, conversation, cleanup, describer, fetcher, batcher, handlers):
             raise asyncio.CancelledError  # 关停期间又被取消过：收尾做完了，再把取消传出去
 
 
 SHUTDOWN_GRACE_SECONDS = 15.0
 """关停时「排空前台、等后台收尾」这一段的总时限。pyqbot 等处理函数最多 5 秒，对话被取消后的收尾最多几秒，
 描述的记账很快；超过就记一条警告继续关停，不无限挂住。"""
+
+BOT_CLOSE_SECONDS = 8.0
+"""总时限里留给 `Bot.close()` 与其后等前台处理函数的部分：pyqbot 等处理函数最多 5 秒，再加关闭连接、等放行的
+消息写进流水的余量。等回答收尾的几步只能用剩下的时间。"""
 
 
 async def _shut_down(
@@ -114,26 +131,45 @@ async def _shut_down(
     cleanup: asyncio.Task[None] | None,
     describer: Describer | None,
     fetcher: Fetcher | None,
+    batcher: Batcher | None = None,
+    handlers: Handlers | None = None,
 ) -> bool:
     """按顺序关停，返回期间是否又被取消过。
 
     顺序：
-    1. `Bot.close()`：断开网关，取消前台还在运行的处理函数（停掉网关并不会取消它们，前台的轮次可能还在下载、
-       组装、发起模型调用），但它只等处理函数 5 秒。
-    2. `Conversation.drain()`：等在途的轮次真正结束。对话被取消后最多先用几秒停模型、再用几秒等在途的分片，
-       然后写流水与用量；不等它，数据库可能先关，已送达的内容和用量就丢了。
-    3. 向后台发出停止请求：停掉清理、`Describer.stop()`、`Fetcher.stop()`。这些是同步的、无条件执行，前面
+    1. `Batcher.stop()`：放弃还在计时的批次（消息已在流水里，重启后是待回复的），取消正在回答的轮次（对话自己
+       收尾记账），之后到达的消息只收下、不再回答。
+    2. `Batcher.drain()` 与 `Conversation.drain()`：等处理批次的任务与在途的轮次真正结束。对话被取消后最多先用
+       几秒停模型、再用几秒等在途的分片与结束分片，然后写流水与用量。这一步要在关闭 QQ 客户端之前：回答在
+       `Batcher` 自己的任务里，`Bot.close()` 不等它们，客户端先关的话结束分片发不出去，用户会一直看到「生成中」。
+    3. `Bot.close()`：断开网关，取消前台还在运行的处理函数（它们只在收消息、下载附件；消息在下载之前已经入库），
+       最多等它们 5 秒，再关 QQ 的 HTTP 客户端。
+    4. `Handlers.drain()`：等前台的处理真正结束。被取消的处理函数仍会等 Gate 的决定、把放行的消息写进流水；
+       数据库的队列堵着时这可能晚于 pyqbot 的 5 秒，不等它，数据库先关，这条消息就丢了（去重记录已经提交，
+       平台重推也会被丢弃）。
+       理想的顺序是先断开网关、不再收新事件，再收尾，最后关 HTTP 客户端；但 pyqbot 的 `Bot.close()` 把这三步
+       连在一起，没有只断开网关的公开接口（自己传入 HTTP 客户端可以避开，但要直接依赖 `httpx2`）。所以第 2 步
+       期间网关仍在收事件：这些消息照常放行、入库，因为 `Batcher` 已停，它们不会被回答，重启后是待回复的。
+    5. 向后台发出停止请求：停掉清理、`Describer.stop()`、`Fetcher.stop()`。这些是同步的、无条件执行，前面
        用完了时间也照样发出，免得后台任务在模型客户端和数据库关闭后还在跑。
-    4. 限时等后台收尾：清理任务、描述任务与它们受保护的写入、下载与响应的关闭。
+    6. 限时等后台收尾：清理任务、描述任务与它们受保护的写入、下载与响应的关闭。
     之后由调用方（外层的 `async with`）关模型的客户端与数据库。
 
     每一步的等待都受保护：再次取消（如连按两次 Ctrl+C）不会打断这一段；但所有等待共用
     `SHUTDOWN_GRACE_SECONDS` 的总时限，时间用完就跳过剩下的等待（停止请求仍会发出）。
     """
     deadline = asyncio.get_running_loop().time() + SHUTDOWN_GRACE_SECONDS
-    interrupted = await _drain(bot.close(), deadline, "关闭 QQ 连接与前台的处理函数")
+    # 给 Bot.close() 留出它等处理函数的时间：前面的收尾用超了也不至于来不及断开网关、关掉 HTTP 客户端。
+    replies_deadline = deadline - BOT_CLOSE_SECONDS
+    interrupted = False
+    if batcher is not None:
+        batcher.stop()
+        interrupted |= await _drain(batcher.drain(), replies_deadline, "等待攒批的任务收尾")
     if conversation is not None:
-        interrupted |= await _drain(conversation.drain(), deadline, "等待在途的对话收尾")
+        interrupted |= await _drain(conversation.drain(), replies_deadline, "等待在途的对话收尾")
+    interrupted |= await _drain(bot.close(), deadline, "关闭 QQ 连接与前台的处理函数")
+    if handlers is not None:
+        interrupted |= await _drain(handlers.drain(), deadline, "等待放行的消息写进流水")
     if cleanup is not None:
         cleanup.cancel()
     if describer is not None:
