@@ -34,10 +34,9 @@
 - 单独的图片或文件不触发判断；重来时一并带上，否则留到下一轮按上面「空闲时」的规则等文字。
 
 只显示了过程消息（`process.py`）不算回答已开始显示，照常可以重来；重来时把上一次的 `TurnControl` 交给新的
-（`previous`），被重来的过程消息由最后答完的那一次处理。
-
-「正在输入」在一轮开始时发；重来时只有距上次发出已有 `TYPING_REFRESH_SECONDS` 才再发一次（每次都占用被动回复
-的名额）。回复挂在这一轮最后一条不是表情的消息上。
+（`previous`），被重来的过程消息由最后答完的那一次处理，上次实际发出「正在输入」的时刻（`TurnControl.typed_at`）
+也接着用：发不发「正在输入」全由 `Conversation` 按它判断（见那里的「正在输入」一节），这里不另记。回复挂在这一轮
+最后一条不是表情的消息上。
 
 同一个用户的这些事在一个任务里依次处理，不同用户的互不影响。
 
@@ -87,10 +86,6 @@ def classify(message: ChatInput) -> InputKind | None:
 MAX_BATCH = ROWS_PER_TURN
 """一轮最多带这么多条消息，多出来的留给下一轮。与「这一轮的输入最多取几条」（`journal.pending_messages()`）是同一个
 数：一轮比它多时，最早的几条进不了请求，回复的 `reply_to` 却覆盖了它们，之后再也取不回来。"""
-
-TYPING_REFRESH_SECONDS = 50.0
-"""重来时距上次发「正在输入」至少这么久才再发一次。「正在输入」持续 `conversation.TYPING_SECONDS`（60 秒），
-早于这个时刻再发是浪费：每次都占用这条消息一次被动回复的名额，平台对同一条消息的被动回复次数有限。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,12 +145,6 @@ def next_step(
     return Ask()
 
 
-def typing_due(typed_at: float | None, now: float, *, restarted: bool) -> bool:
-    """这次开始（或重来）一轮时要不要发「正在输入」：开始时总是发；重来时距上次发出已有
-    `TYPING_REFRESH_SECONDS` 才发。"""
-    return not restarted or typed_at is None or now - typed_at >= TYPING_REFRESH_SECONDS
-
-
 class Responder(Protocol):
     """收消息、回答一轮、判断插话、询问附件，`conversation.Conversation` 符合它。"""
 
@@ -210,7 +199,6 @@ class _UserState:
     worker: asyncio.Task[None] | None = None
     wake: asyncio.Future[None] | None = None
     asked: bool = False  # 这一组等待中的附件已经做过超时动作
-    typed_at: float | None = None  # 上次让回答一轮的一方发「正在输入」的时刻
 
     def poke(self) -> None:
         if self.wake is not None and not self.wake.done():
@@ -384,12 +372,9 @@ class Batcher:
                 return  # 都没能写进流水
             if restarts == 0 and len(recorded) > 1:
                 logger.info("用户 %s 的 %d 条消息合成一轮", user.label, len(recorded))
-            now = self._now()
-            typing = typing_due(state.typed_at, now, restarted=restarts > 0)
-            if typing:
-                state.typed_at = now
-            # 重来时接上上一次的：被重来的几次的过程消息由最后答完的那一次撤回、存档。
-            control = TurnControl(typing=typing, notify=state.poke, previous=control)
+            # 重来时接上上一次的：被重来的几次的过程消息由最后答完的那一次撤回、存档，上次发「正在输入」的时刻
+            # 也接着用。
+            control = TurnControl(notify=state.poke, previous=control)
             ids = [item.message_id for item, _ in recorded]
             task = asyncio.create_task(self._responder.respond(user, ids, recorded[-1][1], control))
             try:

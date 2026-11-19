@@ -33,7 +33,7 @@ from qtalk_bot.config import (
     TurnSettings,
 )
 from qtalk_bot.conversation import (
-    TYPING_SECONDS,
+    TYPING_PULSE_SECONDS,
     ChatInput,
     Conversation,
     SendError,
@@ -254,7 +254,7 @@ class FakeChannel:
         return kinds
 
     async def typing(self, seconds: int) -> None:
-        assert seconds == TYPING_SECONDS
+        assert seconds == TYPING_PULSE_SECONDS
         await asyncio.sleep(0)
         if self.typing_gate is not None:
             await self.typing_gate.wait()
@@ -1555,8 +1555,9 @@ def media_chat(
     store: MediaStore | None = None,
     history_turns: int = 10,
     fetcher: Fetcher | None = None,
+    clock: ManualClock | None = None,
 ) -> Conversation:
-    """第一个模型是默认模型；每个模型带上它声明的 `inputs`。"""
+    """第一个模型是默认模型；每个模型带上它声明的 `inputs`。`clock` 不为空时用作过程消息与「正在输入」的时钟。"""
     fallbacks = fallbacks or {}
     settings = [
         ModelSettings(
@@ -1583,6 +1584,8 @@ def media_chat(
         fetcher=fetcher or Fetcher(store or MediaStore.under(tmp_path), downloader, attachments),
         describer=describer,
         clock=lambda: START,
+        timer=None if clock is None else clock,
+        sleep=asyncio.sleep if clock is None else clock.sleep,
     )
 
 

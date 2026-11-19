@@ -24,7 +24,7 @@
    上一轮实际回答的模型。
 3. 按附件筛出候选模型、整理要告诉用户的情况（`context.plan_turn()`，只就这一批的附件说明）。有说明（下载
    失败、太大、看不了、不支持）就先发一条；没有可以交给模型的内容时就此结束（消息照常已在流水里）。
-4. 后台发「正在输入」（`TurnControl.typing` 为假时不发）；然后在候选里选模型（需要时调用一次决策，在事务
+4. 后台发「正在输入」（距这一轮上次发出不到一个脉冲时不发，见下文「正在输入」一节）；然后在候选里选模型（需要时调用一次决策，在事务
    之外、直接在本任务里 await），失败时退回，不挡住回复。语音不影响候选，由决策按内容选；决策接口收音频时
    （`Router.decision_limits`）把本轮语音的原声和文字题目一起交给它，题目里仍保留识别文本，原声超出内联上限
    的只用识别文本。
@@ -47,13 +47,23 @@
 带上），只记选模型的决策与已有的用量，然后把取消传播出去。服务商内置的搜索在回答开始显示之前进行，所以搜索
 期间照常可以被打断；适配器每执行一次搜索就交出新的 `Usage`，被打断的那次调用里已经执行的搜索照常计数。
 
-**处理过程**（`process.py`）：模型配置了 `show_process` 时，它的思考摘要、调用工具前的说明与搜索进展经
+**处理过程**（`process.py`）：模型配置了 `show_process` 时，它调用工具前的说明与搜索进展经
 `process.ProcessPresenter` 写成单独的一条流式消息（经 `ReplyChannel.open_process()`）。过程消息不算「已开始
 显示」（不 `claim()`），所以只显示了过程时插话照常可以重来：被重来的一轮给过程消息写一行「收到补充，重新开始」
 再结束它，它留在 `TurnControl.earlier` 里，由重来的那一轮按同样的规则撤回、存档。回答的第一片交出之前（以及之后
 要发固定说明、纯文本时）结束过程消息；回答送达（含固定说明）之后，第一片发出不久的过程消息按 `[process].recall`
 撤回。过程的全文存进回复行的 `process` 列，不进之后的上下文。每条被回复的消息记下已用的被动回复次数
-（`ReplyChannel.budget`，经本模块的通道包装计数），不够给回答留余量时不发过程消息。
+（`ReplyChannel.budget`，经本模块的通道包装计数），不够给回答留余量时不发过程消息。思考摘要不展示、不存档。
+
+**「正在输入」像真人一样输一会、停一会**（用户 2026-11-19 决定）：每次只请求 `TYPING_PULSE_SECONDS`，在有进展时
+再请求一次（`_Turn.pulse()`）：一轮开始时；真正开始调用对话模型时（含插话重来、换备用模型之后的那次）；还没有
+任何内容交给 QQ 期间，模型流里出现新的阶段时（一次搜索开始、一段调用工具前的说明开始、一段思考摘要开始）。没有
+进展时（如 OpenAI 隐藏的长时间推理）上一次到期就自然停下。前提是全部满足：过程消息、回答与固定说明（如附件说明）
+都还没交给 QQ；距上一次实际发出至少隔一个脉冲（时刻只记在 `TurnControl.typed_at`，插话重来时接着用）；这条消息
+发「正在输入」的次数没到 `process.MAX_TYPINGS`，发完之后仍给回答留足被动回复的余量，当前的模型或之后还可能换上
+的备用模型会发过程消息时也给它留一次（`ReplyBudget.affords_typing()`）。过程消息与回答的第一片都等开轮的与在途的
+「正在输入」发完（`_Turn.typing_settled()`），免得内容先到、随后才显示正在输入；一轮结束或被取消时取消在途的
+「正在输入」，最多等 `GRACE_SECONDS`。
 
 **判断插话**（`judge()`）：在事务里复查授权、取出正在回答的消息与新消息的文字版（只有这个用户自己的），交给
 `routing.SteerJudge`；决策记录与用量挂在新消息里最后一条上，被取消时也照记。
@@ -95,6 +105,7 @@ from .journal import (
 )
 from .llm import (
     AudioPart,
+    ChatEvent,
     ChatModel,
     ChatRequest,
     Citation,
@@ -105,6 +116,7 @@ from .llm import (
     ModelError,
     Provider,
     SearchProgress,
+    SearchStage,
     TextDelta,
     ThoughtSummary,
     Usage,
@@ -149,7 +161,9 @@ MULTIMODAL_REQUESTS = 3
 这是一道防护性的软上限：被取消的瞬间，异常的 traceback 可能还短暂持有请求（原件），名额归还后内存里会短暂
 多出一份，可以接受。"""
 
-TYPING_SECONDS = 60  # 「正在输入」的时长，平台允许的上限；机器人发出消息时它会自动消失
+TYPING_PULSE_SECONDS = 8
+"""每次「正在输入」的时长（秒）。不一口气请求很久（平台允许 60 秒），而是有进展时再请求一次：程序卡住、没有进展时
+它很快到期，用户看到的是「输一会、停一会」。两次之间至少隔这么久；机器人发出消息时它会自动消失。"""
 GRACE_SECONDS = 3.0  # 被取消后收拢后台任务（在途的分片、结束分片）的时限
 
 
@@ -168,7 +182,6 @@ class SendUncertainError(SendError):
 class TurnControl:
     """回答一轮的过程与决定「何时开始、要不要重来」的一方（`batching.py`）之间的约定。
 
-    - `typing`：开始时要不要发「正在输入」。每次发送都占用这条消息一次被动回复的名额，重来时不一定再发。
     - `claim()`：回答一轮的一方在把任何内容交给 QQ 之前调用（同步，紧挨着发送）。之后 `displayed` 为真，
       这一轮不能再被打断重来：QQ 的流式消息只能追加、不能撤回。已经 `preempt()` 过时返回 `False`，不能再发。
     - `preempt()`：要重来的一方在取消这一轮之前调用。已经开始显示时返回 `False`（不能重来）；否则记下
@@ -176,22 +189,23 @@ class TurnControl:
     - `begin()`：回答一轮的一方从流水里取出这一轮实际带上的用户消息（`included`，含之前遗留的待回复消息）后
       调用，再调用 `notify`。要重来的一方据此判断重来的请求装不装得下新消息，插话判断的输入也用它。
     - `previous`：重来时传入上一次的 `TurnControl`。被重来的几次的过程消息（`earlier`，与上一次共用同一个
-      列表）由最后答完的那一次按规则撤回、连同自己的过程一起存档。过程消息不算「已开始显示」。
+      列表）由最后答完的那一次按规则撤回、连同自己的过程一起存档；上次发「正在输入」的时刻（`typed_at`）也接着
+      用，「正在输入」的间隔据此计算。过程消息不算「已开始显示」。
     """
 
     def __init__(
         self,
         *,
-        typing: bool = True,
         notify: Callable[[], None] | None = None,
         previous: TurnControl | None = None,
     ) -> None:
-        self.typing = typing
         self.displayed = False
         self.preempted = False
         self.included: tuple[int, ...] | None = None
         self._notify = notify
         self.earlier: list[ProcessPresenter] = [] if previous is None else previous.earlier
+        # 这一轮（含被重来的几次）上次发「正在输入」的时刻（`Conversation` 的单调时钟）。
+        self.typed_at: float | None = None if previous is None else previous.typed_at
 
     def begin(self, included: Sequence[int]) -> None:
         self.included = tuple(included)
@@ -397,22 +411,34 @@ class _Turn:
         user: User,
         selection: Selection,
         *,
-        typing: bool = True,
-        may_show: Callable[[], bool] = lambda: True,
+        control: TurnControl | None = None,
         open_process: Callable[[], ProcessStream | None] = lambda: None,
+        process_ahead: bool = False,
         timer: Timer,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
         self.channel = channel
         self.user = user
         self.selection = selection
-        # 不发「正在输入」时也放一个（立即结束的）任务，后面的流程不必区分。
-        self.typing = asyncio.create_task(_typing(channel, user) if typing else _skip())
+        self.control = TurnControl() if control is None else control
+        self._timer = timer
+        self.pulses: set[asyncio.Task[None]] = set()  # 开始之后再发的「正在输入」
+        # 之后（当前的模型与还可能换上的备用模型）有没有会发过程消息的：补发「正在输入」时给过程消息留余量。
+        self.process_ahead = process_ahead
+        # 一轮开始时的「正在输入」（距这一轮上次发出不到一个脉冲时不发）。不发时也放一个（立即结束的）任务，后面的
+        # 流程不必区分。
+        typing = self._affordable(process=process_ahead)
+        self.typing = asyncio.create_task(self._send_typing() if typing else _skip())
+        # 过程消息与回答的第一片都等「正在输入」（开轮的与当时在途的脉冲）发完，免得内容先到、随后才显示正在输入。
         self.process = ProcessPresenter(
-            open_process, before_first=self.typing, timer=timer, sleep=sleep
+            open_process, before_first=self.typing_settled, timer=timer, sleep=sleep
         )
         self.outbox = _Outbox(
-            channel, self.typing, may_show, self.process.make_way, self.process.seal
+            channel,
+            self.typing_settled,
+            self.control.claim,
+            self.process.make_way,
+            self.process.seal,
         )
         self.attempts: list[_Attempt] = []
         self.run: _Run | None = None  # 正在进行的调用
@@ -421,9 +447,69 @@ class _Turn:
         self.tried_notices: set[str] = set()  # 已发出、没有被平台明确拒绝的说明（含送达不明的）
         self.consumer: asyncio.Task[None] | None = None  # 读模型流的任务
 
+    @property
+    def shown(self) -> bool:
+        """已经有东西交给 QQ：过程消息、回答，或固定说明（附件说明等，`TurnControl.displayed`）。之后不再发
+        「正在输入」。"""
+        return self.outbox.handed or self.process.opened or self.control.displayed
+
+    def pulse(self) -> None:
+        """有进展：满足前提时（见模块 docstring）在后台再发一次「正在输入」。之后还可能发过程消息时（`process_ahead`
+        为真、过程消息还没开始），余量里也给它留一次。"""
+        process = self.process_ahead and not self.process.opened and not self.process.failed
+        if not self.shown and self._affordable(process=process):
+            task = asyncio.create_task(self._send_typing())
+            self.pulses.add(task)
+            task.add_done_callback(self.pulses.discard)
+
+    async def typing_settled(self) -> None:
+        """等开轮的「正在输入」与当时在途的脉冲都发完（被取消的也算完）；不随调用方的取消而取消它们。"""
+        while pending := [task for task in (self.typing, *self.pulses) if not task.done()]:
+            await asyncio.wait(pending)
+
+    def _affordable(self, *, process: bool) -> bool:
+        """距上一次够久、次数与余量也够：记下这一次的时刻，返回 `True`。"""
+        last = self.control.typed_at
+        if last is not None and self._timer() - last < TYPING_PULSE_SECONDS:
+            return False
+        if not self.channel.budget.affords_typing(process=process):
+            logger.info(
+                "用户 %s 这条消息的「正在输入」次数或被动回复的余量不够，不再发「正在输入」",
+                self.user.label,
+            )
+            return False
+        self.control.typed_at = self._timer()
+        return True
+
+    async def _send_typing(self) -> None:
+        await _typing(self.channel, self.user)
+
+    async def stop_pulses(self, grace: float) -> None:
+        """取消还在发的「正在输入」，最多等 `grace` 秒让它们结束；超时的不再等，记一条日志，它们结束时再取回
+        结果（不留没人取回的异常）。"""
+        pulses = list(self.pulses)
+        for task in pulses:
+            task.cancel()
+        if pulses:
+            await asyncio.wait(pulses, timeout=grace)
+        late = 0
+        for task in pulses:
+            if task.done():
+                _retrieve(task)
+            else:
+                task.add_done_callback(_retrieve)
+                late += 1
+        if late:
+            logger.warning(
+                "用户 %s 有 %d 次「正在输入」取消后 %g 秒仍没有结束，不再等",
+                self.user.label,
+                late,
+                grace,
+            )
+
     def abandon(self) -> None:
         """出了意外的异常：不再收尾，直接取消后台任务。"""
-        for task in (self.typing, self.consumer):
+        for task in (self.typing, self.consumer, *self.pulses):
             if task is not None:
                 _cancel_and_retrieve(task)
         self.outbox.cancel()
@@ -724,15 +810,16 @@ class Conversation:
             channel,
             user,
             selection,
-            typing=control.typing,
-            may_show=control.claim,
+            control=control,
             open_process=open_process,
+            process_ahead=any(model.show_process for model in models),
             timer=self._timer,
             sleep=self._sleep,
         )
         cancelled: asyncio.CancelledError | None = None
         try:
             outcome = await self._generate(turn, builder, begun.current)
+            await turn.stop_pulses(GRACE_SECONDS)
         except asyncio.CancelledError as exc:
             if control.preempted:
                 # 插话重来：回答什么都没交给 QQ，不写回复行，消息留给重新开始的那一轮；决策与用量照记。过程
@@ -843,15 +930,14 @@ class Conversation:
             turn.selection.record,
             _Reply(model, ending, turn.attempts, outcome, tuple(turn_messages), given, process),
         )
-        thoughts, commentaries, _ = turn.process.notes.counts
+        commentaries, _ = turn.process.notes.counts
         logger.info(
-            "回复了用户 %s：模型 %s，结局 %s，送达 %s，搜索 %d 次，思考摘要 %d 段，说明 %d 段，过程消息 %d 片",
+            "回复了用户 %s：模型 %s，结局 %s，送达 %s，搜索 %d 次，说明 %d 段，过程消息 %d 片",
             turn.user.label,
             model,
             ending.value,
             outcome.delivery.value,
             sum(attempt.searches for attempt in turn.attempts),
-            thoughts,
             commentaries,
             turn.process.chunks,
         )
@@ -1050,7 +1136,7 @@ class Conversation:
             await self._notify(turn, turn.notices)
             delivered = bool(turn.sent_notices)
             return _Outcome("", ReplyDelivery.FAILED if delivered else ReplyDelivery.NOTICE_LOST)
-        await turn.typing  # 之后要发的说明或纯文本不能排在「正在输入」前面
+        await turn.typing_settled()  # 之后要发的说明或纯文本不能排在「正在输入」前面
         if withheld:
             turn.outbox.discard()
             return _Outcome("", ReplyDelivery.WITHHELD)
@@ -1147,6 +1233,11 @@ class Conversation:
                 if not await self._still_allowed(turn, "备用模型" if index else "对话模型"):
                     return True
                 request, given, built = built.request, built.given, None
+                # 进展：真正开始调用这个模型。它与之后的备用模型里有会发过程消息的，就给过程消息留余量。
+                turn.process_ahead = any(
+                    self._router.model(later.name).show_process for later in models[index:]
+                )
+                turn.pulse()
                 guard = MarkdownGuard()
                 try:
                     attempt = await self._attempt(turn, model, request, guard, given)
@@ -1220,10 +1311,25 @@ class Conversation:
             run.parts.append(text)
             turn.outbox.push(guard.feed(text))
 
+        stages: set[tuple[type, str]] = set()
+
         def note(event: ProcessEvent) -> None:
             turn.process.feed(event, show=show)
 
-        consumer = asyncio.create_task(self._consume(model, request, run, sink, note))
+        def progress(event: ChatEvent) -> None:
+            """模型流里出现新的阶段（一次搜索、一段说明或思考摘要开始）：有进展，再发一次「正在输入」。"""
+            match event:
+                case SearchProgress(call_id=key, stage=SearchStage.STARTED):
+                    pass
+                case Commentary(segment=key) | ThoughtSummary(segment=key):
+                    pass
+                case _:
+                    return
+            if (type(event), key) not in stages:
+                stages.add((type(event), key))
+                turn.pulse()
+
+        consumer = asyncio.create_task(self._consume(model, request, run, sink, note, progress))
         turn.consumer = consumer
         broken = asyncio.create_task(turn.outbox.broken.wait())
         try:
@@ -1249,6 +1355,7 @@ class Conversation:
         run: _Run,
         sink: Callable[[str], None],
         note: Callable[[ProcessEvent], None] = lambda _: None,
+        progress: Callable[[ChatEvent], None] = lambda _: None,
     ) -> None:
         try:
             async with (
@@ -1256,6 +1363,7 @@ class Conversation:
                 aclosing(model.stream(request)) as events,
             ):
                 async for event in events:
+                    progress(event)
                     match event:
                         case TextDelta(text=text):
                             sink(text)
@@ -1265,8 +1373,8 @@ class Conversation:
                             run.usage = event
                         case Finished(reason=reason):
                             run.ending = _FINISH_ENDINGS[reason]
-                        case ThoughtSummary() | Commentary() | SearchProgress():
-                            note(event)
+                        case Commentary() | SearchProgress():
+                            note(event)  # 思考摘要（万一服务商仍给了）不展示也不存档
                         case _:
                             pass
         except ModelError as exc:
@@ -1376,6 +1484,7 @@ class Conversation:
             elif consumer is not None:  # 已经在归还多模态名额之前停下了
                 _settle_stopped_consumer(consumer, turn.run.model if turn.run else None)
             turn.typing.cancel()
+            await turn.stop_pulses(_remaining(deadline))
             await turn.outbox.wind_down(deadline)
             await _within(turn.process.conclude(note), deadline, turn.process)
         except asyncio.CancelledError:
@@ -1630,7 +1739,7 @@ class _ProcessChannel:
 
 async def _typing(channel: ReplyChannel, user: User) -> None:
     try:
-        await channel.typing(TYPING_SECONDS)
+        await channel.typing(TYPING_PULSE_SECONDS)
     except SendError as exc:
         logger.info("没能向用户 %s 显示「正在输入」：%s", user.label, exc)
 
@@ -1679,13 +1788,13 @@ class _Outbox:
     def __init__(
         self,
         channel: ReplyChannel,
-        before_first: asyncio.Task[None],
+        before_first: Callable[[], Awaitable[None]],
         may_show: Callable[[], bool] = lambda: True,
         before_show: Callable[[], Awaitable[None]] = _skip,
         on_show: Callable[[], None] = lambda: None,
     ) -> None:
         self._channel = channel
-        self._before_first: asyncio.Task[None] | None = before_first
+        self._before_first: Callable[[], Awaitable[None]] | None = before_first
         self._may_show = may_show  # 第一片交出之前调用；返回假（这一轮已被插话重来）就不再发
         # 第一片：先等 `before_show`（过程消息的第一片回来，见 `ProcessPresenter.make_way()`），`may_show` 成功
         # 之后调用 `on_show`（结束过程消息）。
@@ -1795,7 +1904,7 @@ class _Outbox:
 
     async def _send_pending(self) -> None:
         if self._before_first is not None:
-            await self._before_first
+            await self._before_first()
             self._before_first = None
         while self._pending and self.error is None:
             if not self.handed and not self._pending.strip():

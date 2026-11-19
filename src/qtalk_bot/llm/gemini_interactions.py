@@ -1,8 +1,9 @@
 """Gemini 的对话模型适配器：Interactions API，流式（`generateContent` 已被标为旧接口）。
 
 请求关掉服务端存储（`store=False`），历史每次以 `user_input` / `model_output` 步骤完整带上；配置了推理
-强度时放进 `generation_config.thinking_level`；配置了 `show_process` 时请求思考摘要
-（`generation_config.thinking_summaries = "auto"`，默认关闭）。Gemini 的文字没有「调用工具前的说明」这种标记，
+强度时放进 `generation_config.thinking_level`；构造时 `summaries` 为真才请求思考摘要
+（`generation_config.thinking_summaries = "auto"`，默认关闭；按配置创建的模型现在都不请求，见
+`providers.py`）。Gemini 的文字没有「调用工具前的说明」这种标记，
 一律算回答。
 
 附件都以 base64 内联（`data` 是不带 `data:` 前缀的 base64 字符串）：图片是

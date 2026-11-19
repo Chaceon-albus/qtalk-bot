@@ -154,3 +154,19 @@ async def test_search_setting_reaches_each_model_and_the_describer_never_searche
         assert alt._search is True  # pyright: ignore[reportPrivateUsage]
         assert plain._search is False  # pyright: ignore[reportPrivateUsage]
         assert describer._search is False  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_show_process_does_not_request_thought_summaries() -> None:
+    settings = (
+        ModelSettings(
+            name="main", provider=Provider.OPENAI, model="m", default=True, show_process=True
+        ),
+        ModelSettings(name="alt", provider=Provider.GEMINI, model="g", show_process=True),
+    )
+    async with ChatModels(settings, SECRETS) as models:
+        main, alt = models["main"], models["alt"]
+        assert isinstance(main, OpenAIChatModel)
+        assert isinstance(alt, GeminiChatModel)
+        # 用户 2026-11-19 决定不展示也不请求思考摘要：适配器的能力保留，按配置创建的模型都不打开。
+        assert main._summaries is False  # pyright: ignore[reportPrivateUsage]
+        assert alt._summaries is False  # pyright: ignore[reportPrivateUsage]

@@ -98,10 +98,6 @@ REPLY_REJECTED = "抱歉，这条回复没能通过平台的审核，发不出�
 # ---- 处理过程（`process.py`；每一行放在 Markdown 引用块里，动态内容已转义） ----
 
 
-def process_thought(headline: str) -> str:
-    return f"思考：{headline}"
-
-
 def process_searching(queries: str) -> str:
     """一次搜索开始或得知了查询词；`queries` 为空时还不知道查询词。"""
     return f"正在搜索：{queries}" if queries else "正在搜索"

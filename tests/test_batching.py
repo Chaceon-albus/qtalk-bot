@@ -13,7 +13,6 @@ from qtalk_bot import batching
 from qtalk_bot.access import User, UserStatus
 from qtalk_bot.batching import (
     MAX_BATCH,
-    TYPING_REFRESH_SECONDS,
     Ask,
     Batcher,
     InputKind,
@@ -21,7 +20,6 @@ from qtalk_bot.batching import (
     Wait,
     classify,
     next_step,
-    typing_due,
 )
 from qtalk_bot.config import AttachmentTimeoutAction, TurnSettings
 from qtalk_bot.conversation import ChatInput, Received, ReplyChannel, ReplyStream, TurnControl
@@ -137,13 +135,6 @@ def test_a_turn_takes_at_most_as_many_messages_as_its_input_can() -> None:
     assert next_step(arrivals, settings, asked=False, now=0.0) == Start(MAX_BATCH)  # 满了不等
 
 
-def test_typing_is_sent_at_the_start_and_on_a_restart_only_near_its_expiry() -> None:
-    assert typing_due(None, 0.0, restarted=False)
-    assert typing_due(10.0, 11.0, restarted=False)
-    assert not typing_due(10.0, 10.0 + TYPING_REFRESH_SECONDS - 1, restarted=True)
-    assert typing_due(10.0, 10.0 + TYPING_REFRESH_SECONDS, restarted=True)
-
-
 # ---- Batcher ----
 
 
@@ -198,7 +189,6 @@ class Answered:
     messages: list[int]
     channel: str
     at: float
-    typing: bool = True
 
 
 @dataclass
@@ -266,7 +256,7 @@ class FakeResponder:
         assert control is not None
         self.controls.append(control)
         control.begin([*self.leftover, *messages])
-        record = Answered(user.id, list(messages), channel.name, self.clock.now, control.typing)
+        record = Answered(user.id, list(messages), channel.name, self.clock.now)
         self.started.append(record)
         self.answering += 1
         try:
@@ -542,7 +532,7 @@ async def test_supplement_before_display_restarts_the_turn_with_the_new_message(
     assert responder.judged == [Judged(ALICE.id, [1], [2])]
     assert responder.cancelled == responder.preempted == 1
     assert turns(responder) == [([1], "问一"), ([1, 2], "补充")]
-    assert responder.started[1].typing is False  # 距上次发「正在输入」不久，不再发
+    assert responder.controls[1].earlier is responder.controls[0].earlier  # 重来接着上一次的
     assert responder.answering == 1
     assert "判为补充" in caplog.text
     assert "第 1 次重来" in caplog.text
@@ -568,7 +558,7 @@ async def test_new_question_lets_the_turn_finish_then_answers_it(clock: ManualCl
         ([1], "问一"),
         ([2], "新问题"),
     ]
-    assert responder.started[1].typing is True  # 新的一轮照常发「正在输入」
+    assert responder.controls[1].earlier is not responder.controls[0].earlier  # 新的一轮从头开始
 
 
 @pytest.mark.parametrize("verdict", [Steer.ASSUMED, RuntimeError("意外")])
@@ -723,17 +713,18 @@ async def test_picture_during_a_turn_joins_a_restart(clock: ManualClock) -> None
     assert turns(responder) == [([1], "问一"), ([1, 2, 3], "问题")]
 
 
-async def test_typing_is_sent_again_on_a_restart_close_to_its_expiry(clock: ManualClock) -> None:
+async def test_restarts_carry_over_when_typing_was_actually_last_sent(clock: ManualClock) -> None:
+    # 发不发「正在输入」只按回答一轮的一方实际发出的时刻（`TurnControl.typed_at`）判断，这里不另记一份。
     responder = FakeResponder(clock)
     chat = batcher_of(responder)
     await answering(chat, responder)
+    responder.controls[0].typed_at = 3.0  # 回答一轮的一方实际发出的时刻
 
-    await clock.advance_to(TYPING_REFRESH_SECONDS - 1)
     await submit(chat, ALICE, text("补一"), "补一")
-    await clock.advance_to(TYPING_REFRESH_SECONDS + 1)
+    responder.controls[1].typed_at = 12.0
     await submit(chat, ALICE, text("补二"), "补二")
 
-    assert [a.typing for a in responder.started] == [True, False, True]
+    assert [control.typed_at for control in responder.controls] == [3.0, 12.0, 12.0]
 
 
 async def test_refused_message_during_a_turn_triggers_no_judgment(clock: ManualClock) -> None:

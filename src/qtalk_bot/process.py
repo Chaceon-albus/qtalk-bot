@@ -1,18 +1,18 @@
-"""处理过程的展示：模型思考、搜索时，用单独的一条流式消息告诉用户进展（类似 ChatGPT 的思考摘要）。
+"""处理过程的展示：模型调用工具、搜索时，用单独的一条流式消息告诉用户进展。
 
 不依赖 pyqbot 与 SDK，时钟与等待可以注入。
 
-**来源**是三种流式事件（`llm`）：思考摘要（`ThoughtSummary`，模型配置了 `show_process` 才请求）、调用工具前的
-说明（`Commentary`，OpenAI 的 `phase` 为 `commentary` 的消息）、搜索进展（`SearchProgress`）。
+**来源**是两种流式事件（`llm`）：调用工具前的说明（`Commentary`，OpenAI 的 `phase` 为 `commentary` 的消息）与
+搜索进展（`SearchProgress`）。思考摘要不展示、不存档，也不请求（用户 2026-11-19 决定：实测里摘要很稀疏、而且
+总是英文）；模型只是在思考、还没有内容可显示时，靠「正在输入」提示用户（见 `conversation.py` 的补发）。
 
 **写什么**（`ProcessNotes`）：只写步骤级的短句，每步一行，放在 Markdown 引用块里。QQ 的流式消息只能往后追加、
 不能改已经发出的部分，所以每一步一旦发出就不再变，之后的变化另起一行：
 
-- 思考摘要的每一段写一行「思考：<标题>」：摘要通常以 `**标题**` 开头，取标题；没有标题时取第一句。说明写一行
-  它的第一句。都截到 `MAX_STEP_CHARS` 个字，去掉 Markdown 的强调与代码标记，再经 `escape_line()`（行内的转义
-  加上行首的块标记：每一步都在引用块的行首，`- 检查结果` 会变成列表、`---` 会变成分割线）。
-  一段还看不出标题或第一句时先不写，它后面的步骤也等着（保持顺序）；下一段（或别的事件）开始时，前一段按已有
-  的文字定下来。
+- 说明的每一段写一行：取开头的 `**标题**`，没有标题时取第一句，截到 `MAX_STEP_CHARS` 个字，去掉 Markdown 的
+  强调与代码标记，再经 `escape_line()`（行内的转义加上行首的块标记：每一步都在引用块的行首，`- 检查结果` 会
+  变成列表、`---` 会变成分割线）。一段还看不出第一句时先不写，它后面的步骤也等着（保持顺序）；下一段（或别的
+  事件）开始时，前一段按已有的文字定下来。
 - 搜索：开始时写「正在搜索：<查询词>」（还不知道查询词时只写「正在搜索」），完成时写「搜索完成」，此前没显示过
   的查询词跟在后面。还没发出的那一行会被后来的进展改写（例如 OpenAI 只在完成时给出查询词，开始与完成落在同一次
   更新里时只写一行「搜索完成：<查询词>」；没有查询词的打开网页等动作这时整行去掉）。
@@ -21,13 +21,13 @@
 **怎么发**（`ProcessPresenter`）：有了第一步才开始过程消息（模型直接回答时用户只看到「正在输入」），第一片
 要等「正在输入」发完；之后按步骤更新，两次更新之间至少隔 `MIN_UPDATE_SECONDS`（流式消息每来一片手机就震一下），
 期间的变化合成一片。回答开始显示时（`make_way()` / `seal()`）结束过程消息：没发出的步骤丢掉，发出结束分片，
-之后的思考与搜索不再展示。插话重来时（`conclude()`）先写一行「收到补充，重新开始」再结束。
+之后的说明与搜索不再展示。插话重来时（`conclude()`）先写一行「收到补充，重新开始」再结束。
 
 **撤回**：回答送达之后，过程消息的第一片发出（交给通道）还不到 `RECALL_WINDOW_SECONDS - RECALL_MARGIN_SECONDS`
 秒、并且配置允许时撤回它（`recall_due()`），相当于折叠；平台只允许撤回 2 分钟内的消息，超过就留着。从第一片
 算起是因为还没有实测过 2 分钟从哪一片算起，这样最保守。撤回失败只记日志。
 
-**存档**：过程的全文（摘要与说明的原文、每次搜索的查询词，含回答开始之后的）由 `ProcessNotes.transcript()`
+**存档**：过程的全文（说明的原文、每次搜索的查询词，含回答开始之后的）由 `ProcessNotes.transcript()`
 给出，存进回复行，只供排查，不进之后的上下文。
 
 **被动回复的次数**（`ReplyBudget`）：平台对同一条消息的被动回复次数有限（官方文档写 4 次；pyqbot 实测「正在
@@ -46,12 +46,12 @@ from enum import StrEnum
 from typing import Protocol
 
 from . import texts
-from .llm import Commentary, SearchProgress, SearchStage, ThoughtSummary
+from .llm import Commentary, SearchProgress, SearchStage
 
 logger = logging.getLogger(__name__)
 
 MAX_STEP_CHARS = 40
-"""一步短句（不含「思考：」这类前缀）最多几个字，超过的截断、末尾加「…」。"""
+"""一步短句（不含「正在搜索：」这类前缀）最多几个字，超过的截断、末尾加「…」。"""
 
 MAX_STEPS = 12
 """一条过程消息最多写几步；再多就写一行「……」，之后的只存档。"""
@@ -74,12 +74,15 @@ MAX_PASSIVE_REPLIES = 4
 MAX_PASSIVE_SENDS = 5
 """同一条消息连同「正在输入」最多被动发几次（pyqbot 实测：「正在输入」加 4 条被接受，再多没有测过）。"""
 
+MAX_TYPINGS = 3
+"""同一条消息最多发几次「正在输入」，免得把被动回复的次数耗在它上面。"""
+
 ANSWER_RESERVE = 2
 """开始过程消息时，要给回答留的被动回复次数：回答本身一条，被拒时改发纯文本或固定说明一条。"""
 
 type Timer = Callable[[], float]
 type Sleep = Callable[[float], Awaitable[None]]
-type ProcessEvent = ThoughtSummary | Commentary | SearchProgress
+type ProcessEvent = Commentary | SearchProgress
 
 
 @dataclass(slots=True)
@@ -98,6 +101,14 @@ class ReplyBudget:
         """再发 `extra` 条被动回复之后，是否还给回答留着 `ANSWER_RESERVE` 次。"""
         replies = self.replies + extra + ANSWER_RESERVE
         return replies <= MAX_PASSIVE_REPLIES and replies + self.typings <= MAX_PASSIVE_SENDS
+
+    def affords_typing(self, *, process: bool = False) -> bool:
+        """还能再发一次「正在输入」：这条消息发过的次数没到 `MAX_TYPINGS`，发完之后仍给回答留着 `ANSWER_RESERVE`
+        次（`process` 为真时再给过程消息留一次）。「正在输入」不算被动回复的条数，但算在 `MAX_PASSIVE_SENDS` 里。"""
+        if self.typings >= MAX_TYPINGS:
+            return False
+        replies = self.replies + ANSWER_RESERVE + (1 if process else 0)
+        return replies <= MAX_PASSIVE_REPLIES and replies + self.typings + 1 <= MAX_PASSIVE_SENDS
 
     def affords_process(self) -> bool:
         """再发一条过程消息之后，是否还给回答留着 `ANSWER_RESERVE` 次。"""
@@ -123,7 +134,7 @@ def shorten(text: str, limit: int = MAX_STEP_CHARS) -> str:
 
 
 def headline(text: str, *, final: bool) -> str | None:
-    """一段思考摘要或说明的标题（开头的 `**标题**`）或第一句，经 `shorten()`。
+    """一段说明的标题（开头的 `**标题**`）或第一句，经 `shorten()`。
 
     还看不出来（标题没闭合、第一句没结束，又还没超过 `MAX_STEP_CHARS`）时：`final` 为假返回 `None`，等更多文字；
     为真（这一段已经结束）时用已有的文字。没有可写的内容时返回空串。
@@ -168,7 +179,6 @@ def _queries(queries: tuple[str, ...]) -> str:
 
 
 class _Kind(StrEnum):
-    THOUGHT = "思考"
     COMMENTARY = "说明"
     SEARCH = "搜索"
 
@@ -182,7 +192,7 @@ class _Step:
 
 @dataclass(slots=True)
 class _Segment:
-    """一段思考摘要或说明。"""
+    """一段说明。"""
 
     kind: _Kind
     text: str = ""
@@ -206,29 +216,19 @@ class ProcessNotes:
         self._taken = 0  # 已经由 take() 交出（不再改动）的步数
         self._last = ""  # take() 交出的最后一行
         self._full = False  # 已经写了「……」
-        self._open: _Segment | None = None  # 还可能接着写的那段摘要或说明
+        self._open: _Segment | None = None  # 还可能接着写的那段说明
         self._segments: dict[tuple[_Kind, str], _Segment] = {}
         self._searches: dict[str, _Search] = {}
         self._archive: list[_Segment | _Search] = []
 
     @property
-    def counts(self) -> tuple[int, int, int]:
-        """（思考摘要的段数，说明的段数，搜索的次数），记日志用。"""
-        thoughts = sum(
-            1 for item in self._archive if isinstance(item, _Segment) and item.kind is _Kind.THOUGHT
-        )
-        commentaries = sum(
-            1
-            for item in self._archive
-            if isinstance(item, _Segment) and item.kind is _Kind.COMMENTARY
-        )
-        return thoughts, commentaries, len(self._searches)
+    def counts(self) -> tuple[int, int]:
+        """（说明的段数，搜索的次数），记日志用。"""
+        return len(self._segments), len(self._searches)
 
     def add(self, event: ProcessEvent, *, display: bool = True) -> bool:
         """记下一个事件；`display` 为假时只存档。返回显示的内容是否可能有了变化。"""
         match event:
-            case ThoughtSummary(segment=segment, text=text):
-                return self._text(_Kind.THOUGHT, segment, text, display)
             case Commentary(segment=segment, text=text):
                 return self._text(_Kind.COMMENTARY, segment, text, display)
             case SearchProgress():
@@ -248,7 +248,7 @@ class ProcessNotes:
         return lines
 
     def transcript(self) -> str:
-        """过程的全文：每段摘要、说明的原文与每次搜索的查询词，按出现的顺序。"""
+        """过程的全文：每段说明的原文与每次搜索的查询词，按出现的顺序。"""
         entries: list[str] = []
         for item in self._archive:
             if isinstance(item, _Segment):
@@ -276,7 +276,7 @@ class ProcessNotes:
         return any(step is self._steps[index] for index in range(self._taken))
 
     def _close_open(self) -> None:
-        """前一段摘要或说明不会再接着写了：还没定下来的那一步按已有的文字定下来。"""
+        """前一段说明不会再接着写了：还没定下来的那一步按已有的文字定下来。"""
         segment, self._open = self._open, None
         if segment is not None and segment.step is not None and segment.step.text is None:
             segment.step.text = self._render(segment, final=True)
@@ -285,8 +285,7 @@ class ProcessNotes:
         found = headline(segment.text, final=final)
         if found is None or not found:
             return found
-        found = escape_line(found)
-        return texts.process_thought(found) if segment.kind is _Kind.THOUGHT else found
+        return escape_line(found)
 
     def _text(self, kind: _Kind, key: str, text: str, display: bool) -> bool:
         segment = self._segments.get((kind, key))
@@ -373,14 +372,14 @@ class ProcessPresenter:
     """一轮回答的过程消息：收事件（`feed()`）、节流地发出步骤、回答开始时结束它，回答送达后由调用方决定撤回。
 
     `open_stream` 在要发第一片时调用，返回 `None` 表示不发过程消息（被动回复的次数不够、这一轮已被插话重来）。
-    `before_first` 是第一片之前要等完的任务（「正在输入」）。发送失败只记日志，过程消息就此停下，不影响回答。
+    `before_first` 是第一片之前要等完的事（「正在输入」发完）。发送失败只记日志，过程消息就此停下，不影响回答。
     """
 
     def __init__(
         self,
         open_stream: Callable[[], ProcessStream | None],
         *,
-        before_first: asyncio.Future[None] | None = None,
+        before_first: Callable[[], Awaitable[None]] | None = None,
         timer: Timer,
         sleep: Sleep = asyncio.sleep,
         interval: float = MIN_UPDATE_SECONDS,
@@ -471,7 +470,7 @@ class ProcessPresenter:
     async def _run(self) -> None:
         try:
             if self._before_first is not None:
-                await asyncio.wait((self._before_first,))
+                await self._before_first()
             while not self.sealed:
                 await self._wake.wait()
                 self._wake.clear()

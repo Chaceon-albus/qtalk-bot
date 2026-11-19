@@ -152,9 +152,8 @@ class ModelSettings:
             里选。OpenAI 的模型不能声明 `audio`（Responses API 不接受音频）。
         search: 调用时带上服务商内置的联网搜索工具（OpenAI 的 `web_search`，Gemini 的 `google_search`）。
             模型不支持或服务商拒绝时按普通的模型调用失败处理（会换备用模型）。
-        show_process: 调用时请求思考摘要（OpenAI 的 `reasoning.summary`，Gemini 的
-            `generation_config.thinking_summaries`），并把处理过程（思考摘要、调用工具前的说明、搜索进展）
-            以单独的一条消息展示给用户，见 `process.py`。
+        show_process: 把处理过程（调用工具前的说明、搜索进展）以单独的一条消息展示给用户，见 `process.py`。
+            不请求思考摘要（用户 2026-11-19 决定：实测里摘要稀疏且总是英文），服务商仍给了也不展示。
     """
 
     name: str

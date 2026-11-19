@@ -1,5 +1,8 @@
-"""按配置创建对话模型、决策模型与写图片描述的模型。每家服务商一个 SDK 客户端（带上 `[providers.<服务商>]` 的端点与代理），
-由用到它的模型共用，`ChatModels.aclose()` 时关闭。"""
+"""按配置创建对话模型、决策模型与写图片描述的模型。每家服务商一个 SDK 客户端（带上 `[providers.<服务商>]` 的
+端点与代理），由用到它的模型共用，`ChatModels.aclose()` 时关闭。
+
+对话模型不请求思考摘要（适配器保留了这个能力）：`[[models]].show_process` 只决定展示调用工具前的说明与搜索
+进展，见 `process.py`。"""
 
 from collections.abc import Iterator, Mapping, Sequence
 from types import TracebackType
@@ -118,7 +121,6 @@ class ChatModels(Mapping[str, ChatModel]):
                     model=settings.model,
                     reasoning=settings.reasoning,
                     search=settings.search,
-                    summaries=settings.show_process,
                 )
             case Provider.GEMINI:
                 return GeminiChatModel(
@@ -127,7 +129,6 @@ class ChatModels(Mapping[str, ChatModel]):
                     model=settings.model,
                     reasoning=settings.reasoning,
                     search=settings.search,
-                    summaries=settings.show_process,
                 )
 
     def _create_decider(self, settings: DecisionSettings) -> DecisionModel:

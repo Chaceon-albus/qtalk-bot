@@ -1320,3 +1320,16 @@ async def test_auth_and_rate_limit_errors_are_not_retried_without_summary(status
 
     assert error.status_code == status
     assert len(server.requests) == 1
+
+
+async def test_rejection_without_a_summary_request_is_not_retried() -> None:
+    def always(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(400, json={"error": {"message": "参数错误"}})
+
+    server = Server(always)
+
+    _, error = await failure(model_on(server))  # 没有请求摘要
+
+    assert error.status_code == 400
+    assert len(server.requests) == 1
+    assert "reasoning" not in json.loads(server.requests[0].content)

@@ -64,7 +64,7 @@ from qtalk_bot.config import (
     ModelSettings,
     TurnSettings,
 )
-from qtalk_bot.conversation import TYPING_SECONDS, Conversation
+from qtalk_bot.conversation import TYPING_PULSE_SECONDS, Conversation
 from qtalk_bot.gate import (
     Delivery,
     FriendAdded,
@@ -906,7 +906,7 @@ async def test_text_message_is_answered_with_a_stream_and_recorded(db: Database)
         {
             "path": f"/v2/users/{ALICE}/messages",
             "msg_type": 6,
-            "input_notify": {"input_type": 1, "input_second": TYPING_SECONDS},
+            "input_notify": {"input_type": 1, "input_second": TYPING_PULSE_SECONDS},
             "msg_id": "ROBOT1.0_fake-1",
             "msg_seq": 1,
         }
