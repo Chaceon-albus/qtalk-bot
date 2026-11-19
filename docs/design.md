@@ -711,7 +711,7 @@ inputs = ["text", "image", "audio", "file"]   # 这个模型能直接接收的�
 
 - OpenAI 的 `phase` 在 `added` 时就有，上面的待定点已解决。
 - OpenAI 的思考摘要很稀疏：不设推理强度时没有，`high` 时也只有一段；说明（`commentary`）在提示词要求下会出现。没有遇到组织验证的拒绝。过程展示对 OpenAI 来说主要是「说明 + 搜索」。
-- 两家的思考摘要标题都是英文。
+- 两家的思考摘要标题都是英文。之后在提示词里要求「思考也用与用户相同的语言、小标题用中文」再测一次：OpenAI 的摘要仍是英文（「Considering tool usage」），Gemini 的也仍是英文（「Analyzing Weather Prediction」），说明摘要的语言不受提示词控制，这句已从提示词里去掉。调用工具前的说明（`commentary`）则听提示词：要求「使用与用户相同的语言」后是中文，如「我先查上海今天和明天的天气，重点看气温、降雨和风力。」「查到了：上海市区两天都预计无雨，周六白天更暖。」
 - Gemini 很爱搜索：一个问题计费 11 次查询（免费额度用完后约 0.15 美元），OpenAI 一般 1–4 次。
 - Gemini 的引用链接都是 `vertexaisearch.cloud.google.com` 的跳转链接，打开后才跳到真正的来源；它们可能有有效期。
 - Gemini 的输入 token 明显偏少：搜索结果占用的 token（`total_tool_use_tokens`）没有计入，用量会低估。

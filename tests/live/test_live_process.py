@@ -89,6 +89,10 @@ async def run(model: ChatModel, chat: ChatRequest) -> None:
     for index, text in enumerate(thoughts.values(), 1):
         preview = " ".join(text.split())[:PREVIEW_CHARS]
         print(f"  摘要 {index}：{preview}")  # noqa: T201
+    # 问题是固定的、不含用户数据，打印说明的开头是为了核对它用的是什么语言。
+    for index, text in enumerate(commentaries.values(), 1):
+        preview = " ".join(text.split())[:PREVIEW_CHARS]
+        print(f"  说明 {index}：{preview}")  # noqa: T201
     assert finished is not None
 
 
@@ -99,8 +103,15 @@ async def test_openai_process() -> None:
     client = create_openai_client(key)
     try:
         name = os.environ.get("QTALK_LIVE_OPENAI_MODEL", "gpt-6.2-sol")
+        # 推理强度不设时 gpt-6.2-sol 几乎不给摘要（2026-11-19 实测），默认按 high 测。
+        reasoning = os.environ.get("QTALK_LIVE_OPENAI_REASONING", "high")
         model = OpenAIChatModel(
-            client, name=f"openai:{name}", model=name, search=True, summaries=True
+            client,
+            name=f"openai:{name}",
+            model=name,
+            reasoning=reasoning,
+            search=True,
+            summaries=True,
         )
         await run(model, request(preamble=True))
     finally:
