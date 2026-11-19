@@ -13,6 +13,7 @@ from qtalk_bot.process import (
     MAX_STEPS,
     MAX_TYPINGS,
     MIN_UPDATE_SECONDS,
+    Piece,
     ProcessNotes,
     ProcessPresenter,
     ProcessSendError,
@@ -73,80 +74,163 @@ def comment(segment: str, text: str) -> Commentary:
     return Commentary(segment, text)
 
 
+def joined(text: str) -> Piece:
+    return Piece(text, joined=True)
+
+
 def test_steps_are_ordered_and_wait_for_an_undetermined_comment() -> None:
     notes = ProcessNotes()
     notes.add(comment("r#0", "**比较两个"))
     assert notes.take() == []  # 标题还没写完
     notes.add(comment("r#0", "方案的开销**\n\n细节"))
-    assert notes.take() == ["比较两个方案的开销"]
+    assert notes.take() == [Piece("比较两个方案的开销")]
     notes.add(comment("r#1", "这一段没有句末"))
     notes.add(
         Commentary("m#0", "我先查一下上海今天的天气。")
     )  # 新的一段开始：前一段按已有的文字定下来
-    assert notes.take() == ["这一段没有句末", "我先查一下上海今天的天气"]
+    assert notes.take() == [Piece("这一段没有句末"), Piece("我先查一下上海今天的天气")]
 
 
-def test_search_lines_merge_until_they_are_taken() -> None:
+def test_search_start_and_completion_merge_into_one_line() -> None:
     notes = ProcessNotes()
-    # Gemini：开始时没有查询词，增量里给出，还没交出的那一行被改写。
-    notes.add(SearchProgress("g1", STARTED))
-    notes.add(SearchProgress("g1", UPDATED, ("上海天气",)))
-    assert notes.take() == ["正在搜索：上海天气"]
-    notes.add(SearchProgress("g1", COMPLETED, ("上海天气",)))
-    assert notes.take() == ["搜索完成"]
-    # OpenAI：查询词只在完成时给出；开始与完成落在同一次更新里时合成一行。
+    # OpenAI：查询词只在完成时给出；开始与完成落在同一次更新里时只写一行。
     notes.add(SearchProgress("o1", STARTED))
     notes.add(SearchProgress("o1", COMPLETED, ("明天 上海 天气",)))
-    assert notes.take() == ["搜索完成：明天 上海 天气"]
-    # 开始那一行已经交出：完成时补上没显示过的查询词。
-    notes.add(SearchProgress("o2", STARTED))
-    assert notes.take() == ["正在搜索"]
-    notes.add(SearchProgress("o2", COMPLETED, ("空气质量",)))
-    assert notes.take() == ["搜索完成：空气质量"]
-    # 没有查询词的动作（打开网页）在同一次更新里开始又完成：整行去掉。
-    notes.add(SearchProgress("o3", STARTED))
-    notes.add(SearchProgress("o3", COMPLETED))
+    assert notes.take() == [Piece("正在搜索🔍 明天 上海 天气")]
+    # Gemini：开始时没有查询词，这一行发出之前就有了增量。
+    notes.add(SearchProgress("g1", STARTED))
+    notes.add(SearchProgress("g1", UPDATED, ("上海 今天 天气", "上海 明天 天气")))
+    assert notes.take() == [Piece("正在搜索🔍 上海 今天 天气、上海 明天 天气")]
+    notes.add(SearchProgress("g1", COMPLETED, ("上海 今天 天气", "上海 明天 天气")))
+    assert notes.take() == []  # 不写「搜索完成」
+
+
+def test_queries_learned_after_the_line_is_sent_are_appended() -> None:
+    notes = ProcessNotes()
+    notes.add(SearchProgress("o1", STARTED))
+    assert notes.take() == [Piece("正在搜索🔍")]
+    notes.add(comment("m#0", "接着看"))  # 还看不出写什么：没发出，搜索的那一行仍是最后发出的
+    notes.add(SearchProgress("o1", COMPLETED, ("空气质量",)))
+    notes.add(comment("m#1", "最后一段。"))
+    # 接在行末的先交出，再是新的行。
+    assert notes.take() == [joined(" 空气质量"), Piece("接着看"), Piece("最后一段")]
+
+
+def test_gemini_updates_keep_appending_to_the_same_line() -> None:
+    notes = ProcessNotes()
+    notes.add(SearchProgress("g1", STARTED))
+    assert notes.take() == [Piece("正在搜索🔍")]
+    assert notes.add(SearchProgress("g1", UPDATED, ("上海 今天 天气",)))
+    assert notes.take() == [joined(" 上海 今天 天气")]
+    notes.add(SearchProgress("g1", UPDATED, ("上海 今天 天气", "上海 明天 天气")))
+    notes.add(SearchProgress("g1", UPDATED, ("上海 今天 天气", "上海 明天 天气", "风力")))
+    assert notes.take() == [joined("、上海 明天 天气、风力")]
+    assert not notes.add(
+        SearchProgress("g1", COMPLETED, ("上海 今天 天气", "上海 明天 天气", "风力"))
+    )
     assert notes.take() == []
 
 
-def test_identical_consecutive_lines_and_the_step_limit() -> None:
+def test_queries_after_other_lines_start_a_new_line() -> None:
+    notes = ProcessNotes()
+    notes.add(SearchProgress("g1", STARTED, ("上海天气",)))
+    assert notes.take() == [Piece("正在搜索🔍 上海天气")]
+    notes.add(comment("m#0", "顺便看看空气。"))
+    assert notes.take() == [Piece("顺便看看空气")]
+    notes.add(SearchProgress("g1", UPDATED, ("上海天气", "空气质量")))
+    assert notes.take() == [Piece("正在搜索🔍 空气质量")]  # 退路：另起一行，只写新的查询词
+    notes.add(SearchProgress("g1", COMPLETED, ("上海天气", "空气质量", "风力")))
+    assert notes.take() == [joined("、风力")]  # 新的那一行是最后发出的：接在它后面
+
+
+def test_completion_without_new_queries_appends_nothing() -> None:
+    notes = ProcessNotes()
+    notes.add(SearchProgress("s", STARTED, ("上海天气",)))
+    assert notes.take() == [Piece("正在搜索🔍 上海天气")]
+    assert not notes.add(SearchProgress("s", COMPLETED, ("上海天气",)))
+    assert notes.take() == []
+    notes.add(SearchProgress("t", STARTED))
+    assert notes.take() == [Piece("正在搜索🔍")]
+    assert not notes.add(SearchProgress("t", COMPLETED))  # 打开网页等：始终没有查询词
+    assert notes.take() == []
+
+
+def test_completion_that_settles_a_pending_comment_asks_to_send() -> None:
+    # 搜索行已发出，接着一段还没写完第一句的说明；搜索完成时没有新的查询词，但那段说明因此定了下来，要唤醒发送。
+    notes = ProcessNotes()
+    notes.add(SearchProgress("s", STARTED, ("上海天气",)))
+    assert notes.take() == [Piece("正在搜索🔍 上海天气")]
+    assert not notes.add(comment("m#0", "再看看风力"))  # 第一句还没结束：先不写
+    assert notes.add(SearchProgress("s", COMPLETED, ("上海天气",)))
+    assert notes.take() == [Piece("再看看风力")]
+
+
+def test_new_comment_that_settles_the_previous_one_asks_to_send() -> None:
+    notes = ProcessNotes()
+    assert not notes.add(comment("m#0", "先查天气"))
+    assert notes.add(comment("m#1", "然后"))  # 新的一段还看不出写什么，但前一段定了下来
+    assert notes.take() == [Piece("先查天气")]
+
+
+def test_unsent_search_without_queries_is_dropped() -> None:
+    notes = ProcessNotes()
+    notes.add(comment("m#0", "先打开网页。"))
+    notes.add(SearchProgress("o1", STARTED))
+    notes.add(SearchProgress("o1", COMPLETED))
+    notes.add(comment("m#1", "再找找关键字。"))
+    assert notes.take() == [Piece("先打开网页"), Piece("再找找关键字")]
+
+
+def test_identical_consecutive_lines_share_the_line() -> None:
     notes = ProcessNotes()
     notes.add(SearchProgress("a", STARTED))
-    assert notes.take() == ["正在搜索"]
     notes.add(SearchProgress("b", STARTED))
-    assert notes.take() == []  # 与上一行相同
+    assert notes.take() == [Piece("正在搜索🔍")]  # 与上一行相同：不重复写
+    notes.add(SearchProgress("b", COMPLETED, ("上海天气",)))
+    notes.add(SearchProgress("a", COMPLETED, ("北京天气",)))
+    assert render(notes.take(), first=False) == " 上海天气、北京天气"
+
+
+def test_step_limit_counts_lines_only() -> None:
+    notes = ProcessNotes()
+    notes.add(SearchProgress("g", STARTED))
+    queries: tuple[str, ...] = ()
+    pieces = notes.take()
     for index in range(MAX_STEPS + 5):
+        queries = (*queries, f"词{index}")
+        notes.add(SearchProgress("g", UPDATED, queries))
+        pieces += notes.take()
+    assert all(piece.joined for piece in pieces[1:])  # 接在行末的不算行
+    for index in range(MAX_STEPS - 1):
         notes.add(Commentary(f"m#{index}", f"第 {index} 步。"))
     lines = notes.take()
-    assert lines[-1] == "……"
-    assert len(lines) == MAX_STEPS - 1  # 两次搜索占了两步（第二步没有重复写出）
-
-
-def test_dynamic_text_is_escaped() -> None:
-    notes = ProcessNotes()
-    notes.add(comment("r#0", "**看 [链接](不是网址) 与 *强调***"))
-    notes.add(SearchProgress("s", STARTED, ("a_b`c",)))
-    assert notes.take() == ["看 ［链接］（不是网址） 与 强调", r"正在搜索：a\_bc"]
+    assert len(lines) == MAX_STEPS - 1
+    assert lines[-1] == Piece(f"第 {MAX_STEPS - 2} 步")
+    notes.add(Commentary("m#x", "再一步。"))
+    notes.add(Commentary("m#y", "又一步。"))
+    assert notes.take() == [Piece("……")]
 
 
 @pytest.mark.parametrize(
     ("text", "line"),
     [
-        ("- 检查结果。", r"\- 检查结果"),
-        ("+ 加上一项。", r"\+ 加上一项"),
-        ("---", r"\---"),
-        ("- - -", r"\- - -"),
-        ("1. 第一步。", r"1\. 第一步"),
-        ("2) 第二步。", "2） 第二步"),  # 半角括号本来就换成全角，不再是列表标记
-        ("=== 标题线", r"\=== 标题线"),
+        ("- 检查结果。", "- 检查结果"),
+        ("+ 加上一项。", "+ 加上一项"),
+        ("---", "---"),
+        ("1. 第一步。", "1. 第一步"),
+        ("2) 第二步。", "2) 第二步"),
+        ("**看 [链接](不是网址) 与 *强调***", "看 [链接](不是网址) 与 强调"),
+        ("> 引用的一句。", "引用的一句"),
         ("普通的一句。", "普通的一句"),
     ],
 )
-def test_block_markers_at_the_start_of_a_step_are_escaped(text: str, line: str) -> None:
+def test_steps_are_plain_text_without_escaping(text: str, line: str) -> None:
     notes = ProcessNotes()
     notes.add(Commentary("m#0", text))
-    notes.add(SearchProgress("s", STARTED, ("- 查询",)))
-    assert notes.take() == [line, r"正在搜索：\- 查询"]
+    notes.add(SearchProgress("s", STARTED, ("- a_b`c",)))
+    shown = render(notes.take(), first=True)
+    assert shown == f"{line}\n正在搜索🔍 - a_bc"
+    assert "\\" not in shown
 
 
 def test_transcript_keeps_everything_and_display_can_be_off() -> None:
@@ -163,10 +247,11 @@ def test_transcript_keeps_everything_and_display_can_be_off() -> None:
     assert notes.counts == (2, 2)
 
 
-def test_render_puts_each_step_in_its_own_quote_paragraph() -> None:
-    first = render(["比较两个方案的开销", "正在搜索：上海天气"], first=True)
-    assert first == "> 比较两个方案的开销\n>\n> 正在搜索：上海天气"
-    assert render(["搜索完成"], first=False) == "\n>\n> 搜索完成"
+def test_render_puts_each_line_after_a_single_newline() -> None:
+    first = render([Piece("比较两个方案的开销"), Piece("正在搜索🔍")], first=True)
+    assert first == "比较两个方案的开销\n正在搜索🔍"
+    assert render([joined(" 上海天气"), Piece("整理结果")], first=False) == " 上海天气\n整理结果"
+    assert render([Piece("整理结果")], first=False) == "\n整理结果"
 
 
 # ---- 发送 ----
@@ -225,7 +310,7 @@ async def test_updates_are_throttled_and_merged() -> None:
     shown, _ = presenter(clock, stream)
     shown.feed(SearchProgress("s", STARTED, ("上海天气",)), show=True)
     await settle()
-    assert stream.chunks == ["> 正在搜索：上海天气"]
+    assert stream.chunks == ["正在搜索🔍 上海天气"]
     assert shown.opened_at == 0.0
     # 间隔之内的变化先攒着，到点合成一片。
     await clock.advance_to(0.5)
@@ -234,10 +319,25 @@ async def test_updates_are_throttled_and_merged() -> None:
     await settle()
     assert len(stream.chunks) == 1
     await clock.advance_to(MIN_UPDATE_SECONDS)
-    assert stream.chunks[1:] == ["\n>\n> 搜索完成\n>\n> 比较两个方案的开销"]
+    assert stream.chunks[1:] == ["\n比较两个方案的开销"]  # 完成时没有新的查询词
     shown.seal()
     await shown.settle()
     assert stream.finished == 1
+
+
+async def test_queries_known_later_are_appended_in_a_later_chunk() -> None:
+    clock = ManualClock()
+    stream = FakeStream()
+    shown, _ = presenter(clock, stream)
+    shown.feed(SearchProgress("s", STARTED), show=True)
+    await settle()
+    assert stream.chunks == ["正在搜索🔍"]
+    shown.feed(SearchProgress("s", COMPLETED, ("上海 今天 天气",)), show=True)
+    await clock.advance_to(MIN_UPDATE_SECONDS)
+    assert stream.chunks == ["正在搜索🔍", " 上海 今天 天气"]
+    shown.seal()
+    await shown.settle()
+    assert "".join(stream.chunks) == "正在搜索🔍 上海 今天 天气"
 
 
 async def test_nothing_to_show_opens_no_message() -> None:
@@ -266,7 +366,7 @@ async def test_the_first_chunk_waits_for_typing_and_may_be_refused() -> None:
     assert stream.chunks == []
     typing.set_result(None)
     await settle()
-    assert stream.chunks == ["> 正在搜索"]
+    assert stream.chunks == ["正在搜索🔍"]
 
     refused, opener = presenter(clock, None)  # 被动回复的次数不够等
     refused.feed(SearchProgress("s", STARTED), show=True)
@@ -288,11 +388,11 @@ async def test_answer_ends_the_process_and_later_steps_are_not_shown() -> None:
         await shown.make_way()
         shown.seal()
         await shown.settle()
-    assert stream.chunks == ["> 正在搜索：q"]  # 没发出的步骤丢掉
+    assert stream.chunks == ["正在搜索🔍 q"]  # 没发出的步骤丢掉
     assert stream.finished == 1
     shown.feed(comment("r#9", "**回答之后的思考**"), show=True)
     await clock.advance_to(100)
-    assert stream.chunks == ["> 正在搜索：q"]
+    assert stream.chunks == ["正在搜索🔍 q"]
     assert "回答之后的思考" in shown.notes.transcript()
 
 
@@ -311,7 +411,7 @@ async def test_answer_waits_for_the_first_process_chunk_in_flight() -> None:
         await waiting
         shown.seal()
         await shown.settle()
-    assert stream.chunks == ["> 正在搜索"]
+    assert stream.chunks == ["正在搜索🔍"]
     assert stream.finished == 1
 
 
@@ -323,7 +423,7 @@ async def test_conclude_writes_the_restart_line_only_when_something_was_shown() 
     await settle()
     async with asyncio.timeout(HANG_GUARD):
         await shown.conclude("收到补充，重新开始")
-    assert stream.chunks == ["> 想想", "\n>\n> 收到补充，重新开始"]
+    assert stream.chunks == ["想想", "\n收到补充，重新开始"]
     assert stream.finished == 1
 
     quiet, opener = presenter(clock, FakeStream())

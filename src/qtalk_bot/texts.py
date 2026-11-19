@@ -95,18 +95,10 @@ REPLY_CUT_SHORT = "（回复没有写完就停下了，可以让我接着说。�
 
 REPLY_REJECTED = "抱歉，这条回复没能通过平台的审核，发不出来。换个说法再问问看？"
 
-# ---- 处理过程（`process.py`；每一行放在 Markdown 引用块里，动态内容已转义） ----
+# ---- 处理过程（`process.py`；纯文本的流式消息，每步一行，动态内容不转义） ----
 
-
-def process_searching(queries: str) -> str:
-    """一次搜索开始或得知了查询词；`queries` 为空时还不知道查询词。"""
-    return f"正在搜索：{queries}" if queries else "正在搜索"
-
-
-def process_searched(queries: str) -> str:
-    """一次搜索完成；`queries` 是之前还没显示过的查询词，为空时只说完成了。"""
-    return f"搜索完成：{queries}" if queries else "搜索完成"
-
+PROCESS_SEARCHING = "正在搜索🔍"
+"""一次搜索那一行的开头；得知查询词后接一个空格和查询词，多个查询词之间用「、」。"""
 
 PROCESS_MORE = "……"
 """步骤太多、之后的不再显示时的最后一行。"""

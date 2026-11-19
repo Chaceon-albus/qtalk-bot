@@ -496,7 +496,8 @@ class _QQReplyChannel:
 
 
 class _QQProcessStream:
-    """过程消息：另一条被动回复的流式消息（`coalesce=False`），符合 `conversation.ReplyStream`。
+    """过程消息：另一条被动回复的流式消息（`coalesce=False`），符合 `conversation.ReplyStream`。用纯文本发
+    （`markdown=False`）：Markdown 的流式消息还没结束时，客户端把引用的 `>` 原样显示出来。
 
     pyqbot 实测（`docs/errata.md`）：同一条用户消息可以先后被动回复两条流式消息，两条都正常显示、正常结束；流式
     消息撤回不了，所以过程消息结束后就留着。
@@ -508,7 +509,7 @@ class _QQProcessStream:
 
     async def append(self, text: str) -> None:
         if self._stream is None:
-            self._stream = self._message.reply_stream(coalesce=False)
+            self._stream = self._message.reply_stream(coalesce=False, markdown=False)
         await _guarded(self._stream.append(text))
 
     async def finish(self) -> None:

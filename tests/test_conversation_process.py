@@ -152,7 +152,7 @@ def steps(gate: asyncio.Event, reached: asyncio.Event) -> list[Step]:
     ]
 
 
-EXPECTED_PROCESS = "> 我先查一下上海今天的天气\n>\n> 搜索完成：上海天气"
+EXPECTED_PROCESS = "我先查一下上海今天的天气\n正在搜索🔍 上海天气"
 
 
 async def process_column(db: Database) -> list[str | None]:
@@ -304,12 +304,12 @@ async def test_updates_after_the_first_are_throttled(db: Database) -> None:
     await wait_for(lambda: bool(channel.process_text))
     shown_first.set()
     await settle()
-    assert channel.process_text == "> 正在搜索：上海天气"  # 还在间隔之内：攒着
+    assert channel.process_text == "正在搜索🔍 上海天气"  # 还在间隔之内：攒着
     await clock.advance_to(MIN_UPDATE_SECONDS)
     await wait_for(lambda: "整理结果" in channel.process_text)
     assert [text for kind, text in channel.log if kind == "process"] == [
-        "> 正在搜索：上海天气",
-        "\n>\n> 搜索完成\n>\n> 整理结果",
+        "正在搜索🔍 上海天气",
+        "\n整理结果",  # 完成时没有新的查询词：什么也不接
     ]
     gate.set()
     async with asyncio.timeout(HANG_GUARD):
@@ -379,11 +379,11 @@ async def test_steer_while_only_the_process_is_shown_restarts_with_a_new_process
     # 旧的过程消息写上收尾的一行后结束，之后和新的一样留着。
     assert first.log == [
         ("typing", ""),
-        ("process", "> 想想怎么排序"),
-        ("process", "\n>\n> 收到补充，重新开始"),
+        ("process", "想想怎么排序"),
+        ("process", "\n收到补充，重新开始"),
         ("process_finish", ""),
     ]
-    assert second.process_text == "> 想想怎么排序"  # 重来的那一轮另起一条
+    assert second.process_text == "想想怎么排序"  # 重来的那一轮另起一条
     assert second.streamed == "合起来的回答"
     assert "process_finish" in second.kinds
     assert first.budget == ReplyBudget(typings=1, replies=1)
@@ -414,7 +414,7 @@ async def test_steer_after_the_answer_started_does_not_restart(db: Database) -> 
     await finish(batcher)
 
     assert decider.requests == []  # 回答已经开始显示：不判断，排到下一轮
-    assert first.process_text == "> 想想"
+    assert first.process_text == "想想"
     assert "收到补充" not in first.process_text
     assert first.streamed == "开头结尾"
 
@@ -445,7 +445,7 @@ async def test_steer_is_still_possible_while_the_first_process_chunk_is_in_fligh
 
     assert len(decider.requests) == 1
     assert first.streamed == ""  # 被重来的那次没有发出任何正文
-    assert ("process", "\n>\n> 收到补充，重新开始") in first.log
+    assert ("process", "\n收到补充，重新开始") in first.log
     assert second.streamed == "答案"
 
 
@@ -727,7 +727,7 @@ async def test_pulses_keep_room_for_the_process_of_a_later_fallback(db: Database
     shown_gate.set()
     async with asyncio.timeout(HANG_GUARD):
         await task
-    assert channel.process_text == "> 我先查一下"
+    assert channel.process_text == "我先查一下"
     assert typings(channel) == 1
     assert channel.streamed == "备用的回答"
 

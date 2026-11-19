@@ -1029,7 +1029,9 @@ async def test_process_is_a_separate_stream_that_is_kept(db: Database) -> None:
 
     process = [chunk for chunk in platform.streamed if chunk["msg_seq"] == 2]
     answer = [chunk for chunk in platform.streamed if chunk["msg_seq"] == 3]
-    assert [chunk["content_raw"] for chunk in process] == ["> 正在搜索：上海天气", ""]
+    assert [chunk["content_raw"] for chunk in process] == ["正在搜索🔍 上海天气", ""]
+    assert {chunk["content_type"] for chunk in process} == {"text"}  # 过程消息用纯文本发
+    assert {chunk["content_type"] for chunk in answer} == {"markdown"}
     assert process[-1]["input_state"] == 10  # 过程消息另有结束分片
     assert "".join(chunk["content_raw"] for chunk in answer) == "你好，我是助手。"
     assert platform.recalled == []  # 过程消息留着（QQ 的流式消息撤回不了）

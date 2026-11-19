@@ -6,22 +6,28 @@
 搜索进展（`SearchProgress`）。思考摘要不展示、不存档，也不请求（用户 2026-11-19 决定：实测里摘要很稀疏、而且
 总是英文）；模型只是在思考、还没有内容可显示时，靠「正在输入」提示用户（见 `conversation.py` 的补发）。
 
-**写什么**（`ProcessNotes`）：只写步骤级的短句，每步一行，放在 Markdown 引用块里。QQ 的流式消息只能往后追加、
-不能改已经发出的部分，所以每一步一旦发出就不再变，之后的变化另起一行：
+**写什么**（`ProcessNotes`）：只写步骤级的短句，每步一行，纯文本。QQ 的流式消息只能往后追加、不能改已经发出的
+部分，所以发出的文字就不再变，之后的变化要么接在最后一行的末尾，要么另起一行：
 
 - 说明的每一段写一行：取开头的 `**标题**`，没有标题时取第一句，截到 `MAX_STEP_CHARS` 个字，去掉 Markdown 的
-  强调与代码标记，再经 `escape_line()`（行内的转义加上行首的块标记：每一步都在引用块的行首，`- 检查结果` 会
-  变成列表、`---` 会变成分割线）。一段还看不出第一句时先不写，它后面的步骤也等着（保持顺序）；下一段（或别的
-  事件）开始时，前一段按已有的文字定下来。
-- 搜索：开始时写「正在搜索：<查询词>」（还不知道查询词时只写「正在搜索」），完成时写「搜索完成」，此前没显示过
-  的查询词跟在后面。还没发出的那一行会被后来的进展改写（例如 OpenAI 只在完成时给出查询词，开始与完成落在同一次
-  更新里时只写一行「搜索完成：<查询词>」；没有查询词的打开网页等动作这时整行去掉）。
-- 与上一行完全相同的不重复写；最多 `MAX_STEPS` 步，之后写一行「……」就不再增加。
+  强调与代码标记（模型的说明里常带 `**标题**`，纯文本里星号会原样显示）。一段还看不出第一句时先不写，它后面
+  的步骤也等着（保持顺序）；下一段（或别的事件）开始时，前一段按已有的文字定下来。
+- 搜索写成一行，像进度条一样往后接：开始时另起一行「正在搜索🔍」，得知查询词后在同一行接一个空格和查询词，多个
+  查询词之间用「、」。这一行发出之前就知道的查询词直接写进去（开始与完成落在同一次更新里，或者 Gemini 先给了
+  增量）；发出之后才知道的（OpenAI 只在完成时给出，Gemini 可能在中途更新），这一行仍是最后发出的内容时接在
+  它后面（第一次是「 查询词」，之后是「、新查询词」），之后已经发出过别的内容时另起一行「正在搜索🔍 新查询词」。
+  不写「搜索完成」：完成时没有新的查询词就什么也不接。还没发出就完成、又始终没有查询词的动作（OpenAI 的打开网页
+  等）整行去掉。每次写出的查询词经 `shorten()` 截断，已经写过的不再写。
+- 与上一行完全相同的不重复写；最多 `MAX_STEPS` 行，之后写一行「……」就不再增加。接在行末的文字不算行。
 
-**怎么发**（`ProcessPresenter`）：有了第一步才开始过程消息（模型直接回答时用户只看到「正在输入」），第一片
-要等「正在输入」发完；之后按步骤更新，两次更新之间至少隔 `MIN_UPDATE_SECONDS`（流式消息每来一片手机就震一下），
-期间的变化合成一片。回答开始显示时（`make_way()` / `seal()`）结束过程消息：没发出的步骤丢掉，发出结束分片，
-之后的说明与搜索不再展示。插话重来时（`conclude()`）先写一行「收到补充，重新开始」再结束。
+**怎么发**（`ProcessPresenter`）：用纯文本的流式消息（`content_type=text`，pyqbot 实测按原文显示）。不用
+Markdown 引用块：流式消息还没结束时客户端把 `>` 原样显示出来，而过程消息要一直开着到回答开始。因此动态内容
+不做 Markdown 转义（反斜杠也会原样显示）。每步一行，行与行之间只有一个换行，第一片开头没有换行。
+
+有了第一步才开始过程消息（模型直接回答时用户只看到「正在输入」），第一片要等「正在输入」发完；之后按步骤
+更新，两次更新之间至少隔 `MIN_UPDATE_SECONDS`（流式消息每来一片手机就震一下），期间的变化合成一片。回答开始
+显示时（`make_way()` / `seal()`）结束过程消息：没发出的步骤丢掉，发出结束分片，之后的说明与搜索不再展示。
+插话重来时（`conclude()`）先另起一行「收到补充，重新开始」再结束。
 
 **留着**：过程消息结束之后一直留着，不撤回。QQ 的流式消息撤回不了：pyqbot 实测（`docs/errata.md`）传
 `stream_msg_id` 报 40061001、传 `ref_idx` 报 40011002，都在发出后两分钟内；用户 2026-11-19 决定留着。
@@ -50,10 +56,10 @@ from .llm import Commentary, SearchProgress, SearchStage
 logger = logging.getLogger(__name__)
 
 MAX_STEP_CHARS = 40
-"""一步短句（不含「正在搜索：」这类前缀）最多几个字，超过的截断、末尾加「…」。"""
+"""一步短句（不含「正在搜索🔍」这类前缀；搜索时指每次写出的查询词串）最多几个字，超过的截断、末尾加「…」。"""
 
 MAX_STEPS = 12
-"""一条过程消息最多写几步；再多就写一行「……」，之后的只存档。"""
+"""一条过程消息最多写几行（接在行末的文字不算）；再多就写一行「……」，之后的只存档。"""
 
 MIN_UPDATE_SECONDS = 2.0
 """过程消息两次更新之间的最短间隔（秒），期间的变化合成一片。"""
@@ -147,25 +153,27 @@ def headline(text: str, *, final: bool) -> str | None:
     return None
 
 
-_BLOCK_START = re.compile(r"(?P<mark>[-+#>*=_~|])|(?P<digits>[0-9]{1,9})(?P<dot>[.)])")
-
-
-def escape_line(text: str) -> str:
-    """把一步短句变成引用块里一行普通的文字：`texts.escape_markdown()`（行内的标记、换行），再转义行首的块标记：
-    `-`、`+`、`#`、`>` 等前面加反斜杠（只由 `-`、`*`、`_` 组成的分割线也因此失效），`1.`、`1)` 这类有序列表
-    标记转义其中的点或括号。"""
-    text = texts.escape_markdown(text)
-    match = _BLOCK_START.match(text)
-    if match is None:
-        return text
-    if match.group("mark") is not None:
-        return "\\" + text
-    return f"{match.group('digits')}\\{match.group('dot')}{text[match.end() :]}"
-
-
 def _queries(queries: tuple[str, ...]) -> str:
-    """查询词写成一段：用「、」连起来，经 `shorten()` 与 `escape_line()`。"""
-    return escape_line(shorten("、".join(queries)))
+    """查询词写成一串：用「、」连起来，经 `shorten()`。"""
+    return shorten("、".join(queries))
+
+
+def _searching(queries: tuple[str, ...]) -> str:
+    """搜索的一行：「正在搜索🔍」，有查询词时接一个空格和查询词。"""
+    return f"{texts.PROCESS_SEARCHING} {_queries(queries)}" if queries else texts.PROCESS_SEARCHING
+
+
+@dataclass(frozen=True, slots=True)
+class Piece:
+    """过程消息里的一段文字。
+
+    Attributes:
+        text: 文字，不含换行。
+        joined: 为真时接在上一行的末尾；为假时另起一行。
+    """
+
+    text: str
+    joined: bool = False
 
 
 class _Kind(StrEnum):
@@ -173,11 +181,17 @@ class _Kind(StrEnum):
     SEARCH = "搜索"
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class _Step:
-    """要显示的一步。`text` 为 `None` 时还看不出写什么，为空串时不写。"""
+    """要显示的一行。`text` 为 `None` 时还看不出写什么，为空串时不写。"""
 
     text: str | None
+    line: _Step | None = field(default=None, repr=False)
+    """交出之后显示在哪一行：写出时是自己，与上一行相同而没写时是上一行，没写时为 None。"""
+    tail: str = ""
+    """已经定下、还没交出的、要接在这一行末尾的文字。"""
+    queried: bool = False
+    """搜索的一行已经写了查询词：再接时用「、」，否则用空格。"""
 
 
 @dataclass(slots=True)
@@ -186,7 +200,7 @@ class _Segment:
 
     kind: _Kind
     text: str = ""
-    step: _Step | None = None  # 显示用的一步；不显示（超出步数、不展示）时为 None
+    step: _Step | None = None  # 显示用的一行；不显示（超出行数、不展示）时为 None
 
 
 @dataclass(slots=True)
@@ -194,8 +208,11 @@ class _Search:
     """一次搜索。"""
 
     queries: tuple[str, ...] = ()
-    step: _Step | None = None  # 开始时写的那一步
-    displayed: set[str] = field(default_factory=set[str])  # 已经写进某一步的查询词
+    step: _Step | None = None  # 这次搜索当前的那一行（另起一行的退路之后是新的那一行）
+    before: set[str] = field(default_factory=set[str])  # `step` 那一行开始之前已经写过的查询词
+    displayed: set[str] = field(
+        default_factory=set[str]
+    )  # 已经写进某一行（含未交出的那一行）的查询词
 
 
 class ProcessNotes:
@@ -203,8 +220,9 @@ class ProcessNotes:
 
     def __init__(self) -> None:
         self._steps: list[_Step] = []
-        self._taken = 0  # 已经由 take() 交出（不再改动）的步数
-        self._last = ""  # take() 交出的最后一行
+        self._taken = 0  # 已经由 take() 交出（不再改动）的行数
+        self._line: _Step | None = None  # take() 交出的最后一行
+        self._last = ""  # 这一行已经交出的全部文字（含接在末尾的）
         self._full = False  # 已经写了「……」
         self._open: _Segment | None = None  # 还可能接着写的那段说明
         self._segments: dict[tuple[_Kind, str], _Segment] = {}
@@ -224,18 +242,30 @@ class ProcessNotes:
             case SearchProgress():
                 return self._search(event, display)
 
-    def take(self) -> list[str]:
-        """交出已经能确定的新步骤（按顺序，遇到还看不出写什么的一步就停），交出的不再改动。"""
-        lines: list[str] = []
+    def take(self) -> list[Piece]:
+        """交出已经能确定的新内容：先是要接在上一行末尾的文字，再是新的行（按顺序，遇到还看不出写什么的一行
+        就停）。交出的不再改动。"""
+        pieces: list[Piece] = []
+        line = self._line
+        if line is not None and line.tail:
+            pieces.append(Piece(line.tail, joined=True))
+            self._last += line.tail
+            line.tail = ""
         while self._taken < len(self._steps):
-            text = self._steps[self._taken].text
+            step = self._steps[self._taken]
+            text = step.text
             if text is None:
                 break
             self._taken += 1
-            if text and text != self._last:
-                lines.append(text)
-                self._last = text
-        return lines
+            if not text:
+                continue
+            if text == self._last:
+                step.line = self._line
+                continue
+            pieces.append(Piece(text))
+            step.line = self._line = step
+            self._last = text
+        return pieces
 
     def transcript(self) -> str:
         """过程的全文：每段说明的原文与每次搜索的查询词，按出现的顺序。"""
@@ -265,22 +295,20 @@ class ProcessNotes:
     def _shown(self, step: _Step) -> bool:
         return any(step is self._steps[index] for index in range(self._taken))
 
-    def _close_open(self) -> None:
-        """前一段说明不会再接着写了：还没定下来的那一步按已有的文字定下来。"""
+    def _close_open(self) -> bool:
+        """前一段说明不会再接着写了：还没定下来的那一行按已有的文字定下来。定下了一行时返回 `True`（显示的内容
+        可能有了变化，要唤醒发送）。"""
         segment, self._open = self._open, None
         if segment is not None and segment.step is not None and segment.step.text is None:
-            segment.step.text = self._render(segment, final=True)
-
-    def _render(self, segment: _Segment, *, final: bool) -> str | None:
-        found = headline(segment.text, final=final)
-        if found is None or not found:
-            return found
-        return escape_line(found)
+            segment.step.text = headline(segment.text, final=True)
+            return True
+        return False
 
     def _text(self, kind: _Kind, key: str, text: str, display: bool) -> bool:
         segment = self._segments.get((kind, key))
+        closed = False  # 前一段说明因此定了下来
         if segment is None:
-            self._close_open()
+            closed = self._close_open()
             segment = self._segments[(kind, key)] = _Segment(kind)
             self._archive.append(segment)
             if display:
@@ -288,45 +316,49 @@ class ProcessNotes:
             self._open = segment
         segment.text += text
         if segment is not self._open or segment.step is None or segment.step.text is not None:
-            return False  # 已经定下来的不再改（之后补发的部分只存档）
-        segment.step.text = self._render(segment, final=False)
-        return segment.step.text is not None
+            return closed  # 已经定下来的不再改（之后补发的部分只存档）
+        segment.step.text = headline(segment.text, final=False)
+        return closed or segment.step.text is not None
 
     def _search(self, event: SearchProgress, display: bool) -> bool:
-        self._close_open()
+        closed = self._close_open()  # 前一段说明定了下来：即使这次搜索没有可写的，也要唤醒发送
         search = self._searches.get(event.call_id)
         if search is None:
             search = self._searches[event.call_id] = _Search()
             self._archive.append(search)
             if display:
-                search.step = self._append(None)
+                search.step = self._append(texts.PROCESS_SEARCHING)
         if event.queries:
             search.queries = event.queries
-        if not display:
-            return False
         step = search.step
-        pending = step is not None and not self._shown(step)
-        if event.stage is SearchStage.COMPLETED:
-            fresh = tuple(q for q in search.queries if q not in search.displayed)
-            if pending:
-                assert step is not None
-                # 开始的那一行还没发出：合成一行「搜索完成：…」；没有查询词（打开网页等）的整行去掉。
-                step.text = texts.process_searched(_queries(fresh)) if fresh else ""
+        if not display or step is None:
+            return closed
+        if not self._shown(step):
+            # 这一行还没发出：按现在知道的查询词整行改写；完成时仍没有查询词（打开网页等）的整行去掉。
+            written = tuple(q for q in search.queries if q not in search.before)
+            if written or event.stage is not SearchStage.COMPLETED:
+                step.text = _searching(written)
             else:
-                self._append(texts.process_searched(_queries(fresh) if fresh else ""))
-            search.displayed.update(fresh)
+                step.text = ""
+            step.queried = bool(written)
+            search.displayed = search.before | set(written)
             return True
         fresh = tuple(q for q in search.queries if q not in search.displayed)
-        if pending:
-            assert step is not None
-            step.text = texts.process_searching(_queries(search.queries))
-            search.displayed.update(search.queries)
-            return True
-        if fresh:
-            self._append(texts.process_searching(_queries(fresh)))
-            search.displayed.update(fresh)
-            return True
-        return False
+        if not fresh:
+            return closed
+        line = step.line
+        if line is not None and line is self._line:
+            line.tail += ("、" if line.queried else " ") + _queries(fresh)
+            line.queried = True
+        else:
+            # 这一行之后已经发出过别的内容：另起一行。
+            fallback = self._append(_searching(fresh))
+            if fallback is not None:
+                fallback.queried = True
+                search.step = fallback
+                search.before = set(search.displayed)
+        search.displayed.update(fresh)
+        return True
 
 
 # ---- 发送 ----
@@ -348,10 +380,12 @@ class ProcessStream(Protocol):
         ...
 
 
-def render(lines: list[str], *, first: bool) -> str:
-    """把几步写成过程消息的一片：每步一段引用（段与段之间是只有 `>` 的一行，免得被并成一段）。"""
-    body = "\n>\n".join(f"> {line}" for line in lines)
-    return body if first else f"\n>\n{body}"
+def render(pieces: list[Piece], *, first: bool) -> str:
+    """把几段文字写成过程消息的一片：另起一行的前面加一个换行（`first` 为真时第一段除外），接在行末的直接接上。"""
+    return "".join(
+        piece.text if piece.joined or (first and index == 0) else f"\n{piece.text}"
+        for index, piece in enumerate(pieces)
+    )
 
 
 class ProcessPresenter:
@@ -454,8 +488,8 @@ class ProcessPresenter:
                         await self._sleep(delay)
                 if self.sealed:
                     return
-                lines = self.notes.take()
-                if not lines:
+                pieces = self.notes.take()
+                if not pieces:
                     continue
                 if self._stream is None:
                     stream = self._open_stream()
@@ -465,7 +499,7 @@ class ProcessPresenter:
                     self._stream = stream
                     self.opened_at = self._timer()
                     logger.debug("开始过程消息")
-                await self._send(render(lines, first=self._last is None))
+                await self._send(render(pieces, first=self._last is None))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001  过程只是展示，出了任何问题都不能影响回答；文案可能带正文，只记类型
@@ -496,7 +530,7 @@ class ProcessPresenter:
         if self._stream is None or self.failed:
             return
         if note:
-            await self._send(render([escape_line(note)], first=False))
+            await self._send(render([Piece(note)], first=False))
             if self.failed:
                 return
         try:
