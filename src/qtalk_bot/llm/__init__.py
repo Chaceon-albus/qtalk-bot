@@ -165,12 +165,13 @@ class ChatRequest:
     Attributes:
         system: 系统提示词。
         messages: 按时间排列的消息，最后一条是用户这次说的话。
-        max_output_tokens: 输出上限；含推理的模型里也包括推理所用的 token。
+        max_output_tokens: 输出上限；含推理的模型里也包括推理所用的 token。为 `None` 时不向服务商传这个参数，
+            由模型自己的上限兜底（后台任务用；失控时由调用方的时限兜底）。
     """
 
     system: str = field(repr=False)
     messages: tuple[Message, ...]
-    max_output_tokens: int
+    max_output_tokens: int | None
 
 
 # ---- 流式事件 ----

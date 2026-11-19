@@ -3,6 +3,7 @@
 from qtalk_bot.config import (
     DecisionSettings,
     DescribeSettings,
+    MemorySettings,
     ModelSettings,
     ProviderSettings,
     ProvidersSettings,
@@ -170,3 +171,18 @@ async def test_show_process_does_not_request_thought_summaries() -> None:
         # 用户 2026-11-19 决定不展示也不请求思考摘要：适配器的能力保留，按配置创建的模型都不打开。
         assert main._summaries is False  # pyright: ignore[reportPrivateUsage]
         assert alt._summaries is False  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_memorizer_shares_the_client_of_its_provider() -> None:
+    settings = (ModelSettings(name="main", provider=Provider.OPENAI, model="m", default=True),)
+    memory = MemorySettings(provider=Provider.OPENAI, model="gpt-6-luna", reasoning="high")
+    async with ChatModels(settings, SECRETS, memory=memory) as models:
+        memorizer = models.memorizer
+        assert isinstance(memorizer, OpenAIChatModel)
+        assert (memorizer.name, memorizer.model) == ("memory", "gpt-6-luna")
+        main = models["main"]
+        assert isinstance(main, OpenAIChatModel)
+        assert memorizer._client is main._client  # pyright: ignore[reportPrivateUsage]
+        assert "memory" not in models
+    async with ChatModels(settings, SECRETS) as models:
+        assert models.memorizer is None

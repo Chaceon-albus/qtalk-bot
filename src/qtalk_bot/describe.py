@@ -142,8 +142,12 @@ class Describer:
             task.cancel()
 
     async def aclose(self) -> None:
-        """`stop()`，再等描述任务结束、等还没写完的记账。"""
-        self.stop()
+        """`stop()`（已经停过就不再停），再等描述任务结束、等还没写完的记账。
+
+        已经 `stop()` 过时不再取消一次：第一次取消可能已经让模型的响应流进入异步关闭，再取消会打断它的关闭。
+        """
+        if not self._closed:
+            self.stop()
         if self._tasks:
             await asyncio.wait(set(self._tasks))
         if self._writes:

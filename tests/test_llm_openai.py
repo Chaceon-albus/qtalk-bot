@@ -5,6 +5,7 @@
 """
 
 import base64
+import dataclasses
 import json
 import logging
 import traceback
@@ -247,6 +248,22 @@ async def test_request_shape_and_text_usage_finish() -> None:
 
 
 DONE = Finished(FinishReason.COMPLETED)
+
+
+async def test_no_output_limit_is_sent_when_the_request_has_none() -> None:
+    # 后台任务默认不设输出上限：请求里不带 max_output_tokens，由模型自己的上限兜底。
+    completed = {
+        "type": "response.completed",
+        "sequence_number": 5,
+        "response": response("completed", usage=usage(5, 1)),
+    }
+    server = streaming([CREATED, ITEM_ADDED, text_delta(3, "好"), completed])
+
+    unlimited = dataclasses.replace(REQUEST, max_output_tokens=None)
+    events = [event async for event in model_on(server).stream(unlimited)]
+
+    assert TextDelta("好") in events
+    assert "max_output_tokens" not in server.body
 
 
 @pytest.mark.parametrize(

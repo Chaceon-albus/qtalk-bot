@@ -13,6 +13,7 @@ from tests.test_conversation import (
     ADMIN,
     ALICE,
     BOB,
+    DONE,
     HANG_GUARD,
     SHANGHAI,
     START,
@@ -34,10 +35,16 @@ from tests.test_conversation import (
 
 from qtalk_bot import access, topics
 from qtalk_bot.access import User, UserStatus
-from qtalk_bot.config import ChatSettings, DecisionSettings, ModelSettings, TopicSettings
+from qtalk_bot.config import (
+    ChatSettings,
+    DecisionSettings,
+    MemorySettings,
+    ModelSettings,
+    TopicSettings,
+)
 from qtalk_bot.conversation import ChatInput, Conversation
 from qtalk_bot.journal import DECISION_USAGE_MODEL
-from qtalk_bot.llm import ChatRequest, Provider, Usage
+from qtalk_bot.llm import ChatRequest, Provider, TextDelta, Usage
 from qtalk_bot.llm.decisions import (
     Answer,
     ChoiceAnswer,
@@ -47,7 +54,8 @@ from qtalk_bot.llm.decisions import (
     YesNoAnswer,
     YesNoQuestion,
 )
-from qtalk_bot.prompt import TOPIC_GUIDE
+from qtalk_bot.memory import Summarizer
+from qtalk_bot.prompt import MEMORY_NOTICE, TOPIC_GUIDE
 from qtalk_bot.routing import NEW_TOPIC, QUESTION, TOPIC_QUESTION, Router, SteerJudge
 from qtalk_bot.storage import DATABASE_FILENAME, Database
 
@@ -65,6 +73,7 @@ def topical(
     history_turns: int = 10,
     topic_settings: TopicSettings | None = None,
     steer: bool = False,
+    summarizer: Summarizer | None = None,
 ) -> Conversation:
     """配置了 `[decisions]` 并启用话题线；第一个模型是默认模型。"""
     settings = [
@@ -91,6 +100,7 @@ def topical(
         settings=ChatSettings(history_turns=history_turns),
         timezone=SHANGHAI,
         steer=SteerJudge(decisions, decider) if steer else None,
+        summarizer=summarizer,
         clock=lambda: START,
     )
 
@@ -598,3 +608,72 @@ async def test_preempted_attempt_writes_no_topic_and_the_restart_decides_again(
         ("user", "用 Python", newest),
         ("assistant", "合起来的回答", newest),
     ]
+
+
+# ---- 后台写标题与摘要（第二步）----
+
+
+async def test_ended_turn_schedules_the_summary_which_later_turns_use(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("答"))
+    writer = ScriptedModel(
+        "memory", [TextDelta("标题：快速排序\n摘要：用户在学快排的分区。"), Usage(9, 9), DONE]
+    )
+    summarizer = Summarizer(
+        db,
+        writer,
+        MemorySettings(provider=writer.provider, model=writer.model),
+        admin_openid=ADMIN,
+        clock=lambda: START,
+    )
+    decider = Picker()
+    chat = topical(db, decider, model, summarizer=summarizer)
+
+    await say(chat, alice, "快排怎么写，" + "详细点" * 20)
+    async with asyncio.timeout(HANG_GUARD):
+        await summarizer.wait_idle()
+    ((first, _, _),) = await topic_rows(db)
+    assert len(writer.requests) == 1
+    # 后台写摘要不受输出上限的约束（默认不传）。
+    assert writer.requests[0].max_output_tokens is None
+
+    await say(chat, alice, "另一件事")  # 判成新话题：选项里第一个话题已经用上真正的标题
+    options = topic_question(decider).options
+    assert [(o.value, o.description) for o in options[:1]] == [
+        (str(first), "快速排序：用户在学快排的分区。")
+    ]
+    async with asyncio.timeout(HANG_GUARD):
+        await summarizer.wait_idle()
+    second = (await topic_rows(db))[-1][0]
+    assert len(writer.requests) == 2  # 第二个话题也排了一次
+
+    decider.then(topic_answer(new=0.0, **{f"t{first}": 1.0, f"t{second}": 0.0}))
+    await say(chat, alice, "回到快排")
+    system = model.requests[-1].system
+    assert MEMORY_NOTICE in system  # 摘要写成资料而不是指令
+    assert "当前话题此前的摘要：\n用户在学快排的分区。" in system
+    await summarizer.aclose()
+
+
+async def test_turn_that_did_not_end_schedules_no_summary(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("答"))
+    writer = ScriptedModel("memory", [TextDelta("标题：t\n摘要：s"), DONE])
+    summarizer = Summarizer(
+        db,
+        writer,
+        MemorySettings(provider=writer.provider, model=writer.model),
+        admin_openid=ADMIN,
+    )
+    chat = topical(db, Picker(), model, summarizer=summarizer)
+    await say(chat, alice, "话题一")
+    async with asyncio.timeout(HANG_GUARD):
+        await summarizer.wait_idle()
+    await db.transaction(access.set_user_status, alice.id, UserStatus.DISABLED)
+
+    await say(chat, alice, "停用之后")
+    async with asyncio.timeout(HANG_GUARD):
+        await summarizer.wait_idle()
+
+    assert len(writer.requests) == 1  # 只有第一轮的那一次
+    await summarizer.aclose()

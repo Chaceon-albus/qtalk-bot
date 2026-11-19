@@ -344,6 +344,32 @@ CREATE TABLE topic_messages (
 CREATE INDEX topic_messages_by_topic ON topic_messages (topic_id, message_id);
 """
 
+_V10_MEMORY_USAGE = """
+-- 用量的用途加上 memory（后台给话题写标题与摘要的调用，它的 model 列是固定的 memory）。CHECK 约束改不了，
+-- 同第 4 版按 SQLite 的做法重建表：新建、复制、删旧、改名，再建回索引。列的顺序与原表相同（含第 7 版的 searches）。
+CREATE TABLE usage_new (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id),
+    message_id INTEGER REFERENCES messages (id) ON DELETE SET NULL,
+    model TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    provider_model TEXT NOT NULL,
+    input_tokens INTEGER CHECK (input_tokens >= 0),
+    output_tokens INTEGER CHECK (output_tokens >= 0),
+    created_at INTEGER NOT NULL,
+    purpose TEXT NOT NULL DEFAULT 'chat'
+        CHECK (purpose IN ('chat', 'decision', 'describe', 'memory')),
+    searches INTEGER CHECK (searches >= 0)
+) STRICT;
+INSERT INTO usage_new (id, user_id, message_id, model, provider, provider_model, input_tokens,
+    output_tokens, created_at, purpose, searches)
+SELECT id, user_id, message_id, model, provider, provider_model, input_tokens, output_tokens,
+    created_at, purpose, searches FROM usage;
+DROP TABLE usage;
+ALTER TABLE usage_new RENAME TO usage;
+CREATE INDEX usage_by_user ON usage (user_id, created_at);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     _V1_ACCESS,
     _V2_CHAT,
@@ -354,6 +380,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     _V7_SEARCHES,
     _V8_PROCESS,
     _V9_TOPICS,
+    _V10_MEMORY_USAGE,
 )
 """本程序的迁移列表。业务表由各里程碑在末尾追加，已发布的不能修改。"""
 

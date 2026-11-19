@@ -8,7 +8,7 @@
   回复写在同一个事务里（`attribute()`），被插话打断的那次不写。
 - 「最近活跃」按归进来的最后一轮的回复编号（`last_message_id`）排序，而不是按时刻：时钟可能回拨，同一秒里也会
   有好几轮。
-- 标题与摘要由后台的小模型写（`set_summary()`，下一步接入）；没写出来之前用临时标题（建行时这一轮用户消息
+- 标题与摘要由后台的小模型写（`memory.Summarizer` 经 `set_summary()` 写回）；没写出来之前用临时标题（建行时这一轮用户消息
   文字版的前 `PROVISIONAL_TITLE_CHARS` 字），摘要为空。
 """
 
@@ -25,12 +25,14 @@ UNTITLED = "（无文字）"
 
 @dataclass(frozen=True, slots=True)
 class Topic:
-    """一条话题线。`title` 与 `summary` 由后台写，没写时为 `None`。"""
+    """一条话题线。`title` 与 `summary` 由后台写，没写时为 `None`；`summarized_through` 是摘要覆盖到的最后一条
+    消息。"""
 
     id: int
     provisional_title: str = field(repr=False)
     title: str | None = field(default=None, repr=False)
     summary: str | None = field(default=None, repr=False)
+    summarized_through: int | None = None
 
     @property
     def display_title(self) -> str:
@@ -44,11 +46,13 @@ def provisional_title(text: str) -> str:
     return collapsed[:PROVISIONAL_TITLE_CHARS] if collapsed else UNTITLED
 
 
-_COLUMNS = "id, provisional_title, title, summary"
+_COLUMNS = "id, provisional_title, title, summary, summarized_through"
 
 
 def _topic(row: sqlite3.Row) -> Topic:
-    return Topic(row["id"], row["provisional_title"], row["title"], row["summary"])
+    return Topic(
+        row["id"], row["provisional_title"], row["title"], row["summary"], row["summarized_through"]
+    )
 
 
 def recent_topics(conn: sqlite3.Connection, user_id: int, limit: int) -> list[Topic]:
@@ -146,6 +150,15 @@ def create_topic(
     ).fetchone()
     topic_id: int = row["id"]
     return topic_id
+
+
+def latest_message(conn: sqlite3.Connection, user_id: int, topic_id: int) -> int | None:
+    """这个用户的话题里最后归进来的一条消息（一般是最近一轮的回复）；没有时返回 `None`。"""
+    row = conn.execute(
+        "SELECT max(message_id) AS latest FROM topic_messages WHERE topic_id = ? AND user_id = ?",
+        (topic_id, user_id),
+    ).fetchone()
+    return None if row is None or row["latest"] is None else int(row["latest"])
 
 
 def set_summary(

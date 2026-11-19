@@ -14,6 +14,7 @@ from google import genai
 from ..config import (
     DecisionSettings,
     DescribeSettings,
+    MemorySettings,
     ModelSettings,
     ProvidersSettings,
     Secrets,
@@ -28,11 +29,13 @@ from .openai_responses import OpenAIChatModel
 from .openai_responses import create_client as create_openai_client
 
 DESCRIBER_NAME = "describe"
+MEMORY_NAME = "memory"
 
 
 class ChatModels(Mapping[str, ChatModel]):
     """配置里的全部对话模型，按内部名字取用；配置了 `[decisions]` 时还有决策模型（`decider`），配置了
-    `[describe]` 时还有写图片描述、PDF 摘要的模型（`describer`，内部名字是 `DESCRIBER_NAME`）。
+    `[describe]` 时还有写图片描述、PDF 摘要的模型（`describer`，内部名字是 `DESCRIBER_NAME`），给了 `memory`
+    时还有写话题标题与摘要的模型（`memorizer`，内部名字是 `MEMORY_NAME`）。
 
     用 `async with` 或 `aclose()` 关闭底层客户端。调用方要先用 `config.check_provider_secrets()` 确认用到的
     服务商都有密钥。
@@ -45,6 +48,7 @@ class ChatModels(Mapping[str, ChatModel]):
         providers: ProvidersSettings | None = None,
         decisions: DecisionSettings | None = None,
         describe: DescribeSettings | None = None,
+        memory: MemorySettings | None = None,
     ) -> None:
         self._providers = ProvidersSettings() if providers is None else providers
         self._secrets = secrets
@@ -64,6 +68,16 @@ class ChatModels(Mapping[str, ChatModel]):
                     provider=describe.provider,
                     model=describe.model,
                     reasoning=describe.reasoning,
+                )
+            )
+        self.memorizer: ChatModel | None = None
+        if memory is not None:
+            self.memorizer = self._create(
+                ModelSettings(
+                    name=MEMORY_NAME,
+                    provider=memory.provider,
+                    model=memory.model,
+                    reasoning=memory.reasoning,
                 )
             )
 

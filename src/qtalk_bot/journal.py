@@ -11,6 +11,7 @@ Unix 秒。查询一律按 `user_id` 过滤：一个用户的对话与附件不�
 模型的输入，也不影响轮次。
 """
 
+import bisect
 import json
 import sqlite3
 from collections import defaultdict
@@ -62,6 +63,7 @@ class UsagePurpose(StrEnum):
     CHAT = "chat"  # 对话模型
     DECISION = "decision"  # 决策调用
     DESCRIBE = "describe"  # 给图片写描述、给 PDF 写摘要
+    MEMORY = "memory"  # 给话题写标题与摘要
 
 
 DECISION_USAGE_MODEL = "decisions"
@@ -69,6 +71,9 @@ DECISION_USAGE_MODEL = "decisions"
 
 DESCRIBE_USAGE_MODEL = "describe"
 """给图片写描述、给 PDF 写摘要的调用在用量表 `model` 列里记的固定值。"""
+
+MEMORY_USAGE_MODEL = "memory"
+"""给话题写标题与摘要的调用在用量表 `model` 列里记的固定值。"""
 
 ROWS_PER_TURN = 32
 """取历史时每轮最多看的用户消息数，用来给查询设上限；也是当前这一轮最多取的待回复消息数。攒批的一轮一般远到
@@ -534,6 +539,69 @@ def topic_history(
         picked.append((row, max(age, 0)))
     picked.reverse()
     return _entries(conn, user_id, picked)
+
+
+def topic_turns_after(
+    conn: sqlite3.Connection, user_id: int, topic_id: int, after: int, turns: int
+) -> tuple[list[HistoryEntry], int | None]:
+    """这个用户的话题 `topic_id` 里、结束它的回复编号大于 `after` 的各轮（最多最近 `turns` 轮），以及这些轮里
+    最大的回复编号（没有这样的轮次时为 `None`）。给后台写摘要用：`after` 是摘要已经覆盖到的那一轮的回复。
+
+    按轮次而不是按消息编号取：一轮是结束它的回复（`ends_turn()`）加上它 `reply_to` 覆盖的用户消息。回答进行中
+    到达的下一轮的问题编号比这一轮的回复小（问1、问2、答1、答2），只按编号取会漏掉问2。每条用户消息属于
+    `reply_to` 不小于它的编号的、最早的那一轮（同 `_last_boundary()` 的规则）。只发了说明、没有正文的回复不带，
+    但它照样是轮次的边界，它的问题照常带上。只取这个用户、这个话题的消息；只由表情组成的不带。
+    """
+    if turns <= 0:
+        return [], None
+    # 话题里结束了一轮的回复，按轮次的位置（reply_to）排列。
+    boundary_sql = (
+        "SELECT m.id, m.role, m.content, m.faces_only, m.reply_to, m.delivery"  # noqa: S608  只拼代码里的常量条件
+        " FROM messages AS m JOIN topic_messages AS t ON t.message_id = m.id"
+        " JOIN topics ON topics.id = t.topic_id"
+        " WHERE m.user_id = ? AND t.user_id = ? AND topics.user_id = ? AND t.topic_id = ?"
+        f" AND {_ends_turn_sql('m')}"
+    )
+    fresh = conn.execute(
+        boundary_sql + " AND m.id > ? ORDER BY m.reply_to DESC, m.id DESC LIMIT ?",
+        (user_id, user_id, user_id, topic_id, after, turns),
+    ).fetchall()
+    if not fresh:
+        return [], None
+    through = conn.execute(
+        "SELECT max(m.id) AS latest FROM messages AS m JOIN topic_messages AS t"  # noqa: S608  只拼代码里的常量条件
+        " ON t.message_id = m.id WHERE m.user_id = ? AND t.user_id = ? AND t.topic_id = ?"
+        f" AND m.id > ? AND {_ends_turn_sql('m')}",
+        (user_id, user_id, topic_id, after),
+    ).fetchone()["latest"]
+    lowest = min(row["reply_to"] for row in fresh)
+    highest = max(row["reply_to"] for row in fresh)
+    below = conn.execute(
+        boundary_sql + " AND m.reply_to < ? ORDER BY m.reply_to DESC LIMIT 1",
+        (user_id, user_id, user_id, topic_id, lowest),
+    ).fetchone()
+    lower = 0 if below is None else int(below["reply_to"])
+    # 这个范围里所有轮次的边界（含已经写进摘要的），用来把用户消息分到各自的轮次。
+    edges = sorted(
+        int(row["reply_to"])
+        for row in conn.execute(
+            boundary_sql + " AND m.reply_to > ? AND m.reply_to <= ?",
+            (user_id, user_id, user_id, topic_id, lower, highest),
+        ).fetchall()
+    )
+    wanted = {int(row["reply_to"]) for row in fresh}
+    users = conn.execute(
+        "SELECT m.id, m.role, m.content, m.faces_only, NULL AS reply_to, NULL AS delivery"
+        " FROM messages AS m JOIN topic_messages AS t ON t.message_id = m.id"
+        " WHERE m.user_id = ? AND t.user_id = ? AND t.topic_id = ? AND m.role = 'user'"
+        " AND m.faces_only = 0 AND m.id > ? AND m.id <= ?",
+        (user_id, user_id, topic_id, lower, highest),
+    ).fetchall()
+    kept_users = [
+        row for row in users if edges[bisect.bisect_left(edges, int(row["id"]))] in wanted
+    ]
+    rows = sorted([*kept_users, *fresh], key=_position)
+    return _entries(conn, user_id, [(row, 0) for row in rows]), int(through)
 
 
 def pending_messages(conn: sqlite3.Connection, user_id: int, before: int) -> list[HistoryEntry]:

@@ -182,9 +182,9 @@ class GeminiChatModel:
         return f"GeminiChatModel(name={self._name!r}, model={self._model!r})"
 
     async def stream(self, request: ChatRequest) -> AsyncGenerator[ChatEvent]:
-        config: interactions.GenerationConfigParam = {
-            "max_output_tokens": request.max_output_tokens
-        }
+        config: interactions.GenerationConfigParam = {}
+        if request.max_output_tokens is not None:  # 不写就不传，由模型自己的上限兜底
+            config["max_output_tokens"] = request.max_output_tokens
         if self._reasoning is not None:
             # SDK 把取值写成 Literal，但各款模型接受的取值不同且会变，配置里只做宽松校验，原样透传。
             config["thinking_level"] = cast(interactions.ThinkingLevel, self._reasoning)

@@ -11,6 +11,7 @@ from qtalk_bot.config import (
     DecisionSettings,
     DescribeSettings,
     InviteSettings,
+    MemorySettings,
     ProcessSettings,
     Provider,
     ProvidersSettings,
@@ -63,6 +64,8 @@ def test_example_config_is_valid_and_spells_out_the_defaults() -> None:
     assert example.turns == TurnSettings()
     # [describe] 的模型没有默认值，其余各项要与默认值一致。
     assert example.describe == DescribeSettings(provider=Provider.OPENAI, model="gpt-6-luna")
+    # [memory] 同理；reasoning 默认不传。
+    assert example.memory == MemorySettings(provider=Provider.OPENAI, model="gpt-6-luna")
     # OpenAI 的模型不接受音频；示例里两个模型的输入能力与实测、文档一致。
     assert [sorted(m.value for m in model.inputs) for model in example.models] == [
         ["file", "image"],
@@ -99,6 +102,15 @@ def test_commented_out_examples_are_valid_once_uncommented(tmp_path: Path) -> No
     assert [model.reasoning for model in settings.models] == ["high", "low"]
     assert settings.decisions is not None
     assert settings.decisions.model == "gpt-6-luna"
+    assert settings.memory is not None
+    assert settings.memory.reasoning == "high"
+    # 后台任务的输出上限默认不设，注释掉的示例去掉注释后照常生效。
+    assert settings.memory.max_output_tokens == 4096
+    assert settings.describe is not None
+    assert (settings.describe.max_output_tokens, settings.describe.file_max_output_tokens) == (
+        1024,
+        4096,
+    )
     assert settings.qq.base_url == "https://api.bot.qq.com"
     assert settings.providers.openai.base_url == "https://api.openai.com/v1"
     assert settings.providers.openai.proxy == "socks5://127.0.0.1:1080"

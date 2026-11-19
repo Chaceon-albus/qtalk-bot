@@ -221,7 +221,9 @@ class OpenAIChatModel:
                 model=self._model,
                 instructions=request.system,
                 input=messages,
-                max_output_tokens=request.max_output_tokens,
+                max_output_tokens=(
+                    openai.omit if request.max_output_tokens is None else request.max_output_tokens
+                ),
                 reasoning=self._reasoning_param(summary),
                 tools=tools,
                 store=False,

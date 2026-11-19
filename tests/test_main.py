@@ -1,26 +1,40 @@
 """启动入口 `python -m qtalk_bot`：不连接平台，`Bot.start()` 用替身代替。"""
 
 import asyncio
+import dataclasses
 import logging
 import signal
 import sqlite3
 from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 from typing import cast
+from zoneinfo import ZoneInfo
 
 import pyqbot
 import pytest
 
 from qtalk_bot import __main__ as entry
+from qtalk_bot import memory
+from qtalk_bot.access import User
 from qtalk_bot.alerts import Alerts
 from qtalk_bot.batching import Batcher
 from qtalk_bot.bot import Handlers
-from qtalk_bot.config import AttachmentSettings, DescribeSettings, load_secrets, load_settings
+from qtalk_bot.config import (
+    AttachmentSettings,
+    DecisionSettings,
+    DescribeSettings,
+    MemorySettings,
+    ModelSettings,
+    Settings,
+    load_secrets,
+    load_settings,
+)
 from qtalk_bot.conversation import Conversation
 from qtalk_bot.describe import Describer
 from qtalk_bot.gate import Gate
 from qtalk_bot.llm import ChatEvent, ChatRequest, Finished, FinishReason, Provider
 from qtalk_bot.media import Downloader, Fetcher, MediaStore
+from qtalk_bot.memory import Summarizer
 from qtalk_bot.storage import Database, StorageError
 
 FAKE_ENV = {
@@ -371,6 +385,46 @@ async def test_stop_requests_are_sent_even_when_the_budget_is_used_up(
 
     assert hanging.cancelled()  # 预算用完了，停止请求仍然发出、描述任务被取消
     assert stopped == ["fetcher"]
+
+
+async def test_summarizer_is_stopped_and_awaited_like_the_describer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(entry, "SHUTDOWN_GRACE_SECONDS", 0.05)
+    summarizer = Summarizer(
+        cast(Database, None),
+        _FakeModel(),
+        MemorySettings(provider=Provider.OPENAI, model="m"),
+        admin_openid="FAKE-OPENID-ADMIN",
+    )
+    hanging = asyncio.create_task(_forever())
+    queues = summarizer._queues  # pyright: ignore[reportPrivateUsage]  一个还在写摘要的用户
+    queues[1] = memory._UserQueue(cast(User, None), task=hanging)  # pyright: ignore[reportPrivateUsage]
+
+    await entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+        cast(pyqbot.Bot, _SlowBot()), None, None, None, None, summarizer=summarizer
+    )
+    await asyncio.sleep(0)
+
+    assert hanging.cancelled()  # 预算用完了，停止请求仍然发出、摘要任务被取消
+    summarizer.schedule(cast(User, None), 1)
+    assert summarizer.pending == 0  # 关停之后不再接新的
+
+
+def test_memory_without_decisions_is_ignored_with_a_log(caplog: pytest.LogCaptureFixture) -> None:
+    base = Settings(
+        timezone=ZoneInfo("Asia/Shanghai"),
+        data_dir=Path("/tmp/data"),
+        models=(ModelSettings(name="a", provider=Provider.OPENAI, model="m", default=True),),
+        memory=MemorySettings(provider=Provider.OPENAI, model="m"),
+    )
+    with caplog.at_level(logging.WARNING):
+        assert entry.memory_settings(base) is None
+    assert "[memory] 不起作用" in caplog.text
+    enabled = dataclasses.replace(
+        base, decisions=DecisionSettings(provider=Provider.OPENAI, model="d")
+    )
+    assert entry.memory_settings(enabled) == base.memory
 
 
 async def test_batcher_stops_before_the_bot_closes_and_is_drained_after() -> None:

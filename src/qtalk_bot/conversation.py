@@ -76,6 +76,7 @@
 - 一轮结束（`journal.ends_turn()`）时与回复写在同一个事务里：这一轮的用户消息与回复归到选中的话题，选「新话题」
   时在这时建行，临时标题取这一轮用户消息文字版的开头（`topics.attribute()`）。被插话打断、没有结束一轮的不写。
 - 话题题的决策记录与选模型的写在一起，同一次调用只记一次用量。
+- 写了归属、正常结束的一轮，交给 `memory.Summarizer` 在后台更新这个话题的标题与摘要（配置了 `[memory]` 时）。
 
 **判断插话**（`judge()`）：在事务里复查授权、取出正在回答的消息与新消息的文字版（只有这个用户自己的），交给
 `routing.SteerJudge`；决策记录与用量挂在新消息里最后一条上，被取消时也照记。
@@ -150,6 +151,7 @@ from .media import (
     placeholders,
     skipped,
 )
+from .memory import Summarizer
 from .process import (
     RECALL_TIMEOUT_SECONDS,
     ProcessEvent,
@@ -557,6 +559,7 @@ class Conversation:
         attachments: AttachmentSettings | None = None,
         fetcher: Fetcher | None = None,
         describer: Describer | None = None,
+        summarizer: Summarizer | None = None,
         steer: SteerJudge | None = None,
         process: ProcessSettings | None = None,
         clock: Callable[[], float] = time.time,
@@ -566,7 +569,8 @@ class Conversation:
         """`models` 按内部名字给出配置里的全部对话模型，`router` 决定每条消息用哪一个。
 
         `fetcher` 为 `None` 时不下载附件（都按「没有下载」处理，只用文字版）；`describer` 为 `None` 时不给
-        图片写描述、不给 PDF 写摘要；`steer` 为 `None` 时不判断插话，一律当作补充。
+        图片写描述、不给 PDF 写摘要；`summarizer` 为 `None` 时不给话题写标题与摘要（只在分话题时用到）；`steer` 为
+        `None` 时不判断插话，一律当作补充。
 
         `clock` 是写进流水的时间（墙上时钟）；`timer` 与 `sleep` 是过程消息的节流与撤回时限用的单调时钟与等待
         （默认是事件循环的），测试可以换成可控的。
@@ -579,6 +583,7 @@ class Conversation:
         self._attachments = AttachmentSettings() if attachments is None else attachments
         self._fetcher = fetcher
         self._describer = describer
+        self._summarizer = summarizer
         self._steer = SteerJudge() if steer is None else steer
         self._timezone = timezone
         self._clock = clock
@@ -872,7 +877,7 @@ class Conversation:
             entry.message_id for entry in begun.current if entry.message_id is not None
         ]
         processes = [*control.earlier, turn.process]
-        await asyncio.shield(
+        topic_id = await asyncio.shield(
             self._record(
                 turn,
                 begun.last_message_id,
@@ -886,6 +891,8 @@ class Conversation:
             raise cancelled
         if outcome.delivery is not ReplyDelivery.WITHHELD:  # 结局 skipped 的也是 withheld
             self._schedule_descriptions(user, begun)
+        if topic_id is not None and self._summarizer is not None:
+            self._summarizer.schedule(user, topic_id)
         if outcome.delivery in _RECALL_AFTER:
             self._recall_later(user, processes)
 
@@ -934,10 +941,11 @@ class Conversation:
         turn_messages: Sequence[int],
         process: str | None = None,
         title_text: str | None = None,
-    ) -> None:
+    ) -> int | None:
         """记账。`turn_messages` 是这一轮的全部用户消息（含并进来的），它们的附件按这一轮重记 `given`。
 
-        `title_text` 不为空（分话题）时，这一轮结束了就把它的消息与回复归到选中的话题（新话题以它为临时标题）。
+        `title_text` 不为空（分话题）时，这一轮结束了就把它的消息与回复归到选中的话题（新话题以它为临时标题），
+        返回实际归到的话题编号；没有写归属时返回 `None`。
         """
         # 没有调用过对话模型时（选完模型后发现已不能使用对话，或正在决策时被取消）没有调用结果：结局记成
         # 没有调用或被取消，不记对话的用量。
@@ -962,7 +970,7 @@ class Conversation:
         topic: _TopicWrite | None = None
         if title_text is not None and journal.ends_turn(outcome.content, outcome.delivery):
             topic = _TopicWrite(turn.selection.topic, title_text)
-        await self._db.transaction(
+        topic_id = await self._db.transaction(
             self._finish,
             turn.user,
             message_id,
@@ -982,6 +990,7 @@ class Conversation:
             commentaries,
             turn.process.chunks,
         )
+        return topic_id
 
     async def _record_preempted(self, turn: _Turn, message_id: int) -> None:
         await self._db.transaction(
@@ -1129,7 +1138,8 @@ class Conversation:
         message_id: int,
         decisions: Sequence[DecisionRecord],
         reply: _Reply,
-    ) -> None:
+    ) -> int | None:
+        """写入一轮的记账；写了话题归属时返回话题编号。"""
         now = int(self._clock())
         _record_decisions(conn, user.id, message_id, decisions, now)
         reply_id = journal.add_reply(
@@ -1145,16 +1155,17 @@ class Conversation:
         )
         journal.set_given(conn, user.id, reply.messages, reply.given)
         _record_usage(conn, user.id, message_id, reply.attempts, now)
-        if reply.topic is not None:
-            topics.attribute(
-                conn,
-                user.id,
-                reply.topic.topic_id,
-                reply.messages,
-                title_text=reply.topic.title_text,
-                reply_id=reply_id,
-                now=now,
-            )
+        if reply.topic is None:
+            return None
+        return topics.attribute(
+            conn,
+            user.id,
+            reply.topic.topic_id,
+            reply.messages,
+            title_text=reply.topic.title_text,
+            reply_id=reply_id,
+            now=now,
+        )
 
     def _finish_preempted(
         self,

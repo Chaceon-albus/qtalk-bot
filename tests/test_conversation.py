@@ -23,7 +23,6 @@ from qtalk_bot.access import User, UserStatus
 from qtalk_bot.batching import Batcher
 from qtalk_bot.config import (
     DEFAULT_FILE_INSTRUCTIONS,
-    DEFAULT_FILE_MAX_OUTPUT_TOKENS,
     DEFAULT_PERSONA,
     AttachmentSettings,
     ChatSettings,
@@ -141,6 +140,8 @@ class ScriptedModel:
         self.requests: list[ChatRequest] = []
         self.started = asyncio.Event()  # 每收到一个请求置位一次
         self.closed = 0
+        self.closing = asyncio.Event()  # 开始关闭流（清理）时置位
+        self.cleaned = 0  # 清理（含 `close_delay` 的等待）完整做完的次数，被打断的不算
 
     @property
     def name(self) -> str:
@@ -175,8 +176,10 @@ class ScriptedModel:
                 await asyncio.Event().wait()
         finally:
             self.closed += 1
+            self.closing.set()
             if self.close_delay:
                 await asyncio.sleep(self.close_delay)
+            self.cleaned += 1
             if self.close_error is not None:
                 raise self.close_error
 
@@ -2038,6 +2041,26 @@ async def test_pending_descriptions_are_cancelled_on_shutdown(db: Database, tmp_
     assert row[6] == "pending"
 
 
+async def test_shutdown_cancels_a_description_only_once(db: Database, tmp_path: Path) -> None:
+    # 按实际的关停顺序（先 stop()，过一会儿再 aclose()）：aclose() 不再取消一次，免得打断模型流的异步关闭。
+    alice = await invited(db, ALICE, "小王")
+    describing = ScriptedModel("describe", [], hang=True, close_delay=0.05)
+    describer = describer_of(db, tmp_path, describing)
+    model = ScriptedModel("main", answer("好"))
+    chat = media_chat(
+        db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, SEES), describer=describer
+    )
+    await send(chat, alice, None, image_attachment())
+    async with asyncio.timeout(HANG_GUARD):
+        await describing.started.wait()
+        describer.stop()
+        await describing.closing.wait()  # 流已经在被取消后的清理里
+        await describer.aclose()
+
+    assert describing.cleaned == 1  # 清理没有被第二次取消打断
+    assert describer.pending == 0
+
+
 # ---- PDF 摘要 ----
 
 SUMMARY = "这是一份季度报告：营收增长 12%，主要来自海外市场。"
@@ -2092,7 +2115,7 @@ async def test_pdf_summary_is_written_in_the_background_and_used_in_later_histor
 
     (request,) = describing.requests
     assert request.system == DEFAULT_FILE_INSTRUCTIONS
-    assert request.max_output_tokens == DEFAULT_FILE_MAX_OUTPUT_TOKENS
+    assert request.max_output_tokens is None  # 后台任务默认不设输出上限
     assert request.messages[0].parts == (
         FilePart(SUMMARY_PDF, "application/pdf"),
         TextPart(FILE_PROMPT),

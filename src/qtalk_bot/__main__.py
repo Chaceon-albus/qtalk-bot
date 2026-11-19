@@ -32,6 +32,7 @@ from .bot import (
 from .chat import ChatHandler
 from .config import (
     ConfigError,
+    MemorySettings,
     Secrets,
     Settings,
     check_provider_secrets,
@@ -43,10 +44,23 @@ from .describe import Describer
 from .gate import Gate
 from .llm.providers import ChatModels
 from .media import Fetcher, MediaStore, run_cleanup
+from .memory import Summarizer
 from .routing import Router, SteerJudge
 from .storage import DATABASE_FILENAME, Database, StorageError
 
 logger = logging.getLogger("qtalk_bot")
+
+
+def memory_settings(settings: Settings) -> MemorySettings | None:
+    """生效的 `[memory]`：只在话题线启用（配置了 `[decisions]`）时有；有 `[memory]` 而没有 `[decisions]` 时
+    忽略它并记一条日志（同 `[topics]`，不报错）。"""
+    if settings.memory is None:
+        return None
+    if settings.decisions is None:
+        logger.warning("配置了 [memory] 但没有 [decisions]：话题线没有启用，[memory] 不起作用")
+        return None
+    return settings.memory
+
 
 EXIT_CONFIG_ERROR = 2
 EXIT_RUNTIME_ERROR = 1
@@ -57,10 +71,16 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
 
     调用方要先用 `check_provider_secrets()` 确认用到的服务商都有密钥。
     """
+    memory = memory_settings(settings)
     async with (
         await Database.open(settings.data_dir / DATABASE_FILENAME) as db,
         ChatModels(
-            settings.models, secrets, settings.providers, settings.decisions, settings.describe
+            settings.models,
+            secrets,
+            settings.providers,
+            settings.decisions,
+            settings.describe,
+            memory,
         ) as models,
     ):
         store = MediaStore.under(settings.data_dir)
@@ -72,6 +92,7 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
         alerts = Alerts(AdminAlertSender(bot, secrets.admin_openid))
         hosts = download_hosts(settings.attachments.extra_download_hosts)
         describer: Describer | None = None
+        summarizer: Summarizer | None = None
         fetcher: Fetcher | None = None
         conversation: Conversation | None = None
         batcher: Batcher | None = None
@@ -97,6 +118,10 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                     settings.describe,
                     admin_openid=secrets.admin_openid,
                 )
+            if memory is not None and models.memorizer is not None:
+                summarizer = Summarizer(
+                    db, models.memorizer, memory, admin_openid=secrets.admin_openid
+                )
             if chat is None:
                 fetcher = Fetcher(
                     store,
@@ -120,6 +145,7 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                     attachments=settings.attachments,
                     fetcher=fetcher,
                     describer=describer,
+                    summarizer=summarizer,
                     steer=SteerJudge(settings.decisions, models.decider),
                     process=settings.process,
                 )
@@ -131,11 +157,19 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
             await bot.start()
         except BaseException:
             await _shut_down(
-                bot, conversation, cleanup, describer, fetcher, batcher, handlers, alerts
+                bot,
+                conversation,
+                cleanup,
+                describer,
+                fetcher,
+                batcher,
+                handlers,
+                alerts,
+                summarizer,
             )
             raise
         if await _shut_down(
-            bot, conversation, cleanup, describer, fetcher, batcher, handlers, alerts
+            bot, conversation, cleanup, describer, fetcher, batcher, handlers, alerts, summarizer
         ):
             raise asyncio.CancelledError  # 关停期间又被取消过：收尾做完了，再把取消传出去
 
@@ -158,6 +192,7 @@ async def _shut_down(
     batcher: Batcher | None = None,
     handlers: Handlers | None = None,
     alerts: Alerts | None = None,
+    summarizer: Summarizer | None = None,
 ) -> bool:
     """按顺序关停，返回期间是否又被取消过。
 
@@ -179,9 +214,9 @@ async def _shut_down(
        理想的顺序是先断开网关、不再收新事件，再收尾，最后关 HTTP 客户端；但 pyqbot 的 `Bot.close()` 把这三步
        连在一起，没有只断开网关的公开接口（自己传入 HTTP 客户端可以避开，但要直接依赖 `httpx2`）。所以第 2、3 步
        期间网关仍在收事件：这些消息照常放行、入库，因为 `Batcher` 已停，它们不会被回答，重启后是待回复的。
-    6. 向后台发出停止请求：停掉清理、`Describer.stop()`、`Fetcher.stop()`。这些是同步的、无条件执行，前面
+    6. 向后台发出停止请求：停掉清理、`Describer.stop()`、`Summarizer.stop()`、`Fetcher.stop()`。这些是同步的、无条件执行，前面
        用完了时间也照样发出，免得后台任务在模型客户端和数据库关闭后还在跑。
-    7. 限时等后台收尾：清理任务、描述任务与它们受保护的写入、下载与响应的关闭。
+    7. 限时等后台收尾：清理任务、描述与话题摘要的任务和它们受保护的写入、下载与响应的关闭。
     之后由调用方（外层的 `async with`）关模型的客户端与数据库。
 
     每一步的等待都受保护：再次取消（如连按两次 Ctrl+C）不会打断这一段；但所有等待共用
@@ -207,12 +242,16 @@ async def _shut_down(
         cleanup.cancel()
     if describer is not None:
         describer.stop()
+    if summarizer is not None:
+        summarizer.stop()
     if fetcher is not None:
         fetcher.stop()
     if cleanup is not None:
         interrupted |= await _drain(cleanup, deadline, "停掉附件清理")
     if describer is not None:
         interrupted |= await _drain(describer.aclose(), deadline, "等待图片描述收尾")
+    if summarizer is not None:
+        interrupted |= await _drain(summarizer.aclose(), deadline, "等待话题摘要收尾")
     if fetcher is not None:
         interrupted |= await _drain(fetcher.aclose(), deadline, "等待下载收尾")
     return interrupted

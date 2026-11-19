@@ -7,7 +7,7 @@ from qtalk_bot.config import (
     DEFAULT_DECISION_INSTRUCTIONS,
     DEFAULT_DECISION_MODELS,
     DEFAULT_FILE_INSTRUCTIONS,
-    DEFAULT_FILE_MAX_OUTPUT_TOKENS,
+    DEFAULT_MEMORY_INSTRUCTIONS,
     DEFAULT_PERSONA,
     MAX_ATTACHMENT_WAIT_SECONDS,
     AttachmentSettings,
@@ -17,6 +17,7 @@ from qtalk_bot.config import (
     DecisionSettings,
     DescribeSettings,
     InviteSettings,
+    MemorySettings,
     ModelSettings,
     ProcessSettings,
     ProviderSettings,
@@ -1108,9 +1109,10 @@ def test_describe_is_optional_and_read(tmp_path: Path) -> None:
     )
     assert describe is not None
     assert describe.timeout_seconds == 60
-    assert describe.max_output_tokens == 1024
+    # 后台任务默认不设输出上限（用户 2026-11-19 决定）。
+    assert describe.max_output_tokens is None
     assert describe.file_instructions == DEFAULT_FILE_INSTRUCTIONS
-    assert describe.file_max_output_tokens == DEFAULT_FILE_MAX_OUTPUT_TOKENS == 4096
+    assert describe.file_max_output_tokens is None
 
 
 def test_describe_file_fields_can_be_overridden(tmp_path: Path) -> None:
@@ -1250,3 +1252,98 @@ def test_topics_defaults_and_values(tmp_path: Path) -> None:
 )
 def test_invalid_topics(tmp_path: Path, text: str, problem: str) -> None:
     assert config_error(write_config(tmp_path, text)).problems == (problem,)
+
+
+# ---- [memory] 与后台任务的输出上限 ----
+
+
+def test_memory_is_optional_and_read(tmp_path: Path) -> None:
+    assert load_settings(write_config(tmp_path, "")).memory is None
+    text = '[memory]\nprovider = "gemini"\nmodel = "gemini-lite"\n'
+    memory = load_settings(write_config(tmp_path, text, "b.toml")).memory
+    # reasoning 与输出上限默认都不传（用户 2026-11-19 决定：后台任务默认不设输出上限）。
+    assert memory == MemorySettings(provider=Provider.GEMINI, model="gemini-lite")
+    assert memory is not None
+    assert (memory.reasoning, memory.max_output_tokens, memory.timeout_seconds) == (None, None, 120)
+    assert memory.instructions == DEFAULT_MEMORY_INSTRUCTIONS
+    text = (
+        '[memory]\nprovider = "openai"\nmodel = "gpt-6-luna"\nreasoning = "high"\n'
+        'max_output_tokens = 8000\ntimeout_seconds = 300\ninstructions = "写标题与摘要。"\n'
+    )
+    assert load_settings(write_config(tmp_path, text, "c.toml")).memory == MemorySettings(
+        provider=Provider.OPENAI,
+        model="gpt-6-luna",
+        reasoning="high",
+        max_output_tokens=8000,
+        timeout_seconds=300,
+        instructions="写标题与摘要。",
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ('model = "m"', "memory.provider：缺少这个键"),
+        ('provider = "openai"', "memory.model：缺少这个键"),
+        ('provider = "openai"\nmodel = "m"\ninstructions = " "', "memory.instructions：不能为空"),
+        (
+            'provider = "openai"\nmodel = "m"\ntimeout_seconds = 601',
+            "memory.timeout_seconds：应大于 0、不大于 600",
+        ),
+        (
+            'provider = "openai"\nmodel = "m"\nmax_output_tokens = 0',
+            "memory.max_output_tokens：应为正整数",
+        ),
+        (
+            'provider = "openai"\nmodel = "m"\nmax_output_tokens = 131073',
+            "memory.max_output_tokens：不能大于 131072",
+        ),
+        (
+            'provider = "openai"\nmodel = "m"\nreasoning = "High"',
+            "memory.reasoning：应为小写字母开头的标识符（小写字母、数字、`_`），如 high",
+        ),
+        ('provider = "openai"\nmodel = "m"\nlimit = 3', "memory.limit：未知的键"),
+    ],
+)
+def test_invalid_memory(tmp_path: Path, text: str, problem: str) -> None:
+    assert config_error(write_config(tmp_path, f"[memory]\n{text}\n")).problems == (problem,)
+
+
+@pytest.mark.parametrize(
+    ("key", "problem"),
+    [
+        ("max_output_tokens = 0", "describe.max_output_tokens：应为正整数"),
+        ('max_output_tokens = "1"', "describe.max_output_tokens：应为整数，实际是字符串"),
+        ("file_max_output_tokens = 131073", "describe.file_max_output_tokens：不能大于 131072"),
+    ],
+)
+def test_describe_output_limits_are_checked_only_when_written(
+    tmp_path: Path, key: str, problem: str
+) -> None:
+    base = '[describe]\nprovider = "openai"\nmodel = "m"\n'
+    assert config_error(write_config(tmp_path, base + key + "\n")).problems == (problem,)
+    describe = load_settings(write_config(tmp_path, base + "max_output_tokens = 500\n", "b.toml"))
+    assert describe.describe is not None
+    assert (describe.describe.max_output_tokens, describe.describe.file_max_output_tokens) == (
+        500,
+        None,
+    )
+
+
+def memory_settings_with(decisions: bool) -> Settings:
+    return Settings(
+        timezone=ZoneInfo("Asia/Shanghai"),
+        data_dir=Path("/tmp/data"),
+        models=(ModelSettings(name="a", provider=Provider.OPENAI, model="m", default=True),),
+        decisions=DecisionSettings(provider=Provider.OPENAI, model="d") if decisions else None,
+        memory=MemorySettings(provider=Provider.GEMINI, model="g"),
+    )
+
+
+def test_memory_provider_needs_its_key_only_when_topics_are_on() -> None:
+    secrets = load_secrets({k: v for k, v in FAKE_SECRETS.items() if k != "GEMINI_API_KEY"})
+    with pytest.raises(ConfigError) as info:
+        check_provider_secrets(memory_settings_with(True), secrets)
+    assert "GEMINI_API_KEY" in str(info.value)
+    # 没有 [decisions] 时 [memory] 不起作用，不要求它的密钥。
+    check_provider_secrets(memory_settings_with(False), secrets)

@@ -6,6 +6,7 @@
 """
 
 import base64
+import dataclasses
 import json
 import traceback
 from collections.abc import AsyncIterator, Callable
@@ -213,6 +214,19 @@ async def test_request_shape_and_text_usage_finish() -> None:
         "store": False,
         "stream": True,
     }
+
+
+async def test_no_output_limit_is_sent_when_the_request_has_none() -> None:
+    # 后台任务默认不设输出上限：generation_config 里不带 max_output_tokens，由模型自己的上限兜底。
+    server = streaming(
+        [created(), start(0, "model_output"), text(0, "好"), stop(0), completed("completed")]
+    )
+
+    unlimited = dataclasses.replace(REQUEST, max_output_tokens=None)
+    events = [event async for event in model_on(server).stream(unlimited)]
+
+    assert TextDelta("好") in events
+    assert "max_output_tokens" not in server.body().get("generation_config", {})
 
 
 async def test_missing_usage_is_reported_as_none() -> None:

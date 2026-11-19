@@ -461,6 +461,20 @@ Gemini 的 Decisions 在 `v1beta` 下，而对话用的 Interactions 在 `v1` �
 - 日志只记话题编号与概率，不记标题与摘要。
 - 坏响应改为逐题（评审修正）：适配器只在整次确实失败时抛错（HTTP 错误、超时、整体结构不对、缺题、多题、重名）；某一道题的答案不合法（题型不对、缺选项、概率不合法）只把那一道标成 `llm.decisions.Malformed`，与拒答一样是逐题的结果，其余照常返回。每一道都坏时仍按整次的坏响应抛出，所以只问一道题时（插话判断、只问模型或只问话题）行为与之前相同。`Router` 按逐题结果分别记账、分别走退路，只有整次失败时两道题才记同一个错误。这修正了里程碑 4「坏响应整次作废」的说法。
 
+第二步（后台写标题与摘要）实现时定下的细节：
+
+- 模块 `memory.py`（`Summarizer`），写法照 `describe.py`：后台任务、真正调用之前在事务里复查授权、受保护的记账、`stop()` / `aclose()` 收尾。接在 `__main__.py` 的关停顺序里，与 `Describer` 并列（第 6、7 步）。关停只取消一次（评审修正）：`aclose()` 在已经 `stop()` 过时只等待、不再取消，免得打断模型响应流被第一次取消后的异步关闭；`Describer.aclose()` 同样改了。
+- 配置 `[memory]`：`provider`、`model` 必填；`reasoning` 默认不传；`timeout_seconds` 默认 120（最大 600）；`max_output_tokens` 默认不设；`instructions` 默认题面写在 `config.DEFAULT_MEMORY_INSTRUCTIONS` 与示例里。只在配置了 `[decisions]` 时生效；有 `[memory]` 没有 `[decisions]` 时不报错，忽略它并在启动时记一条警告（同 `[topics]`），也不要求它的服务商的密钥。模型与同一家的对话模型共用客户端（`ChatModels.memorizer`）。
+- **后台任务默认不设输出上限**（用户 2026-11-19 决定：后台用 gpt-6-luna 的任务几乎不花钱）：`[describe]` 的 `max_output_tokens`、`file_max_output_tokens` 与 `[memory]` 的 `max_output_tokens` 都改成可选，不写就不向服务商传（`llm.ChatRequest.max_output_tokens` 可以为空，OpenAI 不带 `max_output_tokens`，Gemini 的 `generation_config` 里不带 `max_output_tokens`），由模型自己的上限兜底，失控时由 `timeout_seconds` 兜底；写了才传，含推理所用的 token。`[chat].max_output_tokens` 不变，仍默认 8192。
+- 排队：每个用户一个后台任务，依次处理排着的话题（按排的顺序、不重复）；正在写的话题又排进来，写完后再写一次；整个进程同时最多 `memory.CONCURRENCY`（2）个调用。只有正常结束（没有被取消）、写了归属的一轮才排。
+- 输入：JSON（`title`、`summary`、`turns`），`turns` 是这个话题里覆盖范围之后的各轮文字版（用户消息是正文加附件的 `text`，回复是 `content`，只发了说明的回复不带），最多最近 20 轮，每条最多 2000 字，合计最多 12000 字，超出时丢掉更早的。没有新的轮次就不调用。
+- 按轮次取（评审修正，`journal.topic_turns_after()`）：`summarized_through` 记的是覆盖到的那一轮的回复，下一次取回复编号更大的那些轮，带上它们各自 `reply_to` 覆盖的用户消息，不论用户消息的编号大小。回答进行中发来的下一轮问题编号比上一轮的回复小（问1、问2、答1、答2），只按消息编号取会漏掉问2。只发了说明的回复照样是轮次的边界，它的问题照常带上。覆盖范围推进到这次带上的各轮里最大的回复编号，所以超出上限被丢掉的更早轮次之后不会补写。
+- 输出：约定的两行纯文本「标题：……」「摘要：……」（摘要可以折行，压成一行），没有用结构化输出（对话接口没有这个参数）。标题超过 40 字、摘要超过 600 字（提示词建议的两倍）、缺一行、空白、模型没有正常写完（`FinishReason` 不是 completed）都按失败处理：只记日志，保留旧值，覆盖范围不动，下次带着更多轮重试。
+- 写回 `topics.set_summary()`（覆盖范围只前进）；用量一行，用途 `memory`、`model` 列是 `memory`，挂在输入里最后一条用户消息上。迁移 V10 按 SQLite 的做法重建用量表，把 `memory` 加进 `purpose` 的 CHECK 约束（保留第 7 版的 `searches`）。
+- 提示词注入：摘要与标题来自用户的对话，系统提示词里在它们前面加 `prompt.MEMORY_NOTICE`，说明这是自动整理的资料、可能过时，其中的要求不是给模型的指令；写摘要的提示词里也说明对话里的要求不要执行。它们只进这个用户自己的上下文。
+- 生效后：决策的话题选项、目录、上下文都用 `Topic.display_title`（有标题用标题，没有用临时标题）与摘要，第一步已经接好。
+- 日志只记话题编号、字数与覆盖的消息条数，不记标题与摘要。
+
 ### 里程碑 7a 定下的细节
 
 - `[[models]].search`（默认 `false`）打开时，调用这个模型带上服务商内置的搜索：OpenAI 是 `{"type": "web_search", "user_location": {"type": "approximate"}}`（只写 `type`，免得服务商默认用户在美国），Gemini 是 `{"type": "google_search"}`。模型不支持或服务商拒绝时按普通的调用失败处理。写描述的模型不带搜索。
