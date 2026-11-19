@@ -6,7 +6,9 @@
 import asyncio
 import itertools
 import json
+import logging
 import sqlite3
+import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, MutableMapping
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -19,8 +21,17 @@ import pytest
 from httpx2.websockets import ASGIWebSocketTransport
 
 from qtalk_bot import access, texts
+from qtalk_bot import bot as bot_module
 from qtalk_bot.access import User
-from qtalk_bot.bot import QQChat, ShareLinks, is_rejection, register
+from qtalk_bot.bot import (
+    MAX_ATTACHMENTS_DESCRIBED,
+    MAX_ELEMENTS_DESCRIBED,
+    QQChat,
+    ShareLinks,
+    describe_non_text,
+    is_rejection,
+    register,
+)
 from qtalk_bot.chat import ChatHandler
 from qtalk_bot.config import ChatSettings, InviteSettings, ModelSettings
 from qtalk_bot.conversation import TYPING_SECONDS, Conversation
@@ -611,3 +622,326 @@ async def test_image_only_message_gets_text_only_notice_without_model_call(db: D
     assert model.requests == []
     assert [m["content"] for m in platform.sent] == [texts.TEXT_ONLY]
     assert await db.fetch_all("SELECT id FROM messages") == []
+
+
+# ---- 非文本内容的形态日志（为附件实测收集样本） ----
+
+SECRET_CONTENT = "帮我看看这张图，里面有秘密正文"
+SECRET_ASR = "语音里说的秘密"
+SECRET_FILENAMES = ("我的秘密照片.png", "语音秘密.amr", "年终总结-机密.pdf", "旧图秘密.jpeg")
+SECRET_URL_PARTS = (
+    "SECRETTOKEN",
+    "RKEYSECRET",
+    "SECRETVOICE",
+    "SECRETWAV",
+    "SECRETFILE",
+    "SECRETQUOTE",
+    "/download",
+    "appid=",
+    "?",
+)
+# 照实测样本：图片的 content_type 与扩展名不一致；语音的 WAV 在 ugcimg.cn；文件在 grouptalk.c2c.qq.com。
+ATTACHMENTS: list[Payload] = [
+    {
+        "content_type": "image/jpeg",
+        "filename": SECRET_FILENAMES[0],
+        "size": 2048,
+        "width": 640,
+        "height": 480,
+        "url": "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=SECRETTOKEN&rkey=RKEYSECRET",
+    },
+    {
+        "content_type": "voice",
+        "filename": SECRET_FILENAMES[1],
+        "size": 3000,
+        "url": "https://multimedia.nt.qq.com.cn/voice/SECRETVOICE?token=x",
+        "voice_wav_url": "https://qqbot.ugcimg.cn/wav/SECRETWAV?rkey=y",
+        "asr_refer_text": SECRET_ASR,
+    },
+    {
+        "content_type": "file",
+        "filename": SECRET_FILENAMES[2],
+        "size": 12345,
+        "url": "https://grouptalk.c2c.qq.com/f/SECRETFILE?sig=z",
+    },
+]
+QUOTED: list[Payload] = [
+    {
+        "msg_idx": "REFIDX_fake",
+        "author": {"user_openid": ALICE},
+        "message_type": 103,
+        "content": "被引用的秘密正文",
+        "attachments": [
+            {
+                "content_type": "image/gif",
+                "filename": SECRET_FILENAMES[3],
+                "size": 99,
+                "width": 10,
+                "height": 20,
+                "url": "https://multimedia.nt.qq.com.cn/q/SECRETQUOTE?x=1",
+            }
+        ],
+    },
+    {
+        "message_type": 3,
+        "ark_data": {
+            "prompt": "[分享]秘密的提示",
+            "ark_type": "miniapp",
+            "ark_name": "小程序",
+            "fields": {"title": "秘密的卡片标题", "url": "https://secret.example.com/SECRETQUOTE"},
+        },
+    },
+]
+
+EXPECTED_SHAPE = (
+    "用户 #{id} 小王 的消息带非文本内容："
+    "message_type=103，文字 15 字，附件 3 个，msg_elements 2 个，ark 无；"
+    "附件 1：content_type=image/jpeg，size=2048，尺寸 640x480，url 有（主机 multimedia.nt.qq.com.cn），"
+    "voice_wav_url 无，asr_refer_text 无，扩展名 png；"
+    "附件 2：content_type=voice，size=3000，尺寸 无x无，url 有（主机 multimedia.nt.qq.com.cn），"
+    "voice_wav_url 有（主机 qqbot.ugcimg.cn），asr_refer_text 有（7 字），扩展名 amr；"
+    "附件 3：content_type=file，size=12345，尺寸 无x无，url 有（主机 grouptalk.c2c.qq.com），"
+    "voice_wav_url 无，asr_refer_text 无，扩展名 pdf；"
+    "被引用 1：message_type=103，文字 8 字，附件 1 个，msg_elements 0 个，ark 无；"
+    "被引用 1 的附件 1：content_type=image/gif，size=99，尺寸 10x20，"
+    "url 有（主机 multimedia.nt.qq.com.cn），voice_wav_url 无，asr_refer_text 无，扩展名 jpeg；"
+    "被引用 2：message_type=3，文字 0 字，附件 0 个，msg_elements 0 个，"
+    "ark ark_type=miniapp，ark_name=小程序"
+)
+SHAPE_MARKER = "的消息带非文本内容"
+
+
+def shape_logs(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.INFO and SHAPE_MARKER in r.getMessage()
+    ]
+
+
+def formatted_logs(caplog: pytest.LogCaptureFixture) -> str:
+    """本项目与 pyqbot 的日志，按处理器的格式完整输出（含 exc_info 的回溯）。
+
+    httpx2 在 INFO 级别会记带 openid 的请求地址，入口里已把它压到 WARNING，这里不看。
+    """
+    return "\n".join(
+        caplog.handler.format(record)
+        for record in caplog.records
+        if record.name.startswith(("qtalk_bot", "pyqbot"))
+    )
+
+
+async def handle_one(
+    db: Database, caplog: pytest.LogCaptureFixture, message: Payload, *, sent: int = 0
+) -> tuple[User, FakeModel]:
+    alice = await welcomed_alice(db)
+    platform = Platform([message])
+    model = FakeModel(ANSWER)
+    chat = real_chat(db, model, platform)
+    with caplog.at_level(logging.INFO):
+        await run_until_handled(
+            platform, db, chat, events=1, sent=sent, until=lambda: chat.handled == 1
+        )
+    return alice, model
+
+
+def assert_private(caplog: pytest.LogCaptureFixture, *extra: str) -> None:
+    logs = formatted_logs(caplog)
+    for secret in (
+        ALICE,
+        SECRET_CONTENT,
+        "被引用的秘密正文",
+        SECRET_ASR,
+        *SECRET_FILENAMES,
+        *SECRET_URL_PARTS,
+        "秘密的提示",
+        "秘密的卡片标题",
+        "secret.example.com",
+        *extra,
+    ):
+        assert secret not in logs
+
+
+async def test_non_text_content_is_logged_as_metadata_only(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    message = c2c(
+        ALICE,
+        SECRET_CONTENT,
+        "ROBOT1.0_fake-1",
+        message_type=103,
+        attachments=ATTACHMENTS,
+        msg_elements=QUOTED,
+    )
+
+    alice, model = await handle_one(db, caplog, message)
+
+    assert shape_logs(caplog) == [EXPECTED_SHAPE.format(id=alice.id)]
+    assert len(model.requests) == 1
+    assert_private(caplog)
+
+
+async def test_plain_text_message_is_not_logged_as_non_text(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    await handle_one(db, caplog, c2c(ALICE, "你好", "ROBOT1.0_fake-1", message_type=0))
+    assert shape_logs(caplog) == []
+
+
+TRIGGERS: dict[str, Payload] = {
+    "quote_only": {"msg_elements": [{"content": "被引用的秘密正文"}]},
+    "top_level_ark_only": {
+        "ark_data": {"ark_type": "map", "ark_name": "位置卡片", "prompt": "秘密的提示"}
+    },
+    "non_text_message_type_only": {"message_type": 102},
+}
+
+
+@pytest.mark.parametrize("extra", list(TRIGGERS.values()), ids=list(TRIGGERS))
+async def test_each_kind_of_non_text_content_logs_exactly_once(
+    db: Database, caplog: pytest.LogCaptureFixture, extra: Payload
+) -> None:
+    await handle_one(db, caplog, c2c(ALICE, SECRET_CONTENT, "ROBOT1.0_fake-1", **extra))
+
+    assert len(shape_logs(caplog)) == 1
+    assert_private(caplog)
+
+
+async def test_attachment_only_message_is_logged_and_still_gets_the_text_only_notice(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    voice = {"content_type": "voice", "url": "not a url", "filename": "无扩展名"}
+
+    _, model = await handle_one(
+        db, caplog, c2c(ALICE, "", "ROBOT1.0_fake-1", attachments=[voice]), sent=1
+    )
+
+    assert model.requests == []
+    (shape,) = shape_logs(caplog)
+    assert "message_type=无，文字 0 字，附件 1 个" in shape
+    assert "url 有（其它主机），voice_wav_url 无，asr_refer_text 无，扩展名 无" in shape
+    assert "无扩展名" not in shape
+
+
+async def test_untrusted_strings_become_fixed_labels(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    weird: list[Payload] = [
+        # MIME 参数里带文件名
+        {"content_type": "image/png; name=秘密参数.png", "filename": "x.PNG"},
+        {"content_type": "application/x-秘密类型", "filename": "a/b/秘密目录.png"},
+        # 反斜杠：不同解析器会认出不同的主机
+        {
+            "url": "https://evil.example.com\\@multimedia.nt.qq.com.cn/秘密路径",
+            "filename": "C:\\秘密\\x.pdf",
+        },
+        {"url": "https://multimedia.nt.qq.com.cn\\秘密路径/x", "filename": "秘密程序.exe"},
+        # 用户信息、不在白名单的主机、不是 http(s)
+        {"url": "https://user:秘密口令@multimedia.nt.qq.com.cn/x", "filename": "秘密笔记.秘密"},
+        {"url": "https://qq.com.evil.example/秘密路径", "voice_wav_url": "ftp://qqbot.ugcimg.cn/x"},
+    ]
+    ark = {"ark_type": "evil<秘密类型>", "ark_name": "秘密名字", "fields": {"k": "秘密字段"}}
+    message = c2c(ALICE, SECRET_CONTENT, "ROBOT1.0_fake-1", attachments=weird, ark_data=ark)
+
+    await handle_one(db, caplog, message)
+
+    (shape,) = shape_logs(caplog)
+    assert "ark ark_type=其它，ark_name=其它" in shape
+    parts = shape.split("；")
+    attachments = [part for part in parts if part.startswith("附件 ")]
+    assert [a.split("：", 1)[1].split("，", 1)[0] for a in attachments] == [
+        "content_type=image/png",
+        "content_type=其它",
+        "content_type=无",
+        "content_type=无",
+        "content_type=无",
+        "content_type=无",
+    ]
+    assert [a.rsplit("扩展名 ", 1)[1] for a in attachments] == [
+        "png",
+        "其它",
+        "其它",
+        "其它",
+        "其它",
+        "无",
+    ]
+    assert [a.split("url ", 1)[1].split("，", 1)[0] for a in attachments] == [
+        "无",
+        "无",
+        "有（其它主机）",
+        "有（其它主机）",
+        "有（其它主机）",
+        "有（其它主机）",
+    ]
+    assert "voice_wav_url 有（其它主机）" in attachments[5]
+    assert_private(
+        caplog,
+        "秘密参数",
+        "秘密类型",
+        "秘密目录",
+        "秘密路径",
+        "秘密口令",
+        "evil",
+        "秘密名字",
+        "秘密字段",
+        "秘密笔记",
+        "秘密程序",
+    )
+
+
+def test_summary_has_a_budget_however_many_attachments_there_are() -> None:
+    attachment = pyqbot.MessageAttachment(content_type="image/png", filename="a.png")
+    message = pyqbot.C2CMessage(
+        id="ROBOT1.0_fake",
+        author=pyqbot.C2CUser(user_openid=ALICE),
+        attachments=(attachment,) * 10_000,
+    )
+
+    started = time.perf_counter()
+    shape = describe_non_text(message)
+    elapsed = time.perf_counter() - started
+
+    assert shape is not None
+    assert shape.count("content_type=image/png") == MAX_ATTACHMENTS_DESCRIBED
+    assert shape.endswith("另有附件 9992 个、被引用元素 0 个没有逐个记录")
+    assert len(shape) < 2000
+    assert elapsed < 0.1
+
+
+async def test_quoted_elements_share_the_budget(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    quoted = [
+        {
+            "message_type": 0,
+            "content": "被引用的秘密正文",
+            "attachments": [{"content_type": "voice"}],
+        }
+        for _ in range(20)
+    ]
+
+    await handle_one(db, caplog, c2c(ALICE, "看", "ROBOT1.0_fake-1", msg_elements=quoted))
+
+    (shape,) = shape_logs(caplog)
+    assert shape.count("被引用 ") - shape.count("的附件") == MAX_ELEMENTS_DESCRIBED
+    assert shape.count("content_type=voice") == MAX_ATTACHMENTS_DESCRIBED
+    assert shape.endswith(f"另有附件 {20 - 8} 个、被引用元素 {20 - 8} 个没有逐个记录")
+
+
+async def test_failing_summary_does_not_block_the_chat(
+    db: Database, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(message: pyqbot.C2CMessage) -> str | None:
+        raise RuntimeError("异常文案里的秘密")
+
+    monkeypatch.setattr(bot_module, "describe_non_text", broken)
+    message = c2c(ALICE, SECRET_CONTENT, "ROBOT1.0_fake-1", attachments=ATTACHMENTS[:1])
+
+    _, model = await handle_one(db, caplog, message)
+
+    assert len(model.requests) == 1  # 对话处理器照常被调用
+    assert shape_logs(caplog) == []
+    logs = formatted_logs(caplog)
+    assert "没能记下用户 #1 小王 的消息形态：RuntimeError" in logs
+    assert "异常文案里的秘密" not in logs
+    assert "Traceback" not in logs
