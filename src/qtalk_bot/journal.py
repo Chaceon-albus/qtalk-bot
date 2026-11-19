@@ -1,10 +1,12 @@
-"""对话的数据层：消息流水与用量的读写。
+"""对话的数据层：消息流水、用量与决策记录的读写。
 
 与 `access.py` 一样，函数都是同步的，第一个参数是连接，由调用方放进 `Database.transaction()`；时间是
 Unix 秒。查询一律按 `user_id` 过滤：一个用户的对话不会被取进另一个用户的上下文。
 """
 
+import json
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -22,6 +24,7 @@ class Ending(StrEnum):
     EMPTY = "empty"  # 正常结束，但只有空白
     ABORTED = "aborted"  # 发送回答时出了说不准是否送达的错误，主动停止
     CANCELLED = "cancelled"  # 处理被取消（如关停）
+    SKIPPED = "skipped"  # 没有调用对话模型：选完模型后发现已不能使用对话（送达状态是 withheld）
 
 
 class ReplyDelivery(StrEnum):
@@ -39,6 +42,17 @@ class ReplyDelivery(StrEnum):
     CANCELLED = "cancelled"  # 处理被取消（如关停）；content 是确认送达的部分
 
 
+class UsagePurpose(StrEnum):
+    """一次调用的用途。"""
+
+    CHAT = "chat"  # 对话模型
+    DECISION = "decision"  # 决策调用
+
+
+DECISION_USAGE_MODEL = "decisions"
+"""决策调用的用量行在 `model` 列（内部名字）里记的固定值：决策模型不在 `[[models]]` 里，没有内部名字。"""
+
+
 @dataclass(frozen=True, slots=True)
 class HistoryEntry:
     role: Role
@@ -47,7 +61,11 @@ class HistoryEntry:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class UsageSummary:
-    """一个用户的用量汇总。token 数只累加服务商返回了的；`*_unreported` 是没有返回用量的调用次数。"""
+    """一个用户的用量汇总。token 数只累加服务商返回了的；`*_unreported` 是没有返回用量的调用次数。
+
+    `*_calls`、`*_input`、`*_output`、`*_unreported` 包括决策调用；`*_decision_calls`、`*_decision_input`
+    是其中决策调用的部分（决策没有输出 token）。
+    """
 
     user_id: int
     name: str
@@ -59,6 +77,10 @@ class UsageSummary:
     total_input: int
     total_output: int
     total_unreported: int
+    today_decision_calls: int = 0
+    today_decision_input: int = 0
+    total_decision_calls: int = 0
+    total_decision_input: int = 0
 
 
 def add_user_message(
@@ -123,6 +145,19 @@ def recent_history(
     return [HistoryEntry(Role(row["role"]), row["content"]) for row in rows]
 
 
+def last_answered_model(conn: sqlite3.Connection, user_id: int, before: int) -> str | None:
+    """这个用户在消息 `before` 之前、最近一次让他看到了回答的模型（内部名字）；没有时返回 `None`。
+
+    没有送达任何文字的回复（`content` 为空，如调用失败只发了固定说明）不算。
+    """
+    row = conn.execute(
+        "SELECT model FROM messages WHERE user_id = ? AND id < ? AND role = 'assistant'"
+        " AND content != '' AND model IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (user_id, before),
+    ).fetchone()
+    return None if row is None else row["model"]
+
+
 def add_usage(
     conn: sqlite3.Connection,
     *,
@@ -134,11 +169,13 @@ def add_usage(
     input_tokens: int | None,
     output_tokens: int | None,
     now: int,
+    purpose: UsagePurpose = UsagePurpose.CHAT,
 ) -> None:
-    """记一次模型调用：`model` 是内部名字，`provider` 与 `provider_model` 是实际调用的服务商与模型名。"""
+    """记一次模型调用：`model` 是内部名字（决策调用是 `DECISION_USAGE_MODEL`），`provider` 与
+    `provider_model` 是实际调用的服务商与模型名。"""
     conn.execute(
         "INSERT INTO usage (user_id, message_id, model, provider, provider_model,"
-        " input_tokens, output_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        " input_tokens, output_tokens, created_at, purpose) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             user_id,
             message_id,
@@ -148,27 +185,75 @@ def add_usage(
             input_tokens,
             output_tokens,
             now,
+            purpose.value,
+        ),
+    )
+
+
+def add_decision(
+    conn: sqlite3.Connection,
+    *,
+    user_id: int,
+    message_id: int | None,
+    question: str,
+    provider: Provider,
+    provider_model: str,
+    probabilities: Mapping[str, float] | None,
+    chosen: str,
+    kept_previous: bool,
+    latency_ms: int,
+    error: str | None,
+    now: int,
+) -> None:
+    """记一次决策调用。成功时 `probabilities` 不为空、`error` 为空，失败时反过来。"""
+    conn.execute(
+        "INSERT INTO decisions (user_id, message_id, question, provider, provider_model,"
+        " probabilities, chosen, kept_previous, latency_ms, error, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            user_id,
+            message_id,
+            question,
+            provider.value,
+            provider_model,
+            None if probabilities is None else json.dumps(dict(probabilities)),
+            chosen,
+            int(kept_previous),
+            latency_ms,
+            error,
+            now,
         ),
     )
 
 
 def usage_summary(conn: sqlite3.Connection, since: int) -> list[UsageSummary]:
-    """按用户汇总用量：`since` 之后（「今天」）与累计。没有用量记录的用户不列出。"""
+    """按用户汇总用量：`since` 之后（「今天」）与累计。没有用量记录的用户不列出。
+
+    token 数用 `total()` 累加再转回整数，不用 `SUM()`：`SUM()` 的结果超出 64 位整数时抛 `integer overflow`，
+    一行异常的大数（如绕过 `Usage` 校验写进来的）就会让整个 `/usage` 失败；`total()` 按浮点数累加，不会溢出，
+    转回整数时超出范围的部分封顶。2**53 以内的总数是精确的。
+    """
     rows = conn.execute(
         """
         SELECT
           u.user_id, users.name,
           SUM(u.created_at >= :since) AS today_calls,
-          COALESCE(SUM(CASE WHEN u.created_at >= :since THEN u.input_tokens END), 0)
+          CAST(total(CASE WHEN u.created_at >= :since THEN u.input_tokens END) AS INTEGER)
             AS today_input,
-          COALESCE(SUM(CASE WHEN u.created_at >= :since THEN u.output_tokens END), 0)
+          CAST(total(CASE WHEN u.created_at >= :since THEN u.output_tokens END) AS INTEGER)
             AS today_output,
           SUM(u.created_at >= :since AND (u.input_tokens IS NULL OR u.output_tokens IS NULL))
             AS today_unreported,
           COUNT(*) AS total_calls,
-          COALESCE(SUM(u.input_tokens), 0) AS total_input,
-          COALESCE(SUM(u.output_tokens), 0) AS total_output,
-          SUM(u.input_tokens IS NULL OR u.output_tokens IS NULL) AS total_unreported
+          CAST(total(u.input_tokens) AS INTEGER) AS total_input,
+          CAST(total(u.output_tokens) AS INTEGER) AS total_output,
+          SUM(u.input_tokens IS NULL OR u.output_tokens IS NULL) AS total_unreported,
+          SUM(u.created_at >= :since AND u.purpose = 'decision') AS today_decision_calls,
+          CAST(total(CASE WHEN u.created_at >= :since AND u.purpose = 'decision'
+            THEN u.input_tokens END) AS INTEGER) AS today_decision_input,
+          SUM(u.purpose = 'decision') AS total_decision_calls,
+          CAST(total(CASE WHEN u.purpose = 'decision' THEN u.input_tokens END) AS INTEGER)
+            AS total_decision_input
         FROM usage AS u JOIN users ON users.id = u.user_id
         GROUP BY u.user_id ORDER BY u.user_id
         """,
@@ -186,6 +271,10 @@ def usage_summary(conn: sqlite3.Connection, since: int) -> list[UsageSummary]:
             total_input=row["total_input"],
             total_output=row["total_output"],
             total_unreported=row["total_unreported"],
+            today_decision_calls=row["today_decision_calls"],
+            today_decision_input=row["today_decision_input"],
+            total_decision_calls=row["total_decision_calls"],
+            total_decision_input=row["total_decision_input"],
         )
         for row in rows
     ]

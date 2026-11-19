@@ -22,7 +22,7 @@ from qtalk_bot import access, texts
 from qtalk_bot.access import User
 from qtalk_bot.bot import QQChat, ShareLinks, is_rejection, register
 from qtalk_bot.chat import ChatHandler
-from qtalk_bot.config import ChatSettings, InviteSettings
+from qtalk_bot.config import ChatSettings, InviteSettings, ModelSettings
 from qtalk_bot.conversation import TYPING_SECONDS, Conversation
 from qtalk_bot.gate import Delivery, FriendAdded, Gate, IncomingMessage, Outcome, Reply
 from qtalk_bot.llm import (
@@ -34,6 +34,7 @@ from qtalk_bot.llm import (
     TextDelta,
     Usage,
 )
+from qtalk_bot.routing import Router
 from qtalk_bot.storage import DATABASE_FILENAME, Database
 
 HANG_GUARD = 5  # 秒：回归时应失败而不是挂起
@@ -525,8 +526,10 @@ def real_chat(db: Database, model: FakeModel, platform: Platform) -> Tracked:
     conversation = Conversation(
         db,
         admin_openid=ADMIN,
-        primary=model,
-        fallback=None,
+        models={"main": model},
+        router=Router(
+            [ModelSettings(name="main", provider=model.provider, model=model.model, default=True)]
+        ),
         settings=ChatSettings(),
         timezone=ZoneInfo("Asia/Shanghai"),
     )

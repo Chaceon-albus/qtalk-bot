@@ -126,7 +126,37 @@ CREATE TABLE usage (
 CREATE INDEX usage_by_user ON usage (user_id, created_at);
 """
 
-MIGRATIONS: tuple[Migration, ...] = (_V1_ACCESS, _V2_CHAT)
+_V3_DECISIONS = """
+-- 决策记录：每次决策调用一行，效果不好时靠它查原因，延迟的实测数据也从这里来。不记题目的输入文本（那是
+-- 聊天内容，流水里已经有了）。
+-- message_id 是触发它的用户消息；question 是题目名（如 model）；provider 与 provider_model 是实际调用的
+-- 服务商与模型名；probabilities 是各选项的概率（JSON 对象，取值 → 概率），失败时为空；chosen 是最终用的
+-- 选项（失败时是退回的那个）；kept_previous 为 1 表示概率最高的不是它，因为差距不够 switch_margin 而沿用了
+-- 上一轮；latency_ms 是这次调用的耗时；error 是失败时的分类（ErrorKind 的取值，或 timeout、cancelled）。
+CREATE TABLE decisions (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id),
+    message_id INTEGER REFERENCES messages (id) ON DELETE SET NULL,
+    question TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    provider_model TEXT NOT NULL,
+    probabilities TEXT,
+    chosen TEXT NOT NULL,
+    kept_previous INTEGER NOT NULL CHECK (kept_previous IN (0, 1)),
+    latency_ms INTEGER NOT NULL CHECK (latency_ms >= 0),
+    error TEXT,
+    created_at INTEGER NOT NULL,
+    CHECK ((probabilities IS NULL) = (error IS NOT NULL)),
+    CHECK (error IS NULL OR kept_previous = 0)
+) STRICT;
+CREATE INDEX decisions_by_user ON decisions (user_id, created_at);
+
+-- 用量按用途区分：chat 是对话模型，decision 是决策调用（它的 model 列是固定的 decisions）。
+ALTER TABLE usage ADD COLUMN purpose TEXT NOT NULL DEFAULT 'chat'
+    CHECK (purpose IN ('chat', 'decision'));
+"""
+
+MIGRATIONS: tuple[Migration, ...] = (_V1_ACCESS, _V2_CHAT, _V3_DECISIONS)
 """本程序的迁移列表。业务表由各里程碑在末尾追加，已发布的不能修改。"""
 
 

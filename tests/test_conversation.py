@@ -2,6 +2,7 @@
 
 import asyncio
 import gc
+import json
 import logging
 import secrets
 import sqlite3
@@ -17,7 +18,7 @@ import pytest
 from qtalk_bot import access, texts
 from qtalk_bot import conversation as conversation_module
 from qtalk_bot.access import User, UserStatus
-from qtalk_bot.config import DEFAULT_PERSONA, ChatSettings
+from qtalk_bot.config import DEFAULT_PERSONA, ChatSettings, DecisionSettings, ModelSettings
 from qtalk_bot.conversation import (
     TYPING_SECONDS,
     ChatInput,
@@ -26,6 +27,7 @@ from qtalk_bot.conversation import (
     SendRejectedError,
     SendUncertainError,
 )
+from qtalk_bot.journal import DECISION_USAGE_MODEL
 from qtalk_bot.llm import (
     ChatEvent,
     ChatRequest,
@@ -39,7 +41,15 @@ from qtalk_bot.llm import (
     TextDelta,
     Usage,
 )
+from qtalk_bot.llm.decisions import (
+    ChoiceAnswer,
+    DecisionError,
+    DecisionRequest,
+    DecisionResult,
+    Refusal,
+)
 from qtalk_bot.prompt import FORMAT_GUIDE
+from qtalk_bot.routing import QUESTION, Router
 from qtalk_bot.storage import DATABASE_FILENAME, Database
 
 ADMIN = "FAKE-OPENID-ADMIN"
@@ -271,11 +281,26 @@ def conversation(
         max_output_tokens=max_output_tokens,
         timeout_seconds=timeout_seconds,
     )
+    settings = [
+        ModelSettings(
+            name=primary.name,
+            provider=primary.provider,
+            model=primary.model,
+            default=True,
+            fallback=None if fallback is None else fallback.name,
+        )
+    ]
+    models = {primary.name: primary}
+    if fallback is not None:
+        settings.append(
+            ModelSettings(name=fallback.name, provider=fallback.provider, model=fallback.model)
+        )
+        models[fallback.name] = fallback
     return Conversation(
         db,
         admin_openid=ADMIN,
-        primary=primary,
-        fallback=fallback,
+        models=models,
+        router=Router(settings),
         settings=chat,
         timezone=SHANGHAI,
         clock=lambda: START,
@@ -962,3 +987,420 @@ async def test_the_last_usage_event_wins(db: Database) -> None:
     await say(conversation(db, primary), alice, "你好")
 
     assert await usage(db) == [("main", 30, 120)]
+
+
+# ---- 按消息选模型（里程碑 4） ----
+
+
+def chances(**values: float) -> DecisionResult:
+    return DecisionResult(answers={QUESTION: ChoiceAnswer(values)}, usage=Usage(40, 0))
+
+
+class FakeDecider:
+    """决策模型的替身：依次给出 `outcomes` 里的结果（异常就抛出），记下请求。`gate` 不为空时先等它置位。"""
+
+    def __init__(
+        self, *outcomes: DecisionResult | Exception, gate: asyncio.Event | None = None
+    ) -> None:
+        self.outcomes = list(outcomes)
+        self.gate = gate
+        self.requests: list[DecisionRequest] = []
+        self.started = asyncio.Event()
+        self.finished = 0
+
+    @property
+    def provider(self) -> Provider:
+        return Provider.GEMINI
+
+    @property
+    def model(self) -> str:
+        return "decision-fake"
+
+    async def decide(self, request: DecisionRequest) -> DecisionResult:
+        self.requests.append(request)
+        self.started.set()
+        try:
+            if self.gate is not None:
+                await self.gate.wait()
+            outcome = self.outcomes[min(len(self.requests), len(self.outcomes)) - 1]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        finally:
+            self.finished += 1
+
+
+def deciding(
+    db: Database,
+    decider: FakeDecider,
+    *models: ScriptedModel,
+    fallbacks: dict[str, str] | None = None,
+    switch_margin: float = 0.2,
+    history_turns: int = 3,
+    timeout_seconds: float = 3.0,
+) -> Conversation:
+    """第一个模型是默认模型；`fallbacks` 是 名字 → 备用模型的名字。"""
+    fallbacks = fallbacks or {}
+    settings = [
+        ModelSettings(
+            name=model.name,
+            provider=model.provider,
+            model=model.model,
+            default=index == 0,
+            fallback=fallbacks.get(model.name),
+            description=f"{model.name} 的描述",
+        )
+        for index, model in enumerate(models)
+    ]
+    decisions = DecisionSettings(
+        provider=Provider.GEMINI,
+        model="decision-fake",
+        switch_margin=switch_margin,
+        history_turns=history_turns,
+        timeout_seconds=timeout_seconds,
+    )
+    return Conversation(
+        db,
+        admin_openid=ADMIN,
+        models={model.name: model for model in models},
+        router=Router(settings, decisions, decider),
+        settings=ChatSettings(),
+        timezone=SHANGHAI,
+        clock=lambda: START,
+    )
+
+
+async def decision_rows(db: Database) -> list[tuple[object, ...]]:
+    result = await db.fetch_all(
+        "SELECT message_id, question, provider, provider_model, probabilities, chosen,"
+        " kept_previous, error FROM decisions ORDER BY id"
+    )
+    return [tuple(row) for row in result]
+
+
+async def usage_by_purpose(db: Database) -> list[tuple[str, str, int | None, int | None]]:
+    result = await db.fetch_all(
+        "SELECT purpose, model, input_tokens, output_tokens FROM usage ORDER BY id"
+    )
+    return [(r["purpose"], r["model"], r["input_tokens"], r["output_tokens"]) for r in result]
+
+
+async def test_decision_picks_the_model_and_is_recorded_with_its_usage(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    solve = ScriptedModel("solve", answer("不该出现"))
+    support = ScriptedModel("support", answer("抱抱你", usage=Usage(20, 5)))
+    decider = FakeDecider(chances(solve=0.2, support=0.8))
+
+    channel = await say(deciding(db, decider, solve, support), alice, "今天好累")
+
+    assert solve.requests == []
+    assert channel.streamed == "抱抱你"
+    assert (await rows(db))[-1] == Row("assistant", "抱抱你", "support", "completed", "streamed")
+    (user_message,) = await db.fetch_all("SELECT id FROM messages WHERE role = 'user'")
+    assert await decision_rows(db) == [
+        (
+            user_message["id"],
+            QUESTION,
+            "gemini",
+            "decision-fake",
+            '{"solve": 0.2, "support": 0.8}',
+            "support",
+            0,
+            None,
+        )
+    ]
+    assert await usage_by_purpose(db) == [
+        ("decision", DECISION_USAGE_MODEL, 40, 0),
+        ("chat", "support", 20, 5),
+    ]
+    latency = await db.fetch_one("SELECT latency_ms FROM decisions")
+    assert latency is not None
+    assert latency[0] >= 0
+
+
+async def test_typing_is_shown_before_the_decision_finishes(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    model = ScriptedModel("solve", answer("好"))
+    decider = FakeDecider(chances(solve=0.9, other=0.1), gate=gate)
+    channel = FakeChannel()
+    chat = deciding(db, decider, model, ScriptedModel("other", []))
+
+    task = asyncio.create_task(say(chat, alice, "你好", channel))
+    async with asyncio.timeout(HANG_GUARD):
+        await decider.started.wait()
+        await asyncio.sleep(0.05)  # 决策还卡着，让「正在输入」有机会发出
+        assert channel.log == [("typing", "")]
+        assert model.requests == []
+        gate.set()
+        await task
+
+    assert channel.kinds == ["typing", "stream", "finish"]
+
+
+async def test_switch_margin_keeps_the_model_that_answered_last_time(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    solve = ScriptedModel("solve", answer("解答"))
+    support = ScriptedModel("support", answer("陪伴"))
+    decider = FakeDecider(
+        chances(solve=0.2, support=0.8),  # 没有上一轮：取最高的
+        chances(solve=0.55, support=0.45),  # 差距不够：沿用上一轮
+        chances(solve=0.7, support=0.3),  # 差距够：换
+    )
+    chat = deciding(db, decider, solve, support, switch_margin=0.2)
+
+    for text in ("第一句", "第二句", "第三句"):
+        await say(chat, alice, text)
+
+    assert [r.model for r in await rows(db) if r.role == "assistant"] == [
+        "support",
+        "support",
+        "solve",
+    ]
+    assert [(r[5], r[6]) for r in await decision_rows(db)] == [
+        ("support", 0),
+        ("support", 1),
+        ("solve", 0),
+    ]
+
+
+async def test_failed_reply_does_not_count_as_the_previous_model(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    solve = ScriptedModel("solve", answer("解答"))
+    support = ScriptedModel("support", [ModelError(Provider.GEMINI, ErrorKind.SERVER, 500)])
+    decider = FakeDecider(
+        chances(solve=0.2, support=0.8),
+        chances(solve=0.55, support=0.45),
+    )
+    chat = deciding(db, decider, solve, support)
+
+    await say(chat, alice, "第一句")  # support 没能回答，用户只收到固定说明
+    await say(chat, alice, "第二句")
+
+    # 上一轮没有任何模型真正回答过，所以直接取最高的。
+    assert [(r[5], r[6]) for r in await decision_rows(db)] == [("support", 0), ("solve", 0)]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        DecisionError(Provider.GEMINI, ErrorKind.BLOCKED, 400),
+        DecisionError(Provider.GEMINI, ErrorKind.CONNECTION),
+        DecisionResult(answers={QUESTION: Refusal()}, usage=Usage(3, 0)),
+        RuntimeError("意外"),
+    ],
+    ids=["blocked", "connection", "refusal", "unexpected"],
+)
+async def test_decision_failure_falls_back_and_still_answers(
+    db: Database, failure: DecisionResult | Exception
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    solve = ScriptedModel("solve", answer("照常回答"))
+    support = ScriptedModel("support", answer("不该出现"))
+
+    channel = await say(deciding(db, FakeDecider(failure), solve, support), alice, "你好")
+
+    assert channel.streamed == "照常回答"
+    (row,) = await decision_rows(db)
+    assert row[4] is None  # 没有概率
+    assert row[5] == "solve"
+    assert row[7] is not None
+    purposes = [u[0] for u in await usage_by_purpose(db)]
+    assert purposes == ["decision", "chat"]
+
+
+async def test_decision_timeout_keeps_the_previous_model(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    solve = ScriptedModel("solve", answer("解答"))
+    support = ScriptedModel("support", answer("陪伴"))
+    gate = asyncio.Event()
+    first = deciding(db, FakeDecider(chances(solve=0.1, support=0.9)), solve, support)
+    await say(first, alice, "第一句")
+
+    slow = FakeDecider(chances(solve=0.9, support=0.1), gate=gate)
+    channel = await say(deciding(db, slow, solve, support, timeout_seconds=0.05), alice, "第二句")
+
+    assert channel.streamed == "陪伴"
+    assert slow.finished == 1
+    assert (await decision_rows(db))[-1][5:] == ("support", 0, "timeout")
+    assert (await usage_by_purpose(db))[-2] == ("decision", DECISION_USAGE_MODEL, None, None)
+
+
+async def test_chosen_model_falls_back_to_its_own_fallback(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    solve = ScriptedModel("solve", answer("不该出现"))
+    support = ScriptedModel("support", [ModelError(Provider.GEMINI, ErrorKind.SERVER, 503)])
+    backup = ScriptedModel("backup", answer("备用的陪伴"))
+    decider = FakeDecider(chances(solve=0.1, support=0.8, backup=0.1))
+    chat = deciding(db, decider, solve, support, backup, fallbacks={"support": "backup"})
+
+    channel = await say(chat, alice, "你好")
+
+    assert solve.requests == []
+    assert channel.streamed == "备用的陪伴"
+    assert [u[1] for u in await usage_by_purpose(db)] == [
+        DECISION_USAGE_MODEL,
+        "support",
+        "backup",
+    ]
+
+
+async def test_fallback_of_the_chosen_model_rechecks_access(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    solve = ScriptedModel("solve", answer("不该出现"))
+    support = ScriptedModel(
+        "support", [disable(db, alice), ModelError(Provider.GEMINI, ErrorKind.SERVER, 500)]
+    )
+    decider = FakeDecider(chances(solve=0.1, support=0.9))
+
+    await say(deciding(db, decider, solve, support, fallbacks={"support": "solve"}), alice, "你好")
+
+    assert solve.requests == []
+    assert (await rows(db))[-1] == Row("assistant", "", "support", "error", "withheld")
+
+
+async def test_decision_input_has_only_this_users_conversation(db: Database) -> None:
+    # AGENTS.md 的第二条不变量也适用于决策的输入。
+    alice = await invited(db, ALICE, "小王")
+    bob = await invited(db, BOB, "小李")
+    solve = ScriptedModel("solve", answer("好的"))
+    support = ScriptedModel("support", answer("好的"))
+    decider = FakeDecider(chances(solve=0.9, support=0.1))
+    chat = deciding(db, decider, solve, support, history_turns=2)
+
+    for n in range(1, 4):
+        await say(chat, alice, f"小王的第{n}句")
+        await say(chat, bob, f"小李的秘密{n}")
+    await say(chat, alice, "小王的第4句")
+
+    payload = json.loads(decider.requests[-1].input)
+    assert payload == {
+        "history": [
+            {"role": "user", "text": "小王的第2句"},
+            {"role": "assistant", "text": "好的"},
+            {"role": "user", "text": "小王的第3句"},
+            {"role": "assistant", "text": "好的"},
+        ],
+        "latest": "小王的第4句",
+    }
+    for request in decider.requests:
+        assert ("小李" in request.input) != ("小王" in request.input)
+
+
+async def test_no_decision_when_chat_is_no_longer_allowed(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    await db.transaction(access.set_user_status, alice.id, UserStatus.DISABLED)
+    decider = FakeDecider(chances(solve=0.9, support=0.1))
+    chat = deciding(db, decider, ScriptedModel("solve", []), ScriptedModel("support", []))
+
+    await say(chat, alice, "你好")
+    await say(chat, alice, None)
+
+    assert decider.requests == []
+    assert await decision_rows(db) == []
+
+
+async def test_cancellation_during_the_decision_leaves_no_task_and_is_recorded(
+    db: Database,
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    solve = ScriptedModel("solve", answer("不该出现"))
+    decider = FakeDecider(chances(solve=0.9, support=0.1), gate=asyncio.Event())
+    channel = FakeChannel()
+    chat = deciding(db, decider, solve, ScriptedModel("support", []))
+    before = asyncio.all_tasks()
+
+    task = asyncio.create_task(say(chat, alice, "你好", channel))
+    await cancel_when(task, decider.started)
+    await asyncio.sleep(0)
+
+    assert decider.finished == 1  # 决策调用随取消一起结束
+    assert asyncio.all_tasks() <= before  # 「正在输入」等后台任务都已收拢
+    assert solve.requests == []
+    assert channel.log == [("typing", "")]
+    assert (await rows(db))[-1] == Row("assistant", "", "solve", "cancelled", "cancelled")
+    assert [r[5:] for r in await decision_rows(db)] == [("solve", 0, "cancelled")]
+    # 只记决策这一次调用；对话模型没有被调用，不记对话的用量。
+    assert await usage_by_purpose(db) == [("decision", DECISION_USAGE_MODEL, None, None)]
+
+
+# ---- 评审修正：决策之后再确认授权、异常的 token 数 ----
+
+
+@pytest.mark.parametrize("why", ["disabled", "paused"])
+async def test_access_is_rechecked_after_the_decision(db: Database, why: str) -> None:
+    # AGENTS.md 的第一条不变量：决策等待期间被停用或暂停，就不再把消息交给对话模型。
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    solve = ScriptedModel("solve", answer("不该出现"))
+    support = ScriptedModel("support", answer("不该出现"))
+    decider = FakeDecider(chances(solve=0.2, support=0.8), gate=gate)
+    channel = FakeChannel()
+    chat = deciding(db, decider, solve, support, fallbacks={"support": "solve"})
+
+    task = asyncio.create_task(say(chat, alice, "你好", channel))
+    async with asyncio.timeout(HANG_GUARD):
+        await decider.started.wait()
+        if why == "disabled":
+            await db.transaction(access.set_user_status, alice.id, UserStatus.DISABLED)
+        else:
+            await db.transaction(access.set_paused, True, 0)
+        gate.set()
+        await task
+
+    assert solve.requests == []
+    assert support.requests == []
+    assert channel.log == [("typing", "")]  # 除了决策前就发出的「正在输入」，什么也不发
+    assert (await rows(db))[-1] == Row("assistant", "", "support", "skipped", "withheld")
+    # 已经发生的决策与它的用量照常记下；对话模型没有被调用，不记对话的用量。
+    assert [r[5:] for r in await decision_rows(db)] == [("support", 0, None)]
+    assert await usage_by_purpose(db) == [("decision", DECISION_USAGE_MODEL, 40, 0)]
+
+
+async def test_absurd_token_counts_do_not_roll_back_the_turn(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    solve = ScriptedModel("solve", answer("照常回答", usage=Usage(2**63, 5)))
+    decider = FakeDecider(
+        DecisionResult(
+            answers={QUESTION: ChoiceAnswer({"solve": 0.9, "support": 0.1})},
+            usage=Usage(2**63, -1),
+        )
+    )
+
+    channel = await say(deciding(db, decider, solve, ScriptedModel("support", [])), alice, "你好")
+
+    assert channel.streamed == "照常回答"
+    assert (await rows(db))[-1] == Row("assistant", "照常回答", "solve", "completed", "streamed")
+    assert len(await decision_rows(db)) == 1
+    assert await usage_by_purpose(db) == [
+        ("decision", DECISION_USAGE_MODEL, None, None),
+        ("chat", "solve", None, 5),
+    ]
+
+
+async def test_rejected_recheck_cancels_the_pending_typing_and_records_the_skip(
+    db: Database,
+) -> None:
+    # 「正在输入」一直发不完：复查拒绝后不能再等它（否则可能在拒绝之后才发出，等的时候关停还会把跳过
+    # 改记成取消），要取消它并立刻记账。
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    support = ScriptedModel("support", answer("不该出现"))
+    decider = FakeDecider(chances(solve=0.2, support=0.8), gate=gate)
+    channel = FakeChannel(typing_gate=asyncio.Event())  # 永远不置位
+    chat = deciding(db, decider, ScriptedModel("solve", []), support)
+    before = asyncio.all_tasks()
+
+    task = asyncio.create_task(say(chat, alice, "你好", channel))
+    async with asyncio.timeout(HANG_GUARD):
+        await decider.started.wait()
+        await db.transaction(access.set_user_status, alice.id, UserStatus.DISABLED)
+        gate.set()
+        await task
+    await asyncio.sleep(0)
+
+    assert channel.log == []  # 「正在输入」没有发出
+    assert asyncio.all_tasks() <= before  # 它的任务已被取消并收拢
+    assert support.requests == []
+    assert (await rows(db))[-1] == Row("assistant", "", "support", "skipped", "withheld")
+    assert await usage_by_purpose(db) == [("decision", DECISION_USAGE_MODEL, 40, 0)]

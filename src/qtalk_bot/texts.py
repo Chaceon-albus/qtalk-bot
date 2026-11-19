@@ -175,10 +175,15 @@ SERVICE_NOT_PAUSED = "服务没有暂停。"
 NO_USAGE = "还没有用量记录。"
 
 
-def _usage_part(calls: int, input_tokens: int, output_tokens: int, unreported: int) -> str:
+def _usage_part(
+    calls: int, input_tokens: int, output_tokens: int, unreported: int, decisions: tuple[int, int]
+) -> str:
     part = f"{calls} 次，输入 {input_tokens} / 输出 {output_tokens} token"
     if unreported:
         part += f"（其中 {unreported} 次没有用量数据）"
+    decision_calls, decision_input = decisions
+    if decision_calls:
+        part += f"，含决策 {decision_calls} 次、输入 {decision_input} token"
     return part
 
 
@@ -188,9 +193,15 @@ def usage_line(
     name: str,
     today: tuple[int, int, int, int],
     total: tuple[int, int, int, int],
+    today_decisions: tuple[int, int] = (0, 0),
+    total_decisions: tuple[int, int] = (0, 0),
 ) -> str:
-    """`today`、`total` 都是（调用次数，输入 token，输出 token，没有用量数据的次数）。"""
-    return f"#{user_id} {name}：今天 {_usage_part(*today)}；累计 {_usage_part(*total)}"
+    """`today`、`total` 都是（调用次数，输入 token，输出 token，没有用量数据的次数），包括决策调用；
+    `*_decisions` 是其中决策调用的（次数，输入 token）。"""
+    return (
+        f"#{user_id} {name}：今天 {_usage_part(*today, today_decisions)}；"
+        f"累计 {_usage_part(*total, total_decisions)}"
+    )
 
 
 def usage_list(lines: list[str]) -> str:

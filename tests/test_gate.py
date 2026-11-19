@@ -222,6 +222,38 @@ async def test_admin_usage_lists_today_and_total_per_user(h: Harness) -> None:
     assert "/usage" in texts.HELP
 
 
+async def test_admin_usage_counts_decision_calls(h: Harness) -> None:
+    assert await h.admin("/usage") == texts.NO_USAGE  # 管理员发过消息后才有自己的一行
+    admin = await h.user(ADMIN)
+    assert admin is not None
+
+    def record(conn: sqlite3.Connection) -> None:
+        for purpose, model, tokens_in, tokens_out in [
+            (journal.UsagePurpose.DECISION, journal.DECISION_USAGE_MODEL, 30, 0),
+            (journal.UsagePurpose.CHAT, "main", 100, 20),
+        ]:
+            journal.add_usage(
+                conn,
+                user_id=admin.id,
+                message_id=None,
+                model=model,
+                provider=Provider.OPENAI,
+                provider_model="gpt-fake",
+                input_tokens=tokens_in,
+                output_tokens=tokens_out,
+                now=START,
+                purpose=purpose,
+            )
+
+    await h.db.transaction(record)
+
+    expected = (
+        f"#{admin.id} {texts.ADMIN_NAME}：今天 2 次，输入 130 / 输出 20 token，含决策 1 次、输入 30 token；"
+        "累计 2 次，输入 130 / 输出 20 token，含决策 1 次、输入 30 token"
+    )
+    assert await h.admin("/usage") == texts.usage_list([expected])
+
+
 def test_day_start_takes_the_first_of_two_midnights() -> None:
     # 哈瓦那 2024-11-03 午夜夏令时回拨：0 点出现两次（UTC 04:00 与 05:00）。
     havana = ZoneInfo("America/Havana")

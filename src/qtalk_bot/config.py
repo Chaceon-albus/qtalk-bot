@@ -3,10 +3,11 @@
 TOML 按表校验：每个表由一个 `_parse_*` 函数经 `_Table` 读取，未知的键、类型不符、取值非法都记成问题，
 最后一次报出。问题只写键名和原因，不回显取值。
 
-以后加一个表（如 `[decisions]`）时，给 `_Table` 补上需要的读取方法，写一个 `_parse_decisions(table)`，
-再在 `_parse_root()` 里经 `table.table("decisions")` 读出它即可，`[invites]` 是现成的例子。
+以后加一个表时，给 `_Table` 补上需要的读取方法，写一个 `_parse_<表名>(table)`，再在 `_parse_root()` 里经
+`table.table("<表名>")` 读出它即可，`[invites]` 是现成的例子。
 """
 
+import math
 import os
 import re
 import tomllib
@@ -18,6 +19,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .llm import Provider
+from .llm.decisions import MAX_OPTIONS
 
 CONFIG_ENV = "QTALK_CONFIG"
 DEFAULT_CONFIG_PATH = "config.toml"
@@ -37,6 +39,16 @@ DEFAULT_MAX_OUTPUT_TOKENS = 8192
 MAX_MAX_OUTPUT_TOKENS = 131072
 DEFAULT_CHAT_TIMEOUT_SECONDS = 120
 MAX_CHAT_TIMEOUT_SECONDS = 3600
+
+DEFAULT_DECISION_MODELS = {Provider.OPENAI: "gpt-6-luna", Provider.GEMINI: "gemini-decision-1"}
+DEFAULT_DECISION_INSTRUCTIONS = """判断用户刚发来的最新一条消息最适合交给哪一个模型回答。
+输入是 JSON：history 是这之前的若干轮对话，按时间排列，role 为 user 的是用户说的话，assistant 的是助手的回复；
+latest 是用户的最新消息。按 latest 的需要选择，history 只用来理解它指的是什么。"""
+DEFAULT_DECISION_TIMEOUT_SECONDS = 3.0
+MAX_DECISION_TIMEOUT_SECONDS = 30.0
+DEFAULT_DECISION_HISTORY_TURNS = 3
+MAX_DECISION_HISTORY_TURNS = 20
+DEFAULT_SWITCH_MARGIN = 0.2
 
 _MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 _REASONING = re.compile(r"[a-z][a-z0-9_]{0,31}")
@@ -101,6 +113,8 @@ class ModelSettings:
             `generation_config.thinking_level`）；`None` 时不传，用服务商的默认值。两家、各款模型接受的
             取值不同（如有的不接受 `none`、`minimal`），且随新模型变化，所以本地只校验它是非空的小写
             标识符，不维护取值表；服务商拒绝时按普通的模型调用失败处理（会换备用模型）。
+        description: 一句话说明这个模型适合回答什么样的消息，是选模型那道选择题里这个选项的描述。
+            配置了 `[decisions]` 且模型多于一个时必填，否则可以不写（写了也不用）。
     """
 
     name: str
@@ -109,6 +123,29 @@ class ModelSettings:
     default: bool = False
     fallback: str | None = None
     reasoning: str | None = None
+    description: str | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DecisionSettings:
+    """`[decisions]` 表：用 Decisions API 按消息选模型。不写这个表就不做决策，始终用默认模型。
+
+    Attributes:
+        provider: 决策调用的服务商；它的客户端与对话模型共用，`[providers.<服务商>]` 同样生效。
+        model: 服务商那边的决策模型名；不写时按服务商取 `DEFAULT_DECISION_MODELS`。
+        instructions: 选模型那道选择题的题面。
+        timeout_seconds: 一次决策调用的硬时限（秒）。它是用户等待时间的一部分，超时就退回不选。
+        history_turns: 题目输入里带最近几轮对话（一问一答算一轮），再加当前这条消息。
+        switch_margin: 换模型所需的概率差：概率最高的模型与这个用户上一轮实际回答的模型不同时，只有
+            高出至少这么多才换，否则沿用上一轮的。两家给出的概率不能直接比较，换服务商时要重新定。
+    """
+
+    provider: Provider
+    model: str
+    instructions: str = field(default=DEFAULT_DECISION_INSTRUCTIONS, repr=False)
+    timeout_seconds: float = DEFAULT_DECISION_TIMEOUT_SECONDS
+    history_turns: int = DEFAULT_DECISION_HISTORY_TURNS
+    switch_margin: float = DEFAULT_SWITCH_MARGIN
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -178,7 +215,8 @@ class ChatSettings:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Settings:
-    """来自 TOML 配置文件的静态设置。`models` 已经校验过：非空、恰好一个默认、名字不重复、备用引用有效。"""
+    """来自 TOML 配置文件的静态设置。`models` 已经校验过：非空、恰好一个默认、名字不重复、备用引用有效；
+    `decisions` 不为空且模型多于一个时，每个模型都有 `description`。"""
 
     timezone: ZoneInfo
     data_dir: Path  # 绝对路径
@@ -187,6 +225,7 @@ class Settings:
     chat: ChatSettings = ChatSettings()
     providers: ProvidersSettings = ProvidersSettings()
     qq: QQSettings = QQSettings()
+    decisions: DecisionSettings | None = None
 
     @property
     def default_model(self) -> ModelSettings:
@@ -197,16 +236,18 @@ class Settings:
 
 
 def check_provider_secrets(settings: Settings, secrets: Secrets) -> None:
-    """配置里用到的每家服务商，对应的密钥都要已设置。
+    """配置里用到的每家服务商（对话模型与 `[decisions]`），对应的密钥都要已设置。
 
     Raises:
         ConfigError: 有服务商缺少密钥；只说变量名。
     """
     keys = {Provider.OPENAI: secrets.openai_api_key, Provider.GEMINI: secrets.gemini_api_key}
-    used = sorted({model.provider for model in settings.models})
+    used = {model.provider for model in settings.models}
+    if settings.decisions is not None:
+        used.add(settings.decisions.provider)
     problems = [
         f"配置里用到了 {provider.value} 的模型，但环境变量 {_PROVIDER_SECRETS[provider]} 未设置"
-        for provider in used
+        for provider in sorted(used)
         if keys[provider] is None
     ]
     if problems:
@@ -344,6 +385,25 @@ class _Table:
             return None
         return value
 
+    def number(self, key: str, default: float) -> float | None:
+        """整数或浮点数，统一成 `float`；`nan`、`inf` 算取值非法。"""
+        self._read.add(key)
+        if key not in self._data:
+            return default
+        value = self._data[key]
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            self.problem(key, f"应为数字，实际是{_type_name(value)}")
+            return None
+        try:
+            number = float(value)  # 超出浮点范围的整数在这里抛 OverflowError
+        except OverflowError:
+            self.problem(key, "数值超出范围")
+            return None
+        if not math.isfinite(number):
+            self.problem(key, "应为有限的数字")
+            return None
+        return number
+
     def table(self, key: str) -> _Table | None:
         """读取子表；缺省时当作空表，类型不符时记下问题并返回 `None`。"""
         self._read.add(key)
@@ -395,7 +455,17 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
     providers = None if providers_table is None else _parse_providers(providers_table)
     qq_table = table.table("qq")
     qq = None if qq_table is None else _parse_qq(qq_table)
+    decisions_ok, decisions = _parse_decisions(table)
     table.finish()
+    if decisions is not None and models is not None and len(models) > MAX_OPTIONS:
+        # 每个模型是选模型那道选择题的一个选项，两家接口都最多 255 个。
+        table.problem("models", f"配置了 [decisions] 时最多 {MAX_OPTIONS} 个模型")
+        decisions_ok = False
+    if decisions is not None and models is not None and len(models) > 1:
+        missing = [index for index, model in enumerate(models) if model.description is None]
+        for index in missing:
+            table.problem(f"models[{index}].description", "配置了 [decisions] 且模型多于一个时必填")
+        decisions_ok = decisions_ok and not missing
     if (
         timezone is None
         or data_dir is None
@@ -404,6 +474,7 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         or chat is None
         or providers is None
         or qq is None
+        or not decisions_ok
     ):
         return None
     return Settings(
@@ -414,7 +485,70 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         chat=chat,
         providers=providers,
         qq=qq,
+        decisions=decisions,
     )
+
+
+def _parse_decisions(root: _Table) -> tuple[bool, DecisionSettings | None]:
+    """可选的 `[decisions]`：返回（是否没有问题，值）；没写这个表时值是 `None`。"""
+    if not root.has("decisions"):
+        root.table("decisions")  # 标记为已读
+        return True, None
+    table = root.table("decisions")
+    if table is None:
+        return False, None
+    provider = _parse_provider_name(table)
+    model: str | None = None
+    model_ok = True
+    if table.has("model"):
+        model = table.required_string("model")
+        model_ok = model is not None
+    instructions = table.string("instructions", DEFAULT_DECISION_INSTRUCTIONS)
+    if instructions is not None and not instructions.strip():
+        table.problem("instructions", "不能为空")
+        instructions = None
+    timeout_seconds = table.number("timeout_seconds", DEFAULT_DECISION_TIMEOUT_SECONDS)
+    if timeout_seconds is not None and not 0 < timeout_seconds <= MAX_DECISION_TIMEOUT_SECONDS:
+        table.problem("timeout_seconds", f"应大于 0、不大于 {MAX_DECISION_TIMEOUT_SECONDS:g}")
+        timeout_seconds = None
+    history_turns = _bounded_int(
+        table, "history_turns", DEFAULT_DECISION_HISTORY_TURNS, 0, MAX_DECISION_HISTORY_TURNS
+    )
+    switch_margin = table.number("switch_margin", DEFAULT_SWITCH_MARGIN)
+    if switch_margin is not None and not 0 <= switch_margin <= 1:
+        table.problem("switch_margin", "应在 0 到 1 之间")
+        switch_margin = None
+    table.finish()
+    if (
+        provider is None
+        or not model_ok
+        or instructions is None
+        or timeout_seconds is None
+        or history_turns is None
+        or switch_margin is None
+    ):
+        return False, None
+    return True, DecisionSettings(
+        provider=provider,
+        model=model or DEFAULT_DECISION_MODELS[provider],
+        instructions=instructions,
+        timeout_seconds=timeout_seconds,
+        history_turns=history_turns,
+        switch_margin=switch_margin,
+    )
+
+
+def _parse_provider_name(table: _Table) -> Provider | None:
+    """必填的 `provider`：`openai` 或 `gemini`。"""
+    name = table.required_string("provider")
+    if name is None:
+        return None
+    try:
+        return Provider(name)
+    except ValueError:
+        choices = "、".join(p.value for p in Provider)
+        table.problem("provider", f"应为 {choices} 之一")
+        return None
 
 
 def _parse_providers(table: _Table) -> ProvidersSettings | None:
@@ -494,6 +628,7 @@ class _ModelDraft:
     default: bool | None
     fallback: str | None
     reasoning: str | None
+    description: str | None
     ok: bool  # 这一项自身没有问题
 
 
@@ -540,6 +675,7 @@ def _parse_models(root: _Table) -> tuple[ModelSettings, ...] | None:
             default=cast(bool, d.default),
             fallback=d.fallback,
             reasoning=d.reasoning,
+            description=d.description,
         )
         for d in drafts
     )
@@ -551,14 +687,7 @@ def _parse_model(table: _Table) -> _ModelDraft:
     if raw_name is not None and not _MODEL_NAME.fullmatch(raw_name):
         table.problem("name", "只能用字母、数字、`_`、`.`、`-`，以字母或数字开头，最长 32 个字符")
         name = None
-    provider_name = table.required_string("provider")
-    provider: Provider | None = None
-    if provider_name is not None:
-        try:
-            provider = Provider(provider_name)
-        except ValueError:
-            choices = "、".join(p.value for p in Provider)
-            table.problem("provider", f"应为 {choices} 之一")
+    provider = _parse_provider_name(table)
     model = table.required_string("model")
     default = table.boolean("default", False)
     fallback: str | None = None
@@ -574,6 +703,11 @@ def _parse_model(table: _Table) -> _ModelDraft:
             table.problem("reasoning", "应为小写字母开头的标识符（小写字母、数字、`_`），如 high")
             reasoning = None
         reasoning_ok = reasoning is not None
+    description: str | None = None
+    description_ok = True
+    if table.has("description"):
+        description = table.required_string("description")
+        description_ok = description is not None
     table.finish()
     ok = (
         name is not None
@@ -582,6 +716,7 @@ def _parse_model(table: _Table) -> _ModelDraft:
         and default is not None
         and fallback_ok
         and reasoning_ok
+        and description_ok
     )
     return _ModelDraft(
         table=table,
@@ -592,6 +727,7 @@ def _parse_model(table: _Table) -> _ModelDraft:
         default=default,
         fallback=fallback,
         reasoning=reasoning,
+        description=description,
         ok=ok,
     )
 

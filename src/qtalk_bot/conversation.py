@@ -1,18 +1,21 @@
-"""一轮对话的核心：上下文、调用模型、流式回复、出错时的处理、流水与用量。
+"""一轮对话的核心：上下文、选模型、调用模型、流式回复、出错时的处理、流水与用量。
 
-不依赖 pyqbot 与 SDK：模型经 `llm.ChatModel`，回复经 `ReplyChannel`（接线层用 pyqbot 实现，见 `bot.py`）。
+不依赖 pyqbot 与 SDK：模型经 `llm.ChatModel`，选模型经 `routing.Router`（决策经 `llm.decisions.DecisionModel`），
+回复经 `ReplyChannel`（接线层用 pyqbot 实现，见 `bot.py`）。
 
 一轮的流程：
 1. 同一个用户的消息串行处理，不同用户互不阻塞。
 2. 一个事务里：`access.chat_allowed()` 再确认一次（不可用就什么都不做）、写入用户消息、取出这个用户最近
-   若干轮的上下文。
-3. 后台发「正在输入」；调用模型，文字增量经 `MarkdownGuard` 处理后流式回复。出现非空白的正文之前不开始
-   流式消息。
-4. 出错时：还没有任何内容交给 QQ 发送、又配置了备用模型，就在事务里再确认一次授权，然后换备用模型重试
-   一次；否则给用户固定的说明。流式回复被平台拒绝时，把全文改用纯文本的普通消息再发一次，仍然失败就发
-   固定说明。发送分片时出了说不准是否送达的错误，立刻停止等模型。
-5. 一个事务里写入：助手的回复（用户实际看到的内容）、送达状态、每次模型调用的用量。处理被取消（关停）时
-   限时收拢后台任务，照样写入已确认送达的部分与已知用量，再把取消传播出去。
+   若干轮的上下文，以及选模型要用的历史和上一轮实际回答的模型。
+3. 后台发「正在输入」；然后选模型（需要时调用一次决策，在事务之外、直接在本任务里 await），失败时退回，
+   不挡住回复。
+   调用过决策的话，调用对话模型之前在事务里再确认一次授权，已不能使用就停下，什么也不发。
+4. 调用选出的模型，文字增量经 `MarkdownGuard` 处理后流式回复。出现非空白的正文之前不开始流式消息。
+5. 出错时：还没有任何内容交给 QQ 发送、选出的模型又配置了备用模型，就在事务里再确认一次授权，然后换
+   备用模型重试一次；否则给用户固定的说明。流式回复被平台拒绝时，把全文改用纯文本的普通消息再发一次，
+   仍然失败就发固定说明。发送分片时出了说不准是否送达的错误，立刻停止等模型。
+6. 一个事务里写入：决策记录与决策的用量、助手的回复（用户实际看到的内容）、送达状态、每次模型调用的用量。
+   处理被取消（关停）时限时收拢后台任务，照样写入已确认送达的部分与已知用量，再把取消传播出去。
 
 没有文字的消息（纯图片、语音、文件等）只回一句「暂时只支持文字」，不调用模型，也不进流水。
 """
@@ -21,7 +24,7 @@ import asyncio
 import logging
 import sqlite3
 import time
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -31,7 +34,7 @@ from zoneinfo import ZoneInfo
 from . import access, journal, texts
 from .access import User
 from .config import ChatSettings
-from .journal import Ending, HistoryEntry, ReplyDelivery
+from .journal import DECISION_USAGE_MODEL, Ending, HistoryEntry, ReplyDelivery, UsagePurpose
 from .llm import (
     ChatModel,
     ChatRequest,
@@ -44,6 +47,7 @@ from .llm import (
 )
 from .markdown_guard import MarkdownGuard
 from .prompt import build_request
+from .routing import DecisionRecord, Router, Selection
 from .storage import Database
 
 logger = logging.getLogger(__name__)
@@ -141,12 +145,23 @@ class _Outcome:
     delivery: ReplyDelivery
 
 
-class _Turn:
-    """一轮回复进行中的状态：后台任务、各次调用的结果。被取消时据此收尾。"""
+@dataclass(frozen=True, slots=True)
+class _Begun:
+    """开始一轮时在事务里取到的东西。"""
 
-    def __init__(self, channel: ReplyChannel, user: User) -> None:
+    message_id: int
+    request: ChatRequest
+    decision_history: list[HistoryEntry] = field(repr=False)
+    previous: str | None  # 这个用户上一轮实际回答的模型
+
+
+class _Turn:
+    """一轮回复进行中的状态：后台任务、选模型、各次调用的结果。被取消时据此收尾。"""
+
+    def __init__(self, channel: ReplyChannel, user: User, selection: Selection) -> None:
         self.channel = channel
         self.user = user
+        self.selection = selection
         self.typing = asyncio.create_task(_typing(channel, user))
         self.outbox = _Outbox(channel, self.typing)
         self.attempts: list[_Attempt] = []
@@ -169,16 +184,17 @@ class Conversation:
         db: Database,
         *,
         admin_openid: str,
-        primary: ChatModel,
-        fallback: ChatModel | None,
+        models: Mapping[str, ChatModel],
+        router: Router,
         settings: ChatSettings,
         timezone: ZoneInfo,
         clock: Callable[[], float] = time.time,
     ) -> None:
+        """`models` 按内部名字给出配置里的全部对话模型，`router` 决定每条消息用哪一个。"""
         self._db = db
         self._admin_openid = admin_openid
-        self._primary = primary
-        self._fallback = fallback
+        self._models = models
+        self._router = router
         self._settings = settings
         self._timezone = timezone
         self._clock = clock
@@ -194,11 +210,13 @@ class Conversation:
             if begun is None:
                 logger.info("用户 %s 已不能使用对话，不再处理这条消息", user.label)
                 return
-            message_id, request = begun
-            turn = _Turn(channel, user)
+            selection = self._router.select(
+                begun.decision_history, message.text, begun.previous, label=user.label
+            )
+            turn = _Turn(channel, user, selection)  # 「正在输入」在决策之前就发出
             cancelled: asyncio.CancelledError | None = None
             try:
-                outcome = await self._generate(turn, request)
+                outcome = await self._generate(turn, begun.request)
             except asyncio.CancelledError as exc:
                 cancelled = exc
                 outcome = await self._wind_down(turn)
@@ -207,20 +225,32 @@ class Conversation:
                 raise
             # 正常结束与被取消共用这一次记账；shield 让写入不随取消撤掉（数据库线程正忙、事务还没执行时，
             # 直接 await 被取消会把它撤掉），即使这里再次被取消，事务也照常完成，且只写一次。
-            await asyncio.shield(self._record(turn, message_id, outcome))
+            await asyncio.shield(self._record(turn, begun.message_id, outcome))
             if cancelled is not None:
                 raise cancelled
 
     async def _record(self, turn: _Turn, message_id: int, outcome: _Outcome) -> None:
-        if not turn.attempts:  # 还没开始调用模型就被取消
-            turn.attempts.append(_Run(self._primary).attempt(Ending.CANCELLED))
-        await self._db.transaction(self._finish, turn.user, message_id, turn.attempts, outcome)
-        last = turn.attempts[-1]
+        # 没有调用过对话模型时（选完模型后发现已不能使用对话，或正在决策时被取消）没有调用结果：结局记成
+        # 没有调用或被取消，不记对话的用量。
+        model = turn.attempts[-1].model if turn.attempts else turn.selection.model
+        if turn.attempts:
+            ending = turn.attempts[-1].ending
+        elif outcome.delivery is ReplyDelivery.WITHHELD:
+            ending = Ending.SKIPPED
+        else:
+            ending = Ending.CANCELLED
+        await self._db.transaction(
+            self._finish,
+            turn.user,
+            message_id,
+            turn.selection.record,
+            _Reply(model, ending, turn.attempts, outcome),
+        )
         logger.info(
             "回复了用户 %s：模型 %s，结局 %s，送达 %s",
             turn.user.label,
-            last.model,
-            last.ending.value,
+            model,
+            ending.value,
             outcome.delivery.value,
         )
 
@@ -231,7 +261,7 @@ class Conversation:
 
     def _begin(
         self, conn: sqlite3.Connection, user: User, qq_message_id: str, text: str
-    ) -> tuple[int, ChatRequest] | None:
+    ) -> _Begun | None:
         if not access.chat_allowed(conn, user.id, self._admin_openid):
             return None
         now = self._clock()
@@ -246,28 +276,38 @@ class Conversation:
             text=text,
             max_output_tokens=self._settings.max_output_tokens,
         )
-        return message_id, request
+        decision_history: list[HistoryEntry] = []
+        previous: str | None = None
+        if self._router.deciding:
+            # 与对话的上下文一样只取这个用户自己的流水。
+            decision_history = journal.recent_history(
+                conn, user.id, message_id, self._router.history_turns
+            )
+            previous = journal.last_answered_model(conn, user.id, message_id)
+        return _Begun(message_id, request, decision_history, previous)
 
     def _finish(
         self,
         conn: sqlite3.Connection,
         user: User,
         message_id: int,
-        attempts: list[_Attempt],
-        outcome: _Outcome,
+        decision: DecisionRecord | None,
+        reply: _Reply,
     ) -> None:
         now = int(self._clock())
+        if decision is not None:
+            _record_decision(conn, user.id, message_id, decision, now)
         journal.add_reply(
             conn,
             user_id=user.id,
             reply_to=message_id,
-            content=outcome.content,
-            model=attempts[-1].model,
-            ending=attempts[-1].ending,
-            delivery=outcome.delivery,
+            content=reply.outcome.content,
+            model=reply.model,
+            ending=reply.ending,
+            delivery=reply.outcome.delivery,
             now=now,
         )
-        for attempt in attempts:
+        for attempt in reply.attempts:
             usage = attempt.usage
             journal.add_usage(
                 conn,
@@ -284,16 +324,36 @@ class Conversation:
     # ---- 生成与回复 ----
 
     async def _generate(self, turn: _Turn, request: ChatRequest) -> _Outcome:
-        withheld = await self._attempts(turn, request)
+        chosen = await turn.selection.run()
+        # 决策最长要等 timeout_seconds，这期间用户可能被停用、服务可能被暂停：调用对话模型之前再确认一次。
+        # 已知的窗口：复查的事务提交之后、对话模型启动之前，管理员的 /disable 恰好提交时模型仍会启动。任何
+        # 「先检查、后行动」都有这样的窗口，它和「停用发生在模型调用开始后的一瞬间」无法区分；要消除它只能
+        # 让管理命令等待进行中的对话，不值得，所以接受。
+        if turn.selection.record is not None and not await self._db.transaction(
+            self._allowed, turn.user
+        ):
+            logger.info("用户 %s 在选模型期间已不能使用对话，不再调用模型", turn.user.label)
+            # 还没发出的「正在输入」不再发；也不再 await 任何东西，免得已定的跳过被关停改记成取消。
+            _cancel_and_retrieve(turn.typing)  # 已经发完时取消不起作用，只取回结果
+            turn.outbox.discard()
+            return _Outcome("", ReplyDelivery.WITHHELD)
+        withheld = await self._attempts(turn, request, self._chain(chosen))
         await turn.typing  # 之后要发的说明或纯文本不能排在「正在输入」前面
         if withheld:
             turn.outbox.discard()
             return _Outcome("", ReplyDelivery.WITHHELD)
         return await self._deliver(turn)
 
-    async def _attempts(self, turn: _Turn, request: ChatRequest) -> bool:
-        """依次调用主模型与备用模型；换备用模型前发现已不能使用对话时返回 `True`。"""
-        models = [self._primary] if self._fallback is None else [self._primary, self._fallback]
+    def _chain(self, name: str) -> list[ChatModel]:
+        """选出的模型，加上它自己配置的备用模型。"""
+        fallback = self._router.model(name).fallback
+        chain = [self._models[name]]
+        if fallback is not None:
+            chain.append(self._models[fallback])
+        return chain
+
+    async def _attempts(self, turn: _Turn, request: ChatRequest, models: list[ChatModel]) -> bool:
+        """依次调用选出的模型与它的备用模型；换备用模型前发现已不能使用对话时返回 `True`。"""
         for index, model in enumerate(models):
             if index > 0 and not await self._db.transaction(self._allowed, turn.user):
                 logger.info("用户 %s 已不能使用对话，不再改用备用模型", turn.user.label)
@@ -436,6 +496,48 @@ class Conversation:
         return _Outcome(turn.outbox.delivered_answer, ReplyDelivery.CANCELLED)
 
 
+@dataclass(frozen=True, slots=True)
+class _Reply:
+    """一轮回复要写进流水的东西：最后用的模型与结局、各次调用、送达情况。"""
+
+    model: str
+    ending: Ending
+    attempts: list[_Attempt]
+    outcome: _Outcome
+
+
+def _record_decision(
+    conn: sqlite3.Connection, user_id: int, message_id: int, record: DecisionRecord, now: int
+) -> None:
+    journal.add_decision(
+        conn,
+        user_id=user_id,
+        message_id=message_id,
+        question=record.question,
+        provider=record.provider,
+        provider_model=record.provider_model,
+        probabilities=record.probabilities,
+        chosen=record.chosen,
+        kept_previous=record.kept_previous,
+        latency_ms=record.latency_ms,
+        error=record.error,
+        now=now,
+    )
+    usage = record.usage
+    journal.add_usage(
+        conn,
+        user_id=user_id,
+        message_id=message_id,
+        model=DECISION_USAGE_MODEL,
+        provider=record.provider,
+        provider_model=record.provider_model,
+        input_tokens=None if usage is None else usage.input_tokens,
+        output_tokens=None if usage is None else usage.output_tokens,
+        now=now,
+        purpose=UsagePurpose.DECISION,
+    )
+
+
 def _remaining(deadline: float) -> float:
     return max(0.0, deadline - asyncio.get_running_loop().time())
 
@@ -475,7 +577,7 @@ def _notice(ending: Ending) -> str | None:
             return texts.REPLY_INTERRUPTED
         case Ending.MAX_TOKENS | Ending.INCOMPLETE:
             return texts.REPLY_CUT_SHORT
-        case Ending.COMPLETED | Ending.EMPTY | Ending.ABORTED | Ending.CANCELLED:
+        case Ending.COMPLETED | Ending.EMPTY | Ending.ABORTED | Ending.CANCELLED | Ending.SKIPPED:
             return None
 
 

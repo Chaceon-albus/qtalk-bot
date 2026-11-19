@@ -1,25 +1,29 @@
-"""按配置创建对话模型。每家服务商一个 SDK 客户端（带上 `[providers.<服务商>]` 的端点与代理），由用到它的
-模型共用，`ChatModels.aclose()` 时关闭。"""
+"""按配置创建对话模型与决策模型。每家服务商一个 SDK 客户端（带上 `[providers.<服务商>]` 的端点与代理），
+由用到它的模型共用，`ChatModels.aclose()` 时关闭。"""
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from types import TracebackType
 from typing import Self
 
 import openai
 from google import genai
 
-from ..config import ModelSettings, ProvidersSettings, Secrets
+from ..config import DecisionSettings, ModelSettings, ProvidersSettings, Secrets
 from . import ChatModel, Provider
+from .decisions import DecisionModel
+from .gemini_decisions import GeminiDecisionModel
 from .gemini_interactions import GeminiChatModel
 from .gemini_interactions import create_client as create_gemini_client
+from .openai_decisions import OpenAIDecisionModel
 from .openai_responses import OpenAIChatModel
 from .openai_responses import create_client as create_openai_client
 
 
-class ChatModels:
-    """配置里的全部对话模型，按内部名字取用。用 `async with` 或 `aclose()` 关闭底层客户端。
+class ChatModels(Mapping[str, ChatModel]):
+    """配置里的全部对话模型，按内部名字取用；配置了 `[decisions]` 时还有决策模型（`decider`）。
 
-    调用方要先用 `config.check_provider_secrets()` 确认用到的服务商都有密钥。
+    用 `async with` 或 `aclose()` 关闭底层客户端。调用方要先用 `config.check_provider_secrets()` 确认用到的
+    服务商都有密钥。
     """
 
     def __init__(
@@ -27,16 +31,27 @@ class ChatModels:
         models: Sequence[ModelSettings],
         secrets: Secrets,
         providers: ProvidersSettings | None = None,
+        decisions: DecisionSettings | None = None,
     ) -> None:
         self._providers = ProvidersSettings() if providers is None else providers
+        self._secrets = secrets
         self._openai: openai.AsyncOpenAI | None = None
         self._gemini: genai.Client | None = None
         self._models: dict[str, ChatModel] = {}
         for settings in models:
-            self._models[settings.name] = self._create(settings, secrets)
+            self._models[settings.name] = self._create(settings)
+        self.decider: DecisionModel | None = None
+        if decisions is not None:
+            self.decider = self._create_decider(decisions)
 
     def __getitem__(self, name: str) -> ChatModel:
         return self._models[name]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._models)
+
+    def __len__(self) -> int:
+        return len(self._models)
 
     async def aclose(self) -> None:
         if self._openai is not None:
@@ -56,31 +71,44 @@ class ChatModels:
     ) -> None:
         await self.aclose()
 
-    def _create(self, settings: ModelSettings, secrets: Secrets) -> ChatModel:
+    def _openai_client(self) -> openai.AsyncOpenAI:
+        if self._openai is None:
+            assert self._secrets.openai_api_key is not None, "应先检查密钥"
+            endpoint = self._providers.openai
+            self._openai = create_openai_client(
+                self._secrets.openai_api_key, base_url=endpoint.base_url, proxy=endpoint.proxy
+            )
+        return self._openai
+
+    def _gemini_client(self) -> genai.Client:
+        if self._gemini is None:
+            assert self._secrets.gemini_api_key is not None, "应先检查密钥"
+            endpoint = self._providers.gemini
+            self._gemini = create_gemini_client(
+                self._secrets.gemini_api_key, base_url=endpoint.base_url, proxy=endpoint.proxy
+            )
+        return self._gemini
+
+    def _create(self, settings: ModelSettings) -> ChatModel:
         match settings.provider:
             case Provider.OPENAI:
-                if self._openai is None:
-                    assert secrets.openai_api_key is not None, "应先检查密钥"
-                    endpoint = self._providers.openai
-                    self._openai = create_openai_client(
-                        secrets.openai_api_key, base_url=endpoint.base_url, proxy=endpoint.proxy
-                    )
                 return OpenAIChatModel(
-                    self._openai,
+                    self._openai_client(),
                     name=settings.name,
                     model=settings.model,
                     reasoning=settings.reasoning,
                 )
             case Provider.GEMINI:
-                if self._gemini is None:
-                    assert secrets.gemini_api_key is not None, "应先检查密钥"
-                    endpoint = self._providers.gemini
-                    self._gemini = create_gemini_client(
-                        secrets.gemini_api_key, base_url=endpoint.base_url, proxy=endpoint.proxy
-                    )
                 return GeminiChatModel(
-                    self._gemini,
+                    self._gemini_client(),
                     name=settings.name,
                     model=settings.model,
                     reasoning=settings.reasoning,
                 )
+
+    def _create_decider(self, settings: DecisionSettings) -> DecisionModel:
+        match settings.provider:
+            case Provider.OPENAI:
+                return OpenAIDecisionModel(self._openai_client(), model=settings.model)
+            case Provider.GEMINI:
+                return GeminiDecisionModel(self._gemini_client(), model=settings.model)

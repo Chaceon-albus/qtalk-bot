@@ -486,3 +486,64 @@ def test_proxy_credentials_are_not_shown_in_the_sdk_options() -> None:
         headers: dict[bytes, bytes] = dict(transport._pool._proxy_headers)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
         assert headers[b"Proxy-Authorization"] == b"Basic dXNlcjpodW50ZXIy"
     client.close()
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        # 每一项先校验再相加：无效的思考用量当作没有报告，正常的输出照记。
+        (
+            {"total_input_tokens": 2**63, "total_output_tokens": 9, "total_thought_tokens": -1},
+            Usage(None, 9),
+        ),
+        (
+            {"total_input_tokens": 5, "total_output_tokens": 9, "total_thought_tokens": "x"},
+            Usage(5, 9),
+        ),
+        (
+            {"total_input_tokens": "x", "total_output_tokens": None, "total_thought_tokens": 3},
+            Usage(None, None),
+        ),
+        (
+            {
+                "total_input_tokens": 10**9 + 1,
+                "total_output_tokens": 9,
+                "total_thought_tokens": 10**9,
+            },
+            Usage(None, None),
+        ),
+    ],
+    ids=["negative_thought", "thought_not_a_number", "input_not_a_number", "beyond_the_cap"],
+)
+async def test_bad_usage_items_are_dropped_one_by_one_and_never_fail_the_answer(
+    usage: dict[str, object], expected: Usage
+) -> None:
+    server = streaming(
+        [created(), start(0, "model_output"), text(0, "好"), stop(0), completed("completed", usage)]
+    )
+
+    events = await collect(model_on(server))
+
+    assert events == [TextDelta("好"), expected, DONE]
+
+
+async def test_token_counts_summed_beyond_64_bits_are_reported_as_missing() -> None:
+    hop = {"total_input_tokens": 2**62 + 2**61, "total_output_tokens": 1}
+    first = [
+        created("v1_hop1"),
+        start(0, "model_output"),
+        text(0, "一"),
+        stop(0),
+        completed("requires_continuation", hop, continuation_token="fake-token"),
+    ]
+    second = [
+        created("v1_hop2"),
+        start(0, "model_output"),
+        text(0, "二"),
+        stop(0),
+        completed("completed", hop),
+    ]
+
+    events = await collect(model_on(streaming(first, second)))
+
+    assert events[-2] == Usage(None, 2)

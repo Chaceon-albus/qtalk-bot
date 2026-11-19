@@ -191,3 +191,223 @@ async def test_existing_version_1_database_is_upgraded_in_place(tmp_path: Path) 
             return journal.recent_history(conn, user.id, current + 1, 1)
 
         assert await db.transaction(write) == [HistoryEntry(Role.USER, "升级后的第一句")]
+
+
+# ---- 里程碑 4：决策记录、用量的用途、上一轮的模型 ----
+
+
+async def test_last_answered_model_skips_failed_replies_and_other_users(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+    bob = await new_user(db, "FAKE-OPENID-BOB", "小李")
+
+    def fill(conn: sqlite3.Connection) -> tuple[str | None, str | None, str | None]:
+        assert journal.last_answered_model(conn, alice, 10**9) is None
+        first = journal.add_user_message(conn, alice, "问", "qq-1", 0)
+        journal.add_reply(
+            conn,
+            user_id=alice,
+            reply_to=first,
+            content="答",
+            model="support",
+            ending=Ending.COMPLETED,
+            delivery=ReplyDelivery.STREAMED,
+            now=0,
+        )
+        second = journal.add_user_message(conn, alice, "再问", "qq-2", 0)
+        journal.add_reply(  # 没送达任何文字：不算回答过
+            conn,
+            user_id=alice,
+            reply_to=second,
+            content="",
+            model="solve",
+            ending=Ending.ERROR,
+            delivery=ReplyDelivery.FAILED,
+            now=0,
+        )
+        bobs = journal.add_user_message(conn, bob, "小李", "qq-3", 0)
+        journal.add_reply(
+            conn,
+            user_id=bob,
+            reply_to=bobs,
+            content="好",
+            model="code",
+            ending=Ending.COMPLETED,
+            delivery=ReplyDelivery.STREAMED,
+            now=0,
+        )
+        third = journal.add_user_message(conn, alice, "三问", "qq-4", 0)
+        return (
+            journal.last_answered_model(conn, alice, third),
+            journal.last_answered_model(conn, alice, first),
+            journal.last_answered_model(conn, bob, third + 1),
+        )
+
+    assert await db.transaction(fill) == ("support", None, "code")
+
+
+async def test_decision_rows_are_written_as_given(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def add(conn: sqlite3.Connection) -> None:
+        message = journal.add_user_message(conn, alice, "问", "qq-1", 0)
+        journal.add_decision(
+            conn,
+            user_id=alice,
+            message_id=message,
+            question="model",
+            provider=Provider.GEMINI,
+            provider_model="gemini-decision-1",
+            probabilities={"solve": 0.25, "chat": 0.75},
+            chosen="solve",
+            kept_previous=True,
+            latency_ms=321,
+            error=None,
+            now=5,
+        )
+        journal.add_decision(
+            conn,
+            user_id=alice,
+            message_id=message,
+            question="model",
+            provider=Provider.OPENAI,
+            provider_model="gpt-6-luna",
+            probabilities=None,
+            chosen="solve",
+            kept_previous=False,
+            latency_ms=3000,
+            error="timeout",
+            now=6,
+        )
+
+    await db.transaction(add)
+    rows = await db.fetch_all(
+        "SELECT question, provider, provider_model, probabilities, chosen, kept_previous,"
+        " latency_ms, error, created_at FROM decisions ORDER BY id"
+    )
+    assert [tuple(row) for row in rows] == [
+        (
+            "model",
+            "gemini",
+            "gemini-decision-1",
+            '{"solve": 0.25, "chat": 0.75}',
+            "solve",
+            1,
+            321,
+            None,
+            5,
+        ),
+        ("model", "openai", "gpt-6-luna", None, "solve", 0, 3000, "timeout", 6),
+    ]
+
+
+async def test_decision_rows_need_either_probabilities_or_an_error(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def bad(conn: sqlite3.Connection) -> None:
+        journal.add_decision(
+            conn,
+            user_id=alice,
+            message_id=None,
+            question="model",
+            provider=Provider.OPENAI,
+            provider_model="gpt-6-luna",
+            probabilities=None,
+            chosen="solve",
+            kept_previous=False,
+            latency_ms=1,
+            error=None,
+            now=0,
+        )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.transaction(bad)
+
+
+async def test_usage_summary_counts_decisions_in_the_totals_and_separately(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> None:
+        rows = [
+            (journal.UsagePurpose.DECISION, 40, 0, 100),  # 昨天
+            (journal.UsagePurpose.DECISION, 30, 0, 1000),
+            (journal.UsagePurpose.DECISION, None, None, 1000),  # 超时，没有用量
+            (journal.UsagePurpose.CHAT, 200, 50, 1000),
+        ]
+        for purpose, tokens_in, tokens_out, now in rows:
+            journal.add_usage(
+                conn,
+                user_id=alice,
+                message_id=None,
+                model=journal.DECISION_USAGE_MODEL
+                if purpose is journal.UsagePurpose.DECISION
+                else "main",
+                provider=Provider.OPENAI,
+                provider_model="gpt-fake",
+                input_tokens=tokens_in,
+                output_tokens=tokens_out,
+                now=now,
+                purpose=purpose,
+            )
+
+    await db.transaction(fill)
+    (summary,) = await db.transaction(journal.usage_summary, 1000)
+
+    assert (summary.today_calls, summary.today_input, summary.today_output) == (3, 230, 50)
+    assert (summary.total_calls, summary.total_input, summary.total_output) == (4, 270, 50)
+    assert (summary.today_unreported, summary.total_unreported) == (1, 1)
+    assert (summary.today_decision_calls, summary.today_decision_input) == (2, 30)
+    assert (summary.total_decision_calls, summary.total_decision_input) == (3, 70)
+
+
+async def test_version_2_database_gets_the_decisions_table_and_chat_purpose(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / DATABASE_FILENAME
+    async with await Database.open(path, migrations=MIGRATIONS[:2]) as old:
+        user = await old.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+        await old.execute(
+            "INSERT INTO usage (user_id, model, provider, provider_model, created_at)"
+            " VALUES (?, 'main', 'openai', 'gpt-fake', 0)",
+            (user.id,),
+        )
+
+    async with await Database.open(path) as db:
+        row = await db.fetch_one("SELECT purpose FROM usage")
+        assert row is not None
+        assert row["purpose"] == "chat"
+        assert await db.fetch_all("SELECT * FROM decisions") == []
+        with pytest.raises(sqlite3.IntegrityError):
+            await db.execute(
+                "INSERT INTO usage (user_id, model, provider, provider_model, created_at, purpose)"
+                " VALUES (?, 'main', 'openai', 'gpt-fake', 0, 'other')",
+                (user.id,),
+            )
+
+
+async def test_usage_summary_survives_rows_that_bypassed_the_usage_checks(db: Database) -> None:
+    # 一行能落库的 2**63 - 1 和别的行相加，SUM() 会抛 integer overflow，整个 /usage 都看不到；
+    # total() 不会溢出，总数封顶。
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+    bob = await new_user(db, "FAKE-OPENID-BOB", "小李")
+
+    def fill(conn: sqlite3.Connection) -> None:
+        for user_id, tokens in [(alice, 2**63 - 1), (alice, 2**63 - 1), (bob, 7)]:
+            journal.add_usage(
+                conn,
+                user_id=user_id,
+                message_id=None,
+                model="main",
+                provider=Provider.OPENAI,
+                provider_model="gpt-fake",
+                input_tokens=tokens,
+                output_tokens=1,
+                now=1000,
+            )
+
+    await db.transaction(fill)
+    alice_usage, bob_usage = await db.transaction(journal.usage_summary, 0)
+
+    assert alice_usage.total_input == 2**63 - 1
+    assert alice_usage.today_input == 2**63 - 1
+    assert (alice_usage.total_output, alice_usage.total_calls) == (2, 2)
+    assert (bob_usage.total_input, bob_usage.total_output) == (7, 1)

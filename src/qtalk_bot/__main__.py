@@ -1,8 +1,7 @@
 """启动入口：`python -m qtalk_bot`。
 
-读配置与密钥、打开数据库、创建对话模型、构造 `pyqbot.Bot`、注册处理函数并运行，退出时关闭模型的客户端
-与数据库。配置或数据库有误、
-连不上平台时打印原因并以非零状态退出，不打印 traceback。
+读配置与密钥、打开数据库、创建对话模型与决策模型、构造 `pyqbot.Bot`、注册处理函数并运行，退出时关闭
+模型的客户端与数据库。配置或数据库有误、连不上平台时打印原因并以非零状态退出，不打印 traceback。
 """
 
 import asyncio
@@ -25,6 +24,7 @@ from .config import (
 from .conversation import Conversation
 from .gate import Gate
 from .llm.providers import ChatModels
+from .routing import Router
 from .storage import DATABASE_FILENAME, Database, StorageError
 
 logger = logging.getLogger("qtalk_bot")
@@ -40,7 +40,7 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
     """
     async with (
         await Database.open(settings.data_dir / DATABASE_FILENAME) as db,
-        ChatModels(settings.models, secrets, settings.providers) as models,
+        ChatModels(settings.models, secrets, settings.providers, settings.decisions) as models,
     ):
         if settings.qq.base_url is None:
             bot = pyqbot.Bot(secrets.app_id, secrets.app_secret)
@@ -55,12 +55,11 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
         )
         await gate.prepare()
         if chat is None:
-            default = settings.default_model
             conversation = Conversation(
                 db,
                 admin_openid=secrets.admin_openid,
-                primary=models[default.name],
-                fallback=None if default.fallback is None else models[default.fallback],
+                models=models,
+                router=Router(settings.models, settings.decisions, models.decider),
                 settings=settings.chat,
                 timezone=settings.timezone,
             )

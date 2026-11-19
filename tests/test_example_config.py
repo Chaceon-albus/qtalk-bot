@@ -4,9 +4,12 @@ from pathlib import Path
 
 from qtalk_bot.config import (
     DEFAULT_DATA_DIR,
+    DEFAULT_DECISION_MODELS,
     DEFAULT_TIMEZONE,
     ChatSettings,
+    DecisionSettings,
     InviteSettings,
+    Provider,
     ProvidersSettings,
     QQSettings,
     Secrets,
@@ -46,6 +49,10 @@ def test_example_config_is_valid_and_spells_out_the_defaults() -> None:
     assert example.data_dir == ROOT / DEFAULT_DATA_DIR
     assert example.invites == InviteSettings()
     assert example.chat == ChatSettings()
+    # [decisions] 没有「省略时的默认值」（省略就是不做决策），但表里的各项仍要与默认值一致。
+    assert example.decisions == DecisionSettings(
+        provider=Provider.OPENAI, model=DEFAULT_DECISION_MODELS[Provider.OPENAI]
+    )
 
 
 def test_example_config_shows_both_providers_and_a_fallback() -> None:
@@ -71,7 +78,9 @@ def test_commented_out_examples_are_valid_once_uncommented(tmp_path: Path) -> No
 
     settings = load_settings(config)
 
-    assert settings.default_model.reasoning == "high"
+    assert [model.reasoning for model in settings.models] == ["high", "low"]
+    assert settings.decisions is not None
+    assert settings.decisions.model == "gpt-6-luna"
     assert settings.qq.base_url == "https://api.bot.qq.com"
     assert settings.providers.openai.base_url == "https://api.openai.com/v1"
     assert settings.providers.openai.proxy == "socks5://127.0.0.1:1080"

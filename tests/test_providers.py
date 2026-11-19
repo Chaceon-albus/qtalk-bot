@@ -1,8 +1,16 @@
 """按配置创建对话模型：不发请求，只看创建与关闭。"""
 
-from qtalk_bot.config import ModelSettings, ProviderSettings, ProvidersSettings, Secrets
+from qtalk_bot.config import (
+    DecisionSettings,
+    ModelSettings,
+    ProviderSettings,
+    ProvidersSettings,
+    Secrets,
+)
 from qtalk_bot.llm import Provider
+from qtalk_bot.llm.gemini_decisions import GeminiDecisionModel
 from qtalk_bot.llm.gemini_interactions import GeminiChatModel
+from qtalk_bot.llm.openai_decisions import OpenAIDecisionModel
 from qtalk_bot.llm.openai_responses import OpenAIChatModel
 from qtalk_bot.llm.providers import ChatModels
 
@@ -67,3 +75,38 @@ async def test_endpoints_proxies_and_reasoning_reach_the_sdk_clients() -> None:
         assert gemini_options.async_client_args == {"proxy": "http://127.0.0.1:7890"}
         assert main._reasoning == "high"  # pyright: ignore[reportPrivateUsage]
         assert backup._reasoning == "low"  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_decision_model_shares_the_providers_client() -> None:
+    settings = (
+        ModelSettings(name="main", provider=Provider.OPENAI, model="gpt-a", default=True),
+        ModelSettings(name="alt", provider=Provider.GEMINI, model="gemini-b"),
+    )
+    decisions = DecisionSettings(provider=Provider.GEMINI, model="gemini-decision-x")
+    async with ChatModels(settings, SECRETS, decisions=decisions) as models:
+        decider = models.decider
+        assert isinstance(decider, GeminiDecisionModel)
+        assert (decider.provider, decider.model) == (Provider.GEMINI, "gemini-decision-x")
+        alt = models["alt"]
+        assert isinstance(alt, GeminiChatModel)
+        assert decider._client is alt._client  # pyright: ignore[reportPrivateUsage]  同一家共用客户端
+        assert sorted(models) == ["alt", "main"]
+        assert len(models) == 2
+
+
+async def test_decision_provider_without_chat_models_gets_its_own_configured_client() -> None:
+    settings = (ModelSettings(name="main", provider=Provider.GEMINI, model="g", default=True),)
+    providers = ProvidersSettings(openai=ProviderSettings(base_url="https://oa.example.com/v1"))
+    decisions = DecisionSettings(provider=Provider.OPENAI, model="gpt-6-luna")
+    async with ChatModels(settings, SECRETS, providers, decisions) as models:
+        decider = models.decider
+        assert isinstance(decider, OpenAIDecisionModel)
+        client = decider._client  # pyright: ignore[reportPrivateUsage]
+        assert str(client.base_url) == "https://oa.example.com/v1/"
+        assert "fake-" not in repr(decider)
+
+
+async def test_no_decision_model_without_the_decisions_table() -> None:
+    settings = (ModelSettings(name="main", provider=Provider.OPENAI, model="gpt-a", default=True),)
+    async with ChatModels(settings, SECRETS) as models:
+        assert models.decider is None

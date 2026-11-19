@@ -97,10 +97,35 @@ class Usage:
     可能出现多次（例如 Gemini 自动续写的每一跳结束时），后一次覆盖前一次：调用方取最后一次，不要相加。
     这样调用中途被打断时，已经报告的部分不会丢。`output_tokens` 包括推理（思考）所用的 token，它们也按
     输出计费。
+
+    构造时把不可信的计数（不是整数、布尔值、负数、超过 `MAX_TOKENS_PER_CALL`）换成 `None`，当作服务商没有
+    报告：两家 SDK 都不校验响应，原样留下的超大整数在 SQLite 绑定时会抛 `OverflowError`，让整轮记账一起回滚。
+    要把几项相加的地方（如 Gemini 的思考用量、各跳的累计）先用 `token_count()` 逐项校验再加，这里只能拦住
+    最后交进来的值。
     """
 
     input_tokens: int | None
     output_tokens: int | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "input_tokens", token_count(self.input_tokens))
+        object.__setattr__(self, "output_tokens", token_count(self.output_tokens))
+
+
+MAX_TOKENS_PER_CALL = 10**9
+"""单次调用的输入或输出 token 数的可信上限。现有模型的上下文窗口在百万到千万 token 这个量级，超过 10 亿
+一定是上游出错；而且有了这个上限，`/usage` 的 `SUM()` 要累加约 92 亿行才会超出 64 位整数。"""
+
+
+def token_count(value: object) -> int | None:
+    """服务商报告的 token 数：0 到 `MAX_TOKENS_PER_CALL` 之间的整数才采用，其余（含布尔值）返回 `None`。"""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= MAX_TOKENS_PER_CALL
+    ):
+        return None
+    return value
 
 
 class FinishReason(StrEnum):
@@ -130,6 +155,8 @@ class ErrorKind(StrEnum):
     SERVER = "server"  # 5xx，或流里报告的服务端错误
     FAILED = "failed"  # 流里报告这次生成失败或被取消，没有更具体的分类
     MALFORMED = "malformed"  # 响应无法解析，或流没有正常结束就断开
+    REFUSED = "refused"  # 服务商拒绝回答（如 Decisions 单道题的拒答）
+    BLOCKED = "blocked"  # 输入被服务商的安全策略拦截
     OTHER = "other"
 
 
@@ -141,6 +168,8 @@ _ERROR_LABELS = {
     ErrorKind.SERVER: "服务端出错",
     ErrorKind.FAILED: "生成失败",
     ErrorKind.MALFORMED: "响应无法解析或不完整",
+    ErrorKind.REFUSED: "拒绝回答",
+    ErrorKind.BLOCKED: "被安全策略拦截",
     ErrorKind.OTHER: "其它错误",
 }
 

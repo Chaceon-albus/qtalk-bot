@@ -50,6 +50,7 @@ from . import (
     TextPart,
     Usage,
     kind_for_status,
+    token_count,
 )
 
 OFFICIAL_BASE_URL = "https://generativelanguage.googleapis.com/"
@@ -216,12 +217,20 @@ class _UsageTotal:
         self.unreported = False  # 有累加进来、还没作为事件交出去的用量
 
     def add(self, usage: interactions.Usage) -> None:
+        """累加一跳的用量。每一项先按 `token_count()` 的规则校验，无效的那一项当作没有报告，有效的照常加；
+        用量的问题不抛异常，不能让回答失败。
+
+        SDK 在流式解析里会把 JSON 的 `true` 转成整数 `1`，原始值拿不到，这种情况只能当作 1 收下。
+        """
         self.reported = True
         self.unreported = True
-        self.input_tokens = _add(self.input_tokens, usage.total_input_tokens)
-        output = usage.total_output_tokens
-        if output is not None and usage.total_thought_tokens:
-            output += usage.total_thought_tokens
+        self.input_tokens = _add(
+            self.input_tokens, token_count(_field(usage, "total_input_tokens"))
+        )
+        output = token_count(_field(usage, "total_output_tokens"))
+        thought = token_count(_field(usage, "total_thought_tokens"))
+        if output is not None and thought is not None:
+            output += thought  # 思考用量无效时只记输出本身
         self.output_tokens = _add(self.output_tokens, output)
 
     def event(self) -> Usage:
@@ -240,6 +249,11 @@ def _step(message: Message) -> interactions.StepParam:
 
 def _part(part: TextPart) -> interactions.TextContentParam:
     return {"type": "text", "text": part.text}
+
+
+def _field(usage: interactions.Usage, name: str) -> object:
+    """用量里的一项。SDK 不校验，类型不可信，按 `object` 取出再校验。"""
+    return cast(object, getattr(usage, name, None))
 
 
 def _add(total: int | None, value: int | None) -> int | None:

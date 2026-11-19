@@ -4,9 +4,12 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from qtalk_bot.config import (
+    DEFAULT_DECISION_INSTRUCTIONS,
+    DEFAULT_DECISION_MODELS,
     DEFAULT_PERSONA,
     ChatSettings,
     ConfigError,
+    DecisionSettings,
     InviteSettings,
     ModelSettings,
     ProviderSettings,
@@ -19,7 +22,7 @@ from qtalk_bot.config import (
     load_secrets,
     load_settings,
 )
-from qtalk_bot.llm import Provider
+from qtalk_bot.llm import Provider, gemini_decisions, openai_decisions
 
 # 假密钥：只用于断言它们不会出现在 repr 与异常文案里。
 FAKE_SECRETS = {
@@ -206,9 +209,9 @@ def test_invalid_value_is_not_echoed(tmp_path: Path) -> None:
 
 
 def test_unknown_keys_and_tables_are_reported(tmp_path: Path) -> None:
-    text = 'timezne = "UTC"\n[decisions]\nprovider = "openai"\n'
+    text = 'timezne = "UTC"\n[process]\nrecall = true\n'
     error = config_error(write_config(tmp_path, text))
-    assert error.problems == ("timezne：未知的键", "decisions：未知的键")
+    assert error.problems == ("timezne：未知的键", "process：未知的键")
 
 
 def test_secret_in_config_file_is_rejected_without_echoing_value(tmp_path: Path) -> None:
@@ -673,3 +676,207 @@ def test_base_url_with_query_or_fragment_is_rejected(tmp_path: Path, text: str) 
     (problem,) = error.problems
     assert problem.endswith(".base_url：不能带查询串（?）或片段（#）")
     assert "secret-in" not in str(error)
+
+
+# ---- [decisions] 与模型的 description ----
+
+TWO_MODELS = """
+[[models]]
+name = "solve"
+provider = "openai"
+model = "gpt-fake"
+default = true
+description = "解决具体问题"
+
+[[models]]
+name = "support"
+provider = "gemini"
+model = "gemini-fake"
+description = "闲聊与情感支持"
+"""
+
+
+def test_decisions_default_to_none_and_description_is_optional(tmp_path: Path) -> None:
+    settings = load_settings(write_config(tmp_path, ""))
+    assert settings.decisions is None
+    assert settings.default_model.description is None
+
+
+def test_decisions_defaults(tmp_path: Path) -> None:
+    text = '[decisions]\nprovider = "gemini"\n' + TWO_MODELS
+    settings = load_settings(write_config(tmp_path, text, models=False))
+
+    assert settings.decisions == DecisionSettings(
+        provider=Provider.GEMINI, model="gemini-decision-1"
+    )
+    decisions = settings.decisions
+    assert decisions is not None
+    assert decisions.instructions == DEFAULT_DECISION_INSTRUCTIONS
+    assert decisions.timeout_seconds == 3.0
+    assert decisions.history_turns == 3
+    assert decisions.switch_margin == 0.2
+    assert [m.description for m in settings.models] == ["解决具体问题", "闲聊与情感支持"]
+
+
+def test_default_decision_models_match_the_adapters() -> None:
+    assert DEFAULT_DECISION_MODELS == {
+        Provider.OPENAI: openai_decisions.DEFAULT_MODEL,
+        Provider.GEMINI: gemini_decisions.DEFAULT_MODEL,
+    }
+
+
+def test_decisions_are_read(tmp_path: Path) -> None:
+    text = (
+        """
+[decisions]
+provider = "openai"
+model = "gpt-6-luna-next"
+instructions = "选一个"
+timeout_seconds = 1.5
+history_turns = 0
+switch_margin = 0
+"""
+        + TWO_MODELS
+    )
+    decisions = load_settings(write_config(tmp_path, text, models=False)).decisions
+    assert decisions == DecisionSettings(
+        provider=Provider.OPENAI,
+        model="gpt-6-luna-next",
+        instructions="选一个",
+        timeout_seconds=1.5,
+        history_turns=0,
+        switch_margin=0.0,
+    )
+
+
+def test_integer_timeout_is_accepted(tmp_path: Path) -> None:
+    text = '[decisions]\nprovider = "openai"\ntimeout_seconds = 2\n' + TWO_MODELS
+    decisions = load_settings(write_config(tmp_path, text, models=False)).decisions
+    assert decisions is not None
+    assert decisions.timeout_seconds == 2.0
+
+
+def test_description_is_required_with_decisions_and_several_models(tmp_path: Path) -> None:
+    models = TWO_MODELS.replace('description = "解决具体问题"\n', "").replace(
+        'description = "闲聊与情感支持"\n', ""
+    )
+    text = 'timezne = "UTC"\n[decisions]\nprovider = "openai"\n' + models
+    error = config_error(write_config(tmp_path, text, models=False))
+    assert error.problems == (
+        "timezne：未知的键",
+        "models[0].description：配置了 [decisions] 且模型多于一个时必填",
+        "models[1].description：配置了 [decisions] 且模型多于一个时必填",
+    )
+
+
+def test_description_is_not_required_for_a_single_model(tmp_path: Path) -> None:
+    settings = load_settings(write_config(tmp_path, '[decisions]\nprovider = "openai"\n'))
+    assert settings.decisions is not None
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ("", "decisions.provider：缺少这个键"),
+        ('provider = "claude"', "decisions.provider：应为 openai、gemini 之一"),
+        ('provider = "openai"\nmodel = ""', "decisions.model：不能为空"),
+        ('provider = "openai"\ninstructions = "  "', "decisions.instructions：不能为空"),
+        (
+            'provider = "openai"\ntimeout_seconds = 0',
+            "decisions.timeout_seconds：应大于 0、不大于 30",
+        ),
+        (
+            'provider = "openai"\ntimeout_seconds = 31',
+            "decisions.timeout_seconds：应大于 0、不大于 30",
+        ),
+        ('provider = "openai"\ntimeout_seconds = nan', "decisions.timeout_seconds：应为有限的数字"),
+        (
+            'provider = "openai"\ntimeout_seconds = "3"',
+            "decisions.timeout_seconds：应为数字，实际是字符串",
+        ),
+        ('provider = "openai"\nhistory_turns = 21', "decisions.history_turns：不能大于 20"),
+        ('provider = "openai"\nhistory_turns = -1', "decisions.history_turns：不能小于 0"),
+        ('provider = "openai"\nswitch_margin = 1.5', "decisions.switch_margin：应在 0 到 1 之间"),
+        ('provider = "openai"\nswitch_margin = -0.1', "decisions.switch_margin：应在 0 到 1 之间"),
+        (
+            'provider = "openai"\nswitch_margin = true',
+            "decisions.switch_margin：应为数字，实际是布尔值",
+        ),
+        ('provider = "openai"\nthreshold = 1', "decisions.threshold：未知的键"),
+    ],
+)
+def test_invalid_decisions(tmp_path: Path, text: str, problem: str) -> None:
+    error = config_error(
+        write_config(tmp_path, f"[decisions]\n{text}\n" + TWO_MODELS, models=False)
+    )
+    assert error.problems == (problem,)
+
+
+def test_decisions_that_is_not_a_table(tmp_path: Path) -> None:
+    error = config_error(write_config(tmp_path, 'decisions = "openai"\n'))
+    assert error.problems == ("decisions：应为表，实际是字符串",)
+
+
+def test_empty_description_is_rejected(tmp_path: Path) -> None:
+    text = MODELS + 'description = ""\n'
+    error = config_error(write_config(tmp_path, text, models=False))
+    assert error.problems == ("models[0].description：不能为空",)
+
+
+def test_decision_provider_needs_its_key() -> None:
+    settings = Settings(
+        timezone=ZoneInfo("UTC"),
+        data_dir=Path("/data"),
+        models=(ModelSettings(name="m", provider=Provider.OPENAI, model="x", default=True),),
+        decisions=DecisionSettings(provider=Provider.GEMINI, model="gemini-decision-1"),
+    )
+    secrets = Secrets(
+        app_id="a", app_secret="b", admin_openid="c", openai_api_key=FAKE_SECRETS["OPENAI_API_KEY"]
+    )
+    with pytest.raises(ConfigError) as info:
+        check_provider_secrets(settings, secrets)
+    assert info.value.problems == ("配置里用到了 gemini 的模型，但环境变量 GEMINI_API_KEY 未设置",)
+
+
+# ---- 评审修正：模型个数上限、超大整数 ----
+
+
+def many_models(count: int) -> str:
+    return "".join(
+        f'[[models]]\nname = "m{index}"\nprovider = "openai"\nmodel = "gpt-fake"\n'
+        f'description = "第 {index} 个"\n' + ("default = true\n" if index == 0 else "")
+        for index in range(count)
+    )
+
+
+def test_at_most_255_models_with_decisions(tmp_path: Path) -> None:
+    text = '[decisions]\nprovider = "openai"\n' + many_models(256)
+    error = config_error(write_config(tmp_path, text, models=False))
+    assert error.problems == ("models：配置了 [decisions] 时最多 255 个模型",)
+
+
+def test_255_models_with_decisions_are_fine(tmp_path: Path) -> None:
+    text = '[decisions]\nprovider = "openai"\n' + many_models(255)
+    assert len(load_settings(write_config(tmp_path, text, models=False)).models) == 255
+
+
+def test_no_model_limit_without_decisions(tmp_path: Path) -> None:
+    assert len(load_settings(write_config(tmp_path, many_models(256), models=False)).models) == 256
+
+
+@pytest.mark.parametrize("key", ["timeout_seconds", "switch_margin"])
+def test_integer_beyond_float_range_is_a_config_problem(tmp_path: Path, key: str) -> None:
+    huge = "1" + "0" * 400  # tomllib 读得出来，转成浮点数会溢出
+    text = f'[decisions]\nprovider = "openai"\n{key} = {huge}\n' + TWO_MODELS
+    error = config_error(write_config(tmp_path, text, models=False))
+    assert error.problems == (f"decisions.{key}：数值超出范围",)
+
+
+def test_too_many_models_and_missing_descriptions_are_reported_together(tmp_path: Path) -> None:
+    models = many_models(256).replace('description = "第 3 个"\n', "")
+    text = '[decisions]\nprovider = "openai"\n' + models
+    error = config_error(write_config(tmp_path, text, models=False))
+    assert error.problems == (
+        "models：配置了 [decisions] 时最多 255 个模型",
+        "models[3].description：配置了 [decisions] 且模型多于一个时必填",
+    )

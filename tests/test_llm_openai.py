@@ -15,6 +15,7 @@ import openai
 import pytest
 
 from qtalk_bot.llm import (
+    MAX_TOKENS_PER_CALL,
     ChatEvent,
     ChatRequest,
     ErrorKind,
@@ -495,3 +496,28 @@ def test_proxy_with_credentials_still_authenticates_to_the_proxy() -> None:
     transport = http_client._transport_for_url(httpx2.URL(OFFICIAL_BASE_URL))  # pyright: ignore[reportPrivateUsage]
     headers: dict[bytes, bytes] = dict(transport._pool._proxy_headers)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownArgumentType]
     assert headers[b"Proxy-Authorization"] == b"Basic dXNlcjpodW50ZXIy"  # user:hunter2
+
+
+@pytest.mark.parametrize(
+    ("input_tokens", "output_tokens", "expected"),
+    [
+        (2**63, 20, Usage(None, 20)),
+        (-1, 2**64, Usage(None, None)),
+        (MAX_TOKENS_PER_CALL, 0, Usage(MAX_TOKENS_PER_CALL, 0)),
+        (MAX_TOKENS_PER_CALL + 1, 7, Usage(None, 7)),
+    ],
+    ids=["too_big", "negative_and_too_big", "largest_kept", "beyond_the_cap"],
+)
+async def test_absurd_token_counts_are_reported_as_missing(
+    input_tokens: int, output_tokens: int, expected: Usage
+) -> None:
+    # SDK 原样留下超大的整数，写进 SQLite 时会抛 OverflowError，让整轮记账回滚。
+    completed = {
+        "type": "response.completed",
+        "sequence_number": 4,
+        "response": response("completed", usage=usage(input_tokens, output_tokens)),
+    }
+    events = await collect(
+        model_on(streaming([CREATED, ITEM_ADDED, text_delta(3, "好"), completed]))
+    )
+    assert events[-2] == expected
