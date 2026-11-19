@@ -834,6 +834,7 @@ def test_is_rejection_follows_outcome_unknown(error: pyqbot.QQBotError, rejected
         (404, None, True),
         (500, {"code": 11264, "message": "服务端错误"}, False),  # 5xx 即使带错误码也说不准
         (502, None, False),
+        (303, None, False),  # 发送后的重定向没有错误码：说不准
     ],
 )
 async def test_is_rejection_on_real_pyqbot_errors(

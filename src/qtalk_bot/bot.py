@@ -914,12 +914,9 @@ def _extension(filename: str | None) -> str:
 def is_rejection(exc: pyqbot.QQBotError) -> bool:
     """平台是否明确拒绝了这次请求（可以确定消息没有发出）：pyqbot 的 `outcome_unknown` 为假。
 
-    `outcome_unknown` 为真的（请求发出后的网络错误、HTTP 5xx 不论有没有错误码、2xx 却没有错误码的异常响应）
-    可能已经生效，不算拒绝。pyqbot 说明 `AuditPendingError`（已受理、等待审核）与 `PartialFailureError`
-    （部分已生效）是例外：它们的 `outcome_unknown` 为假，却不是「没有生效」，所以这里也不算拒绝。
+    `outcome_unknown` 为真的可能已经（部分）生效，不算拒绝：请求发出后的网络错误、HTTP 5xx（不论有没有错误码）、
+    没有错误码的 2xx/3xx 异常响应、`AuditPendingError`（已受理、等待审核）、`PartialFailureError`（部分已生效）。
     """
-    if isinstance(exc, pyqbot.AuditPendingError | pyqbot.PartialFailureError):
-        return False
     return not exc.outcome_unknown
 
 

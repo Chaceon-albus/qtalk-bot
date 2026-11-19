@@ -148,7 +148,7 @@
 
 - 每条消息按消息 ID、每次加好友按事件 ID 记进 `processed_events`，与这次处理的全部数据库改动在同一个事务里提交；记过的直接丢弃。记录保留 7 天。
 - 代价是「至多一次」：事务提交后、回复发出前进程退出，这次回复就丢了，但不会重复。
-- 只有平台明确拒绝时（`bot.is_rejection()`：pyqbot 异常的 `outcome_unknown` 为假）才改发备用文案，并撤销「只回一次」的占位；不确定是否送达时两样都不做。`outcome_unknown` 为真的是请求发出后的网络错误、HTTP 5xx（不论有没有错误码）、2xx 却没有错误码的异常响应；为假的是带错误码的 2xx/4xx、HTTP 4xx、建连阶段的错误、取 access_token 失败。5xx 一律算说不准，比早先「带错误码就算拒绝」保守。pyqbot 注明的例外 `AuditPendingError`（已受理、等待审核）与 `PartialFailureError`（部分已生效）的 `outcome_unknown` 为假，却不是「没有生效」，这里也不算拒绝。所有用到「确定没发出 / 说不准」的地方（这里的备用文案与占位、对话的改发纯文本与停读、固定说明的送达状态）都经同一个判据（`bot._send_error()` 把它转成 `SendRejectedError` / `SendUncertainError`）。
+- 只有平台明确拒绝时（`bot.is_rejection()`：pyqbot 异常的 `outcome_unknown` 为假）才改发备用文案，并撤销「只回一次」的占位；不确定是否送达时两样都不做。`outcome_unknown` 为真的是请求发出后的网络错误、HTTP 5xx（不论有没有错误码）、没有错误码的 2xx/3xx 异常响应、`AuditPendingError`（已受理、等待审核）与 `PartialFailureError`（部分已生效）；为假的是带错误码的 2xx/3xx/4xx、HTTP 4xx、建连阶段的错误、取 access_token 失败。5xx 一律算说不准，比早先「带错误码就算拒绝」保守。所有用到「确定没发出 / 说不准」的地方（这里的备用文案与占位、对话的改发纯文本与停读、固定说明的送达状态）都经同一个判据（`bot._send_error()` 把它转成 `SendRejectedError` / `SendUncertainError`）。
 
 对话处理器：`ChatHandler.handle(user, message)`，`message` 是 pyqbot 的原始消息。放行决定与真正开始处理之间有一个很小的窗口，所以实现者必须在开始有代价的操作之前，在自己的事务里调用 `access.chat_allowed()` 再确认一次。
 
