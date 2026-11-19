@@ -6,7 +6,10 @@ readme = "README.md"
 authors = [{ name = "capric98" }]
 requires-python = ">=3.14"
 dependencies = [
+    "google-genai>=3.6.1",
+    "openai>=3.55.1",
     "pyqbot",
+    "socksio>=1,<2",
 ]
 
 [build-system]
@@ -43,7 +46,8 @@ typeCheckingMode = "strict"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["--import-mode=importlib", "--strict-markers", "--strict-config"]
+addopts = ["--import-mode=importlib", "--strict-markers", "--strict-config", "-m", "not live"]
+markers = ["live: 连接真实服务的实测（计费），默认不运行；征得同意后用 `-m live` 显式运行"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 xfail_strict = true

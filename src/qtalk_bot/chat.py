@@ -1,14 +1,13 @@
-"""对话处理器：已授权用户的普通消息交给它。
+"""对话处理器的协议：已授权用户的普通消息交给它。
 
-授权部分（`gate.py`、`bot.py`）只认 `ChatHandler` 这个协议。下一个里程碑把 `ChatNotReady` 换成真正的
-实现（调用大模型、流式回复），在 `__main__.py` 里注入即可，不需要改动授权部分。
+授权部分（`gate.py`、`bot.py`）只认 `ChatHandler` 这个协议。真正的实现是 `bot.QQChat`：把 pyqbot 的消息
+转成普通数据，交给 `conversation.Conversation`。
 """
 
 from typing import Protocol
 
 import pyqbot
 
-from . import texts
 from .access import User
 
 
@@ -27,10 +26,3 @@ class ChatHandler(Protocol):
     """
 
     async def handle(self, user: User, message: pyqbot.C2CMessage) -> None: ...
-
-
-class ChatNotReady:
-    """对话功能上线前的占位实现：固定回复一句「还没有上线」。"""
-
-    async def handle(self, user: User, message: pyqbot.C2CMessage) -> None:
-        await message.reply(texts.CHAT_NOT_READY)

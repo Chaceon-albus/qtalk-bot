@@ -12,14 +12,24 @@ FAKE_ENV = {
     "APP_ID": "fake-app-id",
     "APP_SECRET": "fake-app-secret-never-shown",
     "ADMIN_OPENID": "FAKE-OPENID-ADMIN",
+    "OPENAI_API_KEY": "fake-openai-key-never-shown",
 }
+
+MODELS = """
+[[models]]
+name = "main"
+provider = "openai"
+model = "gpt-fake"
+default = true
+"""
 
 
 @pytest.fixture
 def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "config.toml"
-    path.write_text('timezone = "UTC"\n', encoding="utf-8")
+    path.write_text('timezone = "UTC"\n' + MODELS, encoding="utf-8")
     monkeypatch.setenv("QTALK_CONFIG", str(path))
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     for name, value in FAKE_ENV.items():
         monkeypatch.setenv(name, value)
     return path
@@ -34,6 +44,18 @@ def test_config_error_prints_message_and_exits_nonzero(
     assert "环境变量 ADMIN_OPENID 未设置" in err
     assert "Traceback" not in err
     assert FAKE_ENV["APP_SECRET"] not in err
+
+
+def test_missing_provider_key_exits_nonzero_naming_the_variable(
+    config: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config.write_text(
+        'timezone = "UTC"\n' + MODELS.replace('"openai"', '"gemini"'), encoding="utf-8"
+    )
+    assert entry.main() == entry.EXIT_CONFIG_ERROR
+    err = capsys.readouterr().err
+    assert "GEMINI_API_KEY" in err
+    assert FAKE_ENV["OPENAI_API_KEY"] not in err
 
 
 def test_missing_config_file_exits_nonzero(
@@ -65,6 +87,22 @@ def test_run_opens_database_registers_handlers_and_closes(
     assert names == ["管理员"]
 
 
+def test_qq_base_url_is_passed_to_pyqbot(config: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    started: list[pyqbot.Bot] = []
+
+    async def start(self: pyqbot.Bot) -> None:
+        started.append(self)
+
+    monkeypatch.setattr(pyqbot.Bot, "start", start)
+    config.write_text(
+        'timezone = "UTC"\n[qq]\nbase_url = "https://sandbox.example.com"\n' + MODELS,
+        encoding="utf-8",
+    )
+    assert entry.main() == 0
+    (bot,) = started
+    assert bot.config.base_url == "https://sandbox.example.com"
+
+
 def test_platform_error_exits_nonzero_without_secrets(
     config: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -87,7 +125,7 @@ def test_data_dir_that_is_a_file_exits_nonzero_without_traceback(
 
     monkeypatch.setattr(pyqbot.Bot, "start", start)
     (config.parent / "blocker").write_text("我是一个普通文件")
-    config.write_text('timezone = "UTC"\ndata_dir = "blocker"\n', encoding="utf-8")
+    config.write_text('timezone = "UTC"\ndata_dir = "blocker"\n' + MODELS, encoding="utf-8")
     assert entry.main() == entry.EXIT_RUNTIME_ERROR
     err = capsys.readouterr().err
     assert "无法打开数据库" in err

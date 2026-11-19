@@ -35,7 +35,17 @@ DISABLED = "你的使用权限已被管理员停用，暂时无法使用。"
 
 PAUSED = "服务暂停中，请稍后再来。"
 
-CHAT_NOT_READY = "对话功能还没有上线，敬请期待。"
+# ---- 对话 ----
+
+TEXT_ONLY = "暂时只支持文字消息，图片、语音和文件还看不懂。可以用文字说说想问什么。"
+
+MODEL_FAILED = "抱歉，刚才没能生成回复，请稍后再试一次。"
+
+REPLY_INTERRUPTED = "（回复中断了，请稍后再试一次。）"
+
+REPLY_CUT_SHORT = "（回复没有写完就停下了，可以让我接着说。）"
+
+REPLY_REJECTED = "抱歉，这条回复没能通过平台的审核，发不出来。换个说法再问问看？"
 
 # ---- 管理命令 ----
 
@@ -48,6 +58,7 @@ HELP = """管理命令：
 /enable <编号>：启用用户
 /pause：暂停服务
 /resume：恢复服务
+/usage：查看各用户今天和累计的用量
 /help：显示这份说明"""
 
 UNKNOWN_COMMAND = "没有这个命令，发送 /help 查看可用的命令。"
@@ -159,3 +170,28 @@ SERVICE_PAUSED = (
 SERVICE_ALREADY_PAUSED = "服务已经是暂停状态。"
 SERVICE_RESUMED = "已恢复服务。"
 SERVICE_NOT_PAUSED = "服务没有暂停。"
+
+
+NO_USAGE = "还没有用量记录。"
+
+
+def _usage_part(calls: int, input_tokens: int, output_tokens: int, unreported: int) -> str:
+    part = f"{calls} 次，输入 {input_tokens} / 输出 {output_tokens} token"
+    if unreported:
+        part += f"（其中 {unreported} 次没有用量数据）"
+    return part
+
+
+def usage_line(
+    *,
+    user_id: int,
+    name: str,
+    today: tuple[int, int, int, int],
+    total: tuple[int, int, int, int],
+) -> str:
+    """`today`、`total` 都是（调用次数，输入 token，输出 token，没有用量数据的次数）。"""
+    return f"#{user_id} {name}：今天 {_usage_part(*today)}；累计 {_usage_part(*total)}"
+
+
+def usage_list(lines: list[str]) -> str:
+    return "用量（今天从本地时间 0 点算起）：\n" + "\n".join(lines)

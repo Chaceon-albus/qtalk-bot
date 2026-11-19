@@ -8,12 +8,16 @@ TOML 按表校验：每个表由一个 `_parse_*` 函数经 `_Table` 读取，�
 """
 
 import os
+import re
 import tomllib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from .llm import Provider
 
 CONFIG_ENV = "QTALK_CONFIG"
 DEFAULT_CONFIG_PATH = "config.toml"
@@ -22,7 +26,22 @@ DEFAULT_DATA_DIR = "data"
 DEFAULT_INVITE_TTL_HOURS = 7 * 24
 DEFAULT_INVITE_MAX_USES = 1
 MAX_INVITE_TTL_HOURS = 10 * 365 * 24  # 再大就可能超出 datetime 能表示的范围
-MAX_INVITE_MAX_USES = 10000  # 邀请是给认识的人的；也免得超出 SQLite 的 64 位整数
+MAX_INVITE_MAX_USES = 32  # 一个邀请最多带进来的人数；机器人撑不了太多用户
+
+DEFAULT_PERSONA = """你是一个友善、可靠的聊天助手，在 QQ 上和用户一对一聊天。
+回答准确、简洁、口语化，篇幅与问题相称；不确定的事情直说不确定，不编造事实。
+用户用什么语言提问，就用什么语言回答。"""
+DEFAULT_HISTORY_TURNS = 10
+MAX_HISTORY_TURNS = 100
+DEFAULT_MAX_OUTPUT_TOKENS = 8192
+MAX_MAX_OUTPUT_TOKENS = 131072
+DEFAULT_CHAT_TIMEOUT_SECONDS = 120
+MAX_CHAT_TIMEOUT_SECONDS = 3600
+
+_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
+_REASONING = re.compile(r"[a-z][a-z0-9_]{0,31}")
+_PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
+_PROVIDER_SECRETS = {Provider.OPENAI: "OPENAI_API_KEY", Provider.GEMINI: "GEMINI_API_KEY"}
 
 _REQUIRED_SECRETS = ("APP_ID", "APP_SECRET", "ADMIN_OPENID")
 _OPTIONAL_SECRETS = ("OPENAI_API_KEY", "GEMINI_API_KEY")
@@ -69,12 +88,129 @@ class InviteSettings:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ModelSettings:
+    """`[[models]]` 的一项。
+
+    Attributes:
+        name: 内部名字，用于日志、用量与互相引用。
+        provider: 服务商。
+        model: 服务商那边的模型名。
+        default: 是否是默认模型；恰好有一项是。
+        fallback: 调用失败时改用的模型（另一项的 `name`），没有时为 `None`。
+        reasoning: 推理强度，原样透传给服务商（OpenAI 的 `reasoning.effort`，Gemini 的
+            `generation_config.thinking_level`）；`None` 时不传，用服务商的默认值。两家、各款模型接受的
+            取值不同（如有的不接受 `none`、`minimal`），且随新模型变化，所以本地只校验它是非空的小写
+            标识符，不维护取值表；服务商拒绝时按普通的模型调用失败处理（会换备用模型）。
+    """
+
+    name: str
+    provider: Provider
+    model: str
+    default: bool = False
+    fallback: str | None = None
+    reasoning: str | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ProviderSettings:
+    """`[providers.<服务商>]` 表：调用这家服务商时的端点与代理。
+
+    Attributes:
+        base_url: 端点；`None` 时用官方端点。端点只有这两个来源，`OPENAI_BASE_URL`、
+            `GOOGLE_GEMINI_BASE_URL` 这类环境变量一律不采用。OpenAI 的写法含版本号（如
+            `https://api.openai.com/v1`），Gemini 的不含（如 `https://generativelanguage.googleapis.com/`，
+            版本号由程序固定）。
+        proxy: 代理地址，`http`、`https`、`socks5`、`socks5h` 之一（SOCKS 由依赖 `socksio` 提供支持）。
+            `None` 时不设代理，系统级的 `HTTPS_PROXY` 等环境变量照常生效。地址里可能带用户名和密码，
+            所以不进 `repr`、日志与报错。
+    """
+
+    base_url: str | None = None
+    proxy: str | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ProvidersSettings:
+    """`[providers]` 表：按服务商分开的设置。"""
+
+    openai: ProviderSettings = ProviderSettings()
+    gemini: ProviderSettings = ProviderSettings()
+
+    def __getitem__(self, provider: Provider) -> ProviderSettings:
+        match provider:
+            case Provider.OPENAI:
+                return self.openai
+            case Provider.GEMINI:
+                return self.gemini
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class QQSettings:
+    """`[qq]` 表：QQ 开放平台一侧。
+
+    Attributes:
+        base_url: 开放平台 HTTP 接口的地址，传给 `pyqbot.Bot(base_url=...)`；`None` 时用 pyqbot 的默认值。
+            网关的 WebSocket 地址是平台在 `GET /gateway` 里返回的，不受它影响。
+
+    QQ 侧暂时不能配代理：pyqbot 目前只能由调用方自己构造 `httpx2.AsyncClient` 来设代理，那需要本项目
+    直接依赖 `httpx2`；等 pyqbot 加上代理参数再做。
+    """
+
+    base_url: str | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ChatSettings:
+    """`[chat]` 表：对话的人设、上下文与限制。
+
+    Attributes:
+        persona: 人设，系统提示词的第一部分。
+        history_turns: 上下文里带最近几轮（一问一答算一轮）。
+        max_output_tokens: 单次回复的输出上限（含推理所用的 token）。
+        timeout_seconds: 一次模型调用（从发出请求到流结束）的时限；换备用模型重试时重新计时。
+    """
+
+    persona: str = field(default=DEFAULT_PERSONA, repr=False)
+    history_turns: int = DEFAULT_HISTORY_TURNS
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
+    timeout_seconds: float = DEFAULT_CHAT_TIMEOUT_SECONDS
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Settings:
-    """来自 TOML 配置文件的静态设置。"""
+    """来自 TOML 配置文件的静态设置。`models` 已经校验过：非空、恰好一个默认、名字不重复、备用引用有效。"""
 
     timezone: ZoneInfo
     data_dir: Path  # 绝对路径
+    models: tuple[ModelSettings, ...]
     invites: InviteSettings = InviteSettings()
+    chat: ChatSettings = ChatSettings()
+    providers: ProvidersSettings = ProvidersSettings()
+    qq: QQSettings = QQSettings()
+
+    @property
+    def default_model(self) -> ModelSettings:
+        return next(model for model in self.models if model.default)
+
+    def model(self, name: str) -> ModelSettings:
+        return next(model for model in self.models if model.name == name)
+
+
+def check_provider_secrets(settings: Settings, secrets: Secrets) -> None:
+    """配置里用到的每家服务商，对应的密钥都要已设置。
+
+    Raises:
+        ConfigError: 有服务商缺少密钥；只说变量名。
+    """
+    keys = {Provider.OPENAI: secrets.openai_api_key, Provider.GEMINI: secrets.gemini_api_key}
+    used = sorted({model.provider for model in settings.models})
+    problems = [
+        f"配置里用到了 {provider.value} 的模型，但环境变量 {_PROVIDER_SECRETS[provider]} 未设置"
+        for provider in used
+        if keys[provider] is None
+    ]
+    if problems:
+        raise ConfigError("缺少大模型的密钥：", problems)
 
 
 def load_secrets(environ: Mapping[str, str] | None = None) -> Secrets:
@@ -173,6 +309,31 @@ class _Table:
             return None
         return value
 
+    def has(self, key: str) -> bool:
+        return key in self._data
+
+    def required_string(self, key: str) -> str | None:
+        """必填的非空字符串；缺失、为空或类型不符时记下问题并返回 `None`。"""
+        if key not in self._data:
+            self._read.add(key)
+            self.problem(key, "缺少这个键")
+            return None
+        value = self.string(key, "")
+        if value is not None and not value.strip():
+            self.problem(key, "不能为空")
+            return None
+        return value
+
+    def boolean(self, key: str, default: bool) -> bool | None:
+        self._read.add(key)
+        if key not in self._data:
+            return default
+        value = self._data[key]
+        if not isinstance(value, bool):
+            self.problem(key, f"应为布尔值，实际是{_type_name(value)}")
+            return None
+        return value
+
     def integer(self, key: str, default: int) -> int | None:
         self._read.add(key)
         if key not in self._data:
@@ -193,6 +354,23 @@ class _Table:
         full = f"{self._name}.{key}" if self._name else key
         return _Table(cast(dict[str, object], value), full, self._problems)
 
+    def tables(self, key: str) -> list[_Table] | None:
+        """读取表的数组（`[[key]]`）；缺省时是空列表，类型不符时记下问题并返回 `None`。"""
+        self._read.add(key)
+        value = self._data.get(key, [])
+        full = f"{self._name}.{key}" if self._name else key
+        if not isinstance(value, list):
+            self.problem(key, f"应为表的数组，实际是{_type_name(value)}")
+            return None
+        items = cast(list[object], value)
+        result: list[_Table] = []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                self.problem(f"{key}[{index}]", f"应为表，实际是{_type_name(item)}")
+                return None
+            result.append(_Table(cast(dict[str, object], item), f"{full}[{index}]", self._problems))
+        return result
+
     def finish(self) -> None:
         for key in self._data:
             if key in self._read:
@@ -210,10 +388,242 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
     data_dir = _parse_data_dir(table, base_dir)
     invites_table = table.table("invites")
     invites = None if invites_table is None else _parse_invites(invites_table)
+    models = _parse_models(table)
+    chat_table = table.table("chat")
+    chat = None if chat_table is None else _parse_chat(chat_table)
+    providers_table = table.table("providers")
+    providers = None if providers_table is None else _parse_providers(providers_table)
+    qq_table = table.table("qq")
+    qq = None if qq_table is None else _parse_qq(qq_table)
     table.finish()
-    if timezone is None or data_dir is None or invites is None:
+    if (
+        timezone is None
+        or data_dir is None
+        or invites is None
+        or models is None
+        or chat is None
+        or providers is None
+        or qq is None
+    ):
         return None
-    return Settings(timezone=timezone, data_dir=data_dir, invites=invites)
+    return Settings(
+        timezone=timezone,
+        data_dir=data_dir,
+        models=models,
+        invites=invites,
+        chat=chat,
+        providers=providers,
+        qq=qq,
+    )
+
+
+def _parse_providers(table: _Table) -> ProvidersSettings | None:
+    parsed: dict[Provider, ProviderSettings | None] = {}
+    for provider in Provider:
+        sub = table.table(provider.value)
+        parsed[provider] = None if sub is None else _parse_provider(sub)
+    table.finish()
+    openai, gemini = parsed[Provider.OPENAI], parsed[Provider.GEMINI]
+    if openai is None or gemini is None:
+        return None
+    return ProvidersSettings(openai=openai, gemini=gemini)
+
+
+def _parse_provider(table: _Table) -> ProviderSettings | None:
+    url_ok, base_url = _optional_base_url(table)
+    proxy_ok, proxy = _optional_url(table, "proxy", _PROXY_SCHEMES)
+    table.finish()
+    if not (url_ok and proxy_ok):
+        return None
+    return ProviderSettings(base_url=base_url, proxy=proxy)
+
+
+def _parse_qq(table: _Table) -> QQSettings | None:
+    url_ok, base_url = _optional_base_url(table)
+    table.finish()
+    if not url_ok:
+        return None
+    return QQSettings(base_url=base_url)
+
+
+def _optional_url(table: _Table, key: str, schemes: Sequence[str]) -> tuple[bool, str | None]:
+    """可选的地址，协议须是 `schemes` 之一：返回（是否没有问题，值）；缺省时值是 `None`。
+
+    报错不回显取值：代理地址里可能有用户名和密码。
+    """
+    if not table.has(key):
+        return True, None
+    value = table.required_string(key)
+    if value is None:
+        return False, None
+    if not _is_url(value, schemes):
+        table.problem(key, f"应为完整的地址，协议是 {'、'.join(schemes)} 之一")
+        return False, None
+    return True, value
+
+
+def _optional_base_url(table: _Table) -> tuple[bool, str | None]:
+    """可选的 `base_url`：http(s) 地址，不能带查询串或片段（SDK 与 pyqbot 都是在后面直接拼路径）。"""
+    ok, value = _optional_url(table, "base_url", ("http", "https"))
+    if value is not None and ("?" in value or "#" in value):
+        table.problem("base_url", "不能带查询串（?）或片段（#）")
+        return False, None
+    return ok, value
+
+
+def _is_url(value: str, schemes: Sequence[str]) -> bool:
+    if any(c.isspace() for c in value):
+        return False
+    try:
+        parts = urlsplit(value)
+        parts.port  # noqa: B018  端口不是数字时这里抛 ValueError
+    except ValueError:
+        return False
+    return parts.scheme.lower() in schemes and bool(parts.hostname)
+
+
+@dataclass(slots=True)
+class _ModelDraft:
+    """一项模型配置读出来的样子；某个字段有问题时是 `None`，其余字段照常可用于交叉检查。"""
+
+    table: _Table
+    raw_name: str | None  # 读到的字符串，即使格式不对（用于重名与引用检查）
+    name: str | None
+    provider: Provider | None
+    model: str | None
+    default: bool | None
+    fallback: str | None
+    reasoning: str | None
+    ok: bool  # 这一项自身没有问题
+
+
+def _parse_models(root: _Table) -> tuple[ModelSettings, ...] | None:
+    tables = root.tables("models")
+    if tables is None:
+        return None
+    if not tables:
+        root.problem("models", "至少要配置一个模型（[[models]]）")
+        return None
+    drafts = [_parse_model(table) for table in tables]
+    ok = all(draft.ok for draft in drafts)
+    first_index: dict[str, int] = {}
+    for index, draft in enumerate(drafts):
+        if draft.raw_name is None:
+            continue
+        if draft.raw_name in first_index:
+            draft.table.problem("name", f"与 models[{first_index[draft.raw_name]}] 重名")
+            ok = False
+        else:
+            first_index[draft.raw_name] = index
+    for draft in drafts:
+        if draft.fallback is None:
+            continue
+        if draft.fallback == draft.raw_name:
+            draft.table.problem("fallback", "不能指向自己")
+            ok = False
+        elif draft.fallback not in first_index:
+            draft.table.problem("fallback", "引用的模型不存在")
+            ok = False
+    defaults = sum(draft.default is True for draft in drafts)
+    unknown = sum(draft.default is None for draft in drafts)
+    if defaults > 1 or (defaults == 0 and unknown == 0):
+        detail = "没有" if defaults == 0 else f"有 {defaults} 个"
+        root.problem("models", f"应恰好有一个 default = true 的模型，实际{detail}")
+        ok = False
+    if not ok:
+        return None
+    return tuple(
+        ModelSettings(
+            name=cast(str, d.name),
+            provider=cast(Provider, d.provider),
+            model=cast(str, d.model),
+            default=cast(bool, d.default),
+            fallback=d.fallback,
+            reasoning=d.reasoning,
+        )
+        for d in drafts
+    )
+
+
+def _parse_model(table: _Table) -> _ModelDraft:
+    raw_name = table.required_string("name")
+    name = raw_name
+    if raw_name is not None and not _MODEL_NAME.fullmatch(raw_name):
+        table.problem("name", "只能用字母、数字、`_`、`.`、`-`，以字母或数字开头，最长 32 个字符")
+        name = None
+    provider_name = table.required_string("provider")
+    provider: Provider | None = None
+    if provider_name is not None:
+        try:
+            provider = Provider(provider_name)
+        except ValueError:
+            choices = "、".join(p.value for p in Provider)
+            table.problem("provider", f"应为 {choices} 之一")
+    model = table.required_string("model")
+    default = table.boolean("default", False)
+    fallback: str | None = None
+    fallback_ok = True
+    if table.has("fallback"):
+        fallback = table.required_string("fallback")
+        fallback_ok = fallback is not None
+    reasoning: str | None = None
+    reasoning_ok = True
+    if table.has("reasoning"):
+        reasoning = table.required_string("reasoning")
+        if reasoning is not None and not _REASONING.fullmatch(reasoning):
+            table.problem("reasoning", "应为小写字母开头的标识符（小写字母、数字、`_`），如 high")
+            reasoning = None
+        reasoning_ok = reasoning is not None
+    table.finish()
+    ok = (
+        name is not None
+        and provider is not None
+        and model is not None
+        and default is not None
+        and fallback_ok
+        and reasoning_ok
+    )
+    return _ModelDraft(
+        table=table,
+        raw_name=raw_name,
+        name=name,
+        provider=provider,
+        model=model,
+        default=default,
+        fallback=fallback,
+        reasoning=reasoning,
+        ok=ok,
+    )
+
+
+def _parse_chat(table: _Table) -> ChatSettings | None:
+    persona = table.string("persona", DEFAULT_PERSONA)
+    if persona is not None and not persona.strip():
+        table.problem("persona", "不能为空")
+        persona = None
+    history_turns = _bounded_int(
+        table, "history_turns", DEFAULT_HISTORY_TURNS, 0, MAX_HISTORY_TURNS
+    )
+    max_output_tokens = _positive_int(
+        table, "max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS, MAX_MAX_OUTPUT_TOKENS
+    )
+    timeout_seconds = _positive_int(
+        table, "timeout_seconds", DEFAULT_CHAT_TIMEOUT_SECONDS, MAX_CHAT_TIMEOUT_SECONDS
+    )
+    table.finish()
+    if (
+        persona is None
+        or history_turns is None
+        or max_output_tokens is None
+        or timeout_seconds is None
+    ):
+        return None
+    return ChatSettings(
+        persona=persona,
+        history_turns=history_turns,
+        max_output_tokens=max_output_tokens,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def _parse_invites(table: _Table) -> InviteSettings | None:
@@ -223,6 +633,19 @@ def _parse_invites(table: _Table) -> InviteSettings | None:
     if ttl_hours is None or max_uses is None:
         return None
     return InviteSettings(ttl_hours=ttl_hours, max_uses=max_uses)
+
+
+def _bounded_int(table: _Table, key: str, default: int, minimum: int, maximum: int) -> int | None:
+    value = table.integer(key, default)
+    if value is None:
+        return None
+    if value < minimum:
+        table.problem(key, f"不能小于 {minimum}")
+        return None
+    if value > maximum:
+        table.problem(key, f"不能大于 {maximum}")
+        return None
+    return value
 
 
 def _positive_int(table: _Table, key: str, default: int, maximum: int) -> int | None:

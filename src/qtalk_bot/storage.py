@@ -83,8 +83,51 @@ CREATE TABLE processed_events (
 CREATE INDEX processed_events_by_time ON processed_events (processed_at);
 """
 
-MIGRATIONS: tuple[Migration, ...] = (_V1_ACCESS,)
-"""本程序的迁移列表。业务表由各里程碑在末尾追加。"""
+_V2_CHAT = """
+-- 消息流水：只追加，是对话的事实来源；话题、摘要等派生数据都应能从它重新算出。
+-- role = 'user'：用户发来的文字，qq_message_id 是平台的消息 ID。
+-- role = 'assistant'：一轮的回复，content 是用户实际看到的回答（不含固定的说明文字）；reply_to 是它回答
+-- 的那条用户消息；model 是最后调用的模型的内部名字；finish 是模型这一边的结局，delivery 是送达状态，
+-- 取值与含义见 journal.py 的 Ending 与 ReplyDelivery。
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id),
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    qq_message_id TEXT,
+    reply_to INTEGER REFERENCES messages (id) ON DELETE CASCADE,
+    model TEXT,
+    finish TEXT,
+    delivery TEXT,
+    created_at INTEGER NOT NULL,
+    CHECK (
+        (role = 'user' AND reply_to IS NULL AND model IS NULL AND finish IS NULL
+            AND delivery IS NULL)
+        OR (role = 'assistant' AND reply_to IS NOT NULL AND finish IS NOT NULL
+            AND delivery IS NOT NULL AND qq_message_id IS NULL)
+    )
+) STRICT;
+CREATE INDEX messages_by_user ON messages (user_id, id);
+
+-- 用量：每次模型调用一行。服务商没有返回的 token 数为空，不估算。
+-- model 是当时配置里的内部名字（用于展示）；provider 与 provider_model 是实际调用的服务商与那边的模型名，
+-- 配置改了也能按实际模型归因成本。message_id 是触发这次调用的用户消息（遗忘时流水被删，这里只断开引用）。
+CREATE TABLE usage (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id),
+    message_id INTEGER REFERENCES messages (id) ON DELETE SET NULL,
+    model TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    provider_model TEXT NOT NULL,
+    input_tokens INTEGER CHECK (input_tokens >= 0),
+    output_tokens INTEGER CHECK (output_tokens >= 0),
+    created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX usage_by_user ON usage (user_id, created_at);
+"""
+
+MIGRATIONS: tuple[Migration, ...] = (_V1_ACCESS, _V2_CHAT)
+"""本程序的迁移列表。业务表由各里程碑在末尾追加，已发布的不能修改。"""
 
 
 class StorageError(Exception):

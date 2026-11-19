@@ -20,10 +20,20 @@ from httpx2.websockets import ASGIWebSocketTransport
 
 from qtalk_bot import access, texts
 from qtalk_bot.access import User
-from qtalk_bot.bot import ShareLinks, is_rejection, register
-from qtalk_bot.chat import ChatHandler, ChatNotReady
-from qtalk_bot.config import InviteSettings
+from qtalk_bot.bot import QQChat, ShareLinks, is_rejection, register
+from qtalk_bot.chat import ChatHandler
+from qtalk_bot.config import ChatSettings, InviteSettings
+from qtalk_bot.conversation import TYPING_SECONDS, Conversation
 from qtalk_bot.gate import Delivery, FriendAdded, Gate, IncomingMessage, Outcome, Reply
+from qtalk_bot.llm import (
+    ChatEvent,
+    ChatRequest,
+    Finished,
+    FinishReason,
+    Provider,
+    TextDelta,
+    Usage,
+)
 from qtalk_bot.storage import DATABASE_FILENAME, Database
 
 HANG_GUARD = 5  # 秒：回归时应失败而不是挂起
@@ -43,7 +53,7 @@ type Send = Callable[[ASGIMessage], Awaitable[None]]
 type Payload = dict[str, Any]
 
 
-def c2c(openid: str, content: str, message_id: str) -> Payload:
+def c2c(openid: str, content: str, message_id: str, **extra: Any) -> Payload:
     return {
         "op": 0,
         "t": "C2C_MESSAGE_CREATE",
@@ -52,6 +62,7 @@ def c2c(openid: str, content: str, message_id: str) -> Payload:
             "content": content,
             "id": message_id,
             "timestamp": "2026-11-18T10:00:00+08:00",
+            **extra,
         },
     }
 
@@ -106,9 +117,11 @@ def reject_links(body: Payload) -> httpx2.Response | None:
 
 
 class Platform:
-    """扮演开放平台：READY 之后按顺序推送 `events`，记下机器人发出的单聊消息与生成链接的请求。
+    """扮演开放平台：READY 之后按顺序推送 `events`，记下机器人发出的单聊消息、流式消息的分片与生成链接的
+    请求。
 
-    `respond` 给出某条单聊消息的响应时用它（模拟失败），不记进 `sent`，只记进 `attempts`。
+    `respond` 给出某条单聊消息或某个分片的响应时用它（模拟失败），不记进 `sent` / `streamed`，只记进
+    `attempts`。
     """
 
     def __init__(self, events: list[Payload], *, respond: Respond | None = None) -> None:
@@ -116,6 +129,7 @@ class Platform:
         self.respond = respond
         self.attempts: list[Payload] = []
         self.sent: list[Payload] = []
+        self.streamed: list[Payload] = []  # 流式消息的分片
         self.share_links: list[Payload] = []
         self.changed = asyncio.Event()  # 每发出一条消息置位一次
 
@@ -138,6 +152,13 @@ class Platform:
             self.sent.append({"path": path, **body})
             self.changed.set()
             return httpx2.Response(200, json={"id": f"ROBOT1.0_sent-{len(self.sent)}"})
+        if path.startswith("/v2/users/") and path.endswith("/stream_messages"):
+            self.attempts.append(body)
+            if self.respond is not None and (response := self.respond(body)) is not None:
+                return response
+            self.streamed.append(body)
+            self.changed.set()
+            return httpx2.Response(200, json={"id": "STREAM_fake", "remain_msg_len": 0})
         raise AssertionError(f"意外的请求：{request.method} {path}")
 
     async def gateway(self, scope: ASGIMessage, receive: Receive, send: Send) -> None:
@@ -231,8 +252,10 @@ async def run_until_handled(
     sent: int,
     invites: InviteSettings | None = None,
     settled: list[Delivery] | None = None,
+    until: Callable[[], bool] = lambda: True,
 ) -> None:
-    """跑机器人，直到 `events` 个事件都经过 `Gate`、平台至少收到 `sent` 条消息，再稍等后关闭。"""
+    """跑机器人，直到 `events` 个事件都经过 `Gate`、平台至少收到 `sent` 条消息、`until()` 为真，
+    再稍等后关闭。"""
     codes = itertools.count(1)
     async with asyncio.timeout(HANG_GUARD), bot_on(platform) as bot:
         gate = CountingGate(
@@ -247,7 +270,7 @@ async def run_until_handled(
         gate.settled = settled if settled is not None else []
         register(bot, gate, chat)
         running = asyncio.create_task(bot.start())
-        while gate.done < events or len(platform.sent) < sent:
+        while gate.done < events or len(platform.sent) < sent or not until():
             platform.changed.clear()
             await platform.changed.wait()
         await asyncio.sleep(SETTLE)
@@ -267,7 +290,7 @@ async def test_friend_add_with_invite_gets_welcome_once(db: Database) -> None:
     event = friend_add(ALICE, CODE, "FRIEND_ADD:fake-1")
     platform = Platform([event, event])  # 第二次是重复推送
 
-    await run_until_handled(platform, db, ChatNotReady(), events=2, sent=1)
+    await run_until_handled(platform, db, RecordingChat(), events=2, sent=1)
 
     assert platform.sent == [
         {
@@ -308,20 +331,6 @@ async def test_unauthorized_messages_get_one_refusal_and_never_reach_chat(db: Da
         }
     ]
     assert chat.users == []
-
-
-async def test_authorized_message_reaches_placeholder_chat(db: Database) -> None:
-    await add_invite(db)
-    user = await db.transaction(access.redeem_invite, CODE, ALICE, 0)
-    assert isinstance(user, User)
-    await db.transaction(access.mark_welcomed, user.id, 0)
-    platform = Platform([c2c(ALICE, "你好", "ROBOT1.0_fake-1")])
-
-    await run_until_handled(platform, db, ChatNotReady(), events=1, sent=1)
-
-    assert [(m["content"], m["msg_id"]) for m in platform.sent] == [
-        (texts.CHAT_NOT_READY, "ROBOT1.0_fake-1")
-    ]
 
 
 async def test_redeemed_user_reaches_injected_chat_handler_after_welcome(db: Database) -> None:
@@ -401,7 +410,7 @@ async def test_disabled_notice_rejected_by_platform_is_sent_next_time(db: Databa
 async def test_admin_invite_sends_link_and_code(db: Database) -> None:
     platform = Platform([c2c(ADMIN, "/invite 小王", "ROBOT1.0_fake-1")])
 
-    await run_until_handled(platform, db, ChatNotReady(), events=1, sent=1)
+    await run_until_handled(platform, db, RecordingChat(), events=1, sent=1)
 
     code = f"{1:032x}"
     assert platform.share_links == [{"callback_data": code}]
@@ -413,7 +422,7 @@ async def test_admin_invite_sends_link_and_code(db: Database) -> None:
 async def test_admin_invite_falls_back_to_code_only_when_link_is_rejected(db: Database) -> None:
     platform = Platform([c2c(ADMIN, "/invite 小王", "ROBOT1.0_fake-1")], respond=reject_links)
 
-    await run_until_handled(platform, db, ChatNotReady(), events=1, sent=1)
+    await run_until_handled(platform, db, RecordingChat(), events=1, sent=1)
 
     code = f"{1:032x}"
     (message,) = platform.sent
@@ -431,7 +440,7 @@ async def test_invite_link_with_ambiguous_failure_gets_no_fallback(db: Database)
     settled: list[Delivery] = []
     platform = Platform([c2c(ADMIN, "/invite 小王", "ROBOT1.0_fake-1")], respond=garble_links)
 
-    await run_until_handled(platform, db, ChatNotReady(), events=1, sent=0, settled=settled)
+    await run_until_handled(platform, db, RecordingChat(), events=1, sent=0, settled=settled)
 
     assert len(platform.attempts) == 1  # 说不准有没有发出：不改发，免得收到两条
     assert platform.sent == []
@@ -457,3 +466,145 @@ def api_error(status_code: int, err_code: int | None) -> pyqbot.APIError:
 )
 def test_is_rejection(error: pyqbot.QQBotError, rejected: bool) -> None:
     assert is_rejection(error) is rejected
+
+
+# ---- 对话：真实的 QQChat 与 Conversation，模型用替身 ----
+
+
+class FakeModel:
+    """按顺序给出 `events` 的对话模型替身，记下收到的请求。"""
+
+    def __init__(self, events: list[ChatEvent]) -> None:
+        self.events = events
+        self.requests: list[ChatRequest] = []
+
+    @property
+    def name(self) -> str:
+        return "main"
+
+    @property
+    def provider(self) -> Provider:
+        return Provider.OPENAI
+
+    @property
+    def model(self) -> str:
+        return "gpt-fake"
+
+    async def stream(self, request: ChatRequest) -> AsyncGenerator[ChatEvent]:
+        self.requests.append(request)
+        for event in self.events:
+            await asyncio.sleep(0)
+            yield event
+
+
+class Tracked:
+    """包住对话处理器，记下处理完了几条消息，并唤醒 `run_until_handled` 的等待。"""
+
+    def __init__(self, inner: ChatHandler, platform: Platform) -> None:
+        self.inner = inner
+        self.platform = platform
+        self.handled = 0
+
+    async def handle(self, user: User, message: pyqbot.C2CMessage) -> None:
+        try:
+            await self.inner.handle(user, message)
+        finally:
+            self.handled += 1
+            self.platform.changed.set()
+
+
+async def welcomed_alice(db: Database) -> User:
+    await add_invite(db)
+    user = await db.transaction(access.redeem_invite, CODE, ALICE, 0)
+    assert isinstance(user, User)
+    await db.transaction(access.mark_welcomed, user.id, 0)
+    return user
+
+
+def real_chat(db: Database, model: FakeModel, platform: Platform) -> Tracked:
+    conversation = Conversation(
+        db,
+        admin_openid=ADMIN,
+        primary=model,
+        fallback=None,
+        settings=ChatSettings(),
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )
+    return Tracked(QQChat(conversation), platform)
+
+
+ANSWER: list[ChatEvent] = [
+    TextDelta("你好，"),
+    TextDelta("我是助手。"),
+    Usage(30, 8),
+    Finished(FinishReason.COMPLETED),
+]
+
+
+async def test_text_message_is_answered_with_a_stream_and_recorded(db: Database) -> None:
+    alice = await welcomed_alice(db)
+    platform = Platform([c2c(ALICE, "你好", "ROBOT1.0_fake-1")])
+    model = FakeModel(ANSWER)
+    chat = real_chat(db, model, platform)
+
+    await run_until_handled(platform, db, chat, events=1, sent=0, until=lambda: chat.handled == 1)
+
+    assert [m.parts[0].text for m in model.requests[0].messages] == ["你好"]
+    assert platform.sent == [
+        {
+            "path": f"/v2/users/{ALICE}/messages",
+            "msg_type": 6,
+            "input_notify": {"input_type": 1, "input_second": TYPING_SECONDS},
+            "msg_id": "ROBOT1.0_fake-1",
+            "msg_seq": 1,
+        }
+    ]
+    chunks = platform.streamed
+    assert "".join(chunk["content_raw"] for chunk in chunks) == "你好，我是助手。"
+    assert {chunk["msg_id"] for chunk in chunks} == {"ROBOT1.0_fake-1"}
+    assert {chunk["msg_seq"] for chunk in chunks} == {2}
+    assert chunks[-1]["input_state"] == 10  # 结束分片
+    assert {chunk["content_type"] for chunk in chunks} == {"markdown"}
+
+    messages = await db.fetch_all("SELECT user_id, role, content, delivery FROM messages")
+    assert [tuple(row) for row in messages] == [
+        (alice.id, "user", "你好", None),
+        (alice.id, "assistant", "你好，我是助手。", "streamed"),
+    ]
+    usage = await db.fetch_all(
+        "SELECT user_id, model, provider, provider_model, input_tokens, output_tokens FROM usage"
+    )
+    assert [tuple(row) for row in usage] == [(alice.id, "main", "openai", "gpt-fake", 30, 8)]
+
+
+async def test_rejected_stream_is_resent_as_plain_message(db: Database) -> None:
+    await welcomed_alice(db)
+
+    def reject_stream(body: Payload) -> httpx2.Response | None:
+        return reject(body) if "content_raw" in body else None
+
+    platform = Platform([c2c(ALICE, "你好", "ROBOT1.0_fake-1")], respond=reject_stream)
+    chat = real_chat(db, FakeModel(ANSWER), platform)
+
+    await run_until_handled(platform, db, chat, events=1, sent=0, until=lambda: chat.handled == 1)
+
+    assert platform.streamed == []
+    plain = [m for m in platform.sent if m["msg_type"] == 0]
+    assert [(m["content"], m["msg_seq"]) for m in plain] == [("你好，我是助手。", 3)]
+    row = await db.fetch_one("SELECT content, delivery FROM messages WHERE role = 'assistant'")
+    assert row is not None
+    assert tuple(row) == ("你好，我是助手。", "plain")
+
+
+async def test_image_only_message_gets_text_only_notice_without_model_call(db: Database) -> None:
+    await welcomed_alice(db)
+    image = {"content_type": "image/png", "filename": "a.png", "url": "https://img.invalid/a"}
+    platform = Platform([c2c(ALICE, "", "ROBOT1.0_fake-1", attachments=[image])])
+    model = FakeModel(ANSWER)
+    chat = real_chat(db, model, platform)
+
+    await run_until_handled(platform, db, chat, events=1, sent=1, until=lambda: chat.handled == 1)
+
+    assert model.requests == []
+    assert [m["content"] for m in platform.sent] == [texts.TEXT_ONLY]
+    assert await db.fetch_all("SELECT id FROM messages") == []

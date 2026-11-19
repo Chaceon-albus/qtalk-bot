@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from . import access, texts
+from . import access, journal, texts
 from .access import Invite, UserStatus
 from .config import InviteSettings
 
@@ -19,7 +19,18 @@ NOTE_MAX_LENGTH = 30
 """邀请备注（即用户名字）的最大长度。"""
 
 COMMAND_NAMES = frozenset(
-    ("invite", "invites", "revoke", "users", "disable", "enable", "pause", "resume", "help")
+    (
+        "invite",
+        "invites",
+        "revoke",
+        "users",
+        "disable",
+        "enable",
+        "pause",
+        "resume",
+        "usage",
+        "help",
+    )
 )
 
 _ID = re.compile(r"#?([0-9]{1,18})")  # 18 位以内放得进 SQLite 的 64 位整数
@@ -78,6 +89,8 @@ def execute(
         case "resume":
             changed = access.set_paused(conn, False, now)
             return texts.SERVICE_RESUMED if changed else texts.SERVICE_NOT_PAUSED
+        case "usage":
+            return _usage(conn, context, now)
         case "help":
             return texts.HELP
         case _:
@@ -165,6 +178,34 @@ def _set_status(
         return texts.user_already_active(user.id, user.name)
     access.set_user_status(conn, user.id, status)
     return texts.user_enabled(user.id, user.name)
+
+
+def day_start(now: int, timezone: ZoneInfo) -> int:
+    """`now` 所在的本地日期第一次到达 0 点的时刻。
+
+    `fold=0`：午夜正好遇上夏令时回拨的时区里，0 点会出现两次，取第一次，免得把回拨前的那段漏掉；
+    `fromtimestamp()` 在重复的那一小时里给出的是 `fold=1`，不能沿用。午夜被夏令时跳过时，`fold=0` 对应
+    跳变后的第一个时刻，也就是这一天真正的开始。
+    """
+    local = datetime.fromtimestamp(now, timezone)
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0, fold=0)
+    return int(midnight.timestamp())
+
+
+def _usage(conn: sqlite3.Connection, context: CommandContext, now: int) -> str:
+    summaries = journal.usage_summary(conn, day_start(now, context.timezone))
+    if not summaries:
+        return texts.NO_USAGE
+    lines = [
+        texts.usage_line(
+            user_id=s.user_id,
+            name=s.name,
+            today=(s.today_calls, s.today_input, s.today_output, s.today_unreported),
+            total=(s.total_calls, s.total_input, s.total_output, s.total_unreported),
+        )
+        for s in summaries
+    ]
+    return texts.usage_list(lines)
 
 
 def _parse_id(argument: str) -> int | None:

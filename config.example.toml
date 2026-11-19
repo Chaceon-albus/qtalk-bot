@@ -4,7 +4,8 @@
 #
 # - 配置文件的位置由环境变量 QTALK_CONFIG 指定，默认是当前目录下的 config.toml。
 # - 密钥（APP_SECRET、大模型的 key 等）不写在这里，只从环境变量读取，见 .env。
-# - 下面每一项都可以省略，省略时取示例里的值。出现程序不认识的键会报错。
+# - 除了 [[models]] 必须至少有一项，其余每一项都可以省略，省略时取示例里的值。
+# - 出现程序不认识的键会报错。
 
 # IANA 时区名，显示时间时使用
 timezone = "Asia/Shanghai"
@@ -15,4 +16,50 @@ data_dir = "data"
 # 新建邀请时的默认值
 [invites]
 ttl_hours = 168   # 有效期，单位小时；168 即 7 天，最大 87600
-max_uses = 1      # 可用次数；1 即一次性，最大 10000
+max_uses = 1      # 可用次数；1 即一次性，最大 32
+
+# 对话
+[chat]
+# 人设：系统提示词的第一部分，所有模型共用
+persona = """
+你是一个友善、可靠的聊天助手，在 QQ 上和用户一对一聊天。
+回答准确、简洁、口语化，篇幅与问题相称；不确定的事情直说不确定，不编造事实。
+用户用什么语言提问，就用什么语言回答。"""
+history_turns = 10         # 上下文里带最近几轮（一问一答算一轮），0 到 100
+max_output_tokens = 8192   # 单次回复的输出上限，含推理所用的 token
+timeout_seconds = 120      # 一次模型调用的时限，单位秒；换备用模型重试时重新计时
+
+# 模型列表：至少一项，恰好一项 default = true。
+# provider 是 "openai" 或 "gemini"；用到哪家，对应的密钥（OPENAI_API_KEY / GEMINI_API_KEY）
+# 就必须在环境变量里，否则启动时报错。只用一家时，删掉另一项和 fallback 那一行。
+[[models]]
+name = "sol"              # 内部名字，用于日志、用量和互相引用
+provider = "openai"
+model = "gpt-6.2-sol"     # 服务商那边的模型名
+default = true
+fallback = "hydrogen"     # 可选：调用失败时改用的模型，写另一项的 name
+# reasoning = "high"      # 可选：推理强度，原样传给服务商；不写用服务商的默认值。
+#                         # 各家各款模型接受的取值不同，写了不支持的值会在调用时失败
+
+[[models]]
+name = "hydrogen"
+provider = "gemini"
+model = "gemini-4-hydrogen"
+
+# ---- 以下各项默认都不设置；需要时去掉行首的 "# " ----
+#
+# QQ 开放平台的接口地址。只影响接口请求，网关的 WebSocket 地址由平台返回，不受它影响。
+# QQ 侧暂时不能单独设代理。
+# [qq]
+# base_url = "https://api.bot.qq.com"
+#
+# 调用各家模型时的接口地址与代理。不设 base_url 时用官方地址；
+# 不设 proxy 时不走代理（系统的 HTTPS_PROXY 等环境变量照常生效）。
+# proxy 支持 http、https、socks5、socks5h 四种协议，地址里可以带用户名和密码。
+# [providers.openai]
+# base_url = "https://api.openai.com/v1"                    # 末尾带 /v1
+# proxy = "socks5://127.0.0.1:1080"
+#
+# [providers.gemini]
+# base_url = "https://generativelanguage.googleapis.com/"   # 不带版本号
+# proxy = "http://127.0.0.1:7890"

@@ -1,6 +1,6 @@
 """接线层：把 pyqbot 的事件转成普通数据交给 `Gate`，再按结果回复或交给对话处理器。
 
-只注册单聊消息与加好友两个处理函数，群聊明确不做。这里尽量薄，判断都在 `gate.py`。
+只注册单聊消息与加好友两个处理函数，群聊明确不做。这里尽量薄，判断都在 `gate.py` 与 `conversation.py`。
 
 日志不记 openid 与消息正文。pyqbot 的异常文案里可能带 openid（请求路径），所以这里只记异常类型、
 `err_code` 与 `trace_id`。
@@ -11,7 +11,9 @@ from collections.abc import Awaitable, Callable
 
 import pyqbot
 
+from .access import User
 from .chat import ChatHandler
+from .conversation import ChatInput, Conversation, SendError, SendRejectedError, SendUncertainError
 from .gate import Chat, Delivery, FriendAdded, Gate, IncomingMessage, Reply, ShareLinkError
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,59 @@ class ShareLinks:
         except pyqbot.QQBotError as exc:
             logger.warning("生成邀请链接失败：%s", _describe(exc))
             raise ShareLinkError from exc
+
+
+class QQChat:
+    """对话处理器：把 pyqbot 的单聊消息交给 `Conversation`，回复经 `_QQReplyChannel` 发出。"""
+
+    def __init__(self, conversation: Conversation) -> None:
+        self._conversation = conversation
+
+    async def handle(self, user: User, message: pyqbot.C2CMessage) -> None:
+        text = message.content if message.content.strip() else None
+        incoming = ChatInput(message_id=message.id, text=text)
+        await self._conversation.handle(user, incoming, _QQReplyChannel(message))
+
+
+class _QQReplyChannel:
+    """用 pyqbot 被动回复一条单聊消息，符合 `conversation.ReplyChannel`。
+
+    流式回复用 `coalesce=False`：每次调用发一片、等它发完，合并由 `Conversation` 自己做，这样才知道哪些
+    内容确实送达了。pyqbot 的异常按 `is_rejection()` 分成「确定没发出」与「说不准」。
+    """
+
+    def __init__(self, message: pyqbot.C2CMessage) -> None:
+        self._message = message
+        self._stream: pyqbot.StreamMessage | None = None
+
+    async def typing(self, seconds: int) -> None:
+        await _guarded(self._message.send_typing(seconds=seconds))
+
+    async def stream(self, text: str) -> None:
+        if self._stream is None:
+            self._stream = self._message.reply_stream(coalesce=False)
+        await _guarded(self._stream.append(text))
+
+    async def finish_stream(self) -> None:
+        if self._stream is not None:
+            await _guarded(self._stream.finish())
+
+    async def send(self, text: str) -> None:
+        await _guarded(self._message.reply(text))
+
+
+async def _guarded(call: Awaitable[object]) -> None:
+    try:
+        await call
+    except pyqbot.QQBotError as exc:
+        raise _send_error(exc) from None
+    except RuntimeError as exc:  # 流式消息已终止，或客户端已关闭
+        raise SendUncertainError(type(exc).__name__) from None
+
+
+def _send_error(exc: pyqbot.QQBotError) -> SendError:
+    described = _describe(exc)
+    return SendRejectedError(described) if is_rejection(exc) else SendUncertainError(described)
 
 
 class _Handlers:

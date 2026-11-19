@@ -7,12 +7,13 @@ import sqlite3
 import threading
 import uuid
 from collections.abc import AsyncIterator
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from qtalk_bot import access, texts
+from qtalk_bot import access, commands, journal, texts
 from qtalk_bot.access import EVENT_RETENTION_SECONDS, Invite, User, UserStatus
 from qtalk_bot.config import InviteSettings
 from qtalk_bot.gate import (
@@ -26,6 +27,7 @@ from qtalk_bot.gate import (
     ShareLinkError,
     normalize_invite_code,
 )
+from qtalk_bot.llm import Provider
 from qtalk_bot.storage import DATABASE_FILENAME, Database
 
 # 明显是假的 openid。
@@ -172,6 +174,65 @@ async def test_admin_plain_message_goes_to_chat_without_invite(h: Harness) -> No
 async def test_admin_help(h: Harness) -> None:
     assert await h.admin("/help") == texts.HELP
     assert await h.admin("  /HELP  ") == texts.HELP
+
+
+async def test_admin_usage_lists_today_and_total_per_user(h: Harness) -> None:
+    assert await h.admin("/usage") == texts.NO_USAGE
+    code = await h.invite("小王")
+    await h.friend_add(ALICE, code)
+    alice = await h.user(ALICE)
+    admin = await h.user(ADMIN)
+    assert alice is not None
+    assert admin is not None
+
+    def record(conn: sqlite3.Connection) -> None:
+        # 上海时间今天 0 点是 START - 16 小时。
+        rows = [
+            (alice.id, 100, 20, START - HOUR),
+            (alice.id, None, None, START - 15 * HOUR),
+            (alice.id, 1000, 200, START - 17 * HOUR),  # 昨天
+            (admin.id, 5, 1, START),
+        ]
+        for user_id, tokens_in, tokens_out, now in rows:
+            journal.add_usage(
+                conn,
+                user_id=user_id,
+                message_id=None,
+                model="main",
+                provider=Provider.OPENAI,
+                provider_model="gpt-fake",
+                input_tokens=tokens_in,
+                output_tokens=tokens_out,
+                now=now,
+            )
+
+    await h.db.transaction(record)
+
+    assert await h.admin("/usage") == texts.usage_list(
+        [
+            texts.usage_line(
+                user_id=admin.id, name=texts.ADMIN_NAME, today=(1, 5, 1, 0), total=(1, 5, 1, 0)
+            ),
+            texts.usage_line(
+                user_id=alice.id, name="小王", today=(2, 100, 20, 1), total=(3, 1100, 220, 1)
+            ),
+        ]
+    )
+    assert "（其中 1 次没有用量数据）" in await h.admin("/usage")
+    assert "/usage" in texts.HELP
+
+
+def test_day_start_takes_the_first_of_two_midnights() -> None:
+    # 哈瓦那 2024-11-03 午夜夏令时回拨：0 点出现两次（UTC 04:00 与 05:00）。
+    havana = ZoneInfo("America/Havana")
+    first_midnight, second_midnight = 1730606400, 1730610000
+    assert datetime.fromtimestamp(second_midnight + 1800, havana).fold == 1
+    assert commands.day_start(second_midnight + 1800, havana) == first_midnight
+    assert commands.day_start(first_midnight + 600, havana) == first_midnight
+
+
+def test_day_start_in_shanghai() -> None:
+    assert commands.day_start(START, SHANGHAI) == START - 16 * HOUR
 
 
 async def test_admin_unknown_command(h: Harness) -> None:
