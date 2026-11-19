@@ -11,14 +11,17 @@
 地址的路径与查询串（里面有令牌）、卡片的其它字段都不记。
 """
 
+import asyncio
+import contextlib
 import logging
 import re
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Sequence
 from typing import Protocol
 from urllib.parse import urlsplit
 
 import pyqbot
 
+from . import texts
 from .access import User
 from .chat import ChatHandler
 from .conversation import ChatInput, Conversation, SendError, SendRejectedError, SendUncertainError
@@ -46,6 +49,20 @@ class ShareLinks:
         except pyqbot.QQBotError as exc:
             logger.warning("生成邀请链接失败：%s", _describe(exc))
             raise ShareLinkError from exc
+
+
+async def fetch_bot_name(client: pyqbot.Client) -> str:
+    """取机器人的名字（`GET /users/@me`），用在邀请里。取不到或为空时退回通用的说法，不让启动失败。"""
+    try:
+        me = await client.get_me()
+    except pyqbot.QQBotError as exc:
+        logger.warning("没能取到机器人的名字，邀请里改用通用的称呼：%s", _describe(exc))
+        return texts.DEFAULT_BOT_NAME
+    name = " ".join((me.username or "").split())  # 名字只放在一行里
+    if not name:
+        logger.warning("平台没有给出机器人的名字，邀请里改用通用的称呼")
+        return texts.DEFAULT_BOT_NAME
+    return name
 
 
 class QQChat:
@@ -101,10 +118,34 @@ def _send_error(exc: pyqbot.QQBotError) -> SendError:
     return SendRejectedError(described) if is_rejection(exc) else SendUncertainError(described)
 
 
+class _KeyedLock:
+    """按键（这里是 openid）互斥；没人持有、也没人在等的键会被清掉，不随用户数增长。"""
+
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._holders: dict[str, int] = {}
+
+    @contextlib.asynccontextmanager
+    async def hold(self, key: str) -> AsyncGenerator[None]:
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        self._holders[key] = self._holders.get(key, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            self._holders[key] -= 1
+            if not self._holders[key]:
+                del self._holders[key]
+                del self._locks[key]
+
+
 class _Handlers:
     def __init__(self, gate: Gate, chat: ChatHandler) -> None:
         self._gate = gate
         self._chat = chat
+        # 同一个人的回复链成组发出：管理员连发两条 /invite 时，两组「状态 + 邀请」不会交叉，免得把
+        # 不带备注的邀请转发错人。只锁回复链的发送，对话处理器不在锁里。
+        self._reply_locks = _KeyedLock()
 
     async def on_c2c_message(self, message: pyqbot.C2CMessage) -> None:
         incoming = IncomingMessage(
@@ -112,7 +153,7 @@ class _Handlers:
         )
         match await self._gate.on_message(incoming):
             case Reply() as reply:
-                await self._gate.settle(reply, await _send(message.reply, reply))
+                await self._deliver(message.user_openid, message.reply, reply)
             case Chat(user=user):
                 _log_shape(user, message)
                 try:
@@ -131,10 +172,19 @@ class _Handlers:
             return
         if event.event_id is None:
             logger.warning("加好友事件没有事件 ID，无法被动回复")
-            delivery = Delivery.NOT_SENT
-        else:
-            delivery = await _send(event.reply, outcome)
-        await self._gate.settle(outcome, delivery)
+            for reply in outcome.chain():
+                await self._gate.settle(reply, Delivery.NOT_SENT)
+            return
+        await self._deliver(event.openid, event.reply, outcome)
+
+    async def _deliver(self, openid: str, send: _Send, outcome: Reply) -> None:
+        """按顺序发出 `outcome` 与它之后的各条，每条发完就收尾；前一条失败不影响后一条。
+
+        整条链在这个用户的锁里发完，同一个人的另一条回复链要等它发完才开始。
+        """
+        async with self._reply_locks.hold(openid):
+            for reply in outcome.chain():
+                await self._gate.settle(reply, await _send(send, reply))
 
 
 def _log_shape(user: User, message: pyqbot.C2CMessage) -> None:
@@ -403,24 +453,32 @@ def is_rejection(exc: pyqbot.QQBotError) -> bool:
     return exc.err_code is not None or 400 <= exc.status_code < 500
 
 
-async def _send(send: Callable[[str], Awaitable[object]], reply: Reply) -> Delivery:
-    try:
-        await send(reply.text)
-    except pyqbot.QQBotError as exc:
-        if not is_rejection(exc):
-            # 说不准有没有发出：不改发，免得对方收到两条。
-            logger.warning("回复不确定是否发出：%s", _describe(exc))
-            return Delivery.UNKNOWN
-        if reply.fallback is None:
-            logger.warning("回复被平台拒绝：%s", _describe(exc))
-            return Delivery.NOT_SENT
-        logger.warning("回复被平台拒绝，改发备用文案：%s", _describe(exc))
+class _Send(Protocol):
+    """`C2CMessage.reply` 与 `FriendAdd.reply` 里用到的部分。"""
+
+    def __call__(
+        self, content: str | None = None, *, markdown: str | None = None
+    ) -> Awaitable[object]: ...
+
+
+async def _send(send: _Send, reply: Reply) -> Delivery:
+    """发出 `reply.text`（按 `reply.markdown` 决定用 Markdown 还是纯文本）；平台明确拒绝时依次改发
+    `reply.fallbacks` 里的纯文本，说不准是否送达时就此停下，免得对方收到两条。"""
+    attempts = [(reply.text, reply.markdown), *((text, False) for text in reply.fallbacks)]
+    for index, (text, markdown) in enumerate(attempts):
         try:
-            await send(reply.fallback)
-        except pyqbot.QQBotError as fallback_exc:
-            logger.warning("备用文案也没能发出：%s", _describe(fallback_exc))
-            return Delivery.NOT_SENT if is_rejection(fallback_exc) else Delivery.UNKNOWN
-    return Delivery.SENT
+            await (send(markdown=text) if markdown else send(text))
+        except pyqbot.QQBotError as exc:
+            if not is_rejection(exc):
+                logger.warning("回复不确定是否发出：%s", _describe(exc))
+                return Delivery.UNKNOWN
+            if index + 1 < len(attempts):
+                logger.warning("回复被平台拒绝，改发备用文案：%s", _describe(exc))
+            else:
+                logger.warning("回复被平台拒绝：%s", _describe(exc))
+        else:
+            return Delivery.SENT
+    return Delivery.NOT_SENT
 
 
 def _describe(exc: pyqbot.QQBotError) -> str:

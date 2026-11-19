@@ -1,7 +1,15 @@
 """所有面向用户的固定文案（含发给管理员的），集中在这里便于统一修改。
 
 带参数的文案是函数，其余是常量。这里只放会发到 QQ 的文字，日志与异常文案写在各自的模块里。
+
+管理员命令里多行的说明与列表（`/help`、`/invites`、`/users`、`/usage`）和创建邀请后的状态用 Markdown 发送，
+以 `Rich` 同时给出 Markdown 与同样内容的纯文本，平台拒绝 Markdown 时改发纯文本；单句的提示仍是纯文本。
+Markdown 里的动态内容（备注、名字）一律先经 `escape_markdown()`。
 """
+
+import re
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 ADMIN_NAME = "管理员"
 """管理员在用户表里的名字。"""
@@ -47,6 +55,37 @@ REPLY_CUT_SHORT = "（回复没有写完就停下了，可以让我接着说。�
 
 REPLY_REJECTED = "抱歉，这条回复没能通过平台的审核，发不出来。换个说法再问问看？"
 
+# ---- Markdown ----
+
+
+@dataclass(frozen=True, slots=True)
+class Rich:
+    """同一段内容的 Markdown 与纯文本两种写法。"""
+
+    markdown: str
+    plain: str
+
+
+_MD_BACKSLASH = re.compile(r"([\\`*_~<>|$])")
+_MD_FULLWIDTH = str.maketrans({"(": "（", ")": "）", "[": "［", "]": "］"})
+_LINE_BREAKS = re.compile(r"[\r\n\u2028\u2029]+")
+
+
+def escape_markdown(text: str) -> str:
+    """把任意文字变成 Markdown 里的普通文字，用于备注、名字等动态内容。
+
+    规则（依据 pyqbot `docs/errata.md` 的两条 Markdown 实测）：
+
+    - 圆括号、方括号换成全角。`](` 会被判消息内容违规，只转义方括号也不行；而用反斜杠转义圆括号、
+      方括号又会被 QQ 当成 LaTeX 公式（`\\(…\\)`、`\\[…\\]`），所以不用反斜杠。
+    - `` \\ ` * _ ~ < > | $ `` 前面加反斜杠（这些转义都实测被接受）：分别对应转义符、行内代码、
+      强调、删除线、HTML 标签与自动链接、表格、LaTeX。
+    - 换行换成空格：动态内容只放在一行的中间，这样也不会出现行首的 `#`、`-`、`>`、`1.`。
+    """
+    text = _LINE_BREAKS.sub(" ", text).translate(_MD_FULLWIDTH)
+    return _MD_BACKSLASH.sub(r"\\\1", text)
+
+
 # ---- 管理命令 ----
 
 HELP = """管理命令：
@@ -61,6 +100,25 @@ HELP = """管理命令：
 /usage：查看各用户今天和累计的用量
 /help：显示这份说明"""
 
+_HELP_ITEMS = (
+    ("/invite <备注>", "创建邀请，备注会成为对方的名字"),
+    ("/invites", "列出有效的邀请"),
+    ("/revoke <编号>", "撤销邀请"),
+    ("/users", "列出用户"),
+    ("/disable <编号>", "停用用户"),
+    ("/enable <编号>", "启用用户"),
+    ("/pause", "暂停服务"),
+    ("/resume", "恢复服务"),
+    ("/usage", "查看各用户今天和累计的用量"),
+    ("/help", "显示这份说明"),
+)
+
+HELP_MESSAGE = Rich(
+    # 尖括号只能出现在行内代码里，放在正文里会被当成 HTML 标签。
+    "**管理命令**\n\n" + "\n".join(f"- `{command}`：{what}" for command, what in _HELP_ITEMS),
+    HELP,
+)
+
 UNKNOWN_COMMAND = "没有这个命令，发送 /help 查看可用的命令。"
 
 INVITE_NOTE_MISSING = "请写上备注，例如：/invite 小王。备注会成为对方的名字。"
@@ -70,33 +128,40 @@ def invite_note_too_long(limit: int) -> str:
     return f"备注最多 {limit} 个字，并且不能换行。"
 
 
-def _invite_summary(invite_id: int, note: str, uses: int, expires: str) -> str:
-    return f"已创建邀请 #{invite_id}（{note}），{expires} 前有效，可用 {uses} 次。"
+DEFAULT_BOT_NAME = "这个机器人"
+"""取不到机器人的名字时，邀请里用的称呼。"""
+
+LINK_FAILED = "邀请链接没能生成，下面这条邀请里只有邀请码"
 
 
-def invite_created(
-    *, invite_id: int, note: str, uses: int, expires: str, link: str, code: str
-) -> str:
-    return (
-        f"{_invite_summary(invite_id, note, uses, expires)}\n"
-        f"邀请链接：{link}\n"
-        f"邀请码：{code}\n"
-        "链接打不开的话，可以让对方先添加机器人，再把邀请码发给我。"
+def invite_status(
+    *, invite_id: int, note: str, uses: int, expires: str, link_failed: bool = False
+) -> Rich:
+    """创建邀请后的第一条消息：给管理员看的状态，一行。"""
+    tail = f"，可用 {uses} 次。" + (f"{LINK_FAILED}。" if link_failed else "")
+    return Rich(
+        f"已创建邀请 `#{invite_id}`（{escape_markdown(note)}），{expires} 前有效{tail}",
+        f"已创建邀请 #{invite_id}（{note}），{expires} 前有效{tail}",
     )
 
 
-LINK_REJECTED = "带链接的消息被平台拒绝了"
-LINK_FAILED = "邀请链接没能生成"
+def invitation(*, bot_name: str, link: str | None, code: str) -> str:
+    """创建邀请后的第二条消息：管理员可以原样转发给对方的邀请，纯文本，方便长按整条复制。
 
-
-def invite_created_code_only(
-    *, invite_id: int, note: str, uses: int, expires: str, code: str, reason: str
-) -> str:
+    对方把整段原样发给机器人也能兑换（`gate.find_invite_code()`）。`link` 为 `None` 时没有链接那一行。
+    """
+    if link is None:
+        return (
+            f"邀请您来和{bot_name}聊聊天！\n"
+            f"先添加{bot_name}为好友，再把下面的邀请码发给它就可以开始了：\n"
+            f"{code}"
+        )
     return (
-        f"{_invite_summary(invite_id, note, uses, expires)}\n"
-        f"{reason}，先只发邀请码：\n"
-        f"{code}\n"
-        "请让对方先添加机器人，再把邀请码发给我。"
+        f"邀请您来和{bot_name}聊聊天！\n"
+        f"邀请链接：{link}\n"
+        f"打开链接就能添加{bot_name}，直接开聊。链接打不开的话，先添加{bot_name}为好友，"
+        "再把下面的邀请码发给它：\n"
+        f"{code}"
     )
 
 
@@ -109,6 +174,30 @@ def invite_line(*, invite_id: int, note: str, remaining: int, expires: str) -> s
 
 def invite_list(lines: list[str]) -> str:
     return "有效的邀请：\n" + "\n".join(lines)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InviteRow:
+    invite_id: int
+    note: str
+    remaining: int
+    expires: str
+
+
+def invites_message(rows: Sequence[InviteRow]) -> Rich:
+    markdown = "**有效的邀请**\n\n" + "\n".join(
+        f"- `#{r.invite_id}` {escape_markdown(r.note)}：剩余 {r.remaining} 次，{r.expires} 过期"
+        for r in rows
+    )
+    plain = invite_list(
+        [
+            invite_line(
+                invite_id=r.invite_id, note=r.note, remaining=r.remaining, expires=r.expires
+            )
+            for r in rows
+        ]
+    )
+    return Rich(markdown, plain)
 
 
 def id_required(command: str, list_command: str) -> str:
@@ -139,6 +228,24 @@ def user_line(*, user_id: int, name: str, status: str, joined: str) -> str:
 
 def user_list(lines: list[str]) -> str:
     return "用户：\n" + "\n".join(lines)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class UserRow:
+    user_id: int
+    name: str
+    status: str
+    joined: str
+
+
+def users_message(rows: Sequence[UserRow]) -> Rich:
+    markdown = "**用户**\n\n" + "\n".join(
+        f"- `#{r.user_id}` {escape_markdown(r.name)}：{r.status}，{r.joined} 加入" for r in rows
+    )
+    plain = user_list(
+        [user_line(user_id=r.user_id, name=r.name, status=r.status, joined=r.joined) for r in rows]
+    )
+    return Rich(markdown, plain)
 
 
 def user_not_found(user_id: int) -> str:
@@ -206,3 +313,39 @@ def usage_line(
 
 def usage_list(lines: list[str]) -> str:
     return "用量（今天从本地时间 0 点算起）：\n" + "\n".join(lines)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class UsageRow:
+    """`today`、`total` 与 `usage_line()` 相同。"""
+
+    user_id: int
+    name: str
+    today: tuple[int, int, int, int]
+    total: tuple[int, int, int, int]
+    today_decisions: tuple[int, int] = (0, 0)
+    total_decisions: tuple[int, int] = (0, 0)
+
+
+def usage_message(rows: Sequence[UsageRow]) -> Rich:
+    blocks = [
+        f"- `#{r.user_id}` {escape_markdown(r.name)}\n"
+        f"  - 今天：{_usage_part(*r.today, r.today_decisions)}\n"
+        f"  - 累计：{_usage_part(*r.total, r.total_decisions)}"
+        for r in rows
+    ]
+    markdown = "**用量**（今天从本地时间 0 点算起）\n\n" + "\n".join(blocks)
+    plain = usage_list(
+        [
+            usage_line(
+                user_id=r.user_id,
+                name=r.name,
+                today=r.today,
+                total=r.total,
+                today_decisions=r.today_decisions,
+                total_decisions=r.total_decisions,
+            )
+            for r in rows
+        ]
+    )
+    return Rich(markdown, plain)

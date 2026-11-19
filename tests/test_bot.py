@@ -12,7 +12,7 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, MutableMapping
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 import httpx2
@@ -29,6 +29,7 @@ from qtalk_bot.bot import (
     QQChat,
     ShareLinks,
     describe_non_text,
+    fetch_bot_name,
     is_rejection,
     register,
 )
@@ -124,8 +125,28 @@ def garble(body: Payload) -> httpx2.Response:
     return httpx2.Response(200, content=b"<html>gateway timeout</html>")
 
 
+def text_of(body: Payload) -> str:
+    """一条单聊消息的文字：纯文本的 `content`，或 Markdown 的 `markdown.content`。"""
+    markdown = body.get("markdown")
+    if isinstance(markdown, dict):
+        return str(cast(dict[str, object], markdown).get("content", ""))
+    return str(body.get("content", ""))
+
+
+def is_markdown(body: Payload) -> bool:
+    return "markdown" in body
+
+
 def reject_links(body: Payload) -> httpx2.Response | None:
-    return reject(body) if "https://" in body.get("content", "") else None
+    return reject(body) if "https://" in text_of(body) else None
+
+
+def reject_markdown(body: Payload) -> httpx2.Response | None:
+    return reject(body) if is_markdown(body) else None
+
+
+def garble_markdown(body: Payload) -> httpx2.Response | None:
+    return garble(body) if is_markdown(body) else None
 
 
 class Platform:
@@ -136,16 +157,25 @@ class Platform:
     `attempts`。
     """
 
-    def __init__(self, events: list[Payload], *, respond: Respond | None = None) -> None:
+    def __init__(
+        self,
+        events: list[Payload],
+        *,
+        respond: Respond | None = None,
+        share_link_fails: bool = False,
+        delay: Callable[[Payload], float] | None = None,
+    ) -> None:
         self.events = events
         self.respond = respond
+        self.delay = delay  # 某条单聊消息要拖多久才响应（秒），用来制造交错
+        self.share_link_fails = share_link_fails
         self.attempts: list[Payload] = []
         self.sent: list[Payload] = []
         self.streamed: list[Payload] = []  # 流式消息的分片
         self.share_links: list[Payload] = []
         self.changed = asyncio.Event()  # 每发出一条消息置位一次
 
-    def handle(self, request: httpx2.Request) -> httpx2.Response:
+    async def handle(self, request: httpx2.Request) -> httpx2.Response:
         path = request.url.path
         if path == "/app/getAppAccessToken":
             return httpx2.Response(200, json={"access_token": "fake-token", "expires_in": "7200"})
@@ -154,11 +184,16 @@ class Platform:
         body: Payload = json.loads(request.content)
         if path == "/v2/generate_url_link":
             self.share_links.append(body)
+            if self.share_link_fails:
+                error = {"message": "生成失败", "err_code": 11255, "trace_id": "fake"}
+                return httpx2.Response(500, json=error)
             return httpx2.Response(
                 200, json={"retcode": 0, "msg": "success", "data": {"url": SHARE_URL}}
             )
         if path.startswith("/v2/users/") and path.endswith("/messages"):
             self.attempts.append(body)
+            if self.delay is not None and (seconds := self.delay(body)):
+                await asyncio.sleep(seconds)
             if self.respond is not None and (response := self.respond(body)) is not None:
                 return response
             self.sent.append({"path": path, **body})
@@ -214,7 +249,8 @@ class CountingGate(Gate):
     async def settle(self, reply: Reply, delivery: Delivery) -> None:
         self.settled.append(delivery)
         await super().settle(reply, delivery)
-        self._finish()
+        if reply.then is None:  # 一个结果里的最后一条
+            self._finish()
 
     def _count_unless_reply(self, outcome: Outcome) -> Outcome:
         if not isinstance(outcome, Reply):
@@ -276,6 +312,7 @@ async def run_until_handled(
             timezone=ZoneInfo("Asia/Shanghai"),
             invites=InviteSettings() if invites is None else invites,
             share_link=ShareLinks(bot),
+            bot_name=BOT_NAME,
             new_code=lambda: f"{next(codes):032x}",
         )
         gate.changed = platform.changed
@@ -419,44 +456,248 @@ async def test_disabled_notice_rejected_by_platform_is_sent_next_time(db: Databa
     assert [m["content"] for m in second.sent] == [texts.DISABLED]
 
 
-async def test_admin_invite_sends_link_and_code(db: Database) -> None:
-    platform = Platform([c2c(ADMIN, "/invite 小王", "ROBOT1.0_fake-1")])
-
-    await run_until_handled(platform, db, RecordingChat(), events=1, sent=1)
-
-    code = f"{1:032x}"
-    assert platform.share_links == [{"callback_data": code}]
-    (message,) = platform.sent
-    assert SHARE_URL in message["content"]
-    assert code in message["content"]
+CODE_1 = f"{1:032x}"  # 测试里第一个生成的邀请码
+BOT_NAME = "测试助手"
 
 
-async def test_admin_invite_falls_back_to_code_only_when_link_is_rejected(db: Database) -> None:
-    platform = Platform([c2c(ADMIN, "/invite 小王", "ROBOT1.0_fake-1")], respond=reject_links)
-
-    await run_until_handled(platform, db, RecordingChat(), events=1, sent=1)
-
-    code = f"{1:032x}"
-    (message,) = platform.sent
-    assert "https://" not in message["content"]
-    assert code in message["content"]
-    assert texts.LINK_REJECTED in message["content"]
-    assert message["msg_id"] == "ROBOT1.0_fake-1"
-    assert message["msg_seq"] == 2  # 第 1 个序号被拒绝的那条用掉了
+def admin_says(content: str) -> Payload:
+    return c2c(ADMIN, content, "ROBOT1.0_fake-1")
 
 
-async def test_invite_link_with_ambiguous_failure_gets_no_fallback(db: Database) -> None:
-    def garble_links(body: Payload) -> httpx2.Response | None:
-        return garble(body) if "https://" in body.get("content", "") else None
+def invitation(link: str | None) -> str:
+    return texts.invitation(bot_name=BOT_NAME, link=link, code=CODE_1)
+
+
+async def test_admin_invite_sends_status_then_forwardable_invitation(db: Database) -> None:
+    settled: list[Delivery] = []
+    platform = Platform([admin_says("/invite 小王")])
+
+    await run_until_handled(platform, db, RecordingChat(), events=1, sent=2, settled=settled)
+
+    assert platform.share_links == [{"callback_data": CODE_1}]
+    first, second = platform.sent
+    assert is_markdown(first)
+    assert first["msg_type"] == 2
+    assert text_of(first).startswith("已创建邀请 `#1`（小王）")
+    assert CODE_1 not in text_of(first)
+    assert second == {
+        "path": f"/v2/users/{ADMIN}/messages",
+        "msg_type": 0,
+        "content": invitation(SHARE_URL),
+        "msg_id": "ROBOT1.0_fake-1",
+        "msg_seq": 2,
+    }
+    assert settled == [Delivery.SENT, Delivery.SENT]
+
+
+async def test_admin_invite_rejected_markdown_falls_back_to_plain_status(db: Database) -> None:
+    platform = Platform([admin_says("/invite 小王")], respond=reject_markdown)
+
+    await run_until_handled(platform, db, RecordingChat(), events=1, sent=2)
+
+    first, second = platform.sent
+    assert not is_markdown(first)
+    assert first["content"].startswith("已创建邀请 #1（小王）")
+    assert "`" not in first["content"]
+    assert second["content"] == invitation(SHARE_URL)
+    assert (first["msg_seq"], second["msg_seq"]) == (2, 3)
+
+
+async def test_admin_invite_with_rejected_link_sends_invitation_without_link(
+    db: Database,
+) -> None:
+    platform = Platform([admin_says("/invite 小王")], respond=reject_links)
+
+    await run_until_handled(platform, db, RecordingChat(), events=1, sent=2)
+
+    first, second = platform.sent
+    assert is_markdown(first)
+    assert second["content"] == invitation(None)
+    assert "https://" not in second["content"]
+    assert (first["msg_seq"], second["msg_seq"]) == (1, 3)  # 第 2 个序号被拒的那条用掉了
+
+
+async def test_admin_invite_sends_invitation_even_if_status_is_rejected(db: Database) -> None:
+    def reject_status(body: Payload) -> httpx2.Response | None:
+        return reject(body) if text_of(body).startswith("已创建邀请") else None
 
     settled: list[Delivery] = []
-    platform = Platform([c2c(ADMIN, "/invite 小王", "ROBOT1.0_fake-1")], respond=garble_links)
+    platform = Platform([admin_says("/invite 小王")], respond=reject_status)
+
+    await run_until_handled(platform, db, RecordingChat(), events=1, sent=1, settled=settled)
+
+    assert len(platform.attempts) == 3  # Markdown 被拒、纯文本被拒，然后是邀请
+    assert [m["content"] for m in platform.sent] == [invitation(SHARE_URL)]
+    assert settled == [Delivery.NOT_SENT, Delivery.SENT]
+
+
+async def test_admin_invite_with_ambiguous_status_gets_no_fallback_but_the_invitation(
+    db: Database,
+) -> None:
+    settled: list[Delivery] = []
+    platform = Platform([admin_says("/invite 小王")], respond=garble_markdown)
+
+    await run_until_handled(platform, db, RecordingChat(), events=1, sent=1, settled=settled)
+
+    # 说不准第一条有没有发出：不改发，免得收到两条；邀请照发。
+    assert len(platform.attempts) == 2
+    assert [m["content"] for m in platform.sent] == [invitation(SHARE_URL)]
+    assert settled == [Delivery.UNKNOWN, Delivery.SENT]
+
+
+async def test_admin_invite_without_link_says_so_and_sends_invitation(db: Database) -> None:
+    platform = Platform([admin_says("/invite 小王")], share_link_fails=True)
+
+    await run_until_handled(platform, db, RecordingChat(), events=1, sent=2)
+
+    first, second = platform.sent
+    assert is_markdown(first)
+    assert texts.LINK_FAILED in text_of(first)
+    assert second["content"] == invitation(None)
+
+
+async def test_forwarded_invitation_is_redeemed_end_to_end(db: Database) -> None:
+    created = Platform([admin_says("/invite 小王")])
+    await run_until_handled(created, db, RecordingChat(), events=1, sent=2)
+    forwarded = created.sent[1]["content"]
+
+    redeemed = Platform([c2c(ALICE, forwarded, "ROBOT1.0_fake-2")])
+    await run_until_handled(redeemed, db, RecordingChat(), events=1, sent=1)
+    assert [m["content"] for m in redeemed.sent] == [texts.welcome("小王")]
+
+
+async def test_concurrent_invites_reply_in_groups(db: Database) -> None:
+    code_2 = f"{2:032x}"
+
+    def slow_first_invitation(body: Payload) -> float:
+        # 小王的邀请拖一会儿：没有按用户的锁时，小李的两条会插到小王的状态与邀请之间。
+        return 0.2 if CODE_1 in text_of(body) else 0
+
+    platform = Platform(
+        [
+            c2c(ADMIN, "/invite 小王", "ROBOT1.0_fake-1"),
+            c2c(ADMIN, "/invite 小李", "ROBOT1.0_fake-2"),
+        ],
+        delay=slow_first_invitation,
+    )
+
+    await run_until_handled(platform, db, RecordingChat(), events=2, sent=4)
+
+    def owner(message: Payload) -> str:
+        text = text_of(message)
+        if "小王" in text or CODE_1 in text:
+            return "小王"
+        assert "小李" in text or code_2 in text
+        return "小李"
+
+    owners = [owner(message) for message in platform.sent]
+    assert owners in (["小王"] * 2 + ["小李"] * 2, ["小李"] * 2 + ["小王"] * 2)
+    # 每组都是先状态、后邀请，而且是对同一条命令的被动回复。
+    for status, invite in (platform.sent[:2], platform.sent[2:]):
+        assert is_markdown(status)
+        assert not is_markdown(invite)
+        assert status["msg_id"] == invite["msg_id"]
+
+
+async def test_reply_lock_does_not_hold_the_chat_handler(db: Database) -> None:
+    release = asyncio.Event()
+
+    class BlockingChat:
+        async def handle(self, user: User, message: pyqbot.C2CMessage) -> None:
+            await release.wait()
+
+    platform = Platform([admin_says("你好"), c2c(ADMIN, "/help", "ROBOT1.0_fake-2")])
+
+    async def run() -> None:
+        await run_until_handled(platform, db, BlockingChat(), events=2, sent=1)
+
+    running = asyncio.create_task(run())
+    try:
+        async with asyncio.timeout(2):  # 对话处理器卡住时 /help 照样回复
+            while not platform.sent:
+                platform.changed.clear()
+                await platform.changed.wait()
+    finally:
+        release.set()
+        await running
+    assert text_of(platform.sent[0]) == texts.HELP_MESSAGE.markdown
+
+
+async def test_ambiguous_invitation_is_not_resent_without_link(db: Database) -> None:
+    def garble_invitation(body: Payload) -> httpx2.Response | None:
+        return garble(body) if CODE_1 in text_of(body) else None
+
+    settled: list[Delivery] = []
+    platform = Platform([admin_says("/invite 小王")], respond=garble_invitation)
+
+    await run_until_handled(platform, db, RecordingChat(), events=1, sent=1, settled=settled)
+
+    # 第一条状态送达；第二条说不准是否送达，不再改发含同一邀请码的不带链接版本。
+    assert settled == [Delivery.SENT, Delivery.UNKNOWN]
+    assert [text_of(m).startswith("已创建邀请") for m in platform.sent] == [True]
+    assert [CODE_1 in text_of(body) for body in platform.attempts] == [False, True]
+
+
+async def test_help_is_sent_as_markdown(db: Database) -> None:
+    platform = Platform([admin_says("/help")])
+
+    await run_until_handled(platform, db, RecordingChat(), events=1, sent=1)
+
+    (message,) = platform.sent
+    assert message["msg_type"] == 2
+    assert text_of(message) == texts.HELP_MESSAGE.markdown
+
+
+@pytest.mark.parametrize("command", ["/help", "/users"])
+async def test_rejected_markdown_command_reply_falls_back_to_plain_text(
+    db: Database, command: str
+) -> None:
+    platform = Platform([admin_says(command)], respond=reject_markdown)
+
+    await run_until_handled(platform, db, RecordingChat(), events=1, sent=1)
+
+    (message,) = platform.sent
+    assert not is_markdown(message)
+    assert message["msg_seq"] == 2
+    assert "**" not in message["content"]
+    if command == "/help":
+        assert message["content"] == texts.HELP
+
+
+async def test_ambiguous_markdown_command_reply_is_not_resent(db: Database) -> None:
+    settled: list[Delivery] = []
+    platform = Platform([admin_says("/help")], respond=garble_markdown)
 
     await run_until_handled(platform, db, RecordingChat(), events=1, sent=0, settled=settled)
 
-    assert len(platform.attempts) == 1  # 说不准有没有发出：不改发，免得收到两条
-    assert platform.sent == []
+    assert len(platform.attempts) == 1
     assert settled == [Delivery.UNKNOWN]
+
+
+async def test_short_prompt_is_sent_as_plain_text(db: Database) -> None:
+    platform = Platform([admin_says("/pause")])
+
+    await run_until_handled(platform, db, RecordingChat(), events=1, sent=1)
+
+    assert platform.sent[0]["content"] == texts.SERVICE_PAUSED
+    assert not is_markdown(platform.sent[0])
+
+
+async def test_logs_have_no_openid_code_or_text(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="qtalk_bot")
+    platform = Platform(
+        [admin_says("/invite 私密备注"), c2c(STRANGER, "陌生人的私密消息", "ROBOT1.0_fake-2")],
+        respond=reject_links,
+    )
+
+    await run_until_handled(platform, db, RecordingChat(), events=2, sent=3)
+
+    logged = "\n".join(r.getMessage() for r in caplog.records if r.name.startswith("qtalk_bot"))
+    assert "被平台拒绝" in logged
+    for secret in (ADMIN, STRANGER, CODE_1, SHARE_URL, "私密消息", BOT_NAME):
+        assert secret not in logged
 
 
 def api_error(status_code: int, err_code: int | None) -> pyqbot.APIError:
@@ -945,3 +1186,38 @@ async def test_failing_summary_does_not_block_the_chat(
     assert "没能记下用户 #1 小王 的消息形态：RuntimeError" in logs
     assert "异常文案里的秘密" not in logs
     assert "Traceback" not in logs
+
+
+# ---- 机器人的名字 ----
+
+
+async def bot_name_from(response: httpx2.Response) -> str:
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == "/app/getAppAccessToken":
+            return httpx2.Response(200, json={"access_token": "fake-token", "expires_in": "7200"})
+        assert request.url.path == "/users/@me"
+        return response
+
+    async with (
+        httpx2.AsyncClient(transport=httpx2.MockTransport(handle)) as http_client,
+        pyqbot.Client("fake-app-id", "fake-app-secret", http_client=http_client) as client,
+    ):
+        return await fetch_bot_name(client)
+
+
+async def test_bot_name_comes_from_get_me() -> None:
+    response = httpx2.Response(200, json={"id": "1", "username": " 测试\n助手 "})
+    assert await bot_name_from(response) == "测试 助手"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx2.Response(500, json={"message": "内部错误", "err_code": 11255}),
+        httpx2.Response(200, content=b"not json"),
+        httpx2.Response(200, json={"id": "1"}),
+        httpx2.Response(200, json={"id": "1", "username": "  "}),
+    ],
+)
+async def test_bot_name_falls_back_when_unavailable(response: httpx2.Response) -> None:
+    assert await bot_name_from(response) == texts.DEFAULT_BOT_NAME

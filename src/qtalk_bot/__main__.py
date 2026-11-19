@@ -11,7 +11,7 @@ import sys
 
 import pyqbot
 
-from .bot import QQChat, ShareLinks, register
+from .bot import QQChat, ShareLinks, fetch_bot_name, register
 from .chat import ChatHandler
 from .config import (
     ConfigError,
@@ -46,26 +46,28 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
             bot = pyqbot.Bot(secrets.app_id, secrets.app_secret)
         else:
             bot = pyqbot.Bot(secrets.app_id, secrets.app_secret, base_url=settings.qq.base_url)
-        gate = Gate(
-            db,
-            admin_openid=secrets.admin_openid,
-            timezone=settings.timezone,
-            invites=settings.invites,
-            share_link=ShareLinks(bot),
-        )
-        await gate.prepare()
-        if chat is None:
-            conversation = Conversation(
+        # 从这里起都在 Bot 的上下文里：取名字时被取消、后面准备失败，HTTP 连接也会被关闭。
+        async with bot:
+            gate = Gate(
                 db,
                 admin_openid=secrets.admin_openid,
-                models=models,
-                router=Router(settings.models, settings.decisions, models.decider),
-                settings=settings.chat,
                 timezone=settings.timezone,
+                invites=settings.invites,
+                share_link=ShareLinks(bot),
+                bot_name=await fetch_bot_name(bot),
             )
-            chat = QQChat(conversation)
-        register(bot, gate, chat)
-        async with bot:
+            await gate.prepare()
+            if chat is None:
+                conversation = Conversation(
+                    db,
+                    admin_openid=secrets.admin_openid,
+                    models=models,
+                    router=Router(settings.models, settings.decisions, models.decider),
+                    settings=settings.chat,
+                    timezone=settings.timezone,
+                )
+                chat = QQChat(conversation)
+            register(bot, gate, chat)
             logger.info("机器人启动")
             await bot.start()
 

@@ -3,6 +3,7 @@
 import asyncio
 import itertools
 import logging
+import re
 import sqlite3
 import threading
 import uuid
@@ -25,6 +26,7 @@ from qtalk_bot.gate import (
     Outcome,
     Reply,
     ShareLinkError,
+    find_invite_code,
     normalize_invite_code,
 )
 from qtalk_bot.llm import Provider
@@ -39,6 +41,7 @@ STRANGER = "FAKE-OPENID-STRANGER"
 START = 1_800_000_000  # 2027-01-15 08:00:00 UTC，即上海时间 16:00
 HOUR = 3600
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+BOT_NAME = "测试助手"
 
 
 class Clock:
@@ -90,6 +93,7 @@ class Harness:
             timezone=SHANGHAI,
             invites=InviteSettings() if invites is None else invites,
             share_link=self.links,
+            bot_name=BOT_NAME,
             clock=self.clock,
             new_code=lambda: code_for(next(self._codes)),
         )
@@ -110,7 +114,13 @@ class Harness:
 
     async def _settled(self, outcome: Outcome) -> Outcome:
         if isinstance(outcome, Reply):
-            await self.gate.settle(outcome, self.delivery)
+            for reply in outcome.chain():
+                await self.gate.settle(reply, self.delivery)
+        return outcome
+
+    async def admin_reply(self, content: str) -> Reply:
+        outcome = await self.message(self.admin_openid, content)
+        assert isinstance(outcome, Reply)
         return outcome
 
     async def admin(self, content: str) -> str:
@@ -171,9 +181,18 @@ async def test_admin_plain_message_goes_to_chat_without_invite(h: Harness) -> No
     assert user.name == texts.ADMIN_NAME
 
 
-async def test_admin_help(h: Harness) -> None:
-    assert await h.admin("/help") == texts.HELP
-    assert await h.admin("  /HELP  ") == texts.HELP
+async def test_admin_help_is_markdown_with_plain_fallback(h: Harness) -> None:
+    reply = await h.admin_reply("/help")
+    assert reply == Reply(texts.HELP_MESSAGE.markdown, markdown=True, fallbacks=(texts.HELP,))
+    assert await h.admin_reply("  /HELP  ") == reply
+    assert reply.text.startswith("**管理命令**\n\n")
+    assert "- `/invite <备注>`：创建邀请" in reply.text
+    # 尖括号只出现在行内代码里。
+    outside_code = "".join(reply.text.split("`")[::2])
+    assert "<" not in outside_code
+    assert ">" not in outside_code
+    for command in commands.COMMAND_NAMES:
+        assert f"`/{command}" in reply.text
 
 
 async def test_admin_usage_lists_today_and_total_per_user(h: Harness) -> None:
@@ -208,17 +227,41 @@ async def test_admin_usage_lists_today_and_total_per_user(h: Harness) -> None:
 
     await h.db.transaction(record)
 
-    assert await h.admin("/usage") == texts.usage_list(
-        [
-            texts.usage_line(
-                user_id=admin.id, name=texts.ADMIN_NAME, today=(1, 5, 1, 0), total=(1, 5, 1, 0)
-            ),
-            texts.usage_line(
-                user_id=alice.id, name="小王", today=(2, 100, 20, 1), total=(3, 1100, 220, 1)
-            ),
-        ]
+    reply = await h.admin_reply("/usage")
+    assert reply == Reply.rich(
+        texts.usage_message(
+            [
+                texts.UsageRow(
+                    user_id=admin.id, name=texts.ADMIN_NAME, today=(1, 5, 1, 0), total=(1, 5, 1, 0)
+                ),
+                texts.UsageRow(
+                    user_id=alice.id, name="小王", today=(2, 100, 20, 1), total=(3, 1100, 220, 1)
+                ),
+            ]
+        )
     )
-    assert "（其中 1 次没有用量数据）" in await h.admin("/usage")
+    assert reply.markdown
+    assert reply.text == (
+        "**用量**（今天从本地时间 0 点算起）\n\n"
+        f"- `#{admin.id}` 管理员\n"
+        "  - 今天：1 次，输入 5 / 输出 1 token\n"
+        "  - 累计：1 次，输入 5 / 输出 1 token\n"
+        f"- `#{alice.id}` 小王\n"
+        "  - 今天：2 次，输入 100 / 输出 20 token（其中 1 次没有用量数据）\n"
+        "  - 累计：3 次，输入 1100 / 输出 220 token（其中 1 次没有用量数据）"
+    )
+    assert reply.fallbacks == (
+        texts.usage_list(
+            [
+                texts.usage_line(
+                    user_id=admin.id, name="管理员", today=(1, 5, 1, 0), total=(1, 5, 1, 0)
+                ),
+                texts.usage_line(
+                    user_id=alice.id, name="小王", today=(2, 100, 20, 1), total=(3, 1100, 220, 1)
+                ),
+            ]
+        ),
+    )
     assert "/usage" in texts.HELP
 
 
@@ -251,7 +294,10 @@ async def test_admin_usage_counts_decision_calls(h: Harness) -> None:
         f"#{admin.id} {texts.ADMIN_NAME}：今天 2 次，输入 130 / 输出 20 token，含决策 1 次、输入 30 token；"
         "累计 2 次，输入 130 / 输出 20 token，含决策 1 次、输入 30 token"
     )
-    assert await h.admin("/usage") == texts.usage_list([expected])
+    assert (await h.admin_reply("/usage")).fallbacks == (texts.usage_list([expected]),)
+    assert "  - 今天：2 次，输入 130 / 输出 20 token，含决策 1 次、输入 30 token" in (
+        await h.admin("/usage")
+    )
 
 
 def test_day_start_takes_the_first_of_two_midnights() -> None:
@@ -285,30 +331,47 @@ async def test_admin_sending_an_invite_code_is_told_it_is_not_needed(h: Harness)
 # ---- 邀请的创建 ----
 
 
-async def test_invite_replies_with_link_and_code(h: Harness) -> None:
+async def test_invite_replies_with_status_then_a_forwardable_invitation(h: Harness) -> None:
     outcome = await h.message(ADMIN, "/invite 小王")
     assert isinstance(outcome, Reply)
     code = code_for(1)
+    link = "https://links.invalid/s/1"
     assert h.links.codes == [code]
     expires = "2027-01-22 16:00"  # 7 天后，按上海时间显示
-    assert outcome.text == texts.invite_created(
-        invite_id=1,
-        note="小王",
-        uses=1,
-        expires=expires,
-        link="https://links.invalid/s/1",
-        code=code,
+    status = texts.invite_status(invite_id=1, note="小王", uses=1, expires=expires)
+    first, second = outcome.chain()
+    assert first == Reply(status.markdown, markdown=True, fallbacks=(status.plain,), then=second)
+    assert first.text == "已创建邀请 `#1`（小王），2027-01-22 16:00 前有效，可用 1 次。"
+    assert code not in first.text
+    # 第二条是纯文本的邀请，带链接被拒时改发不带链接的版本。
+    assert second == Reply(
+        texts.invitation(bot_name=BOT_NAME, link=link, code=code),
+        fallbacks=(texts.invitation(bot_name=BOT_NAME, link=None, code=code),),
     )
-    assert outcome.fallback == texts.invite_created_code_only(
-        invite_id=1, note="小王", uses=1, expires=expires, code=code, reason=texts.LINK_REJECTED
-    )
-    assert outcome.fallback is not None
-    assert "https://" not in outcome.fallback
+    assert not second.markdown
+    assert second.text.startswith(f"邀请您来和{BOT_NAME}聊聊天")
+    assert second.text.endswith(f"\n{code}")  # 邀请码单独占最后一行
+    assert link in second.text
+    assert "https://" not in second.fallbacks[0]
+    assert code in second.fallbacks[0]
     invite = await h.invite_row(code)
     assert (invite.note, invite.max_uses, invite.used_count) == ("小王", 1, 0)
     assert invite.expires_at == START + 7 * 24 * HOUR
     assert invite.created_at == START
     assert invite.revoked_at is None
+
+
+def test_invite_status_markdown_escapes_the_note() -> None:
+    status = texts.invite_status(invite_id=7, note="[e](f) *x*", uses=1, expires="t")
+    assert "（［e］（f） \\*x\\*）" in status.markdown
+    assert "（[e](f) *x*）" in status.plain  # 纯文本原样
+
+
+def test_invitation_reads_well_with_the_generic_bot_name() -> None:
+    text = texts.invitation(bot_name=texts.DEFAULT_BOT_NAME, link=None, code="c" * 32)
+    assert text.startswith("邀请您来和这个机器人聊聊天")
+    assert "**" not in text
+    assert "`" not in text
 
 
 async def test_invite_defaults_come_from_settings(h: Harness) -> None:
@@ -359,19 +422,22 @@ async def test_invite_note_at_the_limit_is_accepted(h: Harness) -> None:
     assert invite.note == "长" * 30
 
 
-async def test_invite_when_link_generation_fails_sends_code_only(h: Harness) -> None:
+async def test_invite_when_link_generation_fails_sends_invitation_without_link(
+    h: Harness,
+) -> None:
     h.links.fail = True
     outcome = await h.message(ADMIN, "/invite 小王")
-    assert outcome == Reply(
-        texts.invite_created_code_only(
-            invite_id=1,
-            note="小王",
-            uses=1,
-            expires="2027-01-22 16:00",
-            code=code_for(1),
-            reason=texts.LINK_FAILED,
-        )
+    assert isinstance(outcome, Reply)
+    status = texts.invite_status(
+        invite_id=1, note="小王", uses=1, expires="2027-01-22 16:00", link_failed=True
     )
+    invitation = texts.invitation(bot_name=BOT_NAME, link=None, code=code_for(1))
+    assert outcome.chain() == [
+        Reply(status.markdown, markdown=True, fallbacks=(status.plain,), then=Reply(invitation)),
+        Reply(invitation),
+    ]
+    assert texts.LINK_FAILED in status.markdown
+    assert "邀请链接" not in invitation
     # 邀请照样建好，邀请码可以直接发给机器人兑换。
     assert reply_text(await h.message(ALICE, code_for(1))) == texts.welcome("小王")
 
@@ -404,9 +470,67 @@ async def test_message_with_invite_code_redeems(h: Harness, variant: str) -> Non
     assert (await h.invite_row(code)).used_count == 1
 
 
-async def test_code_embedded_in_other_text_is_not_redeemed(h: Harness) -> None:
+@pytest.mark.parametrize("with_link", [True, False])
+async def test_whole_forwarded_invitation_is_redeemed(h: Harness, with_link: bool) -> None:
+    h.links.fail = not with_link
+    code = await h.invite("小王")
+    link = None if h.links.fail else f"https://links.invalid/s/{len(h.links.codes)}"
+    invitation = texts.invitation(bot_name=BOT_NAME, link=link, code=code)
+    assert reply_text(await h.message(ALICE, invitation)) == texts.welcome("小王")
+    assert (await h.invite_row(code)).used_count == 1
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["邀请码 {code}", "邀请码：{code}。", "{code}\n谢谢", "（{code}）", "码是{code}吧"],
+)
+async def test_code_inside_other_text_is_redeemed(h: Harness, template: str) -> None:
     code = await h.invite()
-    assert reply_text(await h.message(ALICE, f"邀请码 {code}")) == texts.REFUSAL
+    content = template.format(code=code.upper() if "吧" in template else code)
+    assert reply_text(await h.message(ALICE, content)) == texts.welcome("小王")
+
+
+async def test_two_different_codes_are_not_redeemed(h: Harness) -> None:
+    first, second = await h.invite("甲"), await h.invite("乙")
+    assert reply_text(await h.message(ALICE, f"{first} 还是 {second}")) == texts.REFUSAL
+    assert (await h.invite_row(first)).used_count == 0
+    assert (await h.invite_row(second)).used_count == 0
+    # 同一个码出现两次不算「两个」。
+    assert reply_text(await h.message(BOB, f"{first} {first.upper()}")) == texts.welcome("甲")
+
+
+@pytest.mark.parametrize("template", ["x{code}", "{code}0", "1{code}", "{code}abc", "g{code}g"])
+async def test_code_touching_letters_or_digits_does_not_count(h: Harness, template: str) -> None:
+    code = await h.invite()
+    assert reply_text(await h.message(ALICE, template.format(code=code))) == texts.REFUSAL
+    assert (await h.invite_row(code)).used_count == 0
+
+
+def test_find_invite_code() -> None:
+    code = "a" * 32
+    assert find_invite_code(f"邀请码：\n{code}") == code
+    assert find_invite_code(code.upper()) == code
+    assert find_invite_code("a" * 33) is None
+    assert find_invite_code("a" * 31) is None
+    assert find_invite_code(f"{code}-{'b' * 32}") is None
+    assert find_invite_code("没有邀请码") is None
+
+
+async def test_authorized_user_forwarding_an_invitation_goes_to_chat(h: Harness) -> None:
+    await h.friend_add(ALICE, await h.invite("小王"))
+    await h.message(ALICE, "你好")  # 欢迎语已经确认送达
+    other = await h.invite("小张")
+    invitation = texts.invitation(bot_name=BOT_NAME, link=None, code=other)
+    assert isinstance(await h.message(ALICE, invitation), Chat)
+    assert (await h.invite_row(other)).used_count == 0
+    # 整条就是邀请码时仍回「已经可以使用」。
+    assert reply_text(await h.message(ALICE, other)) == texts.already_authorized("小王")
+
+
+async def test_admin_forwarding_an_invitation_goes_to_chat(h: Harness) -> None:
+    code = await h.invite()
+    invitation = texts.invitation(bot_name=BOT_NAME, link=None, code=code)
+    assert isinstance(await h.message(ADMIN, invitation), Chat)
     assert (await h.invite_row(code)).used_count == 0
 
 
@@ -672,7 +796,7 @@ async def test_pause_only_stops_chat_of_authorized_users(h: Harness) -> None:
     assert reply_text(await h.message(STRANGER, "你好")) == texts.PAUSED
 
     # 管理员照常使用命令与对话。
-    assert (await h.admin("/users")).startswith("用户：")
+    assert (await h.admin("/users")).startswith("**用户**")
     assert isinstance(await h.message(ADMIN, "你好"), Chat)
 
     assert await h.admin("/resume") == texts.SERVICE_RESUMED
@@ -750,12 +874,38 @@ async def test_invites_lists_only_usable_ones(h: Harness) -> None:
     h.gate = h.build_gate(InviteSettings(max_uses=1, ttl_hours=48))
     await h.invite("新的")  # #5
     h.clock.advance(HOUR)
-    assert await h.admin("/invites") == texts.invite_list(
-        [
-            texts.invite_line(invite_id=1, note="剩一次", remaining=1, expires="2027-01-22 16:00"),
-            texts.invite_line(invite_id=5, note="新的", remaining=1, expires="2027-01-17 16:00"),
-        ]
+    reply = await h.admin_reply("/invites")
+    assert reply.markdown
+    assert reply.text == (
+        "**有效的邀请**\n\n"
+        "- `#1` 剩一次：剩余 1 次，2027-01-22 16:00 过期\n"
+        "- `#5` 新的：剩余 1 次，2027-01-17 16:00 过期"
     )
+    assert reply.fallbacks == (
+        texts.invite_list(
+            [
+                texts.invite_line(
+                    invite_id=1, note="剩一次", remaining=1, expires="2027-01-22 16:00"
+                ),
+                texts.invite_line(
+                    invite_id=5, note="新的", remaining=1, expires="2027-01-17 16:00"
+                ),
+            ]
+        ),
+    )
+
+
+async def test_list_markdown_escapes_notes_and_names(h: Harness) -> None:
+    note = "[e](f)`*<b>"
+    await h.friend_add(ALICE, await h.invite(note))
+    await h.invite(note)
+    escaped = "［e］（f）\\`\\*\\<b\\>"
+    invites = await h.admin_reply("/invites")
+    assert f"- `#2` {escaped}：剩余 1 次" in invites.text
+    assert f"#2 {note}：剩余 1 次" in invites.fallbacks[0]  # 纯文本原样
+    users = await h.admin_reply("/users")
+    assert f"- `#2` {escaped}：正常" in users.text
+    assert f"#2 {note}：正常" in users.fallbacks[0]
 
 
 async def test_revoke_edge_cases(h: Harness) -> None:
@@ -774,22 +924,40 @@ async def test_users_lists_everyone_with_status_and_join_time(h: Harness) -> Non
     h.clock.advance(HOUR)
     await h.friend_add(BOB, await h.invite("小李"))
     await h.admin("/disable 3")
-    assert await h.admin("/users") == texts.user_list(
-        [
-            texts.user_line(
-                user_id=1,
-                name=texts.ADMIN_NAME,
-                status=texts.STATUS_ADMIN,
-                joined="2027-01-15 16:00",
-            ),
-            texts.user_line(
-                user_id=2, name="小王", status=texts.STATUS_ACTIVE, joined="2027-01-15 16:00"
-            ),
-            texts.user_line(
-                user_id=3, name="小李", status=texts.STATUS_DISABLED, joined="2027-01-15 17:00"
-            ),
-        ]
+    reply = await h.admin_reply("/users")
+    assert reply.markdown
+    assert reply.text == (
+        "**用户**\n\n"
+        "- `#1` 管理员：管理员，2027-01-15 16:00 加入\n"
+        "- `#2` 小王：正常，2027-01-15 16:00 加入\n"
+        "- `#3` 小李：已停用，2027-01-15 17:00 加入"
     )
+    assert reply.fallbacks == (
+        texts.user_list(
+            [
+                texts.user_line(
+                    user_id=1,
+                    name=texts.ADMIN_NAME,
+                    status=texts.STATUS_ADMIN,
+                    joined="2027-01-15 16:00",
+                ),
+                texts.user_line(
+                    user_id=2, name="小王", status=texts.STATUS_ACTIVE, joined="2027-01-15 16:00"
+                ),
+                texts.user_line(
+                    user_id=3, name="小李", status=texts.STATUS_DISABLED, joined="2027-01-15 17:00"
+                ),
+            ]
+        ),
+    )
+
+
+async def test_short_prompts_stay_plain_text(h: Harness) -> None:
+    await h.friend_add(ALICE, await h.invite())
+    for command in ("/disable 2", "/enable 2", "/revoke 1", "/pause", "/frobnicate", "/invites"):
+        reply = await h.admin_reply(command)
+        assert not reply.markdown, command
+        assert reply.fallbacks == ()
 
 
 # ---- 日志 ----
@@ -990,3 +1158,59 @@ async def test_chat_allowed_tracks_status_pause_welcome_and_admin(h: Harness) ->
     assert not await allowed(alice.id)
     assert not await allowed(999)
     assert not await h.db.transaction(access.chat_allowed, admin.id, NEW_ADMIN)
+
+
+# ---- Markdown 转义 ----
+
+
+@pytest.mark.parametrize(
+    ("raw", "escaped"),
+    [
+        ("小王", "小王"),
+        ("[e](f)", "［e］（f）"),  # 不用反斜杠：`\\(…\\)`、`\\[…\\]` 是 LaTeX
+        ("`code`", "\\`code\\`"),
+        ("*粗*_斜_~删~", "\\*粗\\*\\_斜\\_\\~删\\~"),
+        ("<b>x</b>", "\\<b\\>x\\</b\\>"),
+        ("a|b $x$", "a\\|b \\$x\\$"),
+        ("C:\\path", "C:\\\\path"),
+        ("第一行\n# 第二行\r\n> 三", "第一行 # 第二行 \\> 三"),
+        ("![" + "x](y)", "!［x］（y）"),
+    ],
+)
+def test_escape_markdown(raw: str, escaped: str) -> None:
+    assert texts.escape_markdown(raw) == escaped
+
+
+def test_escaped_text_has_no_link_shape_or_unescaped_specials() -> None:
+    nasty = "[a](b) \\[c\\](d) `e` *f* _g_ ~h~ <i> |j| $k$ \\"
+    escaped = texts.escape_markdown(nasty)
+    assert not re.search(r"\]\s*\(", escaped)
+    assert not any(ch in escaped for ch in "()[]\n")
+    # 每个特殊字符前面都有奇数个反斜杠，即都被转义了。
+    for match in re.finditer(r"(\\*)([`*_~<>|$])", escaped):
+        assert len(match.group(1)) % 2 == 1, escaped
+
+
+async def test_bot_name_with_a_code_like_string_is_replaced(
+    h: Harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    tricky = f"助手{'e' * 32}"
+    gate = Gate(
+        h.db,
+        admin_openid=ADMIN,
+        timezone=SHANGHAI,
+        invites=InviteSettings(),
+        share_link=h.links,
+        bot_name=tricky,
+        clock=h.clock,
+        new_code=lambda: code_for(1),
+    )
+    h.gate = gate
+    outcome = await h.message(ADMIN, "/invite 小王")
+    assert isinstance(outcome, Reply)
+    invitation = outcome.chain()[1].text
+    assert tricky not in invitation
+    assert texts.DEFAULT_BOT_NAME in invitation
+    assert "e" * 32 not in caplog.text
+    # 对方把整段邀请原样贴回来，能兑换。
+    assert reply_text(await h.message(ALICE, invitation)) == texts.welcome("小王")

@@ -1,7 +1,8 @@
 """管理员命令：解析与执行。直接解析，不经过大模型。
 
-`execute()` 是同步函数，在调用方的事务里执行，返回要回复的文字；只有 `/invite` 返回新建的邀请，
-链接要在事务之外生成（要访问网络），回复由调用方拼。
+`execute()` 是同步函数，在调用方的事务里执行，返回要回复的内容：单句提示是纯文本 `str`，说明与列表是
+`texts.Rich`（Markdown 加同样内容的纯文本）；只有 `/invite` 返回新建的邀请，链接要在事务之外生成
+（要访问网络），回复由调用方拼。
 """
 
 import re
@@ -14,6 +15,7 @@ from zoneinfo import ZoneInfo
 from . import access, journal, texts
 from .access import Invite, UserStatus
 from .config import InviteSettings
+from .texts import Rich
 
 NOTE_MAX_LENGTH = 30
 """邀请备注（即用户名字）的最大长度。"""
@@ -69,7 +71,7 @@ def format_time(timestamp: int, timezone: ZoneInfo) -> str:
 
 def execute(
     conn: sqlite3.Connection, command: Command, context: CommandContext, now: int
-) -> str | Invite:
+) -> str | Rich | Invite:
     match command.name:
         case "invite":
             return _invite(conn, command.argument, context, now)
@@ -92,7 +94,7 @@ def execute(
         case "usage":
             return _usage(conn, context, now)
         case "help":
-            return texts.HELP
+            return texts.HELP_MESSAGE
         case _:
             return texts.UNKNOWN_COMMAND
 
@@ -112,12 +114,12 @@ def _invite(conn: sqlite3.Connection, note: str, context: CommandContext, now: i
     )
 
 
-def _list_invites(conn: sqlite3.Connection, context: CommandContext, now: int) -> str:
+def _list_invites(conn: sqlite3.Connection, context: CommandContext, now: int) -> str | Rich:
     invites = access.list_usable_invites(conn, now)
     if not invites:
         return texts.NO_USABLE_INVITES
-    lines = [
-        texts.invite_line(
+    rows = [
+        texts.InviteRow(
             invite_id=invite.id,
             note=invite.note,
             remaining=invite.remaining,
@@ -125,7 +127,7 @@ def _list_invites(conn: sqlite3.Connection, context: CommandContext, now: int) -
         )
         for invite in invites
     ]
-    return texts.invite_list(lines)
+    return texts.invites_message(rows)
 
 
 def _revoke(conn: sqlite3.Connection, argument: str, now: int) -> str:
@@ -141,8 +143,8 @@ def _revoke(conn: sqlite3.Connection, argument: str, now: int) -> str:
     return texts.invite_revoked(invite.id, invite.note)
 
 
-def _list_users(conn: sqlite3.Connection, context: CommandContext) -> str:
-    lines: list[str] = []
+def _list_users(conn: sqlite3.Connection, context: CommandContext) -> Rich:
+    rows: list[texts.UserRow] = []
     for user in access.list_users(conn):
         if user.openid == context.admin_openid:
             status = texts.STATUS_ADMIN
@@ -153,8 +155,8 @@ def _list_users(conn: sqlite3.Connection, context: CommandContext) -> str:
         else:
             status = texts.STATUS_ACTIVE
         joined = format_time(user.joined_at, context.timezone)
-        lines.append(texts.user_line(user_id=user.id, name=user.name, status=status, joined=joined))
-    return texts.user_list(lines)
+        rows.append(texts.UserRow(user_id=user.id, name=user.name, status=status, joined=joined))
+    return texts.users_message(rows)
 
 
 def _set_status(
@@ -192,12 +194,12 @@ def day_start(now: int, timezone: ZoneInfo) -> int:
     return int(midnight.timestamp())
 
 
-def _usage(conn: sqlite3.Connection, context: CommandContext, now: int) -> str:
+def _usage(conn: sqlite3.Connection, context: CommandContext, now: int) -> str | Rich:
     summaries = journal.usage_summary(conn, day_start(now, context.timezone))
     if not summaries:
         return texts.NO_USAGE
-    lines = [
-        texts.usage_line(
+    rows = [
+        texts.UsageRow(
             user_id=s.user_id,
             name=s.name,
             today=(s.today_calls, s.today_input, s.today_output, s.today_unreported),
@@ -207,7 +209,7 @@ def _usage(conn: sqlite3.Connection, context: CommandContext, now: int) -> str:
         )
         for s in summaries
     ]
-    return texts.usage_list(lines)
+    return texts.usage_message(rows)
 
 
 def _parse_id(argument: str) -> int | None:

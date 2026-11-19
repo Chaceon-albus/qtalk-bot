@@ -11,6 +11,7 @@
 「至多一次」：事务提交后、回复发出前进程退出，这次回复就丢了，但不会重复。
 
 回复之后的收尾：有的回复要按发送结果再改一次数据库，由接线层发完后调用 `Gate.settle()`。
+一个结果可以是按顺序发出的几条回复（`Reply.then`），每条各自收尾。
 欢迎语确认发出后才记下「已告知」；「只回一次」的拒绝语与停用说明在事务里先占位（并发时仍只回
 一次），确定没发出时撤销占位，送达与否不确定时保留。
 """
@@ -21,7 +22,7 @@ import secrets
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from zoneinfo import ZoneInfo
 
@@ -34,6 +35,7 @@ from .storage import Database
 logger = logging.getLogger(__name__)
 
 _INVITE_CODE = re.compile(r"[0-9a-f]{32}")
+_EMBEDDED_CODE = re.compile(r"(?<![0-9A-Za-z])[0-9A-Fa-f]{32}(?![0-9A-Za-z])")
 
 
 class ShareLinkError(Exception):
@@ -97,15 +99,34 @@ class Reply:
 
     Attributes:
         text: 要发的文字。
-        fallback: 不为空时，平台明确拒绝 `text` 后改发它。
+        markdown: `text` 是不是 Markdown；怎么按 Markdown 发由接线层决定。
+        fallbacks: 平台明确拒绝 `text` 后依次改发的纯文本，前一条也被明确拒绝才试下一条；
+            不确定是否送达时不再改发。
         on_sent: 确认发出后要做的收尾。
         on_not_sent: 确定没有发出时要做的收尾。
+        then: 这条之后接着发的下一条，无论这条是否发出都要发。
     """
 
     text: str
-    fallback: str | None = None
+    markdown: bool = False
+    fallbacks: tuple[str, ...] = ()
     on_sent: Followup | None = None
     on_not_sent: Followup | None = None
+    then: Reply | None = None
+
+    @classmethod
+    def rich(cls, content: texts.Rich) -> Reply:
+        """用 Markdown 发 `content`，被拒时改发同样内容的纯文本。"""
+        return cls(content.markdown, markdown=True, fallbacks=(content.plain,))
+
+    def chain(self) -> list[Reply]:
+        """这条与它之后的各条，按发送顺序。"""
+        replies: list[Reply] = []
+        current: Reply | None = self
+        while current is not None:
+            replies.append(current)
+            current = current.then
+        return replies
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +155,17 @@ def normalize_invite_code(text: str) -> str | None:
     return candidate if _INVITE_CODE.fullmatch(candidate) else None
 
 
+def find_invite_code(text: str) -> str | None:
+    """`text` 里恰好有一个形如邀请码的串（32 个十六进制字符，前后不紧挨 ASCII 字母或数字）时返回它
+    （转小写）；没有，或有两个以上不同的串时返回 `None`。
+
+    用于未授权的用户：对方常把收到的整段邀请原样发来。前后的界限只认 ASCII 字母数字，所以紧跟在
+    「邀请码：」这类中文后面也算。
+    """
+    found = {match.lower() for match in _EMBEDDED_CODE.findall(text)}
+    return found.pop() if len(found) == 1 else None
+
+
 def _now() -> int:
     return int(time.time())
 
@@ -156,12 +188,18 @@ class Gate:
         timezone: ZoneInfo,
         invites: InviteSettings,
         share_link: ShareLinkFactory,
+        bot_name: str = texts.DEFAULT_BOT_NAME,
         clock: Callable[[], int] = _now,
         new_code: Callable[[], str] = _new_code,
     ) -> None:
         self._db = db
         self._admin_openid = admin_openid
         self._timezone = timezone
+        if _EMBEDDED_CODE.search(bot_name):
+            # 名字里有形如邀请码的串时，对方原样贴回邀请会认出两个不同的串而兑换不了。
+            logger.warning("机器人的名字里有形如邀请码的串，邀请里改用通用的称呼")
+            bot_name = texts.DEFAULT_BOT_NAME
+        self._bot_name = bot_name
         self._share_link = share_link
         self._clock = clock
         self._commands = CommandContext(
@@ -224,8 +262,9 @@ class Gate:
             if access.is_paused(conn):
                 return Reply(texts.PAUSED), f"服务暂停中，回复用户 {user.label} 暂停说明"
             return Chat(user), None
-        if code is not None:
-            return self._redeem(conn, code, message.openid, now, via="消息")
+        embedded = find_invite_code(message.content)
+        if embedded is not None:
+            return self._redeem(conn, embedded, message.openid, now, via="消息")
         return self._refuse(conn, message.openid, now, "未授权的用户发来消息")
 
     def _decide_friend_add(self, conn: sqlite3.Connection, event: FriendAdded) -> _Decision:
@@ -263,7 +302,8 @@ class Gate:
             return _NewInvite(result), f"管理员创建了邀请 #{result.id}（{result.note}）"
         # 未知命令的名字是管理员随手打的字，不进日志。
         name = f"/{command.name}" if command.name in commands.COMMAND_NAMES else "未知命令"
-        return Reply(result), f"管理员执行了{name}"
+        reply = Reply.rich(result) if isinstance(result, texts.Rich) else Reply(result)
+        return reply, f"管理员执行了{name}"
 
     def _redeem(
         self, conn: sqlite3.Connection, code: str, openid: str, now: int, *, via: str
@@ -307,28 +347,30 @@ class Gate:
     # ---- 事务之外 ----
 
     async def _invite_reply(self, invite: Invite) -> Reply:
+        """两条：给管理员看的状态（Markdown，一行），然后是可以原样转发给对方的邀请（纯文本）。
+
+        第二条无论第一条是否发出都发。带链接的邀请被平台明确拒绝时改发不带链接的版本。最坏的情况是
+        4 次被动回复（两条各被拒一次再改发），在平台的限制之内。
+        """
         expires = commands.format_time(invite.expires_at, self._timezone)
 
-        def code_only(reason: str) -> str:
-            return texts.invite_created_code_only(
-                invite_id=invite.id,
-                note=invite.note,
-                uses=invite.max_uses,
-                expires=expires,
-                code=invite.code,
-                reason=reason,
+        def status(*, link_failed: bool) -> Reply:
+            return Reply.rich(
+                texts.invite_status(
+                    invite_id=invite.id,
+                    note=invite.note,
+                    uses=invite.max_uses,
+                    expires=expires,
+                    link_failed=link_failed,
+                )
             )
+
+        def invitation(link: str | None) -> str:
+            return texts.invitation(bot_name=self._bot_name, link=link, code=invite.code)
 
         try:
             link = await self._share_link(invite.code)
         except ShareLinkError:
-            return Reply(code_only(texts.LINK_FAILED))
-        text = texts.invite_created(
-            invite_id=invite.id,
-            note=invite.note,
-            uses=invite.max_uses,
-            expires=expires,
-            link=link,
-            code=invite.code,
-        )
-        return Reply(text, fallback=code_only(texts.LINK_REJECTED))
+            return replace(status(link_failed=True), then=Reply(invitation(None)))
+        forwardable = Reply(invitation(link), fallbacks=(invitation(None),))
+        return replace(status(link_failed=False), then=forwardable)

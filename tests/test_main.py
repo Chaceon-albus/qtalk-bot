@@ -7,6 +7,8 @@ import pyqbot
 import pytest
 
 from qtalk_bot import __main__ as entry
+from qtalk_bot.gate import Gate
+from qtalk_bot.storage import StorageError
 
 FAKE_ENV = {
     "APP_ID": "fake-app-id",
@@ -33,6 +35,19 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for name, value in FAKE_ENV.items():
         monkeypatch.setenv(name, value)
     return path
+
+
+@pytest.fixture(autouse=True)
+def fake_get_me(monkeypatch: pytest.MonkeyPatch) -> list[pyqbot.Bot]:
+    """启动时取机器人名字的接口调用用替身代替。"""
+    calls: list[pyqbot.Bot] = []
+
+    async def get_me(self: pyqbot.Bot) -> pyqbot.BotInfo:
+        calls.append(self)
+        return pyqbot.BotInfo(id="1", username="测试助手")
+
+    monkeypatch.setattr(pyqbot.Bot, "get_me", get_me)
+    return calls
 
 
 def test_config_error_prints_message_and_exits_nonzero(
@@ -143,3 +158,38 @@ def test_corrupt_database_exits_nonzero_without_echoing_it(
     assert "无法打开数据库" in err
     assert "机密内容" not in err
     assert "Traceback" not in err
+
+
+def test_startup_survives_failing_get_me(config: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def get_me(self: pyqbot.Bot) -> pyqbot.BotInfo:
+        raise pyqbot.NetworkError("超时")
+
+    async def start(self: pyqbot.Bot) -> None:
+        pass
+
+    monkeypatch.setattr(pyqbot.Bot, "get_me", get_me)
+    monkeypatch.setattr(pyqbot.Bot, "start", start)
+    assert entry.main() == 0
+
+
+def test_startup_asks_for_the_bot_name(
+    config: Path, monkeypatch: pytest.MonkeyPatch, fake_get_me: list[pyqbot.Bot]
+) -> None:
+    async def start(self: pyqbot.Bot) -> None:
+        pass
+
+    monkeypatch.setattr(pyqbot.Bot, "start", start)
+    assert entry.main() == 0
+    assert len(fake_get_me) == 1
+
+
+def test_bot_is_closed_when_preparation_fails_after_get_me(
+    config: Path, monkeypatch: pytest.MonkeyPatch, fake_get_me: list[pyqbot.Bot]
+) -> None:
+    async def prepare(self: Gate) -> None:
+        raise StorageError("准备失败")
+
+    monkeypatch.setattr(Gate, "prepare", prepare)
+    assert entry.main() == entry.EXIT_RUNTIME_ERROR
+    (bot,) = fake_get_me
+    assert bot.is_closed  # get_me 之后出错，HTTP 连接也关了
