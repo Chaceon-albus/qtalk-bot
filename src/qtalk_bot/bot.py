@@ -7,7 +7,8 @@
 
 已授权用户的消息转成 `ChatInput`（`chat_input()`）交给 `batching.Batcher`：附件转成本项目自己的 `media.IncomingAttachment`，被引用的
 消息（`msg_elements`）里的图片也带上，卡片与转发的聊天记录记成不支持的内容。附件经 `QQDownloader` 用 pyqbot
-的 HTTP 客户端（`bot.http_client`）下载，不另建客户端；以后 pyqbot 加上代理参数，下载会自动走代理。
+的 HTTP 客户端（`bot.http_client`）下载，不另建客户端，所以 `[qq].proxy`（传给 `pyqbot.Bot(proxy=...)`）对下载
+同样生效。
 
 已授权用户的消息带附件、引用、卡片等非文本内容时，还记一条它们的形态（`describe_non_text()`），为处理图片、
 语音、文件收集真实样本。这条日志会长期保留，所以只输出能确认安全的东西：数字、字数，以及对照白名单得到的
@@ -170,16 +171,13 @@ MAX_REF_LENGTH = 512  # 引用索引最长存这么多字符；更长的当作�
 def ref_msg_idx(message: pyqbot.C2CMessage) -> str | None:
     """这条消息引用的那条消息的引用索引；没有引用时为 `None`。按引用定位话题时用。
 
-    平台的真实形态还没有实测，这里是按官方文档推断的：引用消息（`message_type=103`）的 `message_scene.ext` 里
-    有 `ref_msg_idx=...`，`msg_elements` 里被引用的那条也带 `msg_idx`。优先取前者；没有时取 `msg_elements`
-    第一项的 `msg_idx`。pyqbot 只提供了 `msg_idx`（这条消息自己的索引），没有现成的 `ref_msg_idx`，所以这里
-    自己读 `ext`。
+    优先取 pyqbot 的 `message.ref_msg_idx`（`message_scene.ext` 里的 `ref_msg_idx=`；引用机器人的消息时它对应
+    发送结果的 `ext_info.ref_idx`）。pyqbot 不回退到 `msg_elements`，这里自己回退：没有时取 `msg_elements`
+    第一项的 `msg_idx`。两处都取是推断：平台的真实形态还没有实测（pyqbot 的 `tests/live/test_live_quote.py`
+    会回答，结论以它的 `docs/errata.md` 为准），在那之前不确定哪一处一定会给。
     """
-    if message.message_scene is not None:
-        for item in message.message_scene.ext:
-            key, sep, value = item.partition("=")
-            if sep and key == "ref_msg_idx":
-                return _ref_value(value)
+    if message.ref_msg_idx is not None:
+        return _ref_value(message.ref_msg_idx)
     for element in message.msg_elements:
         return _ref_value(element.msg_idx)
     return None
@@ -218,7 +216,9 @@ def _attachment(item: pyqbot.MessageAttachment, *, quoted: bool) -> IncomingAtta
     )
 
 
-def _quoted_images(elements: Sequence[_Element], *, depth: int) -> list[IncomingAttachment]:
+def _quoted_images(
+    elements: Sequence[pyqbot.MessageElement], *, depth: int
+) -> list[IncomingAttachment]:
     """被引用的消息里的图片。被引用的是转发的聊天记录时，整棵子树都不看（里面可能是别人的图片，聊天记录又
     定为不支持），只记一条不支持的条目。"""
     images: list[IncomingAttachment] = []
@@ -479,6 +479,9 @@ class _QQReplyChannel:
     流式回复用 `coalesce=False`：每次调用发一片、等它发完，合并由 `Conversation` 自己做，这样才知道哪些
     内容确实送达了。pyqbot 的异常按 `is_rejection()` 分成「确定没发出」与「说不准」。`budget` 由
     `Conversation` 计数，这里只是让它跟着这条消息。
+
+    引用索引：流式回复取 `StreamMessage.ref_idx`（平台第一次在分片响应里给出的 `ext_info.ref_idx`，哪一片会带
+    还没有实测），纯文本取发送结果的 `ext_info.ref_idx`；超过 `MAX_REF_LENGTH` 的当作没有。
     """
 
     def __init__(self, message: pyqbot.C2CMessage, recall: Recall) -> None:
@@ -493,17 +496,21 @@ class _QQReplyChannel:
     async def typing(self, seconds: int) -> None:
         await _guarded(self._message.send_typing(seconds=seconds))
 
-    async def stream(self, text: str) -> None:
+    async def stream(self, text: str) -> str | None:
         if self._stream is None:
             self._stream = self._message.reply_stream(coalesce=False)
         await _guarded(self._stream.append(text))
+        return _ref_value(self._stream.ref_idx)
 
-    async def finish_stream(self) -> None:
-        if self._stream is not None:
-            await _guarded(self._stream.finish())
+    async def finish_stream(self) -> str | None:
+        if self._stream is None:
+            return None
+        await _guarded(self._stream.finish())
+        return _ref_value(self._stream.ref_idx)
 
-    async def send(self, text: str) -> None:
-        await _guarded(self._message.reply(text))
+    async def send(self, text: str) -> str | None:
+        sent = await _guarded(self._message.reply(text))
+        return None if sent.ext_info is None else _ref_value(sent.ext_info.ref_idx)
 
 
 class _QQProcessStream:
@@ -534,9 +541,9 @@ class _QQProcessStream:
         await _guarded(self._recall(self._message.user_openid, message_id))
 
 
-async def _guarded(call: Awaitable[object]) -> None:
+async def _guarded[T](call: Awaitable[T]) -> T:
     try:
-        await call
+        return await call
     except pyqbot.QQBotError as exc:
         raise _send_error(exc) from None
     except RuntimeError as exc:  # 流式消息已终止，或客户端已关闭
@@ -683,38 +690,6 @@ def _log_shape(user: User, message: pyqbot.C2CMessage, hosts: Sequence[str]) -> 
         logger.warning("没能记下用户 %s 的消息形态：%s", user.label, type(exc).__name__)
 
 
-class _Ark(Protocol):
-    """pyqbot 的 `ArkData` 里用到的部分；pyqbot 没有公开导出这个类型，按结构匹配。"""
-
-    @property
-    def ark_type(self) -> str | None: ...
-
-    @property
-    def ark_name(self) -> str | None: ...
-
-
-class _Element(Protocol):
-    """pyqbot 的 `MessageElement`（被引用的消息）里用到的部分；同样没有公开导出。"""
-
-    @property
-    def msg_idx(self) -> str | None: ...
-
-    @property
-    def message_type(self) -> pyqbot.ReceivedMessageType | None: ...
-
-    @property
-    def content(self) -> str | None: ...
-
-    @property
-    def attachments(self) -> Sequence[pyqbot.MessageAttachment]: ...
-
-    @property
-    def ark_data(self) -> _Ark | None: ...
-
-    @property
-    def msg_elements(self) -> Sequence[_Element]: ...
-
-
 # 只输出能确认安全的固定标签：平台给的字符串一律先对照白名单，对不上就记「其它」，不照抄。
 
 _CONTENT_TYPES = frozenset(
@@ -809,8 +784,8 @@ def _describe_body(
     message_type: pyqbot.ReceivedMessageType | None,
     content: str | None,
     attachments: Sequence[pyqbot.MessageAttachment],
-    elements: Sequence[_Element],
-    ark: _Ark | None,
+    elements: Sequence[pyqbot.MessageElement],
+    ark: pyqbot.ArkData | None,
 ) -> str:
     kind = "无" if message_type is None else str(int(message_type))
     if ark is None:
@@ -826,7 +801,7 @@ def _describe_body(
 
 
 def _describe_elements(
-    label: str, elements: Sequence[_Element], budget: _Budget, *, depth: int
+    label: str, elements: Sequence[pyqbot.MessageElement], budget: _Budget, *, depth: int
 ) -> list[str]:
     parts: list[str] = []
     for index, element in enumerate(elements, 1):
@@ -852,7 +827,7 @@ def _describe_elements(
     return parts
 
 
-def _skip(elements: Sequence[_Element], budget: _Budget, *, depth: int) -> None:
+def _skip(elements: Sequence[pyqbot.MessageElement], budget: _Budget, *, depth: int) -> None:
     """预算用完后，把剩下的元素和它们（往下不超过 `_NESTING_LIMIT` 层）带的附件计入总数。"""
     for element in elements:
         budget.skipped_elements += 1
@@ -937,15 +912,15 @@ def _extension(filename: str | None) -> str:
 
 
 def is_rejection(exc: pyqbot.QQBotError) -> bool:
-    """平台是否明确拒绝了这次请求（可以确定消息没有发出）。
+    """平台是否明确拒绝了这次请求（可以确定消息没有发出）：pyqbot 的 `outcome_unknown` 为假。
 
-    依据 pyqbot 的 `_check_response()`：响应体里带非零错误码，或 HTTP 状态是 4xx，都是平台判定的
-    失败。其余的 `APIError`（例如 HTTP 200 但响应解析不了、5xx 且没有错误码）与 `NetworkError`
-    都说不准平台有没有处理，不算。`AuditPendingError` 是「已受理、等待审核」，也不算。
+    `outcome_unknown` 为真的（请求发出后的网络错误、HTTP 5xx 不论有没有错误码、2xx 却没有错误码的异常响应）
+    可能已经生效，不算拒绝。pyqbot 说明 `AuditPendingError`（已受理、等待审核）与 `PartialFailureError`
+    （部分已生效）是例外：它们的 `outcome_unknown` 为假，却不是「没有生效」，所以这里也不算拒绝。
     """
-    if not isinstance(exc, pyqbot.APIError) or isinstance(exc, pyqbot.AuditPendingError):
+    if isinstance(exc, pyqbot.AuditPendingError | pyqbot.PartialFailureError):
         return False
-    return exc.err_code is not None or 400 <= exc.status_code < 500
+    return not exc.outcome_unknown
 
 
 class _Send(Protocol):

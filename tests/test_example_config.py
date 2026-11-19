@@ -114,6 +114,7 @@ def test_commented_out_examples_are_valid_once_uncommented(tmp_path: Path) -> No
         4096,
     )
     assert settings.qq.base_url == "https://api.bot.qq.com"
+    assert settings.qq.proxy == "socks5h://127.0.0.1:1080"
     assert settings.providers.openai.base_url == "https://api.openai.com/v1"
     assert settings.providers.openai.proxy == "socks5://127.0.0.1:1080"
     assert settings.providers.gemini.base_url == "https://generativelanguage.googleapis.com/"

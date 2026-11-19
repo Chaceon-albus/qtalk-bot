@@ -207,7 +207,15 @@ class FakeChannel:
         finish_gate: asyncio.Event | None = None,
         on_finish: Callable[[], None] | None = None,
         send_action: Action | None = None,
+        stream_ref: str | None = None,
+        finish_ref: str | None = None,
+        send_ref: str | None = None,
     ) -> None:
+        # 引用索引：成功的分片与结束分片返回 `stream_ref`；`finish_ref` 不为空时结束分片改返回它（模拟平台只在
+        # 结束分片里给出）；普通消息返回 `send_ref`。
+        self.stream_ref = stream_ref
+        self.finish_ref = finish_ref
+        self.send_ref = send_ref
         self.send_action = (
             send_action  # 不为空时每条普通消息发出前先调用它（模拟发送期间外部状态的变化）
         )
@@ -266,7 +274,7 @@ class FakeChannel:
             raise self.typing_failure
         self.log.append(("typing", ""))
 
-    async def stream(self, text: str) -> None:
+    async def stream(self, text: str) -> str | None:
         await asyncio.sleep(0)
         if (gate := self.stream_gate(text)) is not None:
             await gate.wait()
@@ -275,8 +283,9 @@ class FakeChannel:
             raise error
         self.log.append(("stream", text))
         self.delivered.set()
+        return self.stream_ref
 
-    async def finish_stream(self) -> None:
+    async def finish_stream(self) -> str | None:
         self.finish_calls += 1
         self.finish_started.set()
         await asyncio.sleep(0)
@@ -287,14 +296,16 @@ class FakeChannel:
         self.log.append(("finish", ""))
         if self.on_finish is not None:
             self.on_finish()
+        return self.stream_ref if self.finish_ref is None else self.finish_ref
 
-    async def send(self, text: str) -> None:
+    async def send(self, text: str) -> str | None:
         await asyncio.sleep(0)
         if self.send_action is not None:
             await self.send_action()
         if (error := self.send_failure(text)) is not None:
             raise error
         self.log.append(("send", text))
+        return self.send_ref
 
 
 class FakeProcess:
@@ -982,6 +993,63 @@ async def test_uncertain_send_stops_waiting_for_the_model_at_once(db: Database) 
     assert channel.streamed == "第一段"
     assert channel.sent == []  # 说不准有没有发出：不再改发，免得重复
     assert (await rows(db))[-1] == Row("assistant", "第一段", "main", "aborted", "uncertain")
+
+
+# ---- 回复的引用索引（用户引用机器人的回复时据此定位话题） ----
+
+
+async def reply_indices(db: Database) -> list[str | None]:
+    result = await db.fetch_all("SELECT msg_idx FROM messages WHERE role = 'assistant' ORDER BY id")
+    return [r["msg_idx"] for r in result]
+
+
+async def test_streamed_answer_records_the_index_of_its_stream(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    channel = FakeChannel(stream_ref="REFIDX_stream", send_ref="REFIDX_notice")
+
+    await say(conversation(db, ScriptedModel("main", answer("你好"))), alice, "在吗", channel)
+
+    assert await reply_indices(db) == ["REFIDX_stream"]
+
+
+async def test_index_given_only_by_the_closing_chunk_is_recorded(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    channel = FakeChannel(finish_ref="REFIDX_closing")
+
+    await say(conversation(db, ScriptedModel("main", answer("你好"))), alice, "在吗", channel)
+
+    assert await reply_indices(db) == ["REFIDX_closing"]
+
+
+async def test_plain_text_resend_records_the_index_of_the_plain_message(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    channel = FakeChannel(
+        stream_failure=reject_if("敏感"), stream_ref="REFIDX_stream", send_ref="REFIDX_plain"
+    )
+
+    await say(conversation(db, ScriptedModel("main", answer("敏感"))), alice, "你好", channel)
+
+    assert (await rows(db))[-1].delivery == "plain"
+    assert await reply_indices(db) == ["REFIDX_plain"]
+
+
+async def test_fixed_notice_is_not_recorded_as_the_reply_index(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    channel = FakeChannel(stream_ref="REFIDX_stream", send_ref="REFIDX_notice")
+    primary = ScriptedModel("main", [ModelError(Provider.OPENAI, ErrorKind.SERVER)])
+
+    await say(conversation(db, primary), alice, "你好", channel)
+
+    assert channel.sent == [texts.MODEL_FAILED]
+    assert await reply_indices(db) == [None]
+
+
+async def test_missing_index_is_left_empty(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+
+    await say(conversation(db, ScriptedModel("main", answer("你好"))), alice, "在吗")
+
+    assert await reply_indices(db) == [None]
 
 
 async def test_typing_failure_does_not_stop_the_reply(db: Database) -> None:

@@ -143,6 +143,31 @@ def test_qq_base_url_is_passed_to_pyqbot(config: Path, monkeypatch: pytest.Monke
     assert entry.main() == 0
     (bot,) = started
     assert bot.config.base_url == "https://sandbox.example.com"
+    assert bot.config.proxy is None
+
+
+def test_qq_proxy_is_passed_to_pyqbot_without_showing_credentials(
+    config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    started: list[pyqbot.Bot] = []
+
+    async def start(self: pyqbot.Bot) -> None:
+        started.append(self)
+
+    monkeypatch.setattr(pyqbot.Bot, "start", start)
+    proxy = "socks5h://user:hunter2-proxy@127.0.0.1:1080"
+    config.write_text(f'timezone = "UTC"\n[qq]\nproxy = "{proxy}"\n' + MODELS, encoding="utf-8")
+    with caplog.at_level(logging.DEBUG):
+        assert entry.main() == 0
+    (bot,) = started
+    assert bot.config.proxy == proxy
+    assert bot.config.base_url == "https://api.bot.qq.com"  # 没配 base_url 时用 pyqbot 的默认值
+    captured = capsys.readouterr()
+    shown = [repr(bot.config), captured.out, captured.err, caplog.text]
+    assert all("hunter2" not in text for text in shown)
 
 
 def test_platform_error_exits_nonzero_without_secrets(
@@ -342,6 +367,8 @@ async def _forever() -> None:
 class _SlowBot:
     """`close()` 用掉比整个关停预算还长的时间。"""
 
+    async def stop(self) -> None: ...
+
     async def close(self) -> None:
         await asyncio.sleep(0.2)
 
@@ -428,11 +455,14 @@ def test_memory_without_decisions_is_ignored_with_a_log(caplog: pytest.LogCaptur
 
 
 async def test_batcher_stops_before_the_bot_closes_and_is_drained_after() -> None:
-    # 先放弃计时中的批次、等回答收尾（含结束分片与记账），最后才关闭 Bot：回答在 Batcher 自己的任务里，
-    # Bot.close() 不等它们，QQ 的 HTTP 客户端先关的话结束分片就发不出去了。
+    # 先放弃计时中的批次、停收事件，再等回答收尾（含结束分片与记账），最后才关闭 Bot：回答在 Batcher 自己的
+    # 任务里，pyqbot 不等它们，QQ 的 HTTP 客户端先关的话结束分片就发不出去了。
     order: list[str] = []
 
     class RecordingBot:
+        async def stop(self) -> None:
+            order.append("bot.stop")
+
         async def close(self) -> None:
             order.append("bot")
 
@@ -452,7 +482,107 @@ async def test_batcher_stops_before_the_bot_closes_and_is_drained_after() -> Non
         cast(Batcher, RecordingBatcher()),
     )
 
-    assert order == ["stop", "drain", "bot"]
+    assert order == ["stop", "bot.stop", "drain", "bot"]
+
+
+async def test_shutdown_stops_receiving_first_and_closes_the_bot_after_the_replies(
+    tmp_path: Path,
+) -> None:
+    # 完整的顺序：停止回答 → 停收事件（等处理函数自然结束）→ 等回答与对话收尾记账 → 提醒 → 关闭 Bot
+    # （取消剩下的处理函数、关 HTTP 客户端）→ 等放行的消息入库 → 停后台。
+    order: list[str] = []
+
+    class RecordingBot:
+        async def stop(self) -> None:
+            order.append("bot.stop")
+
+        async def close(self) -> None:
+            order.append("bot.close")
+
+    class RecordingBatcher:
+        def stop(self) -> None:
+            order.append("batcher.stop")
+
+        async def drain(self) -> None:
+            order.append("batcher.drain")
+
+    class RecordingConversation:
+        async def drain(self) -> None:
+            order.append("conversation.drain")
+
+    class RecordingAlerts:
+        def stop(self) -> None:
+            order.append("alerts.stop")
+
+        async def aclose(self) -> None:
+            order.append("alerts.aclose")
+
+    class RecordingHandlers:
+        async def drain(self) -> None:
+            order.append("handlers.drain")
+
+    real_stop = Fetcher.stop
+
+    class RecordingFetcher(Fetcher):
+        def stop(self) -> None:
+            order.append("fetcher.stop")
+            real_stop(self)
+
+    fetcher = RecordingFetcher(
+        MediaStore.under(tmp_path), cast(Downloader, _NoDownloads()), AttachmentSettings()
+    )
+    await entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+        cast(pyqbot.Bot, RecordingBot()),
+        cast(Conversation, RecordingConversation()),
+        None,
+        None,
+        fetcher,
+        cast(Batcher, RecordingBatcher()),
+        cast(Handlers, RecordingHandlers()),
+        cast(Alerts, RecordingAlerts()),
+    )
+
+    assert order[:9] == [
+        "batcher.stop",
+        "bot.stop",
+        "batcher.drain",
+        "conversation.drain",
+        "alerts.stop",
+        "alerts.aclose",
+        "bot.close",
+        "handlers.drain",
+        "fetcher.stop",
+    ]
+
+
+async def test_stop_timeout_only_ends_the_wait_and_close_cancels_the_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 真实的 pyqbot.Bot：处理函数还在（例如下载附件）时，Bot.stop() 的时限到期只结束等待、不取消它，
+    # 回答照常收尾；之后的 Bot.close() 才取消它。
+    monkeypatch.setattr(entry, "BOT_STOP_SECONDS", 0.05)
+    bot = pyqbot.Bot("fake-app-id", "fake-app-secret-never-shown")
+
+    async def download() -> None:
+        await asyncio.Event().wait()
+
+    downloading = asyncio.create_task(download())
+    dispatcher = bot._dispatcher  # pyright: ignore[reportPrivateUsage]  放进一个在途的处理函数
+    dispatcher._tasks.add(downloading)  # pyright: ignore[reportPrivateUsage]
+    seen: list[tuple[str, bool]] = []
+
+    class RecordingConversation:
+        async def drain(self) -> None:
+            seen.append(("conversation.drain", downloading.done()))
+
+    async with asyncio.timeout(5):
+        await entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+            bot, cast(Conversation, RecordingConversation()), None, None, None
+        )
+
+    assert seen == [("conversation.drain", False)]  # stop() 到期后处理函数仍在运行
+    assert downloading.cancelled()  # 由 close() 取消
+    assert bot.is_closed
 
 
 async def test_bot_close_keeps_its_share_of_the_budget_when_replies_take_too_long(
@@ -469,6 +599,8 @@ async def test_bot_close_keeps_its_share_of_the_budget_when_replies_take_too_lon
             await asyncio.Event().wait()  # 收尾一直不结束
 
     class RecordingBot:
+        async def stop(self) -> None: ...
+
         async def close(self) -> None:
             await asyncio.sleep(0.05)
             closed.append(True)
@@ -529,6 +661,9 @@ async def test_handlers_are_drained_after_the_bot_closes_and_before_the_backgrou
     order: list[str] = []
 
     class RecordingBot:
+        async def stop(self) -> None:
+            order.append("bot.stop")
+
         async def close(self) -> None:
             order.append("bot")
 
@@ -557,7 +692,8 @@ async def test_handlers_are_drained_after_the_bot_closes_and_before_the_backgrou
         cast(Handlers, RecordingHandlers()),
     )
 
-    assert order[:3] == ["bot", "handlers", "fetcher"]  # aclose() 还会再调一次 stop()
+    # aclose() 还会再调一次 stop()
+    assert order[:4] == ["bot.stop", "bot", "handlers", "fetcher"]
 
 
 class _NoDownloads:
@@ -569,6 +705,9 @@ async def test_admin_alerts_are_drained_before_the_bot_closes_its_http_client() 
     order: list[str] = []
 
     class RecordingBot:
+        async def stop(self) -> None:
+            order.append("bot.stop")
+
         async def close(self) -> None:
             order.append("bot")
 
@@ -590,7 +729,7 @@ async def test_admin_alerts_are_drained_before_the_bot_closes_its_http_client() 
         cast(Alerts, RecordingAlerts()),
     )
 
-    assert order == ["stop", "alerts", "bot"]
+    assert order == ["bot.stop", "stop", "alerts", "bot"]
 
 
 async def test_alerts_are_stopped_even_when_the_whole_budget_is_used_up(
@@ -615,6 +754,8 @@ async def test_alerts_are_stopped_even_when_the_whole_budget_is_used_up(
             await asyncio.Event().wait()  # 收尾一直不结束
 
     class QuickBot:
+        async def stop(self) -> None: ...
+
         async def close(self) -> None: ...
 
     before = asyncio.all_tasks()

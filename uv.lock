@@ -345,6 +345,9 @@ wheels = [
 ]
 
 [package.optional-dependencies]
+socks = [
+    { name = "socksio" },
+]
 ws = [
     { name = "wsproto" },
 ]
@@ -679,13 +682,13 @@ name = "pyqbot"
 version = "0.1.0"
 source = { editable = "../pyqbot" }
 dependencies = [
-    { name = "httpx2", extra = ["ws"] },
+    { name = "httpx2", extra = ["socks", "ws"] },
     { name = "msgspec" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "httpx2", extras = ["ws"], specifier = ">=2.16.0" },
+    { name = "httpx2", extras = ["socks", "ws"], specifier = ">=2.16.0" },
     { name = "msgspec", specifier = ">=0.22.0" },
 ]
 

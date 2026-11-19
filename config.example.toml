@@ -161,10 +161,12 @@ instructions = """
 
 # ---- 以下各项默认都不设置；需要时去掉行首的 "# " ----
 #
-# QQ 开放平台的接口地址。只影响接口请求，网关的 WebSocket 地址由平台返回，不受它影响。
-# QQ 侧暂时不能单独设代理。
+# QQ 开放平台一侧。base_url 是接口地址，只影响接口请求，网关的 WebSocket 地址由平台返回，不受它影响。
+# proxy 是 QQ 侧的代理，作用于接口请求、网关的 WebSocket 和附件下载；协议与写法同下面的 [providers.*]。
+# 不设 proxy 时不走代理（系统的 HTTPS_PROXY 等环境变量照常生效）。
 # [qq]
 # base_url = "https://api.bot.qq.com"
+# proxy = "socks5h://127.0.0.1:1080"
 #
 # 调用各家模型时的接口地址与代理。不设 base_url 时用官方地址；
 # 不设 proxy 时不走代理（系统的 HTTPS_PROXY 等环境变量照常生效）。

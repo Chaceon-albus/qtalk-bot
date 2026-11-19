@@ -67,7 +67,9 @@
 
 **话题线**（里程碑 6a，`Router.topics` 不为空，即配置了 `[decisions]` 时）：
 - 开轮的事务里取出这个用户最近活跃的 `[topics].candidates` 条话题，并按这一轮消息的引用（`ref_msg_idx`）在这个
-  用户自己的消息里找被引用消息的话题（`topics.quoted_topic()`）；找到就定下它，话题题不问。
+  用户自己的流水里（他的消息与回复他的消息）找被引用消息的话题（`topics.quoted_topic()`）；找到就定下它，话题题
+  不问。回复的引用索引在回答送达后存进回复行（`ReplyChannel` 的发送方法返回它，经 `_Outbox.ref_idx` 与
+  `_Outcome.ref_idx`）。
 - 选话题与选模型在同一次决策调用里（`routing.Router.select()` 的 `topics`）；两道都不问时不调用决策。
 - 决策之后在事务里复查授权，按选中的话题组装上下文（`_topic_context()`）：不分话题的最近 `[topics].recent_turns`
   轮、选中话题最近 `[chat].history_turns` 轮（`journal.topic_history()`），合并去重（`context.merge_history()`）；
@@ -277,6 +279,10 @@ class ReplyChannel(Protocol):
 
     一个通道对应一条被回复的消息，`budget` 记着这条消息已用的被动回复次数（由本模块计数，实现方只要提供一个
     长期存在的 `ReplyBudget`）。
+
+    `stream()`、`finish_stream()`、`send()` 成功时返回发出的那条消息的引用索引（用户引用它时平台带回的索引，
+    见 `ChatInput.ref_msg_idx`），平台没有给出时返回 `None`。回答送达后它存进回复行的 `msg_idx`，用户引用
+    机器人的回复时据此定位话题；过程消息会被撤回，不存。
     """
 
     @property
@@ -292,16 +298,17 @@ class ReplyChannel(Protocol):
         """显示「正在输入」。"""
         ...
 
-    async def stream(self, text: str) -> None:
-        """把 `text` 作为流式回复的下一片发出，等它发完才返回。第一次调用时开始这条流式消息。"""
+    async def stream(self, text: str) -> str | None:
+        """把 `text` 作为流式回复的下一片发出，等它发完才返回。第一次调用时开始这条流式消息。返回这条流式消息
+        目前已知的引用索引（平台还没有给出时为 `None`）。"""
         ...
 
-    async def finish_stream(self) -> None:
-        """结束流式回复。"""
+    async def finish_stream(self) -> str | None:
+        """结束流式回复，返回这条流式消息已知的引用索引（同 `stream()`）。"""
         ...
 
-    async def send(self, text: str) -> None:
-        """发一条纯文本的普通消息。"""
+    async def send(self, text: str) -> str | None:
+        """发一条纯文本的普通消息，返回它的引用索引（平台没有给出时为 `None`）。"""
         ...
 
 
@@ -468,6 +475,8 @@ class _Deadlines:
 class _Outcome:
     content: str = field(repr=False)
     delivery: ReplyDelivery
+    # 送达了回答的那条消息（流式或纯文本）的引用索引，存进回复行的 `msg_idx`。
+    ref_idx: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1228,6 +1237,7 @@ class Conversation:
             delivery=reply.outcome.delivery,
             now=now,
             process=reply.process,
+            msg_idx=reply.outcome.ref_idx,
         )
         journal.set_given(conn, user.id, reply.messages, reply.given)
         _record_usage(conn, user.id, message_id, reply.attempts, now)
@@ -1660,30 +1670,30 @@ class Conversation:
                 sent = await _send_notice(channel, texts.MODEL_FAILED, user)
                 return _Outcome("", ReplyDelivery.FAILED if sent else ReplyDelivery.NOTICE_LOST)
             if outbox.unclosed:
-                return _Outcome(outbox.delivered_answer, ReplyDelivery.UNCLOSED)
+                return outbox.outcome(ReplyDelivery.UNCLOSED)
             delivery = (
                 ReplyDelivery.INTERRUPTED if last.ending in _BROKEN else ReplyDelivery.STREAMED
             )
-            return _Outcome(outbox.delivered_answer, delivery)
+            return outbox.outcome(delivery)
         if isinstance(outbox.error, SendUncertainError):
-            return _Outcome(outbox.delivered_answer, ReplyDelivery.UNCERTAIN)
+            return outbox.outcome(ReplyDelivery.UNCERTAIN)
         # 流式回复被平台拒绝：全文改用纯文本再发一次。
         if last.text.strip():
             answer = last.text + citations.plain_section(last.sources)
             plain = answer if notice is None else f"{answer}\n\n{notice}"
             try:
-                await channel.send(plain)
+                ref_idx = await channel.send(plain)
             except SendRejectedError as exc:
                 logger.warning("用户 %s 的回复改发纯文本也被拒绝：%s", user.label, exc)
             except SendUncertainError as exc:
                 logger.warning("用户 %s 的回复改发纯文本时不确定是否送达：%s", user.label, exc)
-                return _Outcome(outbox.delivered_answer, ReplyDelivery.UNCERTAIN)
+                return outbox.outcome(ReplyDelivery.UNCERTAIN)
             else:
                 logger.info("用户 %s 的流式回复被平台拒绝，已改发纯文本", user.label)
-                return _Outcome(answer, ReplyDelivery.PLAIN)
+                return _Outcome(answer, ReplyDelivery.PLAIN, ref_idx)
         sent = await _send_notice(channel, texts.REPLY_REJECTED, user)
         delivery = ReplyDelivery.REJECTED if sent else ReplyDelivery.NOTICE_LOST
-        return _Outcome(outbox.delivered_answer, delivery)
+        return outbox.outcome(delivery)
 
     async def _close_process(self, turn: _Turn) -> None:
         """一轮正常结束：结束过程消息（回答开始时已经结束的就等它发完），最多等 `GRACE_SECONDS`。"""
@@ -1754,7 +1764,7 @@ class Conversation:
             turn.run = None
         if not quiet:
             logger.info("处理用户 %s 的消息时被取消，按已确认送达的部分收尾", turn.user.label)
-        return _Outcome(turn.outbox.delivered_answer, ReplyDelivery.CANCELLED)
+        return turn.outbox.outcome(ReplyDelivery.CANCELLED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1923,12 +1933,12 @@ def _settle_stopped_consumer(task: asyncio.Task[None], model: ChatModel | None) 
         logger.warning("模型 %s 的流在停止时出错：%s", name, _describe(exc))
 
 
-def _retrieve(task: asyncio.Task[None]) -> None:
+def _retrieve(task: asyncio.Task[object]) -> None:
     if not task.cancelled() and (exc := task.exception()) is not None:
         logger.warning("放弃的后台任务出错：%s", _describe(exc))
 
 
-def _cancel_and_retrieve(task: asyncio.Task[None]) -> None:
+def _cancel_and_retrieve(task: asyncio.Task[object]) -> None:
     """取消一个不再等待的任务，并在它结束时取走结果，免得事件循环原样打印未取回的异常。"""
     task.cancel()
     task.add_done_callback(_retrieve)
@@ -1974,20 +1984,20 @@ class _TurnChannel:
         self.budget.typings += 1
         await self._channel.typing(seconds)
 
-    async def stream(self, text: str) -> None:
+    async def stream(self, text: str) -> str | None:
         self._claim()
         if not self._streamed:
             self._streamed = True
             self.budget.replies += 1
-        await self._channel.stream(text)
+        return await self._channel.stream(text)
 
-    async def finish_stream(self) -> None:
-        await self._channel.finish_stream()
+    async def finish_stream(self) -> str | None:
+        return await self._channel.finish_stream()
 
-    async def send(self, text: str) -> None:
+    async def send(self, text: str) -> str | None:
         self._claim()
         self.budget.replies += 1
-        await self._channel.send(text)
+        return await self._channel.send(text)
 
     def open_process(self) -> ProcessStream:
         """开始一条过程消息（调用方在要发第一片时才调用，所以这时就计数）。"""
@@ -2066,6 +2076,13 @@ class _Outbox:
     内容有三种状态：已入队（`_pending`）、已交给通道（`handed`，结果可能还不知道）、已确认送达
     （`_delivered`）。出现非空白的正文之前不开始流式消息；第一片要等「正在输入」发完再发，交出之前先问
     `may_show`（`TurnControl.claim()`）。
+
+    `ref_idx` 记下通道在成功的分片与结束分片之后报告的引用索引（第一个不为空的为准，平台在哪一片给出还没有
+    实测），回答送达后存进回复行。
+
+    没有改用 pyqbot 的 `StreamMessage.sent_text` 记录已送达的内容：本模块不依赖 pyqbot，替身也要同样成立；
+    这里仍要自己逐片发送（第一片之前的 `claim()`、送达不明时立即停读），还要把回答与接在后面的固定说明分开
+    （`delivered_answer`），改用它省不掉什么。
     """
 
     def __init__(
@@ -2087,10 +2104,13 @@ class _Outbox:
         self._delivered: list[str] = []
         self._answer_length = 0  # 推进来的内容里，回答本身（不含固定说明）的长度
         self._sender: asyncio.Task[None] | None = None
-        self._finishing: asyncio.Task[None] | None = None  # 结束分片；只发一次，始终由这里管着
+        self._finishing: asyncio.Task[str | None] | None = (
+            None  # 结束分片；只发一次，始终由这里管着
+        )
         self._closed = False  # 不再接受新内容
         self.handed = False  # 有内容交给过通道（可能还在途、结果未知）
         self.unclosed = False  # 正文都已确认，但结束分片失败
+        self.ref_idx: str | None = None  # 这条流式消息的引用索引，平台给出之后才有
         self.error: SendError | None = None
         self.broken = asyncio.Event()  # 出现说不准是否送达的错误时置位
 
@@ -2103,6 +2123,14 @@ class _Outbox:
     def delivered_answer(self) -> str:
         """确认送达的回答（不含固定说明）。"""
         return "".join(self._delivered)[: self._answer_length]
+
+    def outcome(self, delivery: ReplyDelivery) -> _Outcome:
+        """以确认送达的回答与这条流式消息的引用索引写成的结局。"""
+        return _Outcome(self.delivered_answer, delivery, self.ref_idx)
+
+    def _note_ref(self, ref_idx: str | None) -> None:
+        if self.ref_idx is None:
+            self.ref_idx = ref_idx
 
     def push(self, text: str, *, answer: bool = True) -> None:
         if not text or self.error is not None or self._closed:
@@ -2169,12 +2197,12 @@ class _Outbox:
             if task is not None and not task.done():
                 _cancel_and_retrieve(task)
 
-    def _start_finish(self) -> asyncio.Task[None]:
+    def _start_finish(self) -> asyncio.Task[str | None]:
         if self._finishing is None:
             self._finishing = asyncio.create_task(self._channel.finish_stream())
         return self._finishing
 
-    def _settle_finish(self, finishing: asyncio.Task[None]) -> None:
+    def _settle_finish(self, finishing: asyncio.Task[str | None]) -> None:
         if finishing.cancelled():
             self.unclosed = True
             return
@@ -2184,6 +2212,8 @@ class _Outbox:
             self.unclosed = True
         elif exc is not None:
             raise exc
+        else:
+            self._note_ref(finishing.result())
 
     async def _send_pending(self) -> None:
         if self._before_first is not None:
@@ -2204,7 +2234,7 @@ class _Outbox:
             chunk, self._pending = self._pending, ""
             self.handed = True
             try:
-                await self._channel.stream(chunk)
+                ref_idx = await self._channel.stream(chunk)
             except SendError as exc:
                 self.error = exc
                 self._pending = ""
@@ -2212,6 +2242,7 @@ class _Outbox:
                     self.broken.set()
                 return
             self._delivered.append(chunk)
+            self._note_ref(ref_idx)
 
 
 class _UserLocks:

@@ -2,7 +2,8 @@
 
 读配置与密钥、打开数据库、创建对话模型、决策模型与写图片描述的模型、构造 `pyqbot.Bot`、注册处理函数（经
 `batching.Batcher` 交给对话）并运行；
-运行期间在后台定期清理过期的附件。退出时先取消后台的描述与清理任务，再关闭模型的客户端与数据库。配置或数据库有误、连不上平台时打印原因并以非零状态退出，不打印 traceback。
+运行期间在后台定期清理过期的附件。退出时按 `_shut_down()` 的顺序先停收事件、等前台与对话收尾，再停后台的任务，
+最后关闭模型的客户端与数据库。配置或数据库有误、连不上平台时打印原因并以非零状态退出，不打印 traceback。
 """
 
 import asyncio
@@ -62,6 +63,15 @@ def memory_settings(settings: Settings) -> MemorySettings | None:
     return settings.memory
 
 
+def _make_bot(secrets: Secrets, settings: Settings) -> pyqbot.Bot:
+    """按 `[qq]` 构造 `pyqbot.Bot`：没配的项不传，用 pyqbot 的默认值。代理也作用于网关与附件下载
+    （`bot.http_client`）；地址里的账号密码由 pyqbot 保证不进它的 `repr`、日志与异常。"""
+    qq = settings.qq
+    if qq.base_url is None:
+        return pyqbot.Bot(secrets.app_id, secrets.app_secret, proxy=qq.proxy)
+    return pyqbot.Bot(secrets.app_id, secrets.app_secret, base_url=qq.base_url, proxy=qq.proxy)
+
+
 EXIT_CONFIG_ERROR = 2
 EXIT_RUNTIME_ERROR = 1
 
@@ -84,10 +94,7 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
         ) as models,
     ):
         store = MediaStore.under(settings.data_dir)
-        if settings.qq.base_url is None:
-            bot = pyqbot.Bot(secrets.app_id, secrets.app_secret)
-        else:
-            bot = pyqbot.Bot(secrets.app_id, secrets.app_secret, base_url=settings.qq.base_url)
+        bot = _make_bot(secrets, settings)
         refuse_cookies(bot)  # 附件下载与 pyqbot 共用这个客户端，见 `refuse_cookies()`
         alerts = Alerts(AdminAlertSender(bot, secrets.admin_openid))
         hosts = download_hosts(settings.attachments.extra_download_hosts)
@@ -175,12 +182,16 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
 
 
 SHUTDOWN_GRACE_SECONDS = 15.0
-"""关停时「排空前台、等后台收尾」这一段的总时限。pyqbot 等处理函数最多 5 秒，对话被取消后的收尾最多几秒，
-描述的记账很快；超过就记一条警告继续关停，不无限挂住。"""
+"""关停时「停收事件、排空前台、等后台收尾」这一段的总时限。超过就记一条警告继续关停，不无限挂住。"""
+
+BOT_STOP_SECONDS = 5.0
+"""等 `Bot.stop()` 的时限：断开网关后等前台的处理函数自然结束（Gate 的决定、写流水、下载附件）。下载自己的时限
+（`[attachments].download_timeout_seconds`）可能更长，不等满：到期只结束等待，还没结束的由之后的 `Bot.close()`
+取消，被取消的下载按「没能下载」记进流水。"""
 
 BOT_CLOSE_SECONDS = 8.0
-"""总时限里留给 `Bot.close()` 与其后等前台处理函数的部分：pyqbot 等处理函数最多 5 秒，再加关闭连接、等放行的
-消息写进流水的余量。等回答收尾的几步只能用剩下的时间。"""
+"""总时限里留给 `Bot.close()` 与其后等前台处理函数的部分：pyqbot 取消处理函数后最多等 5 秒，再加关闭连接、
+等放行的消息写进流水的余量。等回答收尾的几步只能用剩下的时间。"""
 
 
 async def _shut_down(
@@ -197,37 +208,44 @@ async def _shut_down(
     """按顺序关停，返回期间是否又被取消过。
 
     顺序：
-    1. `Batcher.stop()`：放弃等待中的附件、防抖的计时与正在进行的插话判断（消息已在流水里，重启后是待回复的），
-       取消正在回答的轮次（对话自己收尾记账），之后到达的消息只收下、不再回答。
-    2. `Batcher.drain()` 与 `Conversation.drain()`：等各用户的任务与在途的轮次（含插话判断的记账）真正结束。对话被取消后最多先用
-       几秒停模型、再用几秒等在途的分片与结束分片，然后写流水与用量。这一步要在关闭 QQ 客户端之前：回答在
-       `Batcher` 自己的任务里，`Bot.close()` 不等它们，客户端先关的话结束分片发不出去，用户会一直看到「生成中」。
-    3. `Alerts.stop()` 与 `Alerts.aclose()`：同步地不再接受新的提醒、取消还在发的，再限时等它们退出。提醒经
+    1. `Batcher.stop()`（同步）：放弃等待中的附件、防抖的计时与正在进行的插话判断（消息已在流水里，重启后是
+       待回复的），取消正在回答的轮次（对话自己在后台收尾记账），之后到达的消息只收下、不再回答。放在
+       `Bot.stop()` 之前：否则等处理函数的那几秒里，刚收下的消息还会开新的一轮（发「正在输入」、调用决策），
+       随即又被取消。
+    2. `Bot.stop()`，限时 `BOT_STOP_SECONDS`：断开网关、不再收新事件，然后等前台的处理函数自然结束（它们只在
+       等 Gate 的决定、写流水、下载附件），不取消它们，QQ 的 HTTP 客户端照常可用。到期只结束等待，不取消
+       处理函数（pyqbot 的 `stop()` 里等的是 `asyncio.wait`）；还在下载的留给第 5 步。
+    3. `Batcher.drain()` 与 `Conversation.drain()`：等各用户的任务与在途的轮次（含插话判断的记账）真正结束。
+       对话被取消后最多先用几秒停模型、再用几秒等在途的分片与结束分片，然后写流水与用量。这一步要在关闭 QQ
+       客户端之前：回答在 `Batcher` 自己的任务里，pyqbot 不等它们，客户端先关的话结束分片发不出去，用户会一直
+       看到「生成中」。
+    4. `Alerts.stop()` 与 `Alerts.aclose()`：同步地不再接受新的提醒、取消还在发的，再限时等它们退出。提醒经
        QQ 的 HTTP 客户端发出，要在关闭它之前收住；`stop()` 是同步、无条件执行的，前面的收尾用完了时限也照样
        生效（否则 `aclose()` 可能在开始之前就被取消，在途的发送越过客户端的关闭）。之后再触发的提醒（如关停中
        还在下载的附件被拒）直接丢弃，只记日志。
-    4. `Bot.close()`：断开网关，取消前台还在运行的处理函数（它们只在收消息、下载附件；消息在下载之前已经入库），
-       最多等它们 5 秒，再关 QQ 的 HTTP 客户端。
-    5. `Handlers.drain()`：等前台的处理真正结束。被取消的处理函数仍会等 Gate 的决定、把放行的消息写进流水；
+    5. `Bot.close()`：取消第 2 步到期时还没结束的处理函数（如还在下载附件的；消息在下载之前已经入库，被取消的
+       下载按「没能下载」记），最多等它们 5 秒，再关 QQ 的 HTTP 客户端。
+    6. `Handlers.drain()`：等前台的处理真正结束。被取消的处理函数仍会等 Gate 的决定、把放行的消息写进流水；
        数据库的队列堵着时这可能晚于 pyqbot 的 5 秒，不等它，数据库先关，这条消息就丢了（去重记录已经提交，
        平台重推也会被丢弃）。
-       理想的顺序是先断开网关、不再收新事件，再收尾，最后关 HTTP 客户端；但 pyqbot 的 `Bot.close()` 把这三步
-       连在一起，没有只断开网关的公开接口（自己传入 HTTP 客户端可以避开，但要直接依赖 `httpx2`）。所以第 2、3 步
-       期间网关仍在收事件：这些消息照常放行、入库，因为 `Batcher` 已停，它们不会被回答，重启后是待回复的。
-    6. 向后台发出停止请求：停掉清理、`Describer.stop()`、`Summarizer.stop()`、`Fetcher.stop()`。这些是同步的、无条件执行，前面
-       用完了时间也照样发出，免得后台任务在模型客户端和数据库关闭后还在跑。
-    7. 限时等后台收尾：清理任务、描述与话题摘要的任务和它们受保护的写入、下载与响应的关闭。
+    7. 向后台发出停止请求：停掉清理、`Describer.stop()`、`Summarizer.stop()`、`Fetcher.stop()`。这些是同步的、
+       无条件执行，前面用完了时间也照样发出，免得后台任务在模型客户端和数据库关闭后还在跑。
+    8. 限时等后台收尾：清理任务、描述与话题摘要的任务和它们受保护的写入、下载与响应的关闭。
     之后由调用方（外层的 `async with`）关模型的客户端与数据库。
 
     每一步的等待都受保护：再次取消（如连按两次 Ctrl+C）不会打断这一段；但所有等待共用
     `SHUTDOWN_GRACE_SECONDS` 的总时限，时间用完就跳过剩下的等待（停止请求仍会发出）。
     """
-    deadline = asyncio.get_running_loop().time() + SHUTDOWN_GRACE_SECONDS
+    now = asyncio.get_running_loop().time()
+    deadline = now + SHUTDOWN_GRACE_SECONDS
     # 给 Bot.close() 留出它等处理函数的时间：前面的收尾用超了也不至于来不及断开网关、关掉 HTTP 客户端。
     replies_deadline = deadline - BOT_CLOSE_SECONDS
     interrupted = False
     if batcher is not None:
         batcher.stop()
+    stop_deadline = min(now + BOT_STOP_SECONDS, replies_deadline)
+    interrupted |= await _drain(bot.stop(), stop_deadline, "停收事件、等前台的处理函数结束")
+    if batcher is not None:
         interrupted |= await _drain(batcher.drain(), replies_deadline, "等待回答与插话判断收尾")
     if conversation is not None:
         interrupted |= await _drain(conversation.drain(), replies_deadline, "等待在途的对话收尾")

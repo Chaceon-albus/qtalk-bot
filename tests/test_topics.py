@@ -35,10 +35,12 @@ def turn(
     topic: int | None = None,
     msg_idx: str | None = None,
     ref: str | None = None,
+    reply_idx: str | None = None,
     delivery: ReplyDelivery = ReplyDelivery.STREAMED,
     now: int = 0,
 ) -> tuple[int, int]:
-    """写一轮并归到话题 `topic`（`None` 时建新话题），返回（话题编号，用户消息编号）。"""
+    """写一轮并归到话题 `topic`（`None` 时建新话题），返回（话题编号，用户消息编号）。`reply_idx` 是回复的
+    引用索引。"""
     message_id = journal.add_user_message(
         conn, user_id, question, f"qq-{question}", now, msg_idx=msg_idx, ref_msg_idx=ref
     )
@@ -51,6 +53,7 @@ def turn(
         ending=Ending.COMPLETED,
         delivery=delivery,
         now=now,
+        msg_idx=reply_idx,
     )
     topic_id = topics.attribute(
         conn, user_id, topic, [message_id], title_text=question, reply_id=reply_id, now=now
@@ -282,6 +285,44 @@ async def test_quote_of_another_users_message_index_finds_nothing(db: Database) 
         )
     )
     assert await db.transaction(topics.quoted_topic, alice, [bob_quoting]) is None
+
+
+async def test_quote_of_a_reply_to_this_user_finds_its_topic(db: Database) -> None:
+    alice = await new_user(db, ALICE, "小王")
+
+    def write(conn: sqlite3.Connection) -> tuple[int, int]:
+        a, _ = turn(conn, alice, "话题甲", "答甲", reply_idx="REFIDX_reply_a")
+        turn(conn, alice, "话题乙", "答乙", reply_idx="REFIDX_reply_b")
+        quoting = journal.add_user_message(
+            conn, alice, "你刚才说的", "qq-q", 0, ref_msg_idx="REFIDX_reply_a"
+        )
+        return a, quoting
+
+    a, quoting = await db.transaction(write)
+
+    assert await db.transaction(topics.quoted_topic, alice, [quoting]) == a
+
+
+async def test_quote_of_a_reply_to_another_user_finds_nothing(db: Database) -> None:
+    # AGENTS.md 的第二条不变量：机器人回复别人的消息，它的引用索引也解析不到任何话题。
+    alice = await new_user(db, ALICE, "小王")
+    bob = await new_user(db, BOB, "小李")
+
+    def write(conn: sqlite3.Connection) -> tuple[int, int]:
+        turn(conn, alice, "小王自己的话题", "答", reply_idx="REFIDX_reply_alice")
+        turn(conn, bob, "小李的秘密", "答小李", reply_idx="REFIDX_reply_bob")
+        quoting = journal.add_user_message(
+            conn, alice, "引用", "qq-a", 0, ref_msg_idx="REFIDX_reply_bob"
+        )
+        bob_quoting = journal.add_user_message(
+            conn, bob, "引用", "qq-b", 0, ref_msg_idx="REFIDX_reply_alice"
+        )
+        return quoting, bob_quoting
+
+    quoting, bob_quoting = await db.transaction(write)
+
+    assert await db.transaction(topics.quoted_topic, alice, [quoting]) is None
+    assert await db.transaction(topics.quoted_topic, bob, [bob_quoting]) is None
 
 
 # ---- 话题里的历史 ----

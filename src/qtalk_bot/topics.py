@@ -80,8 +80,9 @@ def quoted_topic(conn: sqlite3.Connection, user_id: int, message_ids: Iterable[i
     """这些用户消息（这一轮的）引用了这个用户自己的哪条旧消息、那条消息所在的话题；从最新的一条消息看起，
     第一个找得到话题的引用为准。都找不到时返回 `None`。
 
-    只在这个用户自己的用户消息里按 `msg_idx` 找：引用别人的消息索引（或机器人的回复，流水里没有存它的引用
-    索引）找不到任何东西。
+    只在这个用户自己的流水里按 `msg_idx` 找，含他自己的消息与机器人回复他的消息（回复行的 `msg_idx` 是送达
+    回答的那条消息的引用索引，见 `journal.add_reply()`）：引用别人的消息或机器人回复别人的消息，索引都找不到
+    任何东西。
     """
     ids = sorted(set(message_ids))
     if not ids:
@@ -89,8 +90,7 @@ def quoted_topic(conn: sqlite3.Connection, user_id: int, message_ids: Iterable[i
     placeholders = ", ".join("?" * len(ids))
     row = conn.execute(
         "SELECT t.topic_id FROM messages AS q"  # noqa: S608  只拼 ? 占位符
-        " JOIN messages AS m ON m.user_id = q.user_id AND m.role = 'user'"
-        " AND m.msg_idx = q.ref_msg_idx"
+        " JOIN messages AS m ON m.user_id = q.user_id AND m.msg_idx = q.ref_msg_idx"
         " JOIN topic_messages AS t ON t.message_id = m.id AND t.user_id = q.user_id"
         " JOIN topics ON topics.id = t.topic_id AND topics.user_id = q.user_id"
         f" WHERE q.user_id = ? AND q.role = 'user' AND q.id IN ({placeholders})"

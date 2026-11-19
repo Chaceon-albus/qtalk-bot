@@ -187,6 +187,12 @@ def garble(body: Payload) -> httpx2.Response:
     return httpx2.Response(200, content=b"<html>gateway timeout</html>")
 
 
+def server_error(body: Payload) -> httpx2.Response:
+    """说不准有没有发出：HTTP 5xx 即使带错误码，pyqbot 也算结果不明（`outcome_unknown`）。"""
+    error = {"message": "内部错误", "err_code": 11264, "trace_id": "fake"}
+    return httpx2.Response(500, json=error)
+
+
 def text_of(body: Payload) -> str:
     """一条单聊消息的文字：纯文本的 `content`，或 Markdown 的 `markdown.content`。"""
     markdown = body.get("markdown")
@@ -217,6 +223,9 @@ class Platform:
 
     `respond` 给出某条单聊消息或某个分片的响应时用它（模拟失败），不记进 `sent` / `streamed`，只记进
     `attempts`。
+
+    单聊消息的响应带引用索引 `REFIDX_sent-<序号>`；`stream_ref_at` 不为空时，从第这么多个分片（从 0 数）起，
+    分片的响应带 `REFIDX_stream`（平台在哪一片给出还没有实测）。
     """
 
     def __init__(
@@ -227,8 +236,10 @@ class Platform:
         share_link_fails: bool = False,
         delay: Callable[[Payload], float] | None = None,
         files: dict[str, bytes] | None = None,
+        stream_ref_at: int | None = None,
     ) -> None:
         self.events = events
+        self.stream_ref_at = stream_ref_at
         self.respond = respond
         self.delay = delay  # 某条单聊消息要拖多久才响应（秒），用来制造交错
         self.share_link_fails = share_link_fails
@@ -271,14 +282,24 @@ class Platform:
                 return response
             self.sent.append({"path": path, **body})
             self.changed.set()
-            return httpx2.Response(200, json={"id": f"ROBOT1.0_sent-{len(self.sent)}"})
+            number = len(self.sent)
+            return httpx2.Response(
+                200,
+                json={
+                    "id": f"ROBOT1.0_sent-{number}",
+                    "ext_info": {"ref_idx": f"REFIDX_sent-{number}"},
+                },
+            )
         if path.startswith("/v2/users/") and path.endswith("/stream_messages"):
             self.attempts.append(body)
             if self.respond is not None and (response := self.respond(body)) is not None:
                 return response
             self.streamed.append(body)
             self.changed.set()
-            return httpx2.Response(200, json={"id": "STREAM_fake", "remain_msg_len": 0})
+            sent: Payload = {"id": "STREAM_fake", "remain_msg_len": 0}
+            if self.stream_ref_at is not None and len(self.streamed) > self.stream_ref_at:
+                sent["ext_info"] = {"ref_idx": "REFIDX_stream"}
+            return httpx2.Response(200, json=sent)
         raise AssertionError(f"意外的请求：{request.method} {path}")
 
     async def gateway(self, scope: ASGIMessage, receive: Receive, send: Send) -> None:
@@ -488,7 +509,11 @@ async def test_rejected_welcome_is_resent_and_message_does_not_reach_chat(db: Da
 
 @pytest.mark.parametrize(
     ("respond", "expected", "second_run_sent"),
-    [(reject, Delivery.NOT_SENT, [texts.REFUSAL]), (garble, Delivery.UNKNOWN, [])],
+    [
+        (reject, Delivery.NOT_SENT, [texts.REFUSAL]),
+        (garble, Delivery.UNKNOWN, []),
+        (server_error, Delivery.UNKNOWN, []),
+    ],
 )
 async def test_refusal_is_only_released_when_definitely_not_sent(
     db: Database, respond: Respond, expected: Delivery, second_run_sent: list[str]
@@ -776,25 +801,58 @@ async def test_logs_have_no_openid_code_or_text(
         assert secret not in logged
 
 
-def api_error(status_code: int, err_code: int | None) -> pyqbot.APIError:
-    return pyqbot.APIError("发送失败", status_code=status_code, err_code=err_code)
+def api_error(
+    status_code: int, err_code: int | None, *, outcome_unknown: bool = False
+) -> pyqbot.APIError:
+    return pyqbot.APIError(
+        "发送失败", status_code=status_code, err_code=err_code, outcome_unknown=outcome_unknown
+    )
 
 
 @pytest.mark.parametrize(
     ("error", "rejected"),
     [
-        (api_error(400, 40034006), True),  # 带错误码
-        (api_error(200, 40034006), True),  # 2xx 但带失败结构
-        (api_error(500, 11264), True),
-        (api_error(404, None), True),  # 4xx 没有错误码
-        (api_error(200, None), False),  # 响应解析不了
-        (api_error(502, None), False),
-        (pyqbot.NetworkError("超时"), False),
+        (api_error(400, 40034006), True),
+        (api_error(404, None), True),
+        (api_error(500, 11264, outcome_unknown=True), False),  # 5xx 一律算说不准
+        (api_error(200, None, outcome_unknown=True), False),
+        (pyqbot.NetworkError("连不上"), True),  # 建连阶段的错误：请求没有发出
+        (pyqbot.NetworkError("超时", outcome_unknown=True), False),
         (pyqbot.AuditPendingError("等待审核", status_code=202, err_code=304023), False),
+        (pyqbot.PartialFailureError("部分失败", failed_ids=("x",), status_code=200), False),
     ],
 )
-def test_is_rejection(error: pyqbot.QQBotError, rejected: bool) -> None:
+def test_is_rejection_follows_outcome_unknown(error: pyqbot.QQBotError, rejected: bool) -> None:
     assert is_rejection(error) is rejected
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "rejected"),
+    [
+        (400, {"code": 40034006, "message": "违规"}, True),
+        (200, {"code": 40034006, "message": "违规"}, True),  # 2xx 带错误码
+        (404, None, True),
+        (500, {"code": 11264, "message": "服务端错误"}, False),  # 5xx 即使带错误码也说不准
+        (502, None, False),
+    ],
+)
+async def test_is_rejection_on_real_pyqbot_errors(
+    status: int, body: dict[str, object] | None, rejected: bool
+) -> None:
+    # 由 pyqbot 自己把 HTTP 响应转成异常，确认这里的判据与它的 outcome_unknown 一致。
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == "/app/getAppAccessToken":
+            return httpx2.Response(200, json={"access_token": "fake-token", "expires_in": 7200})
+        if body is None:
+            return httpx2.Response(status, text="bad gateway")
+        return httpx2.Response(status, json=body)
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as http:
+        client = pyqbot.Client("1", "fake-secret", http_client=http)
+        with pytest.raises(pyqbot.QQBotError) as caught:
+            await client.users.send_message("FAKE-OPENID", "你好")
+        await client.close()
+    assert is_rejection(caught.value) is rejected
 
 
 # ---- 对话：真实的 QQChat 与 Conversation，模型用替身 ----
@@ -1007,6 +1065,34 @@ async def test_process_is_a_separate_stream_that_is_recalled_by_its_id(db: Datab
     assert tuple(row) == ("你好，我是助手。", "[搜索] 上海天气")
 
 
+@pytest.mark.parametrize("ref_at", [0, 1, 2])  # 第一片、中间一片、只有结束分片带
+async def test_streamed_answer_records_the_reference_index_of_the_stream(
+    db: Database, ref_at: int
+) -> None:
+    await welcomed_alice(db)
+    platform = Platform([c2c(ALICE, "你好", "ROBOT1.0_fake-1")], stream_ref_at=ref_at)
+    chat = real_chat(db, FakeModel(ANSWER), platform)
+
+    await run_until_handled(platform, db, chat, events=1, sent=0, until=lambda: chat.handled == 1)
+
+    assert len(platform.streamed) == 3  # 两片正文（模型的两段增量）加结束分片
+    row = await db.fetch_one("SELECT delivery, msg_idx FROM messages WHERE role = 'assistant'")
+    assert row is not None
+    assert tuple(row) == ("streamed", "REFIDX_stream")
+
+
+async def test_reply_without_a_reference_index_leaves_it_empty(db: Database) -> None:
+    await welcomed_alice(db)
+    platform = Platform([c2c(ALICE, "你好", "ROBOT1.0_fake-1")])
+    chat = real_chat(db, FakeModel(ANSWER), platform)
+
+    await run_until_handled(platform, db, chat, events=1, sent=0, until=lambda: chat.handled == 1)
+
+    row = await db.fetch_one("SELECT msg_idx FROM messages WHERE role = 'assistant'")
+    assert row is not None
+    assert row[0] is None
+
+
 async def test_rejected_stream_is_resent_as_plain_message(db: Database) -> None:
     await welcomed_alice(db)
 
@@ -1021,9 +1107,30 @@ async def test_rejected_stream_is_resent_as_plain_message(db: Database) -> None:
     assert platform.streamed == []
     plain = [m for m in platform.sent if m["msg_type"] == 0]
     assert [(m["content"], m["msg_seq"]) for m in plain] == [("你好，我是助手。", 3)]
+    row = await db.fetch_one(
+        "SELECT content, delivery, msg_idx FROM messages WHERE role = 'assistant'"
+    )
+    assert row is not None
+    # 引用索引取改发的那条纯文本（之前一条是「正在输入」）。
+    assert tuple(row) == ("你好，我是助手。", "plain", "REFIDX_sent-2")
+
+
+async def test_stream_failing_with_a_server_error_is_not_resent(db: Database) -> None:
+    # 5xx 即使带错误码也说不准有没有发出（pyqbot 的 outcome_unknown）：不改发纯文本，免得用户收到两遍。
+    await welcomed_alice(db)
+
+    def fail_stream(body: Payload) -> httpx2.Response | None:
+        return server_error(body) if "content_raw" in body else None
+
+    platform = Platform([c2c(ALICE, "你好", "ROBOT1.0_fake-1")], respond=fail_stream)
+    chat = real_chat(db, FakeModel(ANSWER), platform)
+
+    await run_until_handled(platform, db, chat, events=1, sent=0, until=lambda: chat.handled == 1)
+
+    assert [m for m in platform.sent if m["msg_type"] == 0] == []
     row = await db.fetch_one("SELECT content, delivery FROM messages WHERE role = 'assistant'")
     assert row is not None
-    assert tuple(row) == ("你好，我是助手。", "plain")
+    assert tuple(row) == ("", "uncertain")
 
 
 class LateDownloader:

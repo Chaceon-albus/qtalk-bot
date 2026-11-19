@@ -394,12 +394,14 @@ class QQSettings:
     Attributes:
         base_url: 开放平台 HTTP 接口的地址，传给 `pyqbot.Bot(base_url=...)`；`None` 时用 pyqbot 的默认值。
             网关的 WebSocket 地址是平台在 `GET /gateway` 里返回的，不受它影响。
-
-    QQ 侧暂时不能配代理：pyqbot 目前只能由调用方自己构造 `httpx2.AsyncClient` 来设代理，那需要本项目
-    直接依赖 `httpx2`；等 pyqbot 加上代理参数再做。
+        proxy: 代理地址，传给 `pyqbot.Bot(proxy=...)`，协议与写法同 `ProviderSettings.proxy`。作用于开放平台
+            的接口请求、网关的 WebSocket，以及经 `bot.http_client` 的附件下载。`None` 时不设代理，系统级的
+            `HTTPS_PROXY` 等环境变量照常生效。地址里可能带用户名和密码，所以不进 `repr`、日志与报错
+            （pyqbot 也保证不出现在它的 `repr`、日志与异常里）。
     """
 
     base_url: str | None = None
+    proxy: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1079,10 +1081,11 @@ def _parse_provider(table: _Table) -> ProviderSettings | None:
 
 def _parse_qq(table: _Table) -> QQSettings | None:
     url_ok, base_url = _optional_base_url(table)
+    proxy_ok, proxy = _optional_url(table, "proxy", _PROXY_SCHEMES)
     table.finish()
-    if not url_ok:
+    if not (url_ok and proxy_ok):
         return None
-    return QQSettings(base_url=base_url)
+    return QQSettings(base_url=base_url, proxy=proxy)
 
 
 def _optional_url(table: _Table, key: str, schemes: Sequence[str]) -> tuple[bool, str | None]:

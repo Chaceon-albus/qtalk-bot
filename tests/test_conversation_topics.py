@@ -154,8 +154,9 @@ async def say(
     *,
     msg_idx: str | None = None,
     ref: str | None = None,
+    channel: FakeChannel | None = None,
 ) -> FakeChannel:
-    channel = FakeChannel()
+    channel = FakeChannel() if channel is None else channel
     item = ChatInput(
         message_id=f"qq-{secrets.token_hex(4)}", text=text, msg_idx=msg_idx, ref_msg_idx=ref
     )
@@ -375,6 +376,46 @@ async def test_quoting_another_users_message_does_not_reach_their_topic(db: Data
     assert all(topic != alices for _, content, topic in await membership(db) if "引用" in content)
     for request in decider.requests:
         assert "小王" not in request.input
+    assert "小王的秘密" not in "".join(texts_of(model.requests[-1]))
+
+
+async def test_quoting_a_reply_settles_the_topic_of_that_reply(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("好的"))
+    decider = Picker()
+    chat = topical(db, decider, model)
+    await say(chat, alice, "话题一", channel=FakeChannel(stream_ref="REFIDX_reply_one"))
+    await say(chat, alice, "话题二", channel=FakeChannel(stream_ref="REFIDX_reply_two"))
+    first, _ = (row[0] for row in await topic_rows(db))
+    asked = len(decider.requests)
+
+    await say(chat, alice, "你刚才说的", ref="REFIDX_reply_one")
+
+    assert len(decider.requests) == asked  # 一个模型、话题已被引用定下：不调用决策
+    assert (await membership(db))[-2:] == [
+        ("user", "你刚才说的", first),
+        ("assistant", "好的", first),
+    ]
+
+
+async def test_quoting_a_reply_to_another_user_does_not_reach_their_topic(db: Database) -> None:
+    # AGENTS.md 的第二条不变量：机器人回复别人的那条消息，它的引用索引解析不到任何话题。
+    alice = await invited(db, ALICE, "小王")
+    bob = await invited(db, BOB, "小李")
+    model = ScriptedModel("main", answer("好的"))
+    decider = Picker()
+    chat = topical(db, decider, model)
+    await say(chat, alice, "小王的秘密", channel=FakeChannel(stream_ref="REFIDX_reply_alice"))
+    ((alices, _, _),) = await topic_rows(db)
+
+    await say(chat, bob, "我引用一下", ref="REFIDX_reply_alice")
+
+    rows = await topic_rows(db)
+    assert [(owner, title) for _, owner, title in rows] == [
+        (alice.id, "小王的秘密"),
+        (bob.id, "我引用一下"),
+    ]
+    assert all(topic != alices for _, content, topic in await membership(db) if "引用" in content)
     assert "小王的秘密" not in "".join(texts_of(model.requests[-1]))
 
 

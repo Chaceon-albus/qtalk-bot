@@ -833,14 +833,39 @@ def test_qq_base_url_is_read(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "proxy", ["http://h:1", "https://h:1", "socks5://h:1080", "socks5h://user:pass@h:1080"]
+)
+def test_qq_proxy_is_read(tmp_path: Path, proxy: str) -> None:
+    assert load_settings(write_config(tmp_path, f'[qq]\nproxy = "{proxy}"\n')).qq == QQSettings(
+        proxy=proxy
+    )
+
+
+@pytest.mark.parametrize(
     ("text", "problem"),
     [
         ('[qq]\nbase_url = "wss://x"\n', "qq.base_url：应为完整的地址，协议是 http、https 之一"),
-        ('[qq]\nproxy = "http://x"\n', "qq.proxy：未知的键"),
+        (
+            f'[qq]\nproxy = "{SECRET_PROXY}"\n',
+            "qq.proxy：应为完整的地址，协议是 http、https、socks5、socks5h 之一",
+        ),
+        (
+            '[qq]\nproxy = "user:hunter2@127.0.0.1:7890"\n',
+            "qq.proxy：应为完整的地址，协议是 http、https、socks5、socks5h 之一",
+        ),
+        ("[qq]\nproxy = 1\n", "qq.proxy：应为字符串，实际是整数"),
+        ('[qq]\nsocks = "socks5://h:1080"\n', "qq.socks：未知的键"),
     ],
 )
 def test_invalid_qq(tmp_path: Path, text: str, problem: str) -> None:
-    assert config_error(write_config(tmp_path, text)).problems == (problem,)
+    error = config_error(write_config(tmp_path, text))
+    assert error.problems == (problem,)
+    assert "hunter2" not in str(error)
+
+
+def test_qq_proxy_is_not_in_repr() -> None:
+    settings = QQSettings(base_url="https://x.example", proxy="socks5h://user:hunter2@h:1080")
+    assert "hunter2" not in repr(settings)
 
 
 @pytest.mark.parametrize(
