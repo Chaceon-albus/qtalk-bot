@@ -1,7 +1,7 @@
 """对话处理器的协议：已授权用户的普通消息交给它。
 
 授权部分（`gate.py`、`bot.py`）只认 `ChatHandler` 这个协议。真正的实现是 `bot.QQChat`：把 pyqbot 的消息
-转成普通数据，经攒批（`batching.Batcher`）交给 `conversation.Conversation`。
+转成普通数据，经 `batching.Batcher` 交给 `conversation.Conversation`。
 """
 
 from typing import Protocol

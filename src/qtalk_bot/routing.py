@@ -14,6 +14,11 @@
 - 任何失败（超时、调用失败、拒答、坏响应、意外的异常）都不挡住回复：沿用上一轮的模型（它不在候选里时
   当作没有），没有上一轮就用默认模型（它也不在候选里时用候选里排在最前面的），记日志，照常回答。
 - 每次调用决策都留一条 `DecisionRecord`（被取消时也有），由调用方写进数据库；不调用决策时没有记录。
+
+插话的判断（`SteerJudge`）也在这里：一轮回答还没开始显示时用户又发来文字或语音，用一道是非题（题目名
+`STEER_QUESTION`）判断新消息是在补充或修正正在回答的问题，还是一个独立的新问题。输入是 JSON 文本（见
+`steer_input()`），只含这个用户自己的消息。没有配置 `[decisions]`、调用失败或超时都当作补充（`Steer.ASSUMED`）：
+把连发的几条合成一个回答，是更稳妥的那种错。它不看模型有几个，只要配置了 `[decisions]` 就判断。
 """
 
 import asyncio
@@ -22,6 +27,7 @@ import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 
 from .config import DecisionSettings, ModelSettings
 from .journal import HistoryEntry
@@ -36,6 +42,8 @@ from .llm.decisions import (
     DecisionRequest,
     Option,
     Refusal,
+    YesNoAnswer,
+    YesNoQuestion,
 )
 
 logger = logging.getLogger(__name__)
@@ -342,4 +350,171 @@ class Selection:
             shown,
             kept,
             record.latency_ms,
+        )
+
+
+# ---- 插话 ----
+
+STEER_QUESTION = "steer"
+"""判断插话那道是非题的题目名，决策记录里的 `question` 就是它。"""
+
+STEER_INSTRUCTIONS = """助手正在回答用户的几条消息（answering），回答还没发出时，用户又发来了新消息（latest）。
+判断：latest 是在补充、修正、追加条件或接着说 answering 里的同一个问题或请求，应当和它合在一起重新回答；
+而不是一个与 answering 无关、可以单独回答的新问题。
+输入是 JSON：answering 与 latest 都是按时间排列的用户消息，方括号里是附件的说明。"""
+
+STEER_THRESHOLD = 0.5
+"""「是补充」的概率不低于它就判为补充。拿不准时取补充，与失败时的退路一致。"""
+
+
+class Steer(StrEnum):
+    """插话的判断结果；取值也是决策记录里 `chosen` 与 `probabilities` 的键（`ASSUMED` 除外）。"""
+
+    SUPPLEMENT = "supplement"  # 补充或修正正在回答的问题：带上新消息重新开始这一轮
+    NEW = "new"  # 独立的新问题：当前这一轮答完后，新消息作为下一轮
+    ASSUMED = "assumed"  # 没有判断（没有配置 [decisions]、调用失败或超时）：当作补充
+
+
+def steer_input(answering: Sequence[str], latest: Sequence[str]) -> str:
+    """插话那道题的输入：JSON 文本，`answering` 是正在回答的消息，`latest` 是新消息，都按时间排列。每条最多
+    `HISTORY_ENTRY_CHARS` 字，超出的截断。"""
+    payload = {
+        "answering": [_clip(text, HISTORY_ENTRY_CHARS) for text in answering],
+        "latest": [_clip(text, HISTORY_ENTRY_CHARS) for text in latest],
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+class SteerJudge:
+    """插话的判断。同一个实例服务所有用户，不保存任何用户的状态。
+
+    `decisions` 或 `decider` 为 `None` 时不调用决策，一律当作补充。
+    """
+
+    def __init__(
+        self,
+        decisions: DecisionSettings | None = None,
+        decider: DecisionModel | None = None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._plan: _SteerPlan | None = None
+        if decisions is not None and decider is not None:
+            question = YesNoQuestion(name=STEER_QUESTION, instructions=STEER_INSTRUCTIONS)
+            self._plan = _SteerPlan(decider, decisions, question, clock)
+
+    @property
+    def configured(self) -> bool:
+        """是否会调用决策。"""
+        return self._plan is not None
+
+    def prepare(self, answering: Sequence[str], latest: Sequence[str], *, label: str) -> SteerCall:
+        """为一次插话准备判断：`answering` 是正在回答的消息、`latest` 是新消息的文字版，`label` 是记日志用的
+        用户称呼。用 `await call.run()` 执行。"""
+        return SteerCall(self._plan, answering, latest, label)
+
+
+@dataclass(frozen=True, slots=True)
+class _SteerPlan:
+    decider: DecisionModel
+    settings: DecisionSettings
+    question: YesNoQuestion
+    clock: Callable[[], float]
+
+
+class SteerCall:
+    """一次插话的判断。`run()` 只调用一次。
+
+    `record` 是这次决策调用的记录，不调用决策时为 `None`。`run()` 被取消时取消照常传播，`record` 记成一条
+    `error = CANCELLED` 的记录（`chosen` 是补充）。
+    """
+
+    def __init__(
+        self,
+        plan: _SteerPlan | None,
+        answering: Sequence[str],
+        latest: Sequence[str],
+        label: str,
+    ) -> None:
+        self._plan = plan
+        self._answering = answering
+        self._latest = latest
+        self._label = label
+        self.record: DecisionRecord | None = None
+
+    async def run(self) -> Steer:
+        plan = self._plan
+        if plan is None:
+            return Steer.ASSUMED
+        request = DecisionRequest(
+            input=steer_input(self._answering, self._latest), questions=(plan.question,)
+        )
+        started = plan.clock()
+        usage: Usage | None = None
+        error: str | None = None
+        chance: float | None = None
+        try:
+            async with asyncio.timeout(plan.settings.timeout_seconds):
+                result = await plan.decider.decide(request)
+        except asyncio.CancelledError:
+            self.record = self._record(plan, started, None, Steer.SUPPLEMENT, CANCELLED)
+            raise
+        except TimeoutError:
+            error = TIMEOUT
+        except DecisionError as exc:
+            error, usage = exc.kind.value, exc.usage
+        except ModelError as exc:
+            error = exc.kind.value
+        except Exception as exc:  # noqa: BLE001  判断出了任何问题都当作补充，不挡住回复
+            logger.warning("插话的决策调用出了意外的异常：%s", type(exc).__name__)
+            error = ErrorKind.OTHER.value
+        else:
+            usage = result.usage
+            match result.answers.get(STEER_QUESTION):
+                case YesNoAnswer(probability=probability):
+                    chance = probability
+                case Refusal():
+                    error = ErrorKind.REFUSED.value
+                case _:
+                    error = ErrorKind.MALFORMED.value
+        if chance is None:
+            verdict = Steer.ASSUMED
+            chosen = Steer.SUPPLEMENT
+        else:
+            verdict = chosen = Steer.SUPPLEMENT if chance >= STEER_THRESHOLD else Steer.NEW
+        self.record = self._record(plan, started, chance, chosen, error, usage)
+        if chance is None:
+            logger.warning(
+                "用户 %s 插话的判断失败（%s，%d 毫秒），当作补充",
+                self._label,
+                error,
+                self.record.latency_ms,
+            )
+        return verdict
+
+    def _record(
+        self,
+        plan: _SteerPlan,
+        started: float,
+        chance: float | None,
+        chosen: Steer,
+        error: str | None,
+        usage: Usage | None = None,
+    ) -> DecisionRecord:
+        elapsed = max(0.0, plan.clock() - started)
+        probabilities = (
+            None
+            if chance is None
+            else {Steer.SUPPLEMENT.value: chance, Steer.NEW.value: 1 - chance}
+        )
+        return DecisionRecord(
+            question=STEER_QUESTION,
+            provider=plan.decider.provider,
+            provider_model=plan.decider.model,
+            probabilities=probabilities,
+            chosen=chosen.value,
+            kept_previous=False,
+            latency_ms=round(elapsed * 1000),
+            error=error,
+            usage=usage,
         )

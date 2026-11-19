@@ -57,10 +57,11 @@ from qtalk_bot.bot import (
 from qtalk_bot.chat import ChatHandler
 from qtalk_bot.config import (
     AttachmentSettings,
-    BatchingSettings,
+    AttachmentTimeoutAction,
     ChatSettings,
     InviteSettings,
     ModelSettings,
+    TurnSettings,
 )
 from qtalk_bot.conversation import TYPING_SECONDS, Conversation
 from qtalk_bot.gate import (
@@ -820,7 +821,7 @@ class FakeModel:
 class Tracked:
     """包住对话处理器，记下处理完了几条消息，并唤醒 `run_until_handled` 的等待。
 
-    给了 `batcher` 时，处理函数收下消息就返回，回答在攒批的任务里进行：等这些任务都结束才算处理完。
+    给了 `batcher` 时，处理函数收下消息就返回，回答在 `Batcher` 的任务里进行：等这些任务都结束才算处理完。
     """
 
     def __init__(
@@ -862,11 +863,14 @@ def real_chat(db: Database, model: FakeModel, platform: Platform) -> Tracked:
         settings=ChatSettings(),
         timezone=ZoneInfo("Asia/Shanghai"),
     )
-    batcher = Batcher(conversation, NO_BATCHING)
+    batcher = Batcher(conversation, LONE_ATTACHMENTS_ANSWERED)
     return Tracked(QQChat(batcher), platform, batcher)
 
 
-NO_BATCHING = BatchingSettings(text_wait_seconds=0, attachment_wait_seconds=0, max_wait_seconds=0)
+# 单独的图片几乎不等就作为一轮去回答，让只带图片的消息也走完一轮（这里是真实的等待，所以取得很短）。
+LONE_ATTACHMENTS_ANSWERED = TurnSettings(
+    attachment_wait_seconds=0.001, attachment_timeout_action=AttachmentTimeoutAction.ANSWER
+)
 
 
 ANSWER: list[ChatEvent] = [
@@ -987,7 +991,7 @@ def media_chat(
             MediaStore.under(tmp_path), downloader, settings, on_host_refused=on_host_refused
         ),
     )
-    batcher = Batcher(conversation, NO_BATCHING)
+    batcher = Batcher(conversation, LONE_ATTACHMENTS_ANSWERED)
     return Tracked(QQChat(batcher), platform, batcher), downloader
 
 

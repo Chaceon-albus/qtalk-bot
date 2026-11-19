@@ -77,6 +77,16 @@ FILE_UNAVAILABLE = "暂不支持查看 PDF 文件。"
 
 VOICE_UNRECOGNIZED = "这条语音没能识别出文字，可以再说一次或者打字告诉我。"
 
+
+def attachments_waiting(images: int, files: int) -> str:
+    """单独发来的图片或文件等了一阵还没有下文时问的一句（`[turns] attachment_timeout_action = "ask"`）。"""
+    parts = [
+        *([f"{images} 张图片"] if images else []),
+        *([f"{files} 个文件"] if files else []),
+    ]
+    return f"收到 {'和 '.join(parts)}，想让我帮你看什么？"
+
+
 MODEL_FAILED = "抱歉，刚才没能生成回复，请稍后再试一次。"
 
 REPLY_INTERRUPTED = "（回复中断了，请稍后再试一次。）"

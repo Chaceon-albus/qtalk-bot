@@ -26,11 +26,11 @@ from qtalk_bot.config import (
     DEFAULT_FILE_MAX_OUTPUT_TOKENS,
     DEFAULT_PERSONA,
     AttachmentSettings,
-    BatchingSettings,
     ChatSettings,
     DecisionSettings,
     DescribeSettings,
     ModelSettings,
+    TurnSettings,
 )
 from qtalk_bot.conversation import (
     TYPING_SECONDS,
@@ -69,6 +69,7 @@ from qtalk_bot.llm.decisions import (
     DecisionRequest,
     DecisionResult,
     Refusal,
+    YesNoAnswer,
 )
 from qtalk_bot.media import (
     DOWNLOAD_CONCURRENCY,
@@ -81,7 +82,7 @@ from qtalk_bot.media import (
     MediaStore,
 )
 from qtalk_bot.prompt import FORMAT_GUIDE
-from qtalk_bot.routing import QUESTION, Router
+from qtalk_bot.routing import QUESTION, STEER_QUESTION, Router, SteerJudge
 from qtalk_bot.storage import DATABASE_FILENAME, Database
 
 ADMIN = "FAKE-OPENID-ADMIN"
@@ -2949,8 +2950,14 @@ def message(text: str | None, *attachments: IncomingAttachment) -> ChatInput:
     )
 
 
-def batcher_of(chat: Conversation, clock: ManualClock) -> Batcher:
-    return Batcher(chat, BatchingSettings(), clock=clock, sleep=clock.sleep)
+def batcher_of(
+    chat: Conversation, clock: ManualClock, settings: TurnSettings | None = None
+) -> Batcher:
+    settings = TurnSettings() if settings is None else settings
+    return Batcher(chat, settings, clock=clock, sleep=clock.sleep)
+
+
+DEBOUNCE = TurnSettings(text_debounce_seconds=1.0)
 
 
 async def submit(batcher: Batcher, user: User, item: ChatInput, channel: FakeChannel) -> None:
@@ -2960,7 +2967,7 @@ async def submit(batcher: Batcher, user: User, item: ChatInput, channel: FakeCha
 
 
 async def finish(batcher: Batcher) -> None:
-    """等到点的批次都回答完（不停下 batcher）：时钟已拨过所有批次的结束时刻，处理批次的任务回答完就退出。"""
+    """等该开始的轮次都回答完（不停下 batcher）：各用户的任务没有事可做时就退出。"""
     workers = batcher._workers  # pyright: ignore[reportPrivateUsage]
     async with asyncio.timeout(HANG_GUARD):
         while workers:
@@ -3023,24 +3030,24 @@ async def test_message_received_while_a_turn_is_generating_stays_pending_for_the
     assert (await reply_targets(db))[-1][1] == received.message_id
 
 
-async def test_batched_messages_are_one_turn_and_the_reply_is_on_the_last(
+async def test_debounced_messages_are_one_turn_and_the_reply_is_on_the_last(
     db: Database,
 ) -> None:
     alice = await invited(db, ALICE, "小王")
     model = ScriptedModel("main", answer("好的"))
     chat = conversation(db, model)
     clock = ManualClock()
-    batcher = batcher_of(chat, clock)
+    batcher = batcher_of(chat, clock, DEBOUNCE)
     first, second = FakeChannel(), FakeChannel()
 
     await submit(batcher, alice, message("帮我看个问题"), first)
-    await clock.advance_to(1.0)
+    await clock.advance_to(0.5)
     await submit(batcher, alice, message("Python 怎么排序"), second)
     # 消息到达时就已经写进流水，不等计时结束。
     assert [row.content for row in await rows(db)] == ["帮我看个问题", "Python 怎么排序"]
-    await clock.advance_to(3.4)
+    await clock.advance_to(1.4)
     assert model.requests == []
-    await clock.advance_to(3.5)
+    await clock.advance_to(1.5)
     await finish(batcher)
 
     (request,) = model.requests
@@ -3051,22 +3058,22 @@ async def test_batched_messages_are_one_turn_and_the_reply_is_on_the_last(
     assert [target for _, target in await reply_targets(db)] == [user_ids[-1]]
 
 
-async def test_messages_during_generation_are_answered_as_the_next_batch(db: Database) -> None:
+async def test_messages_after_the_answer_began_showing_are_the_next_turn(db: Database) -> None:
     alice = await invited(db, ALICE, "小王")
     gate = asyncio.Event()
-    model = ScriptedModel("main", answer("答"), gate=gate)
+    model = ScriptedModel("main", [TextDelta("答"), gate, Usage(1, 1), DONE])
     chat = conversation(db, model)
     clock = ManualClock()
     batcher = batcher_of(chat, clock)
     channels = [FakeChannel() for _ in range(3)]
 
     await submit(batcher, alice, message("一"), channels[0])
-    await clock.advance_to(2.5)
-    await started(model, 1)
+    async with asyncio.timeout(HANG_GUARD):
+        await channels[0].delivered.wait()  # 回答已经开始显示：不再考虑插话
     await submit(batcher, alice, message("二"), channels[1])
     await submit(batcher, alice, message("三"), channels[2])
-    await clock.advance_to(5.0)  # 下一批到点了，但上一轮还在生成
     assert len(model.requests) == 1
+    model.script = answer("答")
     gate.set()
     await finish(batcher)
 
@@ -3230,7 +3237,7 @@ async def test_face_markers_inside_text_are_removed_before_the_journal_and_the_m
     assert user_texts(model.requests[0]) == ["你好呀"]
 
 
-async def test_attachment_notices_are_sent_once_per_batch_on_the_last_message(
+async def test_attachment_notices_are_sent_once_per_turn_on_the_last_message(
     db: Database, tmp_path: Path
 ) -> None:
     alice = await invited(db, ALICE, "小王")
@@ -3242,9 +3249,8 @@ async def test_attachment_notices_are_sent_once_per_batch_on_the_last_message(
 
     await submit(batcher, alice, message(None, image_attachment()), channels[0])
     await submit(batcher, alice, message(None, image_attachment()), channels[1])
+    assert all(channel.log == [] for channel in channels)  # 收消息时不发说明，图片等文字
     await submit(batcher, alice, message("这两张图是什么"), channels[2])
-    assert all(channel.log == [] for channel in channels)  # 收消息时不发说明
-    await clock.advance_to(2.5)
     await finish(batcher)
 
     assert channels[0].log == channels[1].log == []
@@ -3363,39 +3369,39 @@ async def test_message_of_a_user_who_lost_access_never_enters_a_batch(db: Databa
     assert not batcher._workers  # pyright: ignore[reportPrivateUsage]
 
 
-async def test_batches_of_different_users_stay_apart(db: Database) -> None:
-    # AGENTS.md 的第二条不变量：同时在攒的两个人的消息不会进入对方的一轮。
+async def test_waiting_messages_of_different_users_stay_apart(db: Database) -> None:
+    # AGENTS.md 的第二条不变量：同时在等的两个人的消息不会进入对方的一轮。
     alice = await invited(db, ALICE, "小王")
     bob = await invited(db, BOB, "小李")
     model = ScriptedModel("main", answer("好"))
     clock = ManualClock()
-    batcher = batcher_of(conversation(db, model), clock)
+    batcher = batcher_of(conversation(db, model), clock, DEBOUNCE)
 
     await submit(batcher, alice, message("小王一"), FakeChannel())
-    await clock.advance_to(0.5)
+    await clock.advance_to(0.3)
     await submit(batcher, bob, message("小李一"), FakeChannel())
-    await clock.advance_to(1.0)
+    await clock.advance_to(0.6)
     await submit(batcher, alice, message("小王二"), FakeChannel())
-    await clock.advance_to(3.0)
+    await clock.advance_to(1.3)
     await started(model, 1)
     await settle()
-    assert [user_texts(r) for r in model.requests] == [["小李一"]]  # 小王的还在等
-    await clock.advance_to(3.5)
+    assert [user_texts(r) for r in model.requests] == [["小李一"]]  # 小王的还在防抖
+    await clock.advance_to(1.6)
     await finish(batcher)
 
     assert [user_texts(r) for r in model.requests] == [["小李一"], ["小王一\n小王二"]]
 
 
-async def test_shutdown_abandons_waiting_batches_and_their_messages_stay_pending(
+async def test_shutdown_abandons_waiting_messages_and_they_stay_pending(
     db: Database,
 ) -> None:
     alice = await invited(db, ALICE, "小王")
     model = ScriptedModel("main", answer("好"))
     clock = ManualClock()
-    batcher = batcher_of(conversation(db, model), clock)
+    batcher = batcher_of(conversation(db, model), clock, DEBOUNCE)
     before = asyncio.all_tasks()
 
-    await submit(batcher, alice, message("关停前的一句"), FakeChannel())
+    await submit(batcher, alice, message("关停前的一句"), FakeChannel())  # 还在防抖
     batcher.stop()
     async with asyncio.timeout(HANG_GUARD):
         await batcher.drain()
@@ -3407,11 +3413,10 @@ async def test_shutdown_abandons_waiting_batches_and_their_messages_stay_pending
     pending = await db.transaction(journal.pending_messages, alice.id, last[0] + 1)
     assert [entry.content for entry in pending] == ["关停前的一句"]
 
-    # 重启后，下一批把它并进来。
+    # 重启后，下一轮把它并进来。
     clock = ManualClock()
     batcher = batcher_of(conversation(db, model), clock)
     await submit(batcher, alice, message("重启后的一句"), FakeChannel())
-    await clock.advance_to(2.5)
     await finish(batcher)
     assert [user_texts(r) for r in model.requests] == [["关停前的一句\n重启后的一句"]]
 
@@ -3514,3 +3519,361 @@ async def test_real_sticker_is_recorded_as_faces_only(db: Database) -> None:
         "SELECT content, faces_only FROM messages WHERE role = 'user' ORDER BY id"
     )
     assert [tuple(r) for r in result] == [("", 1), ("", 1), ("哈哈", 0)]
+
+
+# ---- 插话 ----
+
+
+def steer_result(chance: float) -> DecisionResult:
+    return DecisionResult(answers={STEER_QUESTION: YesNoAnswer(chance)}, usage=Usage(20, 0))
+
+
+def steering(db: Database, model: ScriptedModel, decider: FakeDecider | None) -> Conversation:
+    """只有一个模型（不选模型）；`decider` 不为空时配置了 `[decisions]`，用它判断插话。"""
+    settings = [
+        ModelSettings(name=model.name, provider=model.provider, model=model.model, default=True)
+    ]
+    decisions = DecisionSettings(provider=Provider.GEMINI, model="decision-fake")
+    return Conversation(
+        db,
+        admin_openid=ADMIN,
+        models={model.name: model},
+        router=Router(settings, decisions, decider),
+        settings=ChatSettings(),
+        timezone=SHANGHAI,
+        steer=None if decider is None else SteerJudge(decisions, decider),
+        clock=lambda: START,
+    )
+
+
+async def user_ids(db: Database) -> list[int]:
+    return [r["id"] for r in await db.fetch_all("SELECT id FROM messages WHERE role = 'user'")]
+
+
+async def test_supplement_cancels_the_hidden_answer_and_restarts_with_the_new_message(
+    db: Database,
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    model = ScriptedModel("main", [gate, *answer("合起来的回答")])
+    decider = FakeDecider(steer_result(0.9))
+    chat = steering(db, model, decider)
+    batcher = batcher_of(chat, ManualClock())
+    first, second = FakeChannel(), FakeChannel()
+
+    await submit(batcher, alice, message("写个排序"), first)
+    await started(model, 1)  # 模型在想，还没有任何内容交给 QQ
+    await submit(batcher, alice, message("用 Python"), second)
+    await started(model, 2)
+    gate.set()
+    await finish(batcher)
+
+    (judged,) = decider.requests
+    assert judged.input == '{"answering": ["写个排序"], "latest": ["用 Python"]}'
+    assert [question.name for question in judged.questions] == [STEER_QUESTION]
+    assert user_texts(model.requests[1]) == ["写个排序\n用 Python"]
+    assert first.kinds == ["typing"]  # 被取消的那次什么都没发
+    assert second.kinds == ["stream", "finish"]  # 刚发过「正在输入」，重来时不再发
+    assert second.streamed == "合起来的回答"
+    ids = await user_ids(db)
+    # 被取消的那次不写回复行；回复挂在新消息上，两条消息都被它覆盖。
+    assert [target for _, target in await reply_targets(db)] == [ids[1]]
+    assert (await rows(db))[-1] == Row("assistant", "合起来的回答", "main", "completed", "streamed")
+    # 被取消的模型调用（服务商没给 token 数，记空）与插话的决策照常记用量。
+    assert await usage_by_purpose(db) == [
+        ("decision", DECISION_USAGE_MODEL, 20, 0),
+        ("chat", "main", None, None),
+        ("chat", "main", 12, 34),
+    ]
+    assert await decision_rows(db) == [
+        (
+            ids[1],
+            STEER_QUESTION,
+            "gemini",
+            "decision-fake",
+            '{"supplement": 0.9, "new": 0.09999999999999998}',
+            "supplement",
+            0,
+            None,
+        )
+    ]
+
+
+async def test_new_question_is_answered_after_the_current_turn(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    model = ScriptedModel("main", [gate, *answer("答")])
+    decider = FakeDecider(steer_result(0.2))
+    chat = steering(db, model, decider)
+    batcher = batcher_of(chat, ManualClock())
+    first, second = FakeChannel(), FakeChannel()
+
+    await submit(batcher, alice, message("讲讲二分查找"), first)
+    await started(model, 1)
+    await submit(batcher, alice, message("明天天气怎么样"), second)
+    assert len(decider.requests) == 1
+    gate.set()
+    await finish(batcher)
+
+    assert [user_texts(request) for request in model.requests] == [
+        ["讲讲二分查找"],
+        ["讲讲二分查找", "明天天气怎么样"],
+    ]
+    assert first.kinds == ["typing", "stream", "finish"]
+    assert second.kinds == ["typing", "stream", "finish"]
+    ids = await user_ids(db)
+    assert [target for _, target in await reply_targets(db)] == ids
+    assert [row[5] for row in await decision_rows(db)] == ["new"]
+
+
+@pytest.mark.parametrize(
+    "decider",
+    [None, FakeDecider(DecisionError(Provider.GEMINI, ErrorKind.SERVER, 503))],
+    ids=["unconfigured", "failed"],
+)
+async def test_without_a_judgment_the_new_message_is_merged(
+    db: Database, decider: FakeDecider | None
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    model = ScriptedModel("main", [gate, *answer("答")])
+    chat = steering(db, model, decider)
+    batcher = batcher_of(chat, ManualClock())
+
+    await submit(batcher, alice, message("一"), FakeChannel())
+    await started(model, 1)
+    await submit(batcher, alice, message("二"), FakeChannel())
+    await started(model, 2)
+    gate.set()
+    await finish(batcher)
+
+    assert user_texts(model.requests[1]) == ["一\n二"]
+    assert len(await reply_targets(db)) == 1
+    expected = [] if decider is None else [("supplement", "server")]
+    assert [(row[5], row[7]) for row in await decision_rows(db)] == expected
+
+
+async def test_answer_already_showing_is_not_judged(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    model = ScriptedModel("main", [TextDelta("答"), gate, Usage(1, 1), DONE])
+    decider = FakeDecider(steer_result(0.9))
+    chat = steering(db, model, decider)
+    batcher = batcher_of(chat, ManualClock())
+    first = FakeChannel()
+
+    await submit(batcher, alice, message("一"), first)
+    async with asyncio.timeout(HANG_GUARD):
+        await first.delivered.wait()
+    await submit(batcher, alice, message("二"), FakeChannel())
+    gate.set()
+    await finish(batcher)
+
+    assert decider.requests == []
+    assert [user_texts(request) for request in model.requests] == [["一"], ["一", "二"]]
+    assert len(await reply_targets(db)) == 2
+
+
+async def test_judgment_reads_only_this_users_messages_and_rechecks_access(db: Database) -> None:
+    # AGENTS.md 的两条不变量：判断的输入只有这个用户自己的消息；已不能使用对话时不调用决策。
+    alice = await invited(db, ALICE, "小王")
+    bob = await invited(db, BOB, "小李")
+    decider = FakeDecider(steer_result(0.9))
+    chat = steering(db, ScriptedModel("main", []), decider)
+
+    async with asyncio.timeout(HANG_GUARD):
+        mine = await chat.receive(alice, message("小王的问题"), FakeChannel())
+        theirs = await chat.receive(bob, message("小李的秘密"), FakeChannel())
+        more = await chat.receive(alice, message(f"补充{STICKER_TEXT}"), FakeChannel())
+        assert mine is not None
+        assert theirs is not None
+        assert more is not None
+        verdict = await chat.judge(alice, [mine.message_id, theirs.message_id], [more.message_id])
+        assert verdict is routing.Steer.SUPPLEMENT
+        await db.transaction(access.set_user_status, alice.id, UserStatus.DISABLED)
+        assert await chat.judge(alice, [mine.message_id], [more.message_id]) is routing.Steer.NEW
+
+    (request,) = decider.requests
+    assert request.input == '{"answering": ["小王的问题"], "latest": ["补充"]}'
+
+
+async def test_ask_about_waiting_attachments_counts_them_and_rechecks_access(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("不该出现"))
+    chat = media_chat(db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, SEES))
+    pdf = IncomingAttachment(kind=AttachmentKind.FILE, url="https://x.qq.com/a.pdf", filename="a")
+    channel = FakeChannel()
+
+    async with asyncio.timeout(HANG_GUARD):
+        one = await chat.receive(alice, message(None, image_attachment()), FakeChannel())
+        two = await chat.receive(alice, message(None, image_attachment(), pdf), FakeChannel())
+        assert one is not None
+        assert two is not None
+        await chat.ask(alice, [one.message_id, two.message_id], channel)
+        await db.transaction(access.set_user_status, alice.id, UserStatus.DISABLED)
+        await chat.ask(alice, [one.message_id, two.message_id], channel)
+
+    assert channel.sent == [texts.attachments_waiting(2, 1)]
+    assert channel.sent == ["收到 2 张图片和 1 个文件，想让我帮你看什么？"]
+    assert model.requests == []
+    assert await reply_targets(db) == []  # 问话不写进流水，附件仍等着下一条文字
+
+
+async def test_waiting_picture_is_asked_about_then_answered_with_the_next_text(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("是猫"))
+    chat = media_chat(db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, SEES))
+    clock = ManualClock()
+    batcher = batcher_of(chat, clock)
+    picture_channel, text_channel = FakeChannel(), FakeChannel()
+
+    await submit(batcher, alice, message(None, image_attachment()), picture_channel)
+    await clock.advance_to(60.0)
+    await finish(batcher)
+    assert picture_channel.sent == ["收到 1 张图片，想让我帮你看什么？"]
+    assert model.requests == []
+    await submit(batcher, alice, message("这是什么"), text_channel)
+    await finish(batcher)
+
+    (request,) = model.requests
+    assert [type(part) for part in request.messages[0].parts] == [ImagePart, TextPart]
+    assert text_channel.streamed == "是猫"
+
+
+async def test_shutdown_during_a_judgment_records_it_as_cancelled_and_leaves_no_task(
+    db: Database,
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", [asyncio.Event()])  # 一直在想
+    decider = FakeDecider(steer_result(0.9), gate=asyncio.Event())
+    chat = steering(db, model, decider)
+    batcher = batcher_of(chat, ManualClock())
+    before = asyncio.all_tasks()
+
+    await submit(batcher, alice, message("一"), FakeChannel())
+    await started(model, 1)
+    await submit(batcher, alice, message("二"), FakeChannel())
+    async with asyncio.timeout(HANG_GUARD):
+        await decider.started.wait()
+        batcher.stop()
+        await batcher.drain()
+        await chat.drain()
+    await settle()
+
+    assert asyncio.all_tasks() == before
+    assert len(model.requests) == 1
+    ids = await user_ids(db)
+    assert [(row[0], row[5], row[7]) for row in await decision_rows(db)] == [
+        (ids[1], "supplement", "cancelled")
+    ]
+    # 正在回答的那一轮按关停收尾（不是重来）：记一条被取消的回复，第二条消息仍是待回复的。
+    assert (await rows(db))[-1] == Row("assistant", "", "main", "cancelled", "cancelled")
+    pending = await db.transaction(journal.pending_messages, alice.id, ids[-1] + 1)
+    assert [entry.content for entry in pending] == ["一", "二"]
+
+
+async def test_restart_during_model_selection_records_the_cancelled_decision(
+    db: Database,
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    first = ScriptedModel("first", answer("答"))
+    second = ScriptedModel("second", answer("不该出现"))
+    picking = FakeDecider(chances(first=0.9, second=0.1), gate=asyncio.Event())
+    judging = FakeDecider(steer_result(0.8))
+    settings = [
+        ModelSettings(
+            name=model.name,
+            provider=model.provider,
+            model=model.model,
+            default=index == 0,
+            description=f"{model.name} 的描述",
+        )
+        for index, model in enumerate((first, second))
+    ]
+    decisions = DecisionSettings(provider=Provider.GEMINI, model="decision-fake")
+    chat = Conversation(
+        db,
+        admin_openid=ADMIN,
+        models={first.name: first, second.name: second},
+        router=Router(settings, decisions, picking),
+        settings=ChatSettings(),
+        timezone=SHANGHAI,
+        steer=SteerJudge(decisions, judging),
+        clock=lambda: START,
+    )
+    batcher = batcher_of(chat, ManualClock())
+
+    await submit(batcher, alice, message("一"), FakeChannel())
+    async with asyncio.timeout(HANG_GUARD):
+        await picking.started.wait()  # 还在选模型
+    picking.started.clear()
+    await submit(batcher, alice, message("二"), FakeChannel())
+    async with asyncio.timeout(HANG_GUARD):
+        await picking.started.wait()  # 重来的那一轮又在选模型
+    assert len(picking.requests) == 2
+    assert picking.gate is not None
+    picking.gate.set()
+    await finish(batcher)
+
+    ids = await user_ids(db)
+    assert [(row[0], row[1], row[5], row[7]) for row in await decision_rows(db)] == [
+        (ids[1], STEER_QUESTION, "supplement", None),
+        (ids[0], QUESTION, "first", "cancelled"),  # 被取消的那次选模型照记
+        (ids[1], QUESTION, "first", None),
+    ]
+    assert [user_texts(request) for request in first.requests] == [["一\n二"]]
+    assert [target for _, target in await reply_targets(db)] == [ids[1]]
+
+
+async def test_leftover_pending_messages_count_toward_the_restart_limit(db: Database) -> None:
+    # 重启后流水里遗留了 31 条待回复的消息：首轮实际带满 32 条，再来的补充不判断、不打断，排到下一轮，
+    # 遗留的最早那条不会被挤出请求、又被回复划进已覆盖的范围。
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    model = ScriptedModel("main", [gate, *answer("答")])
+    decider = FakeDecider(steer_result(0.9))
+    chat = steering(db, model, decider)
+    async with asyncio.timeout(HANG_GUARD):
+        for n in range(31):
+            assert await chat.receive(alice, message(f"遗留{n}"), FakeChannel()) is not None
+    batcher = batcher_of(chat, ManualClock())
+
+    await submit(batcher, alice, message("新问题"), FakeChannel())
+    await started(model, 1)
+    await submit(batcher, alice, message("补充"), FakeChannel())
+    gate.set()
+    await finish(batcher)
+
+    assert decider.requests == []
+    (first, second) = [user_texts(request) for request in model.requests]
+    assert first[0].startswith("遗留0\n")
+    assert first[0].endswith("\n新问题")
+    assert second[-1] == "补充"
+    ids = await user_ids(db)
+    assert [target for _, target in await reply_targets(db)] == [ids[-2], ids[-1]]
+
+
+async def test_judgment_input_has_every_message_the_turn_carries(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    model = ScriptedModel("main", [gate, *answer("答")])
+    decider = FakeDecider(steer_result(0.9))
+    chat = steering(db, model, decider)
+    async with asyncio.timeout(HANG_GUARD):
+        assert await chat.receive(alice, message("遗留的问题"), FakeChannel()) is not None
+    batcher = batcher_of(chat, ManualClock())
+
+    await submit(batcher, alice, message("新问题"), FakeChannel())
+    await started(model, 1)
+    await submit(batcher, alice, message("补充"), FakeChannel())
+    await started(model, 2)
+    gate.set()
+    await finish(batcher)
+
+    (request,) = decider.requests
+    assert json.loads(request.input) == {"answering": ["遗留的问题", "新问题"], "latest": ["补充"]}
+    assert user_texts(model.requests[1]) == ["遗留的问题\n新问题\n补充"]

@@ -14,6 +14,7 @@ import re
 import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlsplit
@@ -61,10 +62,14 @@ DEFAULT_ATTACHMENT_HISTORY_TURNS = 3
 MAX_ATTACHMENT_HISTORY_TURNS = 20
 MAX_EXTRA_DOWNLOAD_HOSTS = 32
 
-DEFAULT_TEXT_WAIT_SECONDS = 2.5
-DEFAULT_ATTACHMENT_WAIT_SECONDS = 12.0
-DEFAULT_MAX_WAIT_SECONDS = 20.0
-MAX_BATCH_WAIT_SECONDS = 300.0  # 攒批的各个时长的上限：再长用户就以为机器人没反应了
+DEFAULT_TEXT_DEBOUNCE_SECONDS = 0.0
+MAX_TEXT_DEBOUNCE_SECONDS = 10.0  # 防抖只为接住快速的连发，再长就违背了「来了就处理」
+DEFAULT_ATTACHMENT_WAIT_SECONDS = 60.0
+MAX_ATTACHMENT_WAIT_SECONDS = 1800.0
+"""超时动作（问一句或直接回答）是对原附件消息的被动回复，平台给被动回复的有效期按文档是 60 分钟，过了消息 ID
+就失效（`answer` 还可能先花掉模型用量才发现发不出去）。取 30 分钟，给回答本身留足余量。"""
+DEFAULT_MAX_RESTARTS = 3
+MAX_MAX_RESTARTS = 10
 
 DEFAULT_DESCRIBE_INSTRUCTIONS = """用一句话客观地描述这张图片的内容，不超过 80 个字。图里有文字时摘录关键的文字。
 只输出描述本身，不要加「这张图片」之类的开头。"""
@@ -204,29 +209,43 @@ class AttachmentSettings:
         return self.max_size_mb * 1024 * 1024
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class BatchingSettings:
-    """`[batching]` 表：把同一个用户短时间内连发的几条消息合成一轮。
+class AttachmentTimeoutAction(StrEnum):
+    """单独发来的图片或文件等了 `attachment_wait_seconds` 还没有下文时做什么。"""
 
-    一批里每来一条消息（单独的表情包除外），就按它的种类重新开始计时，但从这一批的第一条算起最多等
-    `max_wait_seconds`；计时到了就把这一批作为一轮回答。
+    ASK = "ask"  # 发一句固定的问题，问用户想让我看什么；不调用模型
+    ANSWER = "answer"  # 直接把它们作为一轮去回答
+    NONE = "none"  # 什么都不做，继续等
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TurnSettings:
+    """`[turns]` 表：消息什么时候开始一轮回答，回答进行中用户插话时怎么办。
+
+    文字与语音来了就处理；单独的图片或文件不触发回复，等用户的下一条文字或语音，和它合成一轮；一轮回答还没开始
+    显示时来了新的文字或语音，判断它是不是在补充正在回答的问题（插话），是就带上它重新开始这一轮。
 
     Attributes:
-        text_wait_seconds: 带文字或语音的消息之后等多久（秒）。
-        attachment_wait_seconds: 只有图片或文件、没有文字的消息之后等多久（秒），等用户补上问题。
-        max_wait_seconds: 从这一批的第一条消息算起最多等多久（秒）。
+        text_debounce_seconds: 文字或语音到达后先等多久再开始一轮（秒），期间每来一条重新计时，用来接住快速的
+            连发；0 表示不等。
+        attachment_wait_seconds: 单独的图片或文件等多久还没有下文时执行 `attachment_timeout_action`（秒）；
+            0 表示一直等、什么都不做。
+        attachment_timeout_action: 等不到下文时做什么，对同一组等待中的附件只做一次。
+        max_restarts: 一轮最多因插话重新开始几次，之后的新消息排到下一轮；0 表示不考虑插话。
     """
 
-    text_wait_seconds: float = DEFAULT_TEXT_WAIT_SECONDS
+    text_debounce_seconds: float = DEFAULT_TEXT_DEBOUNCE_SECONDS
     attachment_wait_seconds: float = DEFAULT_ATTACHMENT_WAIT_SECONDS
-    max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS
+    attachment_timeout_action: AttachmentTimeoutAction = AttachmentTimeoutAction.ASK
+    max_restarts: int = DEFAULT_MAX_RESTARTS
 
     @property
-    def enabled(self) -> bool:
-        """是否攒批。两种等待都是 0，或上限是 0 时不攒批：来一条处理一条。"""
-        return self.max_wait_seconds > 0 and (
-            self.text_wait_seconds > 0 or self.attachment_wait_seconds > 0
-        )
+    def attachment_timeout(self) -> float | None:
+        """单独的附件等多久后执行超时动作；一直等、不做任何事时为 `None`。"""
+        if self.attachment_wait_seconds <= 0 or (
+            self.attachment_timeout_action is AttachmentTimeoutAction.NONE
+        ):
+            return None
+        return self.attachment_wait_seconds
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -335,7 +354,7 @@ class Settings:
     decisions: DecisionSettings | None = None
     attachments: AttachmentSettings = AttachmentSettings()
     describe: DescribeSettings | None = None
-    batching: BatchingSettings = BatchingSettings()
+    turns: TurnSettings = TurnSettings()
 
     @property
     def default_model(self) -> ModelSettings:
@@ -585,8 +604,8 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
     attachments_table = table.table("attachments")
     attachments = None if attachments_table is None else _parse_attachments(attachments_table)
     describe_ok, describe = _parse_describe(table)
-    batching_table = table.table("batching")
-    batching = None if batching_table is None else _parse_batching(batching_table)
+    turns_table = table.table("turns")
+    turns = None if turns_table is None else _parse_turns(turns_table)
     table.finish()
     if decisions is not None and models is not None and len(models) > MAX_OPTIONS:
         # 每个模型是选模型那道选择题的一个选项，两家接口都最多 255 个。
@@ -608,7 +627,7 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         or not decisions_ok
         or attachments is None
         or not describe_ok
-        or batching is None
+        or turns is None
     ):
         return None
     return Settings(
@@ -622,30 +641,38 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         decisions=decisions,
         attachments=attachments,
         describe=describe,
-        batching=batching,
+        turns=turns,
     )
 
 
-def _parse_batching(table: _Table) -> BatchingSettings | None:
-    values: list[float | None] = []
-    for key, default in (
-        ("text_wait_seconds", DEFAULT_TEXT_WAIT_SECONDS),
-        ("attachment_wait_seconds", DEFAULT_ATTACHMENT_WAIT_SECONDS),
-        ("max_wait_seconds", DEFAULT_MAX_WAIT_SECONDS),
-    ):
-        value = table.number(key, default)
-        if value is not None and not 0 <= value <= MAX_BATCH_WAIT_SECONDS:
-            table.problem(key, f"应不小于 0、不大于 {MAX_BATCH_WAIT_SECONDS:g}")
-            value = None
-        values.append(value)
+def _parse_turns(table: _Table) -> TurnSettings | None:
+    debounce = table.number("text_debounce_seconds", DEFAULT_TEXT_DEBOUNCE_SECONDS)
+    if debounce is not None and not 0 <= debounce <= MAX_TEXT_DEBOUNCE_SECONDS:
+        table.problem("text_debounce_seconds", f"应不小于 0、不大于 {MAX_TEXT_DEBOUNCE_SECONDS:g}")
+        debounce = None
+    wait = table.number("attachment_wait_seconds", DEFAULT_ATTACHMENT_WAIT_SECONDS)
+    if wait is not None and not 0 <= wait <= MAX_ATTACHMENT_WAIT_SECONDS:
+        table.problem(
+            "attachment_wait_seconds", f"应不小于 0、不大于 {MAX_ATTACHMENT_WAIT_SECONDS:g}"
+        )
+        wait = None
+    action: AttachmentTimeoutAction | None = None
+    name = table.string("attachment_timeout_action", AttachmentTimeoutAction.ASK.value)
+    if name is not None:
+        try:
+            action = AttachmentTimeoutAction(name)
+        except ValueError:
+            choices = "、".join(a.value for a in AttachmentTimeoutAction)
+            table.problem("attachment_timeout_action", f"应为 {choices} 之一")
+    max_restarts = _bounded_int(table, "max_restarts", DEFAULT_MAX_RESTARTS, 0, MAX_MAX_RESTARTS)
     table.finish()
-    text_wait, attachment_wait, max_wait = values
-    if text_wait is None or attachment_wait is None or max_wait is None:
+    if debounce is None or wait is None or action is None or max_restarts is None:
         return None
-    return BatchingSettings(
-        text_wait_seconds=text_wait,
-        attachment_wait_seconds=attachment_wait,
-        max_wait_seconds=max_wait,
+    return TurnSettings(
+        text_debounce_seconds=debounce,
+        attachment_wait_seconds=wait,
+        attachment_timeout_action=action,
+        max_restarts=max_restarts,
     )
 
 

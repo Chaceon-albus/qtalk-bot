@@ -1,7 +1,7 @@
 """启动入口：`python -m qtalk_bot`。
 
-读配置与密钥、打开数据库、创建对话模型、决策模型与写图片描述的模型、构造 `pyqbot.Bot`、注册处理函数（经攒批交给
-对话）并运行；
+读配置与密钥、打开数据库、创建对话模型、决策模型与写图片描述的模型、构造 `pyqbot.Bot`、注册处理函数（经
+`batching.Batcher` 交给对话）并运行；
 运行期间在后台定期清理过期的附件。退出时先取消后台的描述与清理任务，再关闭模型的客户端与数据库。配置或数据库有误、连不上平台时打印原因并以非零状态退出，不打印 traceback。
 """
 
@@ -42,7 +42,7 @@ from .describe import Describer
 from .gate import Gate
 from .llm.providers import ChatModels
 from .media import Fetcher, MediaStore, run_cleanup
-from .routing import Router
+from .routing import Router, SteerJudge
 from .storage import DATABASE_FILENAME, Database, StorageError
 
 logger = logging.getLogger("qtalk_bot")
@@ -113,8 +113,9 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                     attachments=settings.attachments,
                     fetcher=fetcher,
                     describer=describer,
+                    steer=SteerJudge(settings.decisions, models.decider),
                 )
-                batcher = Batcher(conversation, settings.batching)
+                batcher = Batcher(conversation, settings.turns)
                 chat = QQChat(batcher)
             handlers = register(bot, gate, chat, hosts=hosts)
             cleanup = asyncio.create_task(run_cleanup(db, store, settings.attachments))
@@ -153,9 +154,9 @@ async def _shut_down(
     """按顺序关停，返回期间是否又被取消过。
 
     顺序：
-    1. `Batcher.stop()`：放弃还在计时的批次（消息已在流水里，重启后是待回复的），取消正在回答的轮次（对话自己
-       收尾记账），之后到达的消息只收下、不再回答。
-    2. `Batcher.drain()` 与 `Conversation.drain()`：等处理批次的任务与在途的轮次真正结束。对话被取消后最多先用
+    1. `Batcher.stop()`：放弃等待中的附件、防抖的计时与正在进行的插话判断（消息已在流水里，重启后是待回复的），
+       取消正在回答的轮次（对话自己收尾记账），之后到达的消息只收下、不再回答。
+    2. `Batcher.drain()` 与 `Conversation.drain()`：等各用户的任务与在途的轮次（含插话判断的记账）真正结束。对话被取消后最多先用
        几秒停模型、再用几秒等在途的分片与结束分片，然后写流水与用量。这一步要在关闭 QQ 客户端之前：回答在
        `Batcher` 自己的任务里，`Bot.close()` 不等它们，客户端先关的话结束分片发不出去，用户会一直看到「生成中」。
     3. `Alerts.stop()` 与 `Alerts.aclose()`：同步地不再接受新的提醒、取消还在发的，再限时等它们退出。提醒经
@@ -184,7 +185,7 @@ async def _shut_down(
     interrupted = False
     if batcher is not None:
         batcher.stop()
-        interrupted |= await _drain(batcher.drain(), replies_deadline, "等待攒批的任务收尾")
+        interrupted |= await _drain(batcher.drain(), replies_deadline, "等待回答与插话判断收尾")
     if conversation is not None:
         interrupted |= await _drain(conversation.drain(), replies_deadline, "等待在途的对话收尾")
     if alerts is not None:

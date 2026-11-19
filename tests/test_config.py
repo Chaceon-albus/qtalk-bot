@@ -9,8 +9,9 @@ from qtalk_bot.config import (
     DEFAULT_FILE_INSTRUCTIONS,
     DEFAULT_FILE_MAX_OUTPUT_TOKENS,
     DEFAULT_PERSONA,
+    MAX_ATTACHMENT_WAIT_SECONDS,
     AttachmentSettings,
-    BatchingSettings,
+    AttachmentTimeoutAction,
     ChatSettings,
     ConfigError,
     DecisionSettings,
@@ -22,6 +23,7 @@ from qtalk_bot.config import (
     QQSettings,
     Secrets,
     Settings,
+    TurnSettings,
     check_provider_secrets,
     config_path,
     load_secrets,
@@ -477,65 +479,91 @@ def test_invalid_chat(tmp_path: Path, text: str, problem: str) -> None:
     assert config_error(write_config(tmp_path, text)).problems == (problem,)
 
 
-# ---- [batching] ----
+# ---- [turns] ----
 
 
-def test_batching_defaults(tmp_path: Path) -> None:
-    batching = load_settings(write_config(tmp_path, "")).batching
-    assert batching == BatchingSettings()
+def test_turns_defaults(tmp_path: Path) -> None:
+    turns = load_settings(write_config(tmp_path, "")).turns
+    assert turns == TurnSettings()
     assert (
-        batching.text_wait_seconds,
-        batching.attachment_wait_seconds,
-        batching.max_wait_seconds,
-    ) == (2.5, 12.0, 20.0)
-    assert batching.enabled
+        turns.text_debounce_seconds,
+        turns.attachment_wait_seconds,
+        turns.attachment_timeout_action,
+        turns.max_restarts,
+    ) == (0.0, 60.0, AttachmentTimeoutAction.ASK, 3)
+    assert turns.attachment_timeout == 60.0
 
 
-def test_batching_values_are_read(tmp_path: Path) -> None:
+def test_attachment_wait_leaves_room_within_the_passive_reply_window(tmp_path: Path) -> None:
+    # 超时动作是对原附件消息的被动回复，平台的有效期是 60 分钟：上限 30 分钟。
+    assert MAX_ATTACHMENT_WAIT_SECONDS == 1800
+    text = "[turns]\nattachment_wait_seconds = 1800\n"
+    assert load_settings(write_config(tmp_path, text)).turns.attachment_wait_seconds == 1800
+
+
+def test_turns_values_are_read(tmp_path: Path) -> None:
     text = (
-        "[batching]\ntext_wait_seconds = 1\nattachment_wait_seconds = 7.5\nmax_wait_seconds = 30\n"
+        "[turns]\ntext_debounce_seconds = 0.8\nattachment_wait_seconds = 30\n"
+        'attachment_timeout_action = "answer"\nmax_restarts = 0\n'
     )
-    batching = load_settings(write_config(tmp_path, text)).batching
-    assert batching == BatchingSettings(
-        text_wait_seconds=1.0, attachment_wait_seconds=7.5, max_wait_seconds=30.0
+    turns = load_settings(write_config(tmp_path, text)).turns
+    assert turns == TurnSettings(
+        text_debounce_seconds=0.8,
+        attachment_wait_seconds=30.0,
+        attachment_timeout_action=AttachmentTimeoutAction.ANSWER,
+        max_restarts=0,
     )
 
 
 @pytest.mark.parametrize(
-    ("text", "enabled"),
+    ("text", "timeout"),
     [
-        ("text_wait_seconds = 0\nattachment_wait_seconds = 0\nmax_wait_seconds = 0\n", False),
-        ("text_wait_seconds = 0\nattachment_wait_seconds = 0\n", False),
-        ("max_wait_seconds = 0\n", False),
-        ("text_wait_seconds = 0\n", True),  # 只有图片或文件时仍然等
+        ("attachment_wait_seconds = 0\n", None),  # 一直等
+        ('attachment_timeout_action = "none"\n', None),
+        ('attachment_timeout_action = "ask"\nattachment_wait_seconds = 5\n', 5.0),
     ],
 )
-def test_zero_waits_turn_batching_off(tmp_path: Path, text: str, enabled: bool) -> None:
-    batching = load_settings(write_config(tmp_path, "[batching]\n" + text)).batching
-    assert batching.enabled is enabled
+def test_attachment_timeout(tmp_path: Path, text: str, timeout: float | None) -> None:
+    turns = load_settings(write_config(tmp_path, "[turns]\n" + text)).turns
+    assert turns.attachment_timeout == timeout
 
 
 @pytest.mark.parametrize(
     ("text", "problem"),
     [
         (
-            "[batching]\ntext_wait_seconds = -1\n",
-            "batching.text_wait_seconds：应不小于 0、不大于 300",
+            "[turns]\ntext_debounce_seconds = -1\n",
+            "turns.text_debounce_seconds：应不小于 0、不大于 10",
         ),
         (
-            "[batching]\nattachment_wait_seconds = 301\n",
-            "batching.attachment_wait_seconds：应不小于 0、不大于 300",
+            "[turns]\ntext_debounce_seconds = 10.5\n",
+            "turns.text_debounce_seconds：应不小于 0、不大于 10",
         ),
-        ("[batching]\nmax_wait_seconds = nan\n", "batching.max_wait_seconds：应为有限的数字"),
         (
-            '[batching]\nmax_wait_seconds = "20"\n',
-            "batching.max_wait_seconds：应为数字，实际是字符串",
+            "[turns]\nattachment_wait_seconds = 1801\n",
+            "turns.attachment_wait_seconds：应不小于 0、不大于 1800",
         ),
-        ("[batching]\nwait = 3\n", "batching.wait：未知的键"),
-        ("batching = 3\n", "batching：应为表，实际是整数"),
+        (
+            "[turns]\nattachment_wait_seconds = nan\n",
+            "turns.attachment_wait_seconds：应为有限的数字",
+        ),
+        (
+            '[turns]\nattachment_timeout_action = "reply"\n',
+            "turns.attachment_timeout_action：应为 ask、answer、none 之一",
+        ),
+        (
+            "[turns]\nattachment_timeout_action = 1\n",
+            "turns.attachment_timeout_action：应为字符串，实际是整数",
+        ),
+        ("[turns]\nmax_restarts = -1\n", "turns.max_restarts：不能小于 0"),
+        ("[turns]\nmax_restarts = 11\n", "turns.max_restarts：不能大于 10"),
+        ("[turns]\nmax_restarts = 1.5\n", "turns.max_restarts：应为整数，实际是浮点数"),
+        ("[turns]\ntext_wait_seconds = 2.5\n", "turns.text_wait_seconds：未知的键"),
+        ("[batching]\ntext_wait_seconds = 2.5\n", "batching：未知的键"),
+        ("turns = 3\n", "turns：应为表，实际是整数"),
     ],
 )
-def test_invalid_batching(tmp_path: Path, text: str, problem: str) -> None:
+def test_invalid_turns(tmp_path: Path, text: str, problem: str) -> None:
     assert config_error(write_config(tmp_path, text)).problems == (problem,)
 
 

@@ -24,12 +24,17 @@ from qtalk_bot.routing import (
     HISTORY_ENTRY_CHARS,
     LATEST_CHARS,
     QUESTION,
+    STEER_INSTRUCTIONS,
+    STEER_QUESTION,
     TIMEOUT,
     Choice,
     DecisionRecord,
     Router,
+    Steer,
+    SteerJudge,
     choose,
     decision_input,
+    steer_input,
 )
 
 HANG_GUARD = 5
@@ -471,3 +476,115 @@ async def test_failed_decision_falls_back_within_the_candidates() -> None:
     assert (await candidate_pick(router(failing), ["chat", "code"], previous="code"))[0] == "code"
     failing = FakeDecider(TimeoutError())
     assert (await candidate_pick(router(failing), ["chat", "code"], previous="solve"))[0] == "chat"
+
+
+# ---- 插话 ----
+
+
+def steer_result(chance: float, usage: Usage | None = USAGE) -> DecisionResult:
+    return DecisionResult(answers={STEER_QUESTION: YesNoAnswer(chance)}, usage=usage)
+
+
+@pytest.mark.parametrize(
+    ("chance", "verdict"), [(0.9, Steer.SUPPLEMENT), (0.5, Steer.SUPPLEMENT), (0.49, Steer.NEW)]
+)
+async def test_steer_verdict_follows_the_probability(chance: float, verdict: Steer) -> None:
+    decider = FakeDecider(steer_result(chance))
+    call = SteerJudge(SETTINGS, decider, clock=Ticker()).prepare(
+        ["写个排序"], ["用 Python"], label="#1 小王"
+    )
+
+    async with asyncio.timeout(HANG_GUARD):
+        assert await call.run() is verdict
+
+    (request,) = decider.requests
+    (question,) = request.questions
+    assert question.name == STEER_QUESTION
+    assert question.instructions == STEER_INSTRUCTIONS
+    assert json.loads(request.input) == {"answering": ["写个排序"], "latest": ["用 Python"]}
+    assert call.record == DecisionRecord(
+        question=STEER_QUESTION,
+        provider=Provider.OPENAI,
+        provider_model="luna-fake",
+        probabilities={"supplement": chance, "new": 1 - chance},
+        chosen=verdict.value,
+        kept_previous=False,
+        latency_ms=250,
+        error=None,
+        usage=USAGE,
+    )
+
+
+def test_steer_input_clips_each_message() -> None:
+    payload = json.loads(steer_input(["问" * 5000], ["补" * 5000, "短"]))
+    assert len(payload["answering"][0]) == HISTORY_ENTRY_CHARS
+    assert [len(text) for text in payload["latest"]] == [HISTORY_ENTRY_CHARS, 1]
+
+
+async def test_steer_without_decisions_is_assumed_a_supplement() -> None:
+    for judge_ in (SteerJudge(), SteerJudge(None, FakeDecider(steer_result(0.1)))):
+        call = judge_.prepare(["一"], ["二"], label="#1 小王")
+        assert not judge_.configured
+        assert await call.run() is Steer.ASSUMED
+        assert call.record is None
+
+
+STEER_FAILURES: list[tuple[str, Outcome, str, Usage | None]] = [
+    ("refused", DecisionResult(answers={STEER_QUESTION: Refusal()}, usage=USAGE), "refused", USAGE),
+    ("malformed", DecisionResult(answers={}, usage=None), "malformed", None),
+    ("error", DecisionError(Provider.OPENAI, ErrorKind.SERVER, 500, usage=USAGE), "server", USAGE),
+    ("connection", ModelError(Provider.OPENAI, ErrorKind.CONNECTION), "connection", None),
+    ("unexpected", RuntimeError(SECRET), "other", None),
+]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "error", "usage"),
+    [failure[1:] for failure in STEER_FAILURES],
+    ids=[failure[0] for failure in STEER_FAILURES],
+)
+async def test_failed_steer_judgment_is_assumed_a_supplement_and_recorded(
+    outcome: Outcome, error: str, usage: Usage | None, caplog: pytest.LogCaptureFixture
+) -> None:
+    call = SteerJudge(SETTINGS, FakeDecider(outcome)).prepare(["一"], [SECRET], label="#1 小王")
+
+    with caplog.at_level(logging.INFO):
+        assert await call.run() is Steer.ASSUMED
+
+    assert call.record is not None
+    assert (call.record.error, call.record.chosen, call.record.probabilities) == (
+        error,
+        "supplement",
+        None,
+    )
+    assert call.record.usage == usage
+    assert "当作补充" in caplog.text
+    assert SECRET not in caplog.text
+
+
+async def test_steer_timeout_is_assumed_a_supplement() -> None:
+    settings = DecisionSettings(provider=Provider.OPENAI, model="m", timeout_seconds=0.05)
+    decider = FakeDecider(steer_result(0.1), gate=asyncio.Event())
+    call = SteerJudge(settings, decider).prepare(["一"], ["二"], label="#1 小王")
+
+    async with asyncio.timeout(HANG_GUARD):
+        assert await call.run() is Steer.ASSUMED
+
+    assert call.record is not None
+    assert call.record.error == TIMEOUT
+    assert decider.finished
+
+
+async def test_cancelled_steer_judgment_leaves_a_cancelled_record() -> None:
+    decider = FakeDecider(steer_result(0.1), gate=asyncio.Event())
+    call = SteerJudge(SETTINGS, decider).prepare(["一"], ["二"], label="#1 小王")
+
+    task = asyncio.create_task(call.run())
+    async with asyncio.timeout(HANG_GUARD):
+        await decider.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert call.record is not None
+    assert (call.record.error, call.record.chosen) == (CANCELLED, "supplement")

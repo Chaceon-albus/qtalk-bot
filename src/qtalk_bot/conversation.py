@@ -2,10 +2,12 @@
 
 不依赖 pyqbot 与 SDK：模型经 `llm.ChatModel`，选模型经 `routing.Router`（决策经 `llm.decisions.DecisionModel`），
 附件经 `media.Fetcher`（下载经接线层实现的 `media.Downloader`），回复经 `ReplyChannel`（接线层用 pyqbot 实现，
-见 `bot.py`），图片描述经 `describe.Describer`。攒批的计时在 `batching.py`，它对每条消息调用一次 `receive()`，
-对每一批调用一次 `respond()`；`handle()` 是两者连在一起、不攒批的写法。
+见 `bot.py`），图片描述经 `describe.Describer`，插话的判断经 `routing.SteerJudge`。什么时候开始一轮、插话时
+要不要重来由 `batching.py` 决定：它对每条消息调用一次 `receive()`，每开始（或重新开始）一轮调用一次
+`respond()`，插话时调用 `judge()`，单独的附件等不到下文时调用 `ask()`；`handle()` 是收消息与回答一轮连在一起的
+写法。
 
-**收消息**（`receive()`，每条消息一次，消息到达时就做，不等攒批的计时）：
+**收消息**（`receive()`，每条消息一次，消息到达时就做）：
 1. 文字里的表情标记直接去掉（`faces.clean()`）。只由表情组成的消息（`faces.is_sticker()`：表情包、单独的
    小黄脸）的图片不下载、不记录，消息本身记进流水（正文为空、`faces_only` 为 1）只留个记录，永远不进模型的
    输入（见 `journal.py`），也不触发回复。
@@ -13,18 +15,19 @@
 3. 确认授权后下载附件、按文件头识别格式、存到本地（`media.Fetcher`，不在事务里）。
 4. 一个事务里：`access.chat_allowed()` 再确认一次（不可用就删掉刚存下的文件，什么都不做），写入用户消息与
    附件。同一个用户的几条消息可以同时下载，但按到达的顺序写进流水。
-不持有这个用户的串行锁：回答上一轮的同时可以收下一批。
+不持有这个用户的串行锁：回答上一轮的同时可以收下一条。
 
-**回答一轮**（`respond()`，每批一次，回复挂在这一批最后一条不只由表情组成的消息上）：
+**回答一轮**（`respond()`，每轮一次，回复挂在这一轮最后一条不只由表情组成的消息上）：
 1. 同一个用户的轮次串行处理，不同用户互不阻塞。
 2. 一个事务里：`access.chat_allowed()` 再确认一次，取出这一轮的输入（流水里编号不大于回复所挂的那条、还没有
    被回复覆盖的用户消息，含之前没有回复的；只由表情组成的跳过）、最近若干轮的上下文，以及选模型要用的历史和
    上一轮实际回答的模型。
 3. 按附件筛出候选模型、整理要告诉用户的情况（`context.plan_turn()`，只就这一批的附件说明）。有说明（下载
    失败、太大、看不了、不支持）就先发一条；没有可以交给模型的内容时就此结束（消息照常已在流水里）。
-4. 后台发「正在输入」；然后在候选里选模型（需要时调用一次决策，在事务之外、直接在本任务里 await），失败时
-   退回，不挡住回复。语音不影响候选，由决策按内容选；决策接口收音频时（`Router.decision_limits`）把本轮语音
-   的原声和文字题目一起交给它，题目里仍保留识别文本，原声超出内联上限的只用识别文本。
+4. 后台发「正在输入」（`TurnControl.typing` 为假时不发）；然后在候选里选模型（需要时调用一次决策，在事务
+   之外、直接在本任务里 await），失败时退回，不挡住回复。语音不影响候选，由决策按内容选；决策接口收音频时
+   （`Router.decision_limits`）把本轮语音的原声和文字题目一起交给它，题目里仍保留识别文本，原声超出内联上限
+   的只用识别文本。
    调用过决策的话，调用对话模型之前在事务里再确认一次授权，已不能使用就停下，什么也不发。
 5. 按选出的模型的能力组装上下文（`context.RequestBuilder`），调用它，文字增量经 `MarkdownGuard` 处理后流式
    回复。出现非空白的正文之前不开始流式消息。
@@ -36,6 +39,14 @@
    给过你」）。
    处理被取消（关停）时限时收拢后台任务，照样写入已确认送达的部分与已知用量，再把取消传播出去。
 8. 正常结束后，把这一轮存下的图片与 PDF 交给后台写描述或摘要（配置了 `[describe]` 时）。
+
+**插话时重来**：每一轮带一个 `TurnControl`。任何内容交给 QQ 之前（固定说明、流式回复的第一片、纯文本）都先
+`claim()`，从此这一轮算「已开始显示」；`batching.py` 要重来时先 `preempt()`（已开始显示就不成功），成功了再
+取消这一轮。被这样取消的一轮停下模型、不发任何东西，**不写回复行**（用户消息仍是待回复的，由重新开始的那一轮
+带上），只记选模型的决策与已有的用量，然后把取消传播出去。
+
+**判断插话**（`judge()`）：在事务里复查授权、取出正在回答的消息与新消息的文字版（只有这个用户自己的），交给
+`routing.SteerJudge`；决策记录与用量挂在新消息里最后一条上，被取消时也照记。
 """
 
 import asyncio
@@ -58,6 +69,7 @@ from .context import (
     RequestBuilder,
     decision_history,
     decision_latest,
+    decision_text,
     fallback_allowed,
     plan_turn,
 )
@@ -98,7 +110,7 @@ from .media import (
     placeholders,
     skipped,
 )
-from .routing import LATEST_CHARS, DecisionRecord, Router, Selection
+from .routing import LATEST_CHARS, DecisionRecord, Router, Selection, Steer, SteerJudge
 from .storage import Database
 
 logger = logging.getLogger(__name__)
@@ -126,6 +138,43 @@ class SendRejectedError(SendError):
 
 class SendUncertainError(SendError):
     """说不准有没有发出，例如网络错误。"""
+
+
+class TurnControl:
+    """回答一轮的过程与决定「何时开始、要不要重来」的一方（`batching.py`）之间的约定。
+
+    - `typing`：开始时要不要发「正在输入」。每次发送都占用这条消息一次被动回复的名额，重来时不一定再发。
+    - `claim()`：回答一轮的一方在把任何内容交给 QQ 之前调用（同步，紧挨着发送）。之后 `displayed` 为真，
+      这一轮不能再被打断重来：QQ 的流式消息只能追加、不能撤回。已经 `preempt()` 过时返回 `False`，不能再发。
+    - `preempt()`：要重来的一方在取消这一轮之前调用。已经开始显示时返回 `False`（不能重来）；否则记下
+      `preempted`，之后 `claim()` 都不成功，被取消的这一轮按「重来」收尾：不写回复行，消息仍是待回复的。
+    - `begin()`：回答一轮的一方从流水里取出这一轮实际带上的用户消息（`included`，含之前遗留的待回复消息）后
+      调用，再调用 `notify`。要重来的一方据此判断重来的请求装不装得下新消息，插话判断的输入也用它。
+    """
+
+    def __init__(self, *, typing: bool = True, notify: Callable[[], None] | None = None) -> None:
+        self.typing = typing
+        self.displayed = False
+        self.preempted = False
+        self.included: tuple[int, ...] | None = None
+        self._notify = notify
+
+    def begin(self, included: Sequence[int]) -> None:
+        self.included = tuple(included)
+        if self._notify is not None:
+            self._notify()
+
+    def claim(self) -> bool:
+        if self.preempted:
+            return False
+        self.displayed = True
+        return True
+
+    def preempt(self) -> bool:
+        if self.displayed:
+            return False
+        self.preempted = True
+        return True
 
 
 class ReplyChannel(Protocol):
@@ -265,12 +314,21 @@ class _Begun:
 class _Turn:
     """一轮回复进行中的状态：后台任务、选模型、各次调用的结果。被取消时据此收尾。"""
 
-    def __init__(self, channel: ReplyChannel, user: User, selection: Selection) -> None:
+    def __init__(
+        self,
+        channel: ReplyChannel,
+        user: User,
+        selection: Selection,
+        *,
+        typing: bool = True,
+        may_show: Callable[[], bool] = lambda: True,
+    ) -> None:
         self.channel = channel
         self.user = user
         self.selection = selection
-        self.typing = asyncio.create_task(_typing(channel, user))
-        self.outbox = _Outbox(channel, self.typing)
+        # 不发「正在输入」时也放一个（立即结束的）任务，后面的流程不必区分。
+        self.typing = asyncio.create_task(_typing(channel, user) if typing else _skip())
+        self.outbox = _Outbox(channel, self.typing, may_show)
         self.attempts: list[_Attempt] = []
         self.run: _Run | None = None  # 正在进行的调用
         self.notices: list[str] = []  # 按实际组装出的请求要告诉用户的情况（各次组装合起来）
@@ -301,12 +359,13 @@ class Conversation:
         attachments: AttachmentSettings | None = None,
         fetcher: Fetcher | None = None,
         describer: Describer | None = None,
+        steer: SteerJudge | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         """`models` 按内部名字给出配置里的全部对话模型，`router` 决定每条消息用哪一个。
 
         `fetcher` 为 `None` 时不下载附件（都按「没有下载」处理，只用文字版）；`describer` 为 `None` 时不给
-        图片写描述、不给 PDF 写摘要。
+        图片写描述、不给 PDF 写摘要；`steer` 为 `None` 时不判断插话，一律当作补充。
         """
         self._db = db
         self._admin_openid = admin_openid
@@ -316,6 +375,7 @@ class Conversation:
         self._attachments = AttachmentSettings() if attachments is None else attachments
         self._fetcher = fetcher
         self._describer = describer
+        self._steer = SteerJudge() if steer is None else steer
         self._timezone = timezone
         self._clock = clock
         self._locks = _UserLocks()
@@ -348,7 +408,7 @@ class Conversation:
         """收下一条消息：先在事务里复查授权、写进流水（附件先写占位），再下载附件、按结果改写占位。没有写进流水
         时（只有不支持的内容、已不能使用对话）返回 `None`。
 
-        每条消息到达时就调用，不等攒批的计时。不持有这个用户的串行锁，回答上一轮的同时也能收。`channel` 只用来
+        每条消息到达时就调用。不持有这个用户的串行锁，回答上一轮的同时也能收。`channel` 只用来
         回「暂不支持」。
 
         - **先入库**：Gate 放行时已经提交了去重记录，平台重推会被丢弃，所以放行的消息无论如何都要进流水。写入
@@ -358,25 +418,78 @@ class Conversation:
         """
         return await self._receive(user, message, channel)
 
-    async def respond(self, user: User, messages: Sequence[int], channel: ReplyChannel) -> None:
-        """回答一轮：`messages` 是这一批写进流水的消息的编号（按时间排列，至少一条），回复挂在最后一条上，
-        `channel` 是回复最后一条消息的通道。
+    async def respond(
+        self,
+        user: User,
+        messages: Sequence[int],
+        channel: ReplyChannel,
+        control: TurnControl | None = None,
+    ) -> None:
+        """回答一轮：`messages` 是这一轮写进流水的消息的编号（按时间排列，至少一条），回复挂在最后一条上，
+        `channel` 是回复最后一条消息的通道，`control` 见 `TurnControl`（不给时发「正在输入」、不会被重来）。
 
-        这一轮的输入从流水里取：编号不大于回复所挂的那条、还没有被回复覆盖的用户消息（这一批，以及之前没有回复
-        的，如回复前关停留下的）。只由表情组成的消息不进输入；回复挂在这一批里最后一条不只由表情组成的消息上，
-        这一批都是表情时不回答。只就这一批的附件向用户说明情况。
+        这一轮的输入从流水里取：编号不大于回复所挂的那条、还没有被回复覆盖的用户消息（这一轮，以及之前没有回复
+        的，如回复前关停留下的）。只由表情组成的消息不进输入；回复挂在这一轮里最后一条不只由表情组成的消息上，
+        都是表情时不回答。只就这一轮的附件向用户说明情况。
 
-        在途的轮次（含被取消后的收尾与记账）由 `drain()` 等待：关停时要在关数据库之前等它们写完流水。
+        被 `preempt()` 之后取消时不写回复行，只记决策与用量，再把取消传播出去。在途的轮次（含被取消后的收尾与
+        记账）由 `drain()` 等待：关停时要在关数据库之前等它们写完流水。
         """
         if not messages:
             raise ValueError("一轮至少要有一条消息")
         async with self._tracking(), self._locks.hold(user.id):
-            await self._respond(user, messages, channel)
+            await self._respond(
+                user, messages, channel, TurnControl() if control is None else control
+            )
+
+    async def judge(self, user: User, answering: Sequence[int], latest: Sequence[int]) -> Steer:
+        """判断插话：`latest`（新到的消息的编号）是在补充或修正 `answering`（正在回答的这一轮的消息），还是一个
+        独立的新问题。
+
+        先在事务里复查授权并取出两组消息的文字版（只取这个用户的、不只由表情组成的）；已不能使用对话时不调用
+        决策，返回 `Steer.NEW`（不重来，下一轮开始时同样会被挡下）。没有配置 `[decisions]`、调用失败或超时返回
+        `Steer.ASSUMED`。决策记录与用量挂在 `latest` 的最后一条上，被取消时也照记，由 `drain()` 等待。
+        """
+        async with self._tracking():
+            found = await self._db.transaction(self._steer_texts, user, answering, latest)
+            if found is None:
+                logger.info("用户 %s 已不能使用对话，不判断插话", user.label)
+                return Steer.NEW
+            before, after = found
+            if not after:
+                return Steer.NEW
+            call = self._steer.prepare(before, after, label=user.label)
+            try:
+                return await call.run()
+            finally:
+                if call.record is not None:
+                    writing = asyncio.ensure_future(
+                        self._db.transaction(self._record_steer, user, latest[-1], call.record)
+                    )
+                    writing.add_done_callback(_retrieve_any)
+                    await asyncio.shield(writing)
+
+    async def ask(self, user: User, messages: Sequence[int], channel: ReplyChannel) -> None:
+        """单独发来的图片或文件等不到下文时，问用户想让我看什么（`texts.attachments_waiting()`），不调用模型。
+
+        `messages` 是这些附件所在的消息，`channel` 回复其中最后一条。先在事务里复查授权、数一数图片和文件。这句
+        问话不写进流水：写成回复会结束这一轮，用户接着发来的问题就看不到这些附件了。由 `drain()` 等待。
+        """
+        async with self._tracking():
+            counts = await self._db.transaction(self._waiting_counts, user, messages)
+            if counts is None:
+                logger.info("用户 %s 已不能使用对话，不再询问", user.label)
+                return
+            images, files = counts
+            if not images and not files:
+                return
+            await _send_notice(channel, texts.attachments_waiting(images, files), user)
+            logger.info("用户 %s 发来的附件等不到下文，问了一句", user.label)
 
     async def handle(
         self, user: User, messages: Sequence[ChatInput], channel: ReplyChannel
     ) -> None:
-        """不攒批地处理：依次收下 `messages`（同一个用户的若干条，按时间排列，至少一条），然后回答一轮，回复挂在
+        """收下就回答：依次收下 `messages`（同一个用户的若干条，按时间排列，至少一条），然后回答一轮，回复挂在
         最后一条不只由表情组成的消息上。都只由表情组成时只记进流水，不回复。
 
         与 `respond()` 一样由 `drain()` 等待。
@@ -391,7 +504,7 @@ class Conversation:
             ]
             answered = [item.message_id for item in received if not item.sticker]
             if answered:
-                await self._respond(user, answered, channel)
+                await self._respond(user, answered, channel, TurnControl())
 
     async def drain(self) -> None:
         """关停时调用：等所有在途的轮次结束（含被取消后的收尾与记账）。"""
@@ -455,7 +568,10 @@ class Conversation:
             self._discard(user, [acquired])
             logger.info("用户 %s 在附件下载期间已不能使用对话，删掉存下的文件", user.label)
 
-    async def _respond(self, user: User, messages: Sequence[int], channel: ReplyChannel) -> None:
+    async def _respond(
+        self, user: User, messages: Sequence[int], channel: ReplyChannel, control: TurnControl
+    ) -> None:
+        channel = _ClaimingChannel(channel, control)
         begun = await self._db.transaction(self._begin, user, messages)
         if begun is None:
             logger.info("用户 %s 已不能使用对话，不再回答", user.label)
@@ -463,6 +579,7 @@ class Conversation:
         if not begun.current:
             logger.info("用户 %s 没有待回复的消息", user.label)
             return
+        control.begin([entry.message_id for entry in begun.current if entry.message_id is not None])
         models = self._router.models
         max_size_mb = self._attachments.max_size_mb
         announce = frozenset(begun.message_ids)  # 只就这一批说明情况，之前的已经说明过
@@ -494,11 +611,17 @@ class Conversation:
             announce=announce,
             max_size_mb=max_size_mb,
         )
-        turn = _Turn(channel, user, selection)  # 「正在输入」在决策之前就发出
+        # 「正在输入」在决策之前就发出
+        turn = _Turn(channel, user, selection, typing=control.typing, may_show=control.claim)
         cancelled: asyncio.CancelledError | None = None
         try:
             outcome = await self._generate(turn, builder, begun.current)
         except asyncio.CancelledError as exc:
+            if control.preempted:
+                # 插话重来：什么都没交给 QQ，不写回复行，消息留给重新开始的那一轮；决策与用量照记。
+                await self._wind_down(turn, quiet=True)
+                await asyncio.shield(self._record_preempted(turn, begun.last_message_id))
+                raise
             cancelled = exc
             outcome = await self._wind_down(turn)
         except BaseException:
@@ -591,6 +714,17 @@ class Conversation:
             outcome.delivery.value,
         )
 
+    async def _record_preempted(self, turn: _Turn, message_id: int) -> None:
+        await self._db.transaction(
+            self._finish_preempted, turn.user, message_id, turn.selection.record, turn.attempts
+        )
+        logger.info(
+            "用户 %s 插话：取消了还没开始显示的回答（模型 %s，调用 %d 次），不记回复",
+            turn.user.label,
+            turn.attempts[-1].model if turn.attempts else turn.selection.model,
+            len(turn.attempts),
+        )
+
     # ---- 事务：同步，在数据库线程里执行 ----
 
     def _allowed(self, conn: sqlite3.Connection, user: User) -> bool:
@@ -646,7 +780,7 @@ class Conversation:
         if not access.chat_allowed(conn, user.id, self._admin_openid):
             return None
         now = self._clock()
-        # 只由表情组成的消息不进输入，回复也不挂在它们上面（接线层与攒批已经滤掉，这里再守一道）。
+        # 只由表情组成的消息不进输入，回复也不挂在它们上面（接线层与 `batching.py` 已经滤掉，这里再守一道）。
         message_ids = journal.not_faces_only(conn, user.id, message_ids)
         if not message_ids:
             return _Begun((), now, [], [], [], None)
@@ -688,19 +822,57 @@ class Conversation:
             now=now,
         )
         journal.set_given(conn, user.id, reply.messages, reply.given)
-        for attempt in reply.attempts:
-            usage = attempt.usage
-            journal.add_usage(
-                conn,
-                user_id=user.id,
-                message_id=message_id,
-                model=attempt.model,
-                provider=attempt.provider,
-                provider_model=attempt.provider_model,
-                input_tokens=None if usage is None else usage.input_tokens,
-                output_tokens=None if usage is None else usage.output_tokens,
-                now=now,
-            )
+        _record_usage(conn, user.id, message_id, reply.attempts, now)
+
+    def _finish_preempted(
+        self,
+        conn: sqlite3.Connection,
+        user: User,
+        message_id: int,
+        decision: DecisionRecord | None,
+        attempts: Sequence[_Attempt],
+    ) -> None:
+        """被插话打断的一轮：只记决策与各次调用的用量，不写回复行，也不动 `given`。"""
+        now = int(self._clock())
+        if decision is not None:
+            _record_decision(conn, user.id, message_id, decision, now)
+        _record_usage(conn, user.id, message_id, attempts, now)
+
+    def _steer_texts(
+        self,
+        conn: sqlite3.Connection,
+        user: User,
+        answering: Sequence[int],
+        latest: Sequence[int],
+    ) -> tuple[list[str], list[str]] | None:
+        if not access.chat_allowed(conn, user.id, self._admin_openid):
+            return None
+
+        def texts_of(ids: Sequence[int]) -> list[str]:
+            entries = journal.current_entries(conn, user.id, ids)
+            return [decision_text(entry) for entry in entries if not entry.faces_only]
+
+        return texts_of(answering), texts_of(latest)
+
+    def _record_steer(
+        self, conn: sqlite3.Connection, user: User, message_id: int, record: DecisionRecord
+    ) -> None:
+        _record_decision(conn, user.id, message_id, record, int(self._clock()))
+
+    def _waiting_counts(
+        self, conn: sqlite3.Connection, user: User, messages: Sequence[int]
+    ) -> tuple[int, int] | None:
+        """这些消息里的图片与文件各有几个；已不能使用对话时返回 `None`。"""
+        if not access.chat_allowed(conn, user.id, self._admin_openid):
+            return None
+        records = [
+            record
+            for items in journal.message_attachments(conn, user.id, messages).values()
+            for record in items
+        ]
+        images = sum(1 for record in records if record.kind is AttachmentKind.IMAGE)
+        files = sum(1 for record in records if record.kind is AttachmentKind.FILE)
+        return images, files
 
     # ---- 生成与回复 ----
 
@@ -970,10 +1142,10 @@ class Conversation:
         delivery = ReplyDelivery.REJECTED if sent else ReplyDelivery.NOTICE_LOST
         return _Outcome(outbox.delivered_answer, delivery)
 
-    async def _wind_down(self, turn: _Turn) -> _Outcome:
+    async def _wind_down(self, turn: _Turn, *, quiet: bool = False) -> _Outcome:
         """被取消后的收尾：在 `GRACE_SECONDS` 内停下模型、等在途的分片、结束流式消息。
 
-        再次被取消时不再等，按已知的情况收尾。
+        再次被取消时不再等，按已知的情况收尾。`quiet` 为真（插话重来）时不记「被取消」的日志。
         """
         deadline = asyncio.get_running_loop().time() + GRACE_SECONDS
         turn.outbox.stop()  # 先停掉排队的发送：之后在途的分片回来，也不会再发下一片
@@ -995,7 +1167,8 @@ class Conversation:
         if turn.run is not None:
             turn.attempts.append(turn.run.attempt(Ending.CANCELLED))
             turn.run = None
-        logger.info("处理用户 %s 的消息时被取消，按已确认送达的部分收尾", turn.user.label)
+        if not quiet:
+            logger.info("处理用户 %s 的消息时被取消，按已确认送达的部分收尾", turn.user.label)
         return _Outcome(turn.outbox.delivered_answer, ReplyDelivery.CANCELLED)
 
 
@@ -1011,6 +1184,28 @@ class _Reply:
     given: frozenset[int] = (
         frozenset()
     )  # 其中实际以原件交给了模型的附件（见 `journal.set_given()`）
+
+
+def _record_usage(
+    conn: sqlite3.Connection,
+    user_id: int,
+    message_id: int,
+    attempts: Sequence[_Attempt],
+    now: int,
+) -> None:
+    for attempt in attempts:
+        usage = attempt.usage
+        journal.add_usage(
+            conn,
+            user_id=user_id,
+            message_id=message_id,
+            model=attempt.model,
+            provider=attempt.provider,
+            provider_model=attempt.provider_model,
+            input_tokens=None if usage is None else usage.input_tokens,
+            output_tokens=None if usage is None else usage.output_tokens,
+            now=now,
+        )
 
 
 def _record_decision(
@@ -1097,6 +1292,40 @@ def _notice(ending: Ending) -> str | None:
             return None
 
 
+async def _skip() -> None:
+    pass
+
+
+class _ClaimingChannel:
+    """回答一轮时用的通道：交给 QQ 之前先 `TurnControl.claim()`。
+
+    回答一轮的任务被 `preempt()` 之后立即被取消，不会再走到发送，所以这里的拒绝只是兜底；流式回复的分片在
+    单独的任务里发，由 `_Outbox` 在第一片交出之前自己检查。
+    """
+
+    def __init__(self, channel: ReplyChannel, control: TurnControl) -> None:
+        self._channel = channel
+        self._control = control
+
+    def _claim(self) -> None:
+        if not self._control.claim():
+            raise asyncio.CancelledError
+
+    async def typing(self, seconds: int) -> None:
+        await self._channel.typing(seconds)
+
+    async def stream(self, text: str) -> None:
+        self._claim()
+        await self._channel.stream(text)
+
+    async def finish_stream(self) -> None:
+        await self._channel.finish_stream()
+
+    async def send(self, text: str) -> None:
+        self._claim()
+        await self._channel.send(text)
+
+
 async def _typing(channel: ReplyChannel, user: User) -> None:
     try:
         await channel.typing(TYPING_SECONDS)
@@ -1141,12 +1370,19 @@ class _Outbox:
     pyqbot 合并模式下失败时说不清失败的是哪一段。
 
     内容有三种状态：已入队（`_pending`）、已交给通道（`handed`，结果可能还不知道）、已确认送达
-    （`_delivered`）。出现非空白的正文之前不开始流式消息；第一片要等「正在输入」发完再发。
+    （`_delivered`）。出现非空白的正文之前不开始流式消息；第一片要等「正在输入」发完再发，交出之前先问
+    `may_show`（`TurnControl.claim()`）。
     """
 
-    def __init__(self, channel: ReplyChannel, before_first: asyncio.Task[None]) -> None:
+    def __init__(
+        self,
+        channel: ReplyChannel,
+        before_first: asyncio.Task[None],
+        may_show: Callable[[], bool] = lambda: True,
+    ) -> None:
         self._channel = channel
         self._before_first: asyncio.Task[None] | None = before_first
+        self._may_show = may_show  # 第一片交出之前调用；返回假（这一轮已被插话重来）就不再发
         self._pending = ""
         self._delivered: list[str] = []
         self._answer_length = 0  # 推进来的内容里，回答本身（不含固定说明）的长度
@@ -1256,6 +1492,9 @@ class _Outbox:
         while self._pending and self.error is None:
             if not self.handed and not self._pending.strip():
                 return  # 换模型时排队的正文被丢掉了，只剩空白
+            if not self.handed and not self._may_show():
+                self.stop()
+                return
             chunk, self._pending = self._pending, ""
             self.handed = True
             try:

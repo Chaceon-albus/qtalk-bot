@@ -5,7 +5,7 @@
 日志不记 openid 与消息正文。pyqbot 的异常文案里可能带 openid（请求路径），所以这里只记异常类型、
 `err_code` 与 `trace_id`。
 
-已授权用户的消息转成 `ChatInput`（`chat_input()`）交给攒批（`batching.Batcher`）：附件转成本项目自己的 `media.IncomingAttachment`，被引用的
+已授权用户的消息转成 `ChatInput`（`chat_input()`）交给 `batching.Batcher`：附件转成本项目自己的 `media.IncomingAttachment`，被引用的
 消息（`msg_elements`）里的图片也带上，卡片与转发的聊天记录记成不支持的内容。附件经 `QQDownloader` 用 pyqbot
 的 HTTP 客户端（`bot.http_client`）下载，不另建客户端；以后 pyqbot 加上代理参数，下载会自动走代理。
 
@@ -102,9 +102,9 @@ async def fetch_bot_name(client: pyqbot.Client) -> str:
 
 
 class QQChat:
-    """对话处理器：把 pyqbot 的单聊消息交给攒批（`Batcher`），回复经 `_QQReplyChannel` 发出。
+    """对话处理器：把 pyqbot 的单聊消息交给 `Batcher`，回复经 `_QQReplyChannel` 发出。
 
-    收下消息（复查授权、下载附件、写进流水）就返回，回答一批消息在 `Batcher` 自己的任务里进行，回复挂在这一批的
+    收下消息（复查授权、下载附件、写进流水）就返回，回答在 `Batcher` 自己的任务里进行，回复挂在这一轮的
     最后一条上（被动回复用它的消息 ID）。
     """
 
