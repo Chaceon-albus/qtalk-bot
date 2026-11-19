@@ -1,16 +1,21 @@
-"""对话的数据层：消息流水、用量与决策记录的读写。
+"""对话的数据层：消息流水、附件、用量与决策记录的读写。
 
 与 `access.py` 一样，函数都是同步的，第一个参数是连接，由调用方放进 `Database.transaction()`；时间是
-Unix 秒。查询一律按 `user_id` 过滤：一个用户的对话不会被取进另一个用户的上下文。
+Unix 秒。查询一律按 `user_id` 过滤：一个用户的对话与附件不会被取进另一个用户的上下文。
+
+一轮是若干条用户消息加上之后的回复（现在总是一条用户消息；以后攒批时一轮可以有多条），回复挂在其中最后
+一条上。没有回复的用户消息并进下一轮。
 """
 
 import json
 import sqlite3
-from collections.abc import Mapping
+from collections import defaultdict
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 
 from .llm import Provider, Role
+from .media import Acquired, AttachmentKind, AttachmentRecord, AttachmentStatus, DescribeStatus
 
 
 class Ending(StrEnum):
@@ -24,7 +29,9 @@ class Ending(StrEnum):
     EMPTY = "empty"  # 正常结束，但只有空白
     ABORTED = "aborted"  # 发送回答时出了说不准是否送达的错误，主动停止
     CANCELLED = "cancelled"  # 处理被取消（如关停）
-    SKIPPED = "skipped"  # 没有调用对话模型：选完模型后发现已不能使用对话（送达状态是 withheld）
+    # 没有调用对话模型：复查授权时发现已不能使用对话（送达状态是 withheld），或组装出的请求里没有可答的
+    # 内容（附件文件缺失、实际大小放不下），只发了说明（送达状态是 failed 或 notice_lost）。
+    SKIPPED = "skipped"
 
 
 class ReplyDelivery(StrEnum):
@@ -40,6 +47,9 @@ class ReplyDelivery(StrEnum):
     UNCERTAIN = "uncertain"  # 发送回答时出错，说不准送达了多少；content 是确认送达的部分
     WITHHELD = "withheld"  # 换备用模型前发现已不能使用对话，就此停止，没有再发任何东西
     CANCELLED = "cancelled"  # 处理被取消（如关停）；content 是确认送达的部分
+    # 没有送达任何回答（被取消、复查不通过、说不准送达了多少），但附件的说明（下载失败、看不了等）已确认送达；
+    # 结局记的是真实的情况（如 cancelled、skipped）
+    NOTICED = "noticed"
 
 
 class UsagePurpose(StrEnum):
@@ -47,16 +57,33 @@ class UsagePurpose(StrEnum):
 
     CHAT = "chat"  # 对话模型
     DECISION = "decision"  # 决策调用
+    DESCRIBE = "describe"  # 给图片写描述
 
 
 DECISION_USAGE_MODEL = "decisions"
 """决策调用的用量行在 `model` 列（内部名字）里记的固定值：决策模型不在 `[[models]]` 里，没有内部名字。"""
 
+DESCRIBE_USAGE_MODEL = "describe"
+"""给图片写描述的调用在用量表 `model` 列里记的固定值。"""
+
+ROWS_PER_TURN = 32
+"""取历史时每轮最多看的行数，用来给查询设上限；攒批的一轮也远到不了这么多条。"""
+
+
+CURRENT_TURN = -1
+"""`HistoryEntry.turns_ago` 的取值：并进当前这一轮的消息（末尾没有回复的用户消息，以及这一轮本身）。"""
+
 
 @dataclass(frozen=True, slots=True)
 class HistoryEntry:
+    """上下文里的一条消息。`attachments` 是用户消息的附件；`turns_ago` 是它属于往前数第几轮（0 是最近一轮
+    完整的对话，`CURRENT_TURN` 是当前这一轮）；`message_id` 是流水里的编号。后两项不参与比较。"""
+
     role: Role
     content: str = field(repr=False)
+    attachments: tuple[AttachmentRecord, ...] = ()
+    turns_ago: int = field(default=0, compare=False)
+    message_id: int | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -84,16 +111,155 @@ class UsageSummary:
 
 
 def add_user_message(
-    conn: sqlite3.Connection, user_id: int, content: str, qq_message_id: str, now: int
+    conn: sqlite3.Connection,
+    user_id: int,
+    content: str,
+    qq_message_id: str,
+    now: int,
+    *,
+    msg_idx: str | None = None,
 ) -> int:
-    """把用户发来的文字写进流水，返回它的编号。"""
+    """把用户发来的文字（没有文字时是空串）写进流水，返回它的编号。`msg_idx` 是平台的引用索引。"""
     row = conn.execute(
-        "INSERT INTO messages (user_id, role, content, qq_message_id, created_at)"
-        " VALUES (?, 'user', ?, ?, ?) RETURNING id",
-        (user_id, content, qq_message_id, now),
+        "INSERT INTO messages (user_id, role, content, qq_message_id, created_at, msg_idx)"
+        " VALUES (?, 'user', ?, ?, ?, ?) RETURNING id",
+        (user_id, content, qq_message_id, now, msg_idx),
     ).fetchone()
     message_id: int = row["id"]
     return message_id
+
+
+def add_attachment(
+    conn: sqlite3.Connection,
+    *,
+    user_id: int,
+    message_id: int,
+    item: Acquired,
+    describe: bool,
+    now: int,
+) -> AttachmentRecord:
+    """把一个附件写进附件表；`describe` 为真时描述的状态记成 `pending`。"""
+    describe_status = DescribeStatus.PENDING.value if describe else None
+    row = conn.execute(
+        "INSERT INTO attachments (user_id, message_id, position, quoted, kind, status, mime_type,"
+        " size, path, filename, text, describe_status, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        (
+            user_id,
+            message_id,
+            item.position,
+            int(item.quoted),
+            item.kind.value,
+            item.status.value,
+            item.mime_type,
+            item.size,
+            item.path,
+            item.filename,
+            item.text,
+            describe_status,
+            now,
+        ),
+    ).fetchone()
+    return AttachmentRecord(
+        id=row["id"],
+        message_id=message_id,
+        kind=item.kind,
+        status=item.status,
+        quoted=item.quoted,
+        mime_type=item.mime_type,
+        size=item.size,
+        path=item.path,
+        text=item.text,
+    )
+
+
+_ATTACHMENT_COLUMNS = "id, message_id, kind, status, quoted, mime_type, size, path, text"
+
+
+def _record(row: sqlite3.Row) -> AttachmentRecord:
+    return AttachmentRecord(
+        id=row["id"],
+        message_id=row["message_id"],
+        kind=AttachmentKind(row["kind"]),
+        status=AttachmentStatus(row["status"]),
+        quoted=bool(row["quoted"]),
+        mime_type=row["mime_type"],
+        size=row["size"],
+        path=row["path"],
+        text=row["text"],
+    )
+
+
+def message_attachments(
+    conn: sqlite3.Connection, user_id: int, message_ids: Iterable[int]
+) -> dict[int, tuple[AttachmentRecord, ...]]:
+    """这个用户的这些消息的附件，按消息编号分组、按顺序排列。别人的消息编号查不出任何东西。"""
+    ids = sorted(set(message_ids))
+    if not ids:
+        return {}
+    placeholders = ", ".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT {_ATTACHMENT_COLUMNS} FROM attachments"
+        f" WHERE user_id = ? AND message_id IN ({placeholders}) ORDER BY message_id, position",
+        (user_id, *ids),
+    ).fetchall()
+    grouped: defaultdict[int, list[AttachmentRecord]] = defaultdict(list)
+    for row in rows:
+        grouped[row["message_id"]].append(_record(row))
+    return {message_id: tuple(items) for message_id, items in grouped.items()}
+
+
+def pending_description(
+    conn: sqlite3.Connection, user_id: int, attachment_id: int
+) -> AttachmentRecord | None:
+    """这个用户的一个等着写描述、文件还在的图片；不是时返回 `None`。"""
+    row = conn.execute(
+        f"SELECT {_ATTACHMENT_COLUMNS} FROM attachments WHERE id = ? AND user_id = ?"
+        " AND kind = 'image' AND status = 'stored' AND describe_status = 'pending'",
+        (attachment_id, user_id),
+    ).fetchone()
+    return None if row is None else _record(row)
+
+
+def set_description(
+    conn: sqlite3.Connection,
+    user_id: int,
+    attachment_id: int,
+    *,
+    status: DescribeStatus,
+    text: str | None = None,
+) -> None:
+    """记下描述的结果；`text` 不为空时同时换掉文字版。"""
+    if text is None:
+        conn.execute(
+            "UPDATE attachments SET describe_status = ? WHERE id = ? AND user_id = ?",
+            (status.value, attachment_id, user_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE attachments SET describe_status = ?, text = ? WHERE id = ? AND user_id = ?",
+            (status.value, text, attachment_id, user_id),
+        )
+
+
+def referenced_paths(conn: sqlite3.Connection) -> set[str]:
+    """附件表仍引用的全部文件（相对路径）。"""
+    return {
+        row["path"] for row in conn.execute("SELECT path FROM attachments WHERE path IS NOT NULL")
+    }
+
+
+def expire_attachments(conn: sqlite3.Connection, cutoff: int) -> list[tuple[int, str]]:
+    """把 `cutoff` 之前存下、文件还在的附件改成 `expired`，返回它们的（用户编号，相对路径）。"""
+    rows = conn.execute(
+        "SELECT id, user_id, path FROM attachments WHERE path IS NOT NULL AND created_at < ?",
+        (cutoff,),
+    ).fetchall()
+    conn.executemany(
+        "UPDATE attachments SET status = 'expired', path = NULL WHERE id = ?",
+        [(row["id"],) for row in rows],
+    )
+    return [(row["user_id"], row["path"]) for row in rows]
 
 
 def add_reply(
@@ -118,31 +284,141 @@ def add_reply(
     return message_id
 
 
+NOTICE_DELIVERIES = frozenset((ReplyDelivery.FAILED, ReplyDelivery.REJECTED, ReplyDelivery.NOTICED))
+"""这几种送达状态下，用户确实收到了固定说明或附件的说明（即使 `content` 为空）。"""
+
+_ENDS_TURN_SQL = (
+    "(role = 'assistant' AND (content != '' OR delivery IN ("
+    + ", ".join(f"'{d.value}'" for d in sorted(NOTICE_DELIVERIES))
+    + ")))"
+)
+
+
+def ends_turn(content: str, delivery: ReplyDelivery) -> bool:
+    """一条回复是否真正结束了一轮：用户实际看到了回答（`content` 不为空），或收到了固定说明（`failed`、
+    `rejected`）或附件的说明（`noticed`）。
+
+    正文为空、又没有确认送达说明的（`withheld`、`cancelled`、`uncertain`、`notice_lost` 等）没有给用户任何
+    东西，不算轮次的边界：它回复的那些用户消息仍属于下一轮的输入，例如 PDF 已落库、还在等名额时关停，
+    重启后追问时那个 PDF 照样参加筛选。`_ENDS_TURN_SQL` 是同一条规则的 SQL 写法。
+    """
+    return content != "" or delivery in NOTICE_DELIVERIES
+
+
+def _last_boundary(conn: sqlite3.Connection, user_id: int, before: int) -> int | None:
+    """这个用户在消息 `before` 之前、最近一条真正结束了一轮的回复的编号；没有时返回 `None`。"""
+    row = conn.execute(
+        f"SELECT MAX(id) AS id FROM messages WHERE user_id = ? AND id < ? AND {_ENDS_TURN_SQL}",
+        (user_id, before),
+    ).fetchone()
+    boundary: int | None = row["id"]
+    return boundary
+
+
 def recent_history(
     conn: sqlite3.Connection, user_id: int, before: int, turns: int
 ) -> list[HistoryEntry]:
-    """这个用户在消息 `before` 之前最近 `turns` 轮的原文，按时间排列。
+    """这个用户在消息 `before` 之前最近 `turns` 轮已经完成的原文与附件，按时间排列。
 
-    一轮从一条用户消息开始，带上它之后的回复。没有送达任何文字的回复（`content` 为空）不带。
+    一轮是连续的若干条用户消息加上结束这一轮的回复（`ends_turn()`）；没有结束一轮的回复行不带，也不算边界。
+    最近一个边界之后还没有回复的用户消息属于当前这一轮，不在这里返回，由 `pending_messages()` 取出。先定下
+    边界、只对边界之前的部分限量（每轮最多看 `ROWS_PER_TURN` 行），所以连来再多待回复的消息也挤不掉已完成
+    的历史。正文为空的回复（只发了固定说明）不带，但算作一轮的结尾。
     """
     if turns <= 0:
         return []
+    boundary = _last_boundary(conn, user_id, before)
+    if boundary is None:
+        return []
+    # 不算边界的回复行（正文为空、没给用户任何东西的）在限量之前就排除，几十条这样的行也挤不掉较早的问答；
+    # 它们回复的用户消息照常留着，并进下一个边界那一轮。
     rows = conn.execute(
-        """
-        SELECT role, content FROM messages
-        WHERE user_id = :user AND id < :before AND (role = 'user' OR content != '')
-          AND id >= (
-            SELECT COALESCE(MIN(id), :before) FROM (
-              SELECT id FROM messages
-              WHERE user_id = :user AND role = 'user' AND id < :before
-              ORDER BY id DESC LIMIT :turns
-            )
-          )
-        ORDER BY id
-        """,
-        {"user": user_id, "before": before, "turns": turns},
+        "SELECT id, role, content, delivery FROM messages WHERE user_id = ? AND id <= ?"
+        f" AND (role = 'user' OR {_ENDS_TURN_SQL}) ORDER BY id DESC LIMIT ?",
+        (user_id, boundary, turns * ROWS_PER_TURN),
     ).fetchall()
-    return [HistoryEntry(Role(row["role"]), row["content"]) for row in rows]
+    picked: list[tuple[sqlite3.Row, int]] = []  # （行，往前数第几轮），从新到旧
+    age = 0
+    seen_user = False
+    for row in rows:
+        if row["role"] == Role.ASSISTANT.value:
+            if not ends_turn(row["content"], ReplyDelivery(row["delivery"])):
+                continue
+            if seen_user:
+                age += 1  # 比这一组用户消息更早的一条回复：往前的又一轮
+                seen_user = False
+                if age == turns:
+                    break
+        else:
+            seen_user = True
+        picked.append((row, age))
+    picked.reverse()
+    attachments = message_attachments(
+        conn, user_id, (row["id"] for row, _ in picked if row["role"] == Role.USER.value)
+    )
+    return [
+        HistoryEntry(
+            Role(row["role"]),
+            row["content"],
+            attachments.get(row["id"], ()),
+            turns_ago=age,
+            message_id=row["id"],
+        )
+        for row, age in picked
+        if row["role"] == Role.USER.value or row["content"] != ""
+    ]
+
+
+def pending_messages(conn: sqlite3.Connection, user_id: int, before: int) -> list[HistoryEntry]:
+    """这个用户在消息 `before` 之前、最近一个轮次边界（`ends_turn()`）之后还没有回复的用户消息（与它们的
+    附件），按时间排列。
+
+    它们属于当前这一轮（只收到固定说明的消息、回复前关停留下的消息等），`turns_ago` 是 `CURRENT_TURN`。
+    最多取最近的 `ROWS_PER_TURN` 条。
+    """
+    boundary = _last_boundary(conn, user_id, before) or 0
+    rows = conn.execute(
+        "SELECT id, content FROM messages WHERE user_id = ? AND role = 'user' AND id > ? AND id < ?"
+        " ORDER BY id DESC LIMIT ?",
+        (user_id, boundary, before, ROWS_PER_TURN),
+    ).fetchall()
+    rows.reverse()
+    attachments = message_attachments(conn, user_id, (row["id"] for row in rows))
+    return [
+        HistoryEntry(
+            Role.USER,
+            row["content"],
+            attachments.get(row["id"], ()),
+            turns_ago=CURRENT_TURN,
+            message_id=row["id"],
+        )
+        for row in rows
+    ]
+
+
+def current_entries(
+    conn: sqlite3.Connection, user_id: int, message_ids: Sequence[int]
+) -> list[HistoryEntry]:
+    """这一轮的用户消息（按编号）与它们的附件，按时间排列。"""
+    if not message_ids:
+        return []
+    placeholders = ", ".join("?" * len(message_ids))
+    rows = conn.execute(
+        f"SELECT id, content FROM messages WHERE user_id = ? AND role = 'user'"
+        f" AND id IN ({placeholders}) ORDER BY id",
+        (user_id, *message_ids),
+    ).fetchall()
+    attachments = message_attachments(conn, user_id, message_ids)
+    return [
+        HistoryEntry(
+            Role.USER,
+            row["content"],
+            attachments.get(row["id"], ()),
+            turns_ago=CURRENT_TURN,
+            message_id=row["id"],
+        )
+        for row in rows
+    ]
 
 
 def last_answered_model(conn: sqlite3.Connection, user_id: int, before: int) -> str | None:

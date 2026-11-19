@@ -4,6 +4,7 @@
 事件的形状照 SDK 3.55.1 的类型定义（`openai/types/responses/*_event.py`）与官方的流式事件文档。
 """
 
+import base64
 import json
 import logging
 import traceback
@@ -16,16 +17,21 @@ import pytest
 
 from qtalk_bot.llm import (
     MAX_TOKENS_PER_CALL,
+    AudioPart,
     ChatEvent,
     ChatRequest,
     ErrorKind,
+    FilePart,
     Finished,
     FinishReason,
+    ImagePart,
     Message,
     ModelError,
+    Part,
     Provider,
     Role,
     TextDelta,
+    TextPart,
     Usage,
 )
 from qtalk_bot.llm.openai_responses import OFFICIAL_BASE_URL, OpenAIChatModel, create_client
@@ -521,3 +527,74 @@ async def test_absurd_token_counts_are_reported_as_missing(
         model_on(streaming([CREATED, ITEM_ADDED, text_delta(3, "好"), completed]))
     )
     assert events[-2] == expected
+
+
+# ---- 附件（里程碑 5a） ----
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\nfake-png"
+PDF_BYTES = b"%PDF-1.7 fake"
+WAV_BYTES = b"RIFF\x00\x00\x00\x00WAVEfake"
+
+
+def b64(data: bytes) -> str:
+    return base64.b64encode(data).decode()
+
+
+def with_parts(*parts: Part) -> ChatRequest:
+    return ChatRequest(
+        system="系统提示词", messages=(Message(Role.USER, parts),), max_output_tokens=100
+    )
+
+
+MEDIA_COMPLETED: Payload = {
+    "type": "response.completed",
+    "sequence_number": 2,
+    "response": response("completed", usage=usage(5, 1)),
+}
+
+
+async def test_image_and_pdf_are_inlined_as_data_urls() -> None:
+    server = streaming([CREATED, text_delta(1, "看到了"), MEDIA_COMPLETED])
+    request = with_parts(
+        TextPart("这是什么"),
+        ImagePart(PNG_BYTES, "image/png"),
+        FilePart(PDF_BYTES, "application/pdf"),
+    )
+
+    events = [event async for event in model_on(server).stream(request)]
+
+    assert events[-1] == DONE
+    assert server.body["input"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "这是什么"},
+                {
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{b64(PNG_BYTES)}",
+                    "detail": "auto",
+                },
+                {
+                    "type": "input_file",
+                    "filename": "document.pdf",
+                    "file_data": f"data:application/pdf;base64,{b64(PDF_BYTES)}",
+                },
+            ],
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "part",
+    [AudioPart(WAV_BYTES, "audio/wav"), ImagePart(b"GIF89a", "image/gif")],
+    ids=["audio", "gif"],
+)
+async def test_unsupported_input_fails_without_a_request(part: Part) -> None:
+    server = streaming([CREATED, MEDIA_COMPLETED])
+
+    with pytest.raises(ModelError) as info:
+        async for _ in model_on(server).stream(with_parts(TextPart("听听"), part)):
+            pass
+
+    assert info.value.kind is ErrorKind.UNSUPPORTED
+    assert server.requests == []

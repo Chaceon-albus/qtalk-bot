@@ -2,13 +2,16 @@
 
 不依赖 SDK 与数据库：决策经 `llm.decisions.DecisionModel`，历史由调用方从流水里取出后传进来。
 
-- 没有 `[decisions]`、或只配置了一个模型时不调用决策，始终用默认模型（与里程碑 3 的行为相同）。
-- 题目只有一道选择题（题目名 `QUESTION`）：选项是配置里的全部模型，取值是内部名字，描述是 `description`。
+- 每条消息先由调用方按附件筛出候选模型（`context.plan_turn()`），只在候选里选；不给候选时是全部模型。
+- 没有 `[decisions]`、或候选只有一个时不调用决策：用默认模型，它不在候选里时用候选里排在最前面的。
+- 题目只有一道选择题（题目名 `QUESTION`）：选项是候选模型（按配置的顺序），取值是内部名字，描述是
+  `description`。
 - 题目的输入是 JSON 文本：`history` 是这个用户最近几轮的对话，`latest` 是当前这条消息（见
   `decision_input()`）。只含这个用户自己的对话。
 - 选择规则见 `choose()`：取概率最高的；它和上一轮实际回答的模型不同时，要高出至少 `switch_margin` 才换。
-- 任何失败（超时、调用失败、拒答、坏响应、意外的异常）都不挡住回复：沿用上一轮的模型（它已不在配置里时
-  当作没有），没有上一轮就用默认模型，记日志，照常回答。
+  上一轮的模型不在候选里时这条不适用，直接取概率最高的。
+- 任何失败（超时、调用失败、拒答、坏响应、意外的异常）都不挡住回复：沿用上一轮的模型（它不在候选里时
+  当作没有），没有上一轮就用默认模型（它也不在候选里时用候选里排在最前面的），记日志，照常回答。
 - 每次调用决策都留一条 `DecisionRecord`（被取消时也有），由调用方写进数据库；不调用决策时没有记录。
 """
 
@@ -138,17 +141,12 @@ class Router:
         self._models = {model.name: model for model in models}
         self.default = next(model.name for model in models if model.default)
         self._clock = clock
+        self._order = [model.name for model in models]
         self._settings: DecisionSettings | None = None
         self._decider: DecisionModel | None = None
-        self._question: ChoiceQuestion | None = None
         if decisions is not None and decider is not None and len(models) > 1:
             self._settings = decisions
             self._decider = decider
-            self._question = ChoiceQuestion(
-                name=QUESTION,
-                instructions=decisions.instructions,
-                options=tuple(Option(model.name, model.description or "") for model in models),
-            )
 
     @property
     def deciding(self) -> bool:
@@ -163,22 +161,46 @@ class Router:
     def model(self, name: str) -> ModelSettings:
         return self._models[name]
 
-    def fallback(self, previous: str | None) -> str:
-        """不调用决策、或决策失败时用的模型。"""
-        if self._settings is None:
-            return self.default  # 不做决策：始终用默认模型
-        return previous if previous in self._models else self.default
+    @property
+    def models(self) -> list[ModelSettings]:
+        """配置里的全部模型，按配置的顺序。"""
+        return [self._models[name] for name in self._order]
+
+    def fallback(self, previous: str | None, candidates: Sequence[str] | None = None) -> str:
+        """不调用决策、或决策失败时用的模型：做决策时先沿用上一轮的，然后是默认模型，都不在候选里时取候选里
+        排在最前面的。"""
+        allowed = self._order if candidates is None else candidates
+        if self._settings is not None and previous is not None and previous in allowed:
+            return previous
+        return self.default if self.default in allowed else allowed[0]
 
     def select(
-        self, history: Sequence[HistoryEntry], latest: str, previous: str | None, *, label: str
+        self,
+        history: Sequence[HistoryEntry],
+        latest: str,
+        previous: str | None,
+        *,
+        label: str,
+        candidates: Sequence[str] | None = None,
     ) -> Selection:
-        """为一条消息准备选模型；`label` 是记日志用的用户称呼。用 `await selection.run()` 执行。"""
-        if previous not in self._models:
-            previous = None  # 上一轮的模型已不在配置里：当作没有上一轮
+        """为一条消息准备选模型；`label` 是记日志用的用户称呼，`candidates` 是能处理这一轮附件的模型（不给时
+        是全部）。用 `await selection.run()` 执行。"""
+        allowed = [name for name in self._order if candidates is None or name in candidates]
+        if not allowed:
+            raise ValueError("候选模型不能为空")
+        if previous not in allowed:
+            previous = None  # 上一轮的模型已不在配置里或不在候选里：当作没有上一轮
         plan: _Plan | None = None
-        if self._decider is not None and self._settings is not None and self._question is not None:
-            plan = _Plan(self._decider, self._settings, self._question, self._clock)
-        return Selection(plan, history, latest, previous, self.fallback(previous), label)
+        if self._decider is not None and self._settings is not None and len(allowed) > 1:
+            question = ChoiceQuestion(
+                name=QUESTION,
+                instructions=self._settings.instructions,
+                options=tuple(
+                    Option(name, self._models[name].description or "") for name in allowed
+                ),
+            )
+            plan = _Plan(self._decider, self._settings, question, self._clock)
+        return Selection(plan, history, latest, previous, self.fallback(previous, allowed), label)
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +237,11 @@ class Selection:
         self._label = label
         self.model = fallback
         self.record: DecisionRecord | None = None
+
+    @property
+    def deciding(self) -> bool:
+        """`run()` 是否会调用决策。"""
+        return self._plan is not None
 
     async def run(self) -> str:
         plan = self._plan

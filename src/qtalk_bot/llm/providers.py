@@ -1,4 +1,4 @@
-"""按配置创建对话模型与决策模型。每家服务商一个 SDK 客户端（带上 `[providers.<服务商>]` 的端点与代理），
+"""按配置创建对话模型、决策模型与写图片描述的模型。每家服务商一个 SDK 客户端（带上 `[providers.<服务商>]` 的端点与代理），
 由用到它的模型共用，`ChatModels.aclose()` 时关闭。"""
 
 from collections.abc import Iterator, Mapping, Sequence
@@ -8,7 +8,13 @@ from typing import Self
 import openai
 from google import genai
 
-from ..config import DecisionSettings, ModelSettings, ProvidersSettings, Secrets
+from ..config import (
+    DecisionSettings,
+    DescribeSettings,
+    ModelSettings,
+    ProvidersSettings,
+    Secrets,
+)
 from . import ChatModel, Provider
 from .decisions import DecisionModel
 from .gemini_decisions import GeminiDecisionModel
@@ -18,9 +24,12 @@ from .openai_decisions import OpenAIDecisionModel
 from .openai_responses import OpenAIChatModel
 from .openai_responses import create_client as create_openai_client
 
+DESCRIBER_NAME = "describe"
+
 
 class ChatModels(Mapping[str, ChatModel]):
-    """配置里的全部对话模型，按内部名字取用；配置了 `[decisions]` 时还有决策模型（`decider`）。
+    """配置里的全部对话模型，按内部名字取用；配置了 `[decisions]` 时还有决策模型（`decider`），配置了
+    `[describe]` 时还有写图片描述的模型（`describer`，内部名字是 `DESCRIBER_NAME`）。
 
     用 `async with` 或 `aclose()` 关闭底层客户端。调用方要先用 `config.check_provider_secrets()` 确认用到的
     服务商都有密钥。
@@ -32,6 +41,7 @@ class ChatModels(Mapping[str, ChatModel]):
         secrets: Secrets,
         providers: ProvidersSettings | None = None,
         decisions: DecisionSettings | None = None,
+        describe: DescribeSettings | None = None,
     ) -> None:
         self._providers = ProvidersSettings() if providers is None else providers
         self._secrets = secrets
@@ -43,6 +53,16 @@ class ChatModels(Mapping[str, ChatModel]):
         self.decider: DecisionModel | None = None
         if decisions is not None:
             self.decider = self._create_decider(decisions)
+        self.describer: ChatModel | None = None
+        if describe is not None:
+            self.describer = self._create(
+                ModelSettings(
+                    name=DESCRIBER_NAME,
+                    provider=describe.provider,
+                    model=describe.model,
+                    reasoning=describe.reasoning,
+                )
+            )
 
     def __getitem__(self, name: str) -> ChatModel:
         return self._models[name]

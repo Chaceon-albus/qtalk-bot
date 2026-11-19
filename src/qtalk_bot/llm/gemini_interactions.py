@@ -3,6 +3,10 @@
 请求关掉服务端存储（`store=False`），历史每次以 `user_input` / `model_output` 步骤完整带上；配置了推理
 强度时放进 `generation_config.thinking_level`。
 
+附件都以 base64 内联（`data` 是不带 `data:` 前缀的 base64 字符串）：图片是
+`{"type": "image", "data": …, "mime_type": …}`，音频是 `{"type": "audio", …}`，PDF 是
+`{"type": "document", …}`。类型不在 `INPUT_LIMITS` 里时不发请求，抛 `ModelError(UNSUPPORTED)`。
+
 处理的流式事件：
 - `step.start`：记下每个步骤（按 `index`）的类型。
 - `step.delta`：`model_output` 步骤里 `type == "text"` 的增量转成 `TextDelta`；思考摘要等现在忽略。
@@ -28,6 +32,7 @@
 """
 
 import asyncio
+import base64
 from collections.abc import AsyncGenerator
 from typing import cast
 
@@ -36,14 +41,20 @@ from google.genai import interactions, types
 from google.genai.client import DebugConfig
 
 from . import (
+    INPUT_LIMITS,
+    AudioPart,
     ChatEvent,
     ChatRequest,
     ErrorKind,
+    FilePart,
     Finished,
     FinishReason,
+    ImagePart,
     Masked,
     Message,
+    Modality,
     ModelError,
+    Part,
     Provider,
     Role,
     TextDelta,
@@ -56,6 +67,8 @@ from . import (
 OFFICIAL_BASE_URL = "https://generativelanguage.googleapis.com/"
 API_VERSION = "v1"  # SDK 的默认版本；固定下来，免得被 GOOGLE_GENAI_API_VERSION 改掉
 RETRY_ATTEMPTS = 2  # 含第一次；SDK 默认 5 次，更多的重试交给备用模型
+
+_LIMITS = INPUT_LIMITS[Provider.GEMINI]
 
 # 流里的 interaction 状态中认得的失败；其余的归到 OTHER。
 _FAILED_STATUSES = frozenset(("failed", "cancelled"))
@@ -132,10 +145,11 @@ class GeminiChatModel:
             config["thinking_level"] = cast(interactions.ThinkingLevel, self._reasoning)
         # `create` 的 `timeout` 参数类型来自 SDK 对 httpx 的可选导入，pyright 看作 Unknown；`model` 的类型是
         # 已知模型名的 Literal 加 SDK 自己的 str 子类，配置里的任意模型名只能 cast 过去。
+        inputs = [_step(message) for message in request.messages]
         try:
             events = await self._client.aio.interactions.create(  # pyright: ignore[reportUnknownMemberType]
                 model=cast(interactions.Model, self._model),
-                input=[_step(message) for message in request.messages],
+                input=inputs,
                 system_instruction=request.system,
                 generation_config=config,
                 store=False,
@@ -239,16 +253,57 @@ class _UsageTotal:
 
 
 def _step(message: Message) -> interactions.StepParam:
-    content: list[interactions.ContentParam] = [_part(part) for part in message.parts]
+    """转换一条消息；有不支持的内容时抛 `ModelError(UNSUPPORTED)`。"""
     match message.role:
         case Role.USER:
+            content = [_part(part) for part in message.parts]
             return {"type": "user_input", "content": content}
         case Role.ASSISTANT:
-            return {"type": "model_output", "content": content}
+            # 助手的历史只存文字。
+            if not all(isinstance(part, TextPart) for part in message.parts):
+                raise ModelError(Provider.GEMINI, ErrorKind.UNSUPPORTED)
+            return {"type": "model_output", "content": [_part(part) for part in message.parts]}
 
 
-def _part(part: TextPart) -> interactions.TextContentParam:
-    return {"type": "text", "text": part.text}
+def _part(part: Part) -> interactions.ContentParam:
+    match part:
+        case TextPart(text=text):
+            text_content: interactions.TextContentParam = {"type": "text", "text": text}
+            return text_content
+        case ImagePart(data=data, mime_type=mime):
+            _check(Modality.IMAGE, mime)
+            # SDK 把 mime_type 写成已知取值的 Literal 加它自己的 str 子类；这里的取值已对照过 INPUT_LIMITS。
+            image: interactions.ImageContentParam = {
+                "type": "image",
+                "data": _base64(data),
+                "mime_type": cast(interactions.ImageContentMimeType, mime),
+            }
+            return image
+        case AudioPart(data=data, mime_type=mime):
+            _check(Modality.AUDIO, mime)
+            audio: interactions.AudioContentParam = {
+                "type": "audio",
+                "data": _base64(data),
+                "mime_type": cast(interactions.AudioContentMimeType, mime),
+            }
+            return audio
+        case FilePart(data=data, mime_type=mime):
+            _check(Modality.FILE, mime)
+            document: interactions.DocumentContentParam = {
+                "type": "document",
+                "data": _base64(data),
+                "mime_type": cast(interactions.DocumentContentMimeType, mime),
+            }
+            return document
+
+
+def _check(modality: Modality, mime_type: str) -> None:
+    if not _LIMITS.accepts(modality, mime_type):
+        raise ModelError(Provider.GEMINI, ErrorKind.UNSUPPORTED)
+
+
+def _base64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
 
 
 def _field(usage: interactions.Usage, name: str) -> object:

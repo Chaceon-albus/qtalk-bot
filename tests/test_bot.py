@@ -10,7 +10,7 @@ import logging
 import sqlite3
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, MutableMapping
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -26,15 +26,20 @@ from qtalk_bot.access import User
 from qtalk_bot.bot import (
     MAX_ATTACHMENTS_DESCRIBED,
     MAX_ELEMENTS_DESCRIBED,
+    MAX_REDIRECTS,
     QQChat,
+    QQDownloader,
     ShareLinks,
+    chat_input,
     describe_non_text,
+    download_refusal,
     fetch_bot_name,
     is_rejection,
+    refuse_cookies,
     register,
 )
 from qtalk_bot.chat import ChatHandler
-from qtalk_bot.config import ChatSettings, InviteSettings, ModelSettings
+from qtalk_bot.config import AttachmentSettings, ChatSettings, InviteSettings, ModelSettings
 from qtalk_bot.conversation import TYPING_SECONDS, Conversation
 from qtalk_bot.gate import Delivery, FriendAdded, Gate, IncomingMessage, Outcome, Reply
 from qtalk_bot.llm import (
@@ -42,14 +47,35 @@ from qtalk_bot.llm import (
     ChatRequest,
     Finished,
     FinishReason,
+    ImagePart,
+    Message,
+    Modality,
+    Part,
     Provider,
+    Role,
     TextDelta,
+    TextPart,
     Usage,
+)
+from qtalk_bot.media import (
+    AttachmentKind,
+    DownloadError,
+    DownloadTooLargeError,
+    Fetcher,
+    IncomingAttachment,
+    MediaStore,
 )
 from qtalk_bot.routing import Router
 from qtalk_bot.storage import DATABASE_FILENAME, Database
 
 HANG_GUARD = 5  # 秒：回归时应失败而不是挂起
+
+
+def part_text(part: Part) -> str:
+    assert isinstance(part, TextPart)
+    return part.text
+
+
 SETTLE = 0.05  # 秒：所有事件处理完之后再等一会儿，确认没有多发
 
 # 明显是假的 openid 与邀请码。
@@ -164,6 +190,7 @@ class Platform:
         respond: Respond | None = None,
         share_link_fails: bool = False,
         delay: Callable[[Payload], float] | None = None,
+        files: dict[str, bytes] | None = None,
     ) -> None:
         self.events = events
         self.respond = respond
@@ -174,8 +201,13 @@ class Platform:
         self.streamed: list[Payload] = []  # 流式消息的分片
         self.share_links: list[Payload] = []
         self.changed = asyncio.Event()  # 每发出一条消息置位一次
+        self.files = files or {}  # 附件的下载地址 → 内容
+        self.downloads: list[httpx2.Request] = []
 
     async def handle(self, request: httpx2.Request) -> httpx2.Response:
+        if str(request.url) in self.files:
+            self.downloads.append(request)
+            return httpx2.Response(200, content=self.files[str(request.url)])
         path = request.url.path
         if path == "/app/getAppAccessToken":
             return httpx2.Response(200, json={"access_token": "fake-token", "expires_in": "7200"})
@@ -301,6 +333,7 @@ async def run_until_handled(
     invites: InviteSettings | None = None,
     settled: list[Delivery] | None = None,
     until: Callable[[], bool] = lambda: True,
+    on_bot: Callable[[pyqbot.Bot], None] | None = None,
 ) -> None:
     """跑机器人，直到 `events` 个事件都经过 `Gate`、平台至少收到 `sent` 条消息、`until()` 为真，
     再稍等后关闭。"""
@@ -318,6 +351,8 @@ async def run_until_handled(
         gate.changed = platform.changed
         gate.settled = settled if settled is not None else []
         register(bot, gate, chat)
+        if on_bot is not None:
+            on_bot(bot)
         running = asyncio.create_task(bot.start())
         while gate.done < events or len(platform.sent) < sent or not until():
             platform.changed.clear()
@@ -804,7 +839,7 @@ async def test_text_message_is_answered_with_a_stream_and_recorded(db: Database)
 
     await run_until_handled(platform, db, chat, events=1, sent=0, until=lambda: chat.handled == 1)
 
-    assert [m.parts[0].text for m in model.requests[0].messages] == ["你好"]
+    assert [part_text(m.parts[0]) for m in model.requests[0].messages] == ["你好"]
     assert platform.sent == [
         {
             "path": f"/v2/users/{ALICE}/messages",
@@ -851,18 +886,449 @@ async def test_rejected_stream_is_resent_as_plain_message(db: Database) -> None:
     assert tuple(row) == ("你好，我是助手。", "plain")
 
 
-async def test_image_only_message_gets_text_only_notice_without_model_call(db: Database) -> None:
+class LateDownloader:
+    """接线层的下载器要用 `Bot`，而 `Bot` 在 `run_until_handled` 里才创建：创建后再接上。"""
+
+    def __init__(self) -> None:
+        self.inner: QQDownloader | None = None
+
+    def attach(self, bot: pyqbot.Bot) -> None:
+        self.inner = QQDownloader(bot)
+
+    async def fetch(self, url: str, *, max_bytes: int) -> AsyncGenerator[bytes]:
+        assert self.inner is not None
+        async with aclosing(self.inner.fetch(url, max_bytes=max_bytes)) as chunks:
+            async for chunk in chunks:
+                yield chunk
+
+    async def aclose(self) -> None:
+        if self.inner is not None:
+            await self.inner.aclose()
+
+
+IMAGE_URL = "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=SECRETTOKEN"
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+
+def media_chat(
+    db: Database, model: FakeModel, platform: Platform, tmp_path: Path
+) -> tuple[Tracked, LateDownloader]:
+    downloader = LateDownloader()
+    settings = AttachmentSettings()
+    conversation = Conversation(
+        db,
+        admin_openid=ADMIN,
+        models={"main": model},
+        router=Router(
+            [
+                ModelSettings(
+                    name="main",
+                    provider=model.provider,
+                    model=model.model,
+                    default=True,
+                    inputs=frozenset({Modality.IMAGE}),
+                )
+            ]
+        ),
+        settings=ChatSettings(),
+        timezone=ZoneInfo("Asia/Shanghai"),
+        attachments=settings,
+        fetcher=Fetcher(MediaStore.under(tmp_path), downloader, settings),
+    )
+    return Tracked(QQChat(conversation), platform), downloader
+
+
+async def test_image_message_is_downloaded_shown_to_the_model_and_recorded(
+    db: Database, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    alice = await welcomed_alice(db)
+    # 照实测：标着 image/jpeg、扩展名 png，实际是 PNG。
+    image = {
+        "content_type": "image/jpeg",
+        "filename": "我的秘密照片.png",
+        "size": len(PNG_BYTES),
+        "url": IMAGE_URL,
+    }
+    message = c2c(
+        ALICE,
+        "",
+        "ROBOT1.0_fake-1",
+        attachments=[image],
+        message_scene={"source": "default", "ext": ["msg_idx=REFIDX_fake-1"]},
+    )
+    platform = Platform([message], files={IMAGE_URL: PNG_BYTES})
+    model = FakeModel(ANSWER)
+    chat, downloader = media_chat(db, model, platform, tmp_path)
+
+    with caplog.at_level(logging.INFO):
+        await run_until_handled(
+            platform,
+            db,
+            chat,
+            events=1,
+            sent=0,
+            until=lambda: chat.handled == 1,
+            on_bot=downloader.attach,
+        )
+
+    (download,) = platform.downloads
+    assert "authorization" not in download.headers  # 不把 QQ 的鉴权头带到下载地址
+    assert model.requests[0].messages == (Message(Role.USER, (ImagePart(PNG_BYTES, "image/png"),)),)
+    assert "".join(chunk["content_raw"] for chunk in platform.streamed) == "你好，我是助手。"
+    messages = await db.fetch_all("SELECT role, content, msg_idx FROM messages ORDER BY id")
+    assert [tuple(row) for row in messages] == [
+        ("user", "", "REFIDX_fake-1"),
+        ("assistant", "你好，我是助手。", None),
+    ]
+    row = await db.fetch_one(
+        "SELECT user_id, kind, status, mime_type, path, filename FROM attachments"
+    )
+    assert row is not None
+    assert tuple(row)[:4] == (alice.id, "image", "stored", "image/png")
+    assert str(row["path"]).startswith(f"{alice.id}/")
+    assert row["filename"] == "我的秘密照片.png"
+    logs = formatted_logs(caplog)
+    assert "SECRETTOKEN" not in logs
+    assert "我的秘密照片" not in logs
+
+
+async def test_image_without_a_capable_model_gets_a_notice_and_no_model_call(
+    db: Database,
+) -> None:
     await welcomed_alice(db)
     image = {"content_type": "image/png", "filename": "a.png", "url": "https://img.invalid/a"}
     platform = Platform([c2c(ALICE, "", "ROBOT1.0_fake-1", attachments=[image])])
     model = FakeModel(ANSWER)
-    chat = real_chat(db, model, platform)
+    chat = real_chat(db, model, platform)  # 只收文字的模型，不下载附件
 
     await run_until_handled(platform, db, chat, events=1, sent=1, until=lambda: chat.handled == 1)
 
     assert model.requests == []
-    assert [m["content"] for m in platform.sent] == [texts.TEXT_ONLY]
-    assert await db.fetch_all("SELECT id FROM messages") == []
+    assert [m["content"] for m in platform.sent] == [texts.IMAGE_UNAVAILABLE]
+    rows = await db.fetch_all("SELECT kind, status FROM attachments")
+    assert [tuple(row) for row in rows] == [("image", "skipped")]
+
+
+class CapturingChat:
+    """对话处理器的替身：记下收到的 pyqbot 消息。"""
+
+    def __init__(self, platform: Platform) -> None:
+        self.platform = platform
+        self.messages: list[pyqbot.C2CMessage] = []
+
+    async def handle(self, user: User, message: pyqbot.C2CMessage) -> None:
+        self.messages.append(message)
+        self.platform.changed.set()
+
+
+async def test_messages_are_converted_with_quoted_images_and_unsupported_parts(
+    db: Database,
+) -> None:
+    await welcomed_alice(db)
+    message = c2c(
+        ALICE,
+        "这是什么",
+        "ROBOT1.0_fake-1",
+        message_type=103,
+        attachments=ATTACHMENTS,
+        msg_elements=QUOTED,
+        message_scene={"source": "default", "ext": ["msg_idx=REFIDX_x"]},
+    )
+    platform = Platform([message])
+    chat = CapturingChat(platform)
+
+    await run_until_handled(
+        platform, db, chat, events=1, sent=0, until=lambda: len(chat.messages) == 1
+    )
+
+    converted = chat_input(chat.messages[0])
+    assert (converted.message_id, converted.text, converted.msg_idx) == (
+        "ROBOT1.0_fake-1",
+        "这是什么",
+        "REFIDX_x",
+    )
+    kinds = [(item.kind, item.quoted) for item in converted.attachments]
+    assert kinds == [
+        (AttachmentKind.IMAGE, False),
+        (AttachmentKind.VOICE, False),
+        (AttachmentKind.FILE, False),
+        (AttachmentKind.IMAGE, True),  # 被引用的消息里的图片；被引用的卡片不理会
+    ]
+    image, voice, file, quoted = converted.attachments
+    assert (image.declared_type, image.extension, image.size) == ("image/jpeg", "png", 2048)
+    assert voice.wav_url == ATTACHMENTS[1]["voice_wav_url"]
+    assert voice.asr_text == SECRET_ASR
+    assert file.filename == SECRET_FILENAMES[2]
+    assert quoted.url == QUOTED[0]["attachments"][0]["url"]
+
+
+async def test_cards_and_chat_history_become_unsupported_parts(db: Database) -> None:
+    await welcomed_alice(db)
+    card = c2c(ALICE, "", "ROBOT1.0_fake-1", message_type=3, ark_data={"ark_type": "map"})
+    history = c2c(ALICE, "", "ROBOT1.0_fake-2", message_type=102)
+    platform = Platform([card, history])
+    chat = CapturingChat(platform)
+
+    await run_until_handled(
+        platform, db, chat, events=2, sent=0, until=lambda: len(chat.messages) == 2
+    )
+
+    kinds = [[item.kind for item in chat_input(m).attachments] for m in chat.messages]
+    assert kinds == [[AttachmentKind.CARD], [AttachmentKind.CHAT_HISTORY]]
+
+
+async def test_quoted_chat_history_is_not_searched_for_images(db: Database) -> None:
+    await welcomed_alice(db)
+    history_with_images: Payload = {
+        "message_type": 102,
+        "content": "转发的聊天记录",
+        "attachments": [{"content_type": "image/png", "url": "https://multimedia.nt.qq.com.cn/x"}],
+        "msg_elements": [
+            {"attachments": [{"content_type": "image/png", "url": "https://qpic.cn/y"}]}
+        ],
+    }
+    message = c2c(
+        ALICE, "总结一下", "ROBOT1.0_fake-1", message_type=103, msg_elements=[history_with_images]
+    )
+    platform = Platform([message])
+    chat = CapturingChat(platform)
+
+    await run_until_handled(
+        platform, db, chat, events=1, sent=0, until=lambda: len(chat.messages) == 1
+    )
+
+    converted = chat_input(chat.messages[0])
+    assert [(item.kind, item.quoted) for item in converted.attachments] == [
+        (AttachmentKind.CHAT_HISTORY, True)  # 只记一条不支持的条目，不取里面（可能是别人）的图片
+    ]
+
+
+def downloader_with(
+    respond: Callable[[httpx2.Request], httpx2.Response], **client_options: Any
+) -> tuple[QQDownloader, list[httpx2.Request]]:
+    """接上替身的下载器，和它实际发出的请求。"""
+    sent: list[httpx2.Request] = []
+
+    def record(request: httpx2.Request) -> httpx2.Response:
+        sent.append(request)
+        return respond(request)
+
+    http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(record), **client_options)
+    client = pyqbot.Client("fake-app-id", "fake-app-secret", http_client=http_client)
+    return QQDownloader(client), sent
+
+
+async def read_all(downloader: QQDownloader, url: str, max_bytes: int = 1024) -> bytes:
+    async with aclosing(downloader.fetch(url, max_bytes=max_bytes)) as chunks:
+        return b"".join([chunk async for chunk in chunks])
+
+
+async def test_downloader_reads_the_whole_body() -> None:
+    downloader, _ = downloader_with(lambda _: httpx2.Response(200, content=PNG_BYTES))
+    assert await read_all(downloader, IMAGE_URL) == PNG_BYTES
+
+
+async def test_downloader_refuses_a_declared_length_over_the_limit() -> None:
+    downloader, _ = downloader_with(lambda _: httpx2.Response(200, content=b"x" * 2048))
+    with pytest.raises(DownloadTooLargeError):
+        await read_all(downloader, IMAGE_URL)
+
+
+async def test_downloader_errors_carry_no_address() -> None:
+    def refuse(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError(f"连不上 {request.url}")
+
+    not_found, _ = downloader_with(lambda _: httpx2.Response(404))
+    broken, _ = downloader_with(refuse)
+
+    with pytest.raises(DownloadError) as status:
+        await read_all(not_found, IMAGE_URL)
+    with pytest.raises(DownloadError) as connection:
+        await read_all(broken, IMAGE_URL)
+
+    assert str(status.value) == "HTTP 404"
+    assert str(connection.value) == "ConnectError"
+    assert connection.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("url", "reason"),
+    [
+        ("ftp://multimedia.nt.qq.com.cn/a", "协议不是 http(s)"),
+        ("https://user:pass@multimedia.nt.qq.com.cn/a", "地址带用户信息"),
+        ("https://127.0.0.1/a", "主机是内网地址"),
+        ("https://10.0.0.8/a", "主机是内网地址"),
+        ("https://169.254.169.254/latest/meta-data", "主机是内网地址"),
+        ("https://[::1]/a", "主机是内网地址"),
+        ("https://8.8.8.8/a", "主机是 IP 地址"),
+        ("https://evil.example.com/a", "主机不在下载白名单里"),
+        ("https://qq.com.evil.example/a", "主机不在下载白名单里"),
+        ("https://localhost/a", "主机不在下载白名单里"),
+        ("https://multimedia.nt.qq.com.cn:bad/a", "地址不合法"),
+    ],
+)
+async def test_downloads_only_go_to_known_platform_hosts(url: str, reason: str) -> None:
+    assert download_refusal(url) == reason
+    downloader, sent = downloader_with(lambda _: httpx2.Response(200, content=PNG_BYTES))
+
+    with pytest.raises(DownloadError) as info:
+        await read_all(downloader, url)
+
+    assert str(info.value) == f"拒绝下载：{reason}"
+    assert sent == []
+
+
+def test_known_platform_hosts_are_allowed() -> None:
+    for url in (
+        IMAGE_URL,
+        "https://qqbot.ugcimg.cn/wav/x",
+        "http://grouptalk.c2c.qq.com/f/x",
+    ):
+        assert download_refusal(url) is None
+
+
+async def test_each_redirect_hop_is_checked_and_its_body_is_not_read() -> None:
+    read_bodies: list[str] = []
+
+    class Body(httpx2.AsyncByteStream):
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            read_bodies.append(self.label)
+            yield b"x" * 10_000
+
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        if request.url.host == "multimedia.nt.qq.com.cn":
+            return httpx2.Response(
+                302, headers={"location": "http://127.0.0.1/admin"}, stream=Body("redirect")
+            )
+        return httpx2.Response(200, content=PNG_BYTES)
+
+    downloader, sent = downloader_with(respond)
+
+    with pytest.raises(DownloadError) as info:
+        await read_all(downloader, IMAGE_URL)
+
+    assert str(info.value) == "拒绝下载：主机是内网地址"
+    assert [request.url.host for request in sent] == ["multimedia.nt.qq.com.cn"]
+    assert read_bodies == []
+
+
+async def test_redirects_within_the_platform_are_followed_a_few_times() -> None:
+    hops = itertools.count()
+
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        if next(hops) < 2:
+            return httpx2.Response(302, headers={"location": "/next"})
+        return httpx2.Response(200, content=PNG_BYTES)
+
+    downloader, sent = downloader_with(respond)
+    assert await read_all(downloader, IMAGE_URL) == PNG_BYTES
+    assert len(sent) == 3
+
+    endless, sent = downloader_with(lambda _: httpx2.Response(302, headers={"location": "/again"}))
+    with pytest.raises(DownloadError) as info:
+        await read_all(endless, IMAGE_URL)
+    assert str(info.value) == "拒绝下载：重定向次数过多"
+    assert len(sent) == MAX_REDIRECTS + 1
+
+
+async def test_download_requests_carry_no_credentials_of_the_shared_client() -> None:
+    downloader, sent = downloader_with(
+        lambda _: httpx2.Response(200, content=PNG_BYTES),
+        headers={"Authorization": "QQBot leaked-token", "X-Trace": "1"},
+        cookies={"session": "leaked-cookie"},
+        params={"token": "leaked-param"},
+        auth=("user", "leaked-password"),
+    )
+
+    assert await read_all(downloader, IMAGE_URL) == PNG_BYTES
+
+    (request,) = sent
+    assert "authorization" not in request.headers
+    assert "cookie" not in request.headers
+    assert "x-trace" not in request.headers
+    assert str(request.url) == IMAGE_URL  # 没有并进客户端的默认查询参数
+    assert "leaked" not in repr(dict(request.headers))
+
+
+async def test_default_pyqbot_client_has_no_credentials() -> None:
+    # pyqbot 自建的客户端：确认它没有默认的请求头、Cookie、鉴权或查询参数可以带给附件服务器。
+    client = pyqbot.Client("fake-app-id", "fake-app-secret")
+    try:
+        http = client.http_client
+        assert "authorization" not in http.headers
+        assert len(http.cookies) == 0
+        assert not http.params
+        assert http.auth is None
+    finally:
+        await client.close()
+
+
+async def test_malformed_redirect_target_is_a_download_failure() -> None:
+    downloader, sent = downloader_with(
+        lambda _: httpx2.Response(302, headers={"location": "http://[::1/broken"})
+    )
+
+    with pytest.raises(DownloadError) as info:
+        await read_all(downloader, IMAGE_URL)
+
+    assert str(info.value) == "拒绝下载：重定向地址不合法"
+    assert len(sent) == 1
+
+
+async def test_redirect_response_is_closed_even_if_the_download_is_cancelled() -> None:
+    closing = asyncio.Event()
+    closed: list[bool] = []
+
+    class SlowClose(httpx2.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b""
+
+        async def aclose(self) -> None:
+            closing.set()
+            await asyncio.sleep(0.05)
+            closed.append(True)
+
+    downloader, _ = downloader_with(
+        lambda _: httpx2.Response(302, headers={"location": "/next"}, stream=SlowClose())
+    )
+    task = asyncio.create_task(read_all(downloader, IMAGE_URL))
+    async with asyncio.timeout(HANG_GUARD):
+        await closing.wait()
+        task.cancel()  # 例如下载的总时限恰好在关闭时到期
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.1)
+
+    assert closed == [True]  # 关闭照样做完，连接才会归还
+
+
+async def test_shared_client_refuses_cookies_from_attachment_hosts() -> None:
+    api_requests: list[httpx2.Request] = []
+
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        if request.url.host == "grouptalk.c2c.qq.com":
+            cookie = "sid=leaked-cookie; Domain=.qq.com; Path=/"
+            return httpx2.Response(200, content=PNG_BYTES, headers={"set-cookie": cookie})
+        if request.url.path == "/app/getAppAccessToken":
+            return httpx2.Response(200, json={"access_token": "fake-token", "expires_in": "7200"})
+        api_requests.append(request)
+        return httpx2.Response(200, json={"id": "1", "username": "测试机器人"})
+
+    http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(respond))
+    async with pyqbot.Client("fake-app-id", "fake-app-secret", http_client=http_client) as client:
+        refuse_cookies(client)
+        data = await read_all(QQDownloader(client), "https://grouptalk.c2c.qq.com/f/x")
+        assert data == PNG_BYTES
+        assert len(http_client.cookies) == 0
+        await client.get_me()
+
+    (api,) = api_requests
+    assert api.url.host.endswith("qq.com")
+    assert "cookie" not in api.headers
+    await http_client.aclose()
 
 
 # ---- 非文本内容的形态日志（为附件实测收集样本） ----
@@ -1048,7 +1514,7 @@ async def test_each_kind_of_non_text_content_logs_exactly_once(
     assert_private(caplog)
 
 
-async def test_attachment_only_message_is_logged_and_still_gets_the_text_only_notice(
+async def test_attachment_only_message_is_logged_and_gets_a_notice(
     db: Database, caplog: pytest.LogCaptureFixture
 ) -> None:
     voice = {"content_type": "voice", "url": "not a url", "filename": "无扩展名"}
@@ -1221,3 +1687,62 @@ async def test_bot_name_comes_from_get_me() -> None:
 )
 async def test_bot_name_falls_back_when_unavailable(response: httpx2.Response) -> None:
     assert await bot_name_from(response) == texts.DEFAULT_BOT_NAME
+
+
+async def test_shutdown_waits_for_responses_left_closing_by_cancelled_downloads() -> None:
+    closing = asyncio.Event()
+    closed: list[bool] = []
+
+    class SlowClose(httpx2.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b""
+
+        async def aclose(self) -> None:
+            closing.set()
+            await asyncio.sleep(0.05)
+            closed.append(True)
+
+    downloader, _ = downloader_with(
+        lambda _: httpx2.Response(302, headers={"location": "/next"}, stream=SlowClose())
+    )
+    task = asyncio.create_task(read_all(downloader, IMAGE_URL))
+    async with asyncio.timeout(HANG_GUARD):
+        await closing.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert closed == []
+        await downloader.aclose()  # 关停时限时等这些关闭任务
+
+    assert closed == [True]
+
+
+async def test_stuck_response_close_does_not_hold_the_download_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bot_module, "CLOSE_TIMEOUT_SECONDS", 0.05)
+    release = asyncio.Event()
+
+    class Stuck(httpx2.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield PNG_BYTES
+            await asyncio.Event().wait()  # 正文读到一半卡住
+            yield b""
+
+        async def aclose(self) -> None:
+            await release.wait()  # 关闭也卡住
+
+    downloader, _ = downloader_with(lambda _: httpx2.Response(200, stream=Stuck()))
+    fetcher = Fetcher(
+        MediaStore.under(tmp_path), downloader, AttachmentSettings(download_timeout_seconds=0.05)
+    )
+    item = IncomingAttachment(kind=AttachmentKind.IMAGE, url=IMAGE_URL)
+
+    async with asyncio.timeout(HANG_GUARD):
+        (result,) = await fetcher.acquire(
+            1, [item], wanted=frozenset({AttachmentKind.IMAGE}), label="#1"
+        )
+        assert result.status.value == "failed"  # 超时照常生效
+        assert fetcher.busy == 0  # 槽位还了，没被卡住的关闭挡住
+        await fetcher.aclose()  # 关停时只限时等那个关闭任务
+    release.set()

@@ -5,6 +5,7 @@
 示例（`event: step.delta` / `data: {...,"event_type":"step.delta"}`，最后是 `data: [DONE]`）。
 """
 
+import base64
 import json
 import traceback
 from collections.abc import AsyncIterator, Callable
@@ -16,16 +17,21 @@ from google import genai
 from google.genai import types
 
 from qtalk_bot.llm import (
+    AudioPart,
     ChatEvent,
     ChatRequest,
     ErrorKind,
+    FilePart,
     Finished,
     FinishReason,
+    ImagePart,
     Message,
     ModelError,
+    Part,
     Provider,
     Role,
     TextDelta,
+    TextPart,
     Usage,
 )
 from qtalk_bot.llm.gemini_interactions import (
@@ -547,3 +553,58 @@ async def test_token_counts_summed_beyond_64_bits_are_reported_as_missing() -> N
     events = await collect(model_on(streaming(first, second)))
 
     assert events[-2] == Usage(None, 2)
+
+
+# ---- 附件（里程碑 5a） ----
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\nfake-png"
+PDF_BYTES = b"%PDF-1.7 fake"
+WAV_BYTES = b"RIFF\x00\x00\x00\x00WAVEfake"
+
+
+def b64(data: bytes) -> str:
+    return base64.b64encode(data).decode()
+
+
+def with_parts(*parts: Part) -> ChatRequest:
+    return ChatRequest(
+        system="系统提示词", messages=(Message(Role.USER, parts),), max_output_tokens=100
+    )
+
+
+async def test_image_audio_and_pdf_are_inlined_as_base64() -> None:
+    server = streaming(
+        [created(), start(0, "model_output"), text(0, "好"), stop(0), completed("completed")]
+    )
+    request = with_parts(
+        TextPart("看看"),
+        ImagePart(PNG_BYTES, "image/png"),
+        AudioPart(WAV_BYTES, "audio/wav"),
+        FilePart(PDF_BYTES, "application/pdf"),
+    )
+
+    events = [event async for event in model_on(server).stream(request)]
+
+    assert events[-1] == DONE
+    assert server.body()["input"] == [
+        {
+            "type": "user_input",
+            "content": [
+                {"type": "text", "text": "看看"},
+                {"type": "image", "data": b64(PNG_BYTES), "mime_type": "image/png"},
+                {"type": "audio", "data": b64(WAV_BYTES), "mime_type": "audio/wav"},
+                {"type": "document", "data": b64(PDF_BYTES), "mime_type": "application/pdf"},
+            ],
+        }
+    ]
+
+
+async def test_image_type_outside_the_documented_list_fails_without_a_request() -> None:
+    server = streaming([created(), completed("completed")])
+
+    with pytest.raises(ModelError) as info:
+        async for _ in model_on(server).stream(with_parts(ImagePart(b"GIF89a", "image/gif"))):
+            pass
+
+    assert info.value.kind is ErrorKind.UNSUPPORTED
+    assert server.requests == []

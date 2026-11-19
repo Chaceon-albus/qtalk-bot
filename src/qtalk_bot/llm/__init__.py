@@ -3,8 +3,10 @@
 调用方只认这里的类型；各家 SDK 的类型留在适配器（`openai_responses.py`、`gemini_interactions.py`）里，
 不出现在接口上。
 
-- 请求是 `ChatRequest`：系统提示词、按时间排列的消息、输出上限。消息的内容是若干段 `Part`，现在只有
-  文字（`TextPart`），以后加图片、音频时在 `Part` 里加新的类型，适配器各自转换。
+- 请求是 `ChatRequest`：系统提示词、按时间排列的消息、输出上限。消息的内容是若干段 `Part`：文字
+  （`TextPart`）、图片（`ImagePart`）、音频（`AudioPart`）、文件（`FilePart`），后三种带字节与按文件头判断出的
+  实际 MIME 类型，由适配器各自转换。适配器收到它不支持的内容时抛 `ModelError(kind=UNSUPPORTED)`；正常情况下
+  调用方已按 `INPUT_LIMITS` 与模型声明的输入能力挡在前面。
 - 输出是一串 `ChatEvent`，是带标签的联合类型。现在有文字增量（`TextDelta`）、用量（`Usage`）、结束
   （`Finished`）三种；以后会加思考摘要、调用工具前的说明、搜索进展等。**调用方必须忽略不认识的事件**
   （`match` 里留一个 `case _: pass`），这样加事件时不必改已有的调用方。
@@ -12,7 +14,7 @@
   来自上游的文字（错误信息、错误码字段都可能回显正文或凭证），可以直接记日志。
 """
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
@@ -51,8 +53,97 @@ class TextPart:
     text: str = field(repr=False)
 
 
-type Part = TextPart
-"""消息内容的一段。以后加 `ImagePart`、`AudioPart` 等。"""
+@dataclass(frozen=True, slots=True)
+class ImagePart:
+    """一张图片。`mime_type` 是按文件头判断出的实际类型。字节不进 `repr`。"""
+
+    data: bytes = field(repr=False)
+    mime_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class AudioPart:
+    """一段音频（现在只有 QQ 语音转出的 WAV）。"""
+
+    data: bytes = field(repr=False)
+    mime_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class FilePart:
+    """一个文件（现在只有 PDF）。"""
+
+    data: bytes = field(repr=False)
+    mime_type: str
+
+
+type Part = TextPart | ImagePart | AudioPart | FilePart
+"""消息内容的一段。"""
+
+
+class Modality(StrEnum):
+    """文字之外、模型可以直接接收的输入（`[[models]]` 的 `inputs`）。"""
+
+    IMAGE = "image"
+    AUDIO = "audio"
+    FILE = "file"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InputLimits:
+    """一家服务商的对话接口对内联附件的限制（以 SDK 的类型与官方文档为准，取保守的一侧）。
+
+    Attributes:
+        image_types: 接受的图片 MIME 类型。
+        audio_types: 接受的音频 MIME 类型；为空表示不接受音频。
+        file_types: 接受的文件 MIME 类型。
+        max_inline_bytes: 一次请求里所有内联附件按 base64 编码后的总字节数上限；单个附件也不能超过它。
+    """
+
+    image_types: frozenset[str]
+    audio_types: frozenset[str]
+    file_types: frozenset[str]
+    max_inline_bytes: int
+
+    def accepts(self, modality: Modality, mime_type: str) -> bool:
+        match modality:
+            case Modality.IMAGE:
+                return mime_type in self.image_types
+            case Modality.AUDIO:
+                return mime_type in self.audio_types
+            case Modality.FILE:
+                return mime_type in self.file_types
+
+
+_MIB = 1024 * 1024
+
+INPUT_LIMITS: Mapping[Provider, InputLimits] = {
+    # Responses API：图片是 `input_image`（PNG、JPEG、WEBP 与非动图的 GIF；本地判断不了是不是动图，GIF 一律
+    # 不给）；文件是 `input_file`，每个文件、全部文件合计都要在 50 MB 以内；音频文档只写了 Chat Completions，
+    # SDK 的 Responses 输入类型里也没有 `input_audio`，所以不接受音频。
+    Provider.OPENAI: InputLimits(
+        image_types=frozenset(("image/png", "image/jpeg", "image/webp")),
+        audio_types=frozenset(),
+        file_types=frozenset(("application/pdf",)),
+        max_inline_bytes=50 * _MIB,
+    ),
+    # Interactions API：文档列的图片类型是 PNG、JPEG、WEBP、HEIC、HEIF（SDK 的类型还多列了 GIF、BMP、TIFF，
+    # 以文档为准）；音频接受 WAV；PDF 单个 50 MB。内联数据时整个请求（含提示词）不超过 20 MB，给文字留 1 MB。
+    Provider.GEMINI: InputLimits(
+        image_types=frozenset(
+            ("image/png", "image/jpeg", "image/webp", "image/heic", "image/heif")
+        ),
+        audio_types=frozenset(("audio/wav",)),
+        file_types=frozenset(("application/pdf",)),
+        max_inline_bytes=19 * _MIB,
+    ),
+}
+"""各家对话接口对内联附件的限制。"""
+
+
+def inline_size(data_length: int) -> int:
+    """`data_length` 字节按 base64 编码后的长度，用来对照 `InputLimits.max_inline_bytes`。"""
+    return 4 * ((data_length + 2) // 3)
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +248,7 @@ class ErrorKind(StrEnum):
     MALFORMED = "malformed"  # 响应无法解析，或流没有正常结束就断开
     REFUSED = "refused"  # 服务商拒绝回答（如 Decisions 单道题的拒答）
     BLOCKED = "blocked"  # 输入被服务商的安全策略拦截
+    UNSUPPORTED = "unsupported"  # 请求里有这个模型（或这家接口）不支持的输入，没有发出
     OTHER = "other"
 
 
@@ -170,6 +262,7 @@ _ERROR_LABELS = {
     ErrorKind.MALFORMED: "响应无法解析或不完整",
     ErrorKind.REFUSED: "拒绝回答",
     ErrorKind.BLOCKED: "被安全策略拦截",
+    ErrorKind.UNSUPPORTED: "不支持这种输入",
     ErrorKind.OTHER: "其它错误",
 }
 

@@ -15,10 +15,17 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from qtalk_bot import access, texts
+from qtalk_bot import access, journal, texts
 from qtalk_bot import conversation as conversation_module
 from qtalk_bot.access import User, UserStatus
-from qtalk_bot.config import DEFAULT_PERSONA, ChatSettings, DecisionSettings, ModelSettings
+from qtalk_bot.config import (
+    DEFAULT_PERSONA,
+    AttachmentSettings,
+    ChatSettings,
+    DecisionSettings,
+    DescribeSettings,
+    ModelSettings,
+)
 from qtalk_bot.conversation import (
     TYPING_SECONDS,
     ChatInput,
@@ -27,26 +34,44 @@ from qtalk_bot.conversation import (
     SendRejectedError,
     SendUncertainError,
 )
+from qtalk_bot.describe import Describer
 from qtalk_bot.journal import DECISION_USAGE_MODEL
 from qtalk_bot.llm import (
+    AudioPart,
     ChatEvent,
     ChatRequest,
     ErrorKind,
+    FilePart,
     Finished,
     FinishReason,
+    ImagePart,
     Message,
+    Modality,
     ModelError,
+    Part,
     Provider,
     Role,
     TextDelta,
+    TextPart,
     Usage,
 )
 from qtalk_bot.llm.decisions import (
     ChoiceAnswer,
+    ChoiceQuestion,
     DecisionError,
     DecisionRequest,
     DecisionResult,
     Refusal,
+)
+from qtalk_bot.media import (
+    DOWNLOAD_CONCURRENCY,
+    Acquired,
+    AttachmentKind,
+    AttachmentStatus,
+    DownloadError,
+    Fetcher,
+    IncomingAttachment,
+    MediaStore,
 )
 from qtalk_bot.prompt import FORMAT_GUIDE
 from qtalk_bot.routing import QUESTION, Router
@@ -58,6 +83,12 @@ BOB = "FAKE-OPENID-BOB"
 START = 1_800_000_000  # 上海时间 2027-01-15 16:00，星期五
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 HANG_GUARD = 5  # 秒：回归时应失败而不是挂起
+
+
+def text_of(part: Part) -> str:
+    assert isinstance(part, TextPart)
+    return part.text
+
 
 DONE = Finished(FinishReason.COMPLETED)
 
@@ -159,7 +190,11 @@ class FakeChannel:
         stream_gate: Callable[[str], asyncio.Event | None] = lambda _: None,
         finish_gate: asyncio.Event | None = None,
         on_finish: Callable[[], None] | None = None,
+        send_action: Action | None = None,
     ) -> None:
+        self.send_action = (
+            send_action  # 不为空时每条普通消息发出前先调用它（模拟发送期间外部状态的变化）
+        )
         self.finish_gate = finish_gate  # 不为空时结束分片要等它置位才发完
         self.on_finish = on_finish  # 结束分片发完时调用
         self.finish_calls = 0
@@ -223,6 +258,8 @@ class FakeChannel:
 
     async def send(self, text: str) -> None:
         await asyncio.sleep(0)
+        if self.send_action is not None:
+            await self.send_action()
         if (error := self.send_failure(text)) is not None:
             raise error
         self.log.append(("send", text))
@@ -313,7 +350,7 @@ async def say(
     channel = FakeChannel() if channel is None else channel
     async with asyncio.timeout(HANG_GUARD):
         await chat.handle(
-            user, ChatInput(message_id=f"qq-{secrets.token_hex(4)}", text=text), channel
+            user, [ChatInput(message_id=f"qq-{secrets.token_hex(4)}", text=text)], channel
         )
     return channel
 
@@ -382,10 +419,12 @@ async def test_context_has_only_this_users_last_n_turns(db: Database) -> None:
         await say(chat, bob, f"小李的秘密{n}")
     await say(chat, alice, "小王的第4句")
 
-    texts_seen = [part.text for message in model.requests[-1].messages for part in message.parts]
+    texts_seen = [
+        text_of(part) for message in model.requests[-1].messages for part in message.parts
+    ]
     assert texts_seen == ["小王的第2句", "好的", "小王的第3句", "好的", "小王的第4句"]
     for request in model.requests:
-        user_texts = [p.text for m in request.messages if m.role is Role.USER for p in m.parts]
+        user_texts = [text_of(p) for m in request.messages if m.role is Role.USER for p in m.parts]
         assert len({t[:2] for t in user_texts}) == 1  # 每次请求里只有一个人的话
 
 
@@ -410,13 +449,15 @@ async def test_no_model_call_when_chat_is_no_longer_allowed(db: Database, why: s
     assert await usage(db) == []
 
 
-async def test_message_without_text_gets_fixed_reply_and_no_model_call(db: Database) -> None:
+async def test_message_without_anything_usable_gets_fixed_reply_and_no_model_call(
+    db: Database,
+) -> None:
     alice = await invited(db, ALICE, "小王")
     model = ScriptedModel("main", answer("不该出现"))
 
     channel = await say(conversation(db, model), alice, None)
 
-    assert channel.log == [("send", texts.TEXT_ONLY)]
+    assert channel.log == [("send", texts.UNSUPPORTED)]
     assert model.requests == []
     assert await rows(db) == []
 
@@ -449,16 +490,16 @@ async def test_same_user_is_serialized_but_different_users_run_in_parallel(db: D
             await model.started.wait()
         await asyncio.sleep(0.05)
         # 小王的第二条还在排队，小李的已经开始调用模型。
-        started = [m.messages[-1].parts[0].text for m in model.requests]
+        started = [text_of(m.messages[-1].parts[0]) for m in model.requests]
         assert sorted(started) == ["小李一", "小王一"]
         gate.set()
         await asyncio.gather(first, second, third)
 
-    order = [m.messages[-1].parts[0].text for m in model.requests]
+    order = [text_of(m.messages[-1].parts[0]) for m in model.requests]
     assert order.index("小王二") > order.index("小王一")
     # 第二条是在第一条的回复写入之后才开始的，所以上下文里有第一轮。
     second_request = model.requests[order.index("小王二")]
-    assert [m.parts[0].text for m in second_request.messages] == ["小王一", "好", "小王二"]
+    assert [text_of(m.parts[0]) for m in second_request.messages] == ["小王一", "好", "小王二"]
 
 
 # ---- 出错与备用模型 ----
@@ -1404,3 +1445,1007 @@ async def test_rejected_recheck_cancels_the_pending_typing_and_records_the_skip(
     assert support.requests == []
     assert (await rows(db))[-1] == Row("assistant", "", "support", "skipped", "withheld")
     assert await usage_by_purpose(db) == [("decision", DECISION_USAGE_MODEL, 40, 0)]
+
+
+# ---- 附件与多模态（里程碑 5a） ----
+
+PNG_A = b"\x89PNG\r\n\x1a\nALICE-IMAGE"
+PNG_B = b"\x89PNG\r\n\x1a\nBOB-IMAGE"
+IMAGE_URL = "https://multimedia.nt.qq.com.cn/download?fileid=SECRET"
+
+
+class FakeDownloader:
+    """按地址给出内容；`before` 不为空时每次下载前先调用它（用来在下载期间改变外部状态）。"""
+
+    def __init__(self, contents: dict[str, bytes], before: Action | None = None) -> None:
+        self.contents = contents
+        self.before = before
+        self.fetched: list[str] = []
+
+    async def fetch(self, url: str, *, max_bytes: int) -> AsyncGenerator[bytes]:
+        self.fetched.append(url)
+        if self.before is not None:
+            await self.before()
+        if url not in self.contents:
+            raise DownloadError("HTTP 404")
+        yield self.contents[url]
+
+    async def aclose(self) -> None:
+        pass
+
+
+class GeminiScriptedModel(ScriptedModel):
+    @property
+    def provider(self) -> Provider:
+        return Provider.GEMINI
+
+
+def media_chat(
+    db: Database,
+    tmp_path: Path,
+    downloader: FakeDownloader,
+    *models: tuple[ScriptedModel, frozenset[Modality]],
+    fallbacks: dict[str, str] | None = None,
+    describer: Describer | None = None,
+    decider: FakeDecider | None = None,
+    image_turns: int = 3,
+    store: MediaStore | None = None,
+    history_turns: int = 10,
+    fetcher: Fetcher | None = None,
+) -> Conversation:
+    """第一个模型是默认模型；每个模型带上它声明的 `inputs`。"""
+    fallbacks = fallbacks or {}
+    settings = [
+        ModelSettings(
+            name=model.name,
+            provider=model.provider,
+            model=model.model,
+            default=index == 0,
+            fallback=fallbacks.get(model.name),
+            description=f"{model.name} 的描述",
+            inputs=inputs,
+        )
+        for index, (model, inputs) in enumerate(models)
+    ]
+    decisions = None if decider is None else DecisionSettings(provider=Provider.GEMINI, model="d")
+    attachments = AttachmentSettings(history_turns=image_turns)
+    return Conversation(
+        db,
+        admin_openid=ADMIN,
+        models={model.name: model for model, _ in models},
+        router=Router(settings, decisions, decider),
+        settings=ChatSettings(history_turns=history_turns),
+        timezone=SHANGHAI,
+        attachments=attachments,
+        fetcher=fetcher or Fetcher(store or MediaStore.under(tmp_path), downloader, attachments),
+        describer=describer,
+        clock=lambda: START,
+    )
+
+
+def image_attachment(url: str = IMAGE_URL, *, quoted: bool = False) -> IncomingAttachment:
+    return IncomingAttachment(
+        kind=AttachmentKind.IMAGE, declared_type="image/jpeg", url=url, quoted=quoted
+    )
+
+
+async def send(
+    chat: Conversation,
+    user: User,
+    text: str | None,
+    *attachments: IncomingAttachment,
+    msg_idx: str | None = None,
+    channel: FakeChannel | None = None,
+) -> FakeChannel:
+    channel = FakeChannel() if channel is None else channel
+    message = ChatInput(
+        message_id=f"qq-{secrets.token_hex(4)}",
+        text=text,
+        msg_idx=msg_idx,
+        attachments=attachments,
+    )
+    async with asyncio.timeout(HANG_GUARD):
+        await chat.handle(user, [message], channel)
+    return channel
+
+
+async def attachment_rows(db: Database) -> list[tuple[object, ...]]:
+    result = await db.fetch_all(
+        "SELECT user_id, kind, status, mime_type, path, text, describe_status FROM attachments"
+        " ORDER BY id"
+    )
+    return [tuple(row) for row in result]
+
+
+SEES = frozenset({Modality.IMAGE})
+SEES_KINDS = frozenset({AttachmentKind.IMAGE})
+BLIND: frozenset[Modality] = frozenset()
+
+
+async def test_image_only_message_is_answered_with_the_image(db: Database, tmp_path: Path) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("是一只猫"))
+    chat = media_chat(db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, SEES))
+
+    channel = await send(chat, alice, None, image_attachment(), msg_idx="REFIDX_abc")
+
+    assert channel.kinds == ["typing", "stream", "finish"]
+    assert model.requests[-1].messages == (Message(Role.USER, (ImagePart(PNG_A, "image/png"),)),)
+    assert await rows(db) == [
+        Row("user", "", None, None, None),
+        Row("assistant", "是一只猫", "main", "completed", "streamed"),
+    ]
+    ((user_id, kind, status, mime, path, text, describe),) = await attachment_rows(db)
+    assert (user_id, kind, status, mime, text, describe) == (
+        alice.id,
+        "image",
+        "stored",
+        "image/png",
+        "[图片]",
+        None,
+    )
+    assert isinstance(path, str)
+    assert path.startswith(f"{alice.id}/")
+    msg_idx = await db.fetch_one("SELECT msg_idx FROM messages WHERE role = 'user'")
+    assert msg_idx is not None
+    assert msg_idx[0] == "REFIDX_abc"
+
+
+async def test_quoted_image_reaches_the_model(db: Database, tmp_path: Path) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("一张截图"))
+    chat = media_chat(db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, SEES))
+
+    await send(chat, alice, "这是什么", image_attachment(quoted=True))
+
+    assert model.requests[-1].messages[-1].parts == (
+        TextPart("这是什么\n[被引用的图片：]"),
+        ImagePart(PNG_A, "image/png"),
+    )
+
+
+async def test_failed_download_is_told_and_the_message_is_still_recorded(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("好的"))
+    chat = media_chat(db, tmp_path, FakeDownloader({}), (model, SEES))
+
+    with_text = await send(chat, alice, "看看这个", image_attachment())
+    image_only = await send(chat, alice, None, image_attachment())
+
+    assert with_text.log[0] == ("send", texts.ATTACHMENT_FAILED)
+    assert with_text.kinds == ["send", "typing", "stream", "finish"]
+    assert model.requests[0].messages[-1] == Message.text(Role.USER, "看看这个\n[图片，没能下载]")
+    assert image_only.log == [("send", texts.ATTACHMENT_FAILED)]
+    assert len(model.requests) == 1  # 只有一张没下载下来的图：不调用模型
+    assert [row.role for row in await rows(db)] == ["user", "assistant", "user"]
+    assert [row[2] for row in await attachment_rows(db)] == ["failed", "failed"]
+
+
+async def test_unsupported_only_message_gets_a_fixed_reply(db: Database, tmp_path: Path) -> None:
+    alice = await invited(db, ALICE, "小王")
+    downloader = FakeDownloader({})
+    model = ScriptedModel("main", answer("不该出现"))
+    chat = media_chat(db, tmp_path, downloader, (model, SEES))
+    video = IncomingAttachment(kind=AttachmentKind.VIDEO, url=IMAGE_URL)
+
+    channel = await send(chat, alice, None, video)
+
+    assert channel.log == [("send", texts.UNSUPPORTED)]
+    assert model.requests == []
+    assert downloader.fetched == []
+    assert await rows(db) == []
+
+
+async def test_image_goes_to_the_only_model_that_sees_without_a_decision(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    blind = ScriptedModel("blind", answer("不该出现"))
+    seeing = ScriptedModel("seeing", answer("看到了"))
+    decider = FakeDecider(chances(blind=0.9, seeing=0.1))
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({IMAGE_URL: PNG_A}),
+        (blind, BLIND),
+        (seeing, SEES),
+        decider=decider,
+    )
+
+    await send(chat, alice, "这是什么", image_attachment())
+
+    assert decider.requests == []
+    assert blind.requests == []
+    assert (await rows(db))[-1].model == "seeing"
+
+
+async def test_decision_input_marks_the_attachment_and_only_offers_capable_models(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    blind = ScriptedModel("blind", answer("不该出现"))
+    one = ScriptedModel("one", answer("看到了"))
+    two = ScriptedModel("two", answer("不该出现"))
+    decider = FakeDecider(chances(one=0.7, two=0.3))
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({IMAGE_URL: PNG_A}),
+        (blind, BLIND),
+        (one, SEES),
+        (two, SEES),
+        decider=decider,
+    )
+
+    await send(chat, alice, "这是什么", image_attachment())
+
+    (request,) = decider.requests
+    assert json.loads(request.input)["latest"] == "这是什么\n[图片]"
+    (question,) = request.questions
+    assert isinstance(question, ChoiceQuestion)
+    assert [option.value for option in question.options] == ["one", "two"]
+
+
+async def test_fallback_that_cannot_see_is_not_used(db: Database, tmp_path: Path) -> None:
+    alice = await invited(db, ALICE, "小王")
+    seeing = ScriptedModel("seeing", [ModelError(Provider.OPENAI, ErrorKind.SERVER)])
+    blind = ScriptedModel("blind", answer("不该出现"))
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({IMAGE_URL: PNG_A}),
+        (seeing, SEES),
+        (blind, BLIND),
+        fallbacks={"seeing": "blind"},
+    )
+
+    channel = await send(chat, alice, "这是什么", image_attachment())
+
+    assert blind.requests == []
+    assert channel.sent == [texts.MODEL_FAILED]
+
+
+async def test_files_of_users_who_lost_access_meanwhile_are_removed(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+
+    async def disable() -> None:
+        await db.transaction(access.set_user_status, alice.id, UserStatus.DISABLED)
+
+    model = ScriptedModel("main", answer("不该出现"))
+    chat = media_chat(db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}, disable), (model, SEES))
+
+    channel = await send(chat, alice, None, image_attachment())
+
+    assert model.requests == []
+    assert channel.log == []
+    assert await rows(db) == []
+    store = MediaStore.under(tmp_path)
+    assert not any(store.user_dir(alice.id).iterdir())
+
+
+async def test_each_users_attachments_stay_in_their_own_directory_and_context(
+    db: Database, tmp_path: Path
+) -> None:
+    # AGENTS.md 的第二条不变量：一个用户的附件不会进入另一个用户的上下文。
+    alice = await invited(db, ALICE, "小王")
+    bob = await invited(db, BOB, "小李")
+    url_b = "https://multimedia.nt.qq.com.cn/download?fileid=BOB"
+    model = ScriptedModel("main", answer("好"))
+    chat = media_chat(db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A, url_b: PNG_B}), (model, SEES))
+
+    await send(chat, alice, "我的图", image_attachment())
+    await send(chat, bob, "我的图", image_attachment(url_b))
+    await send(chat, alice, "还记得我的图吗")
+    await send(chat, bob, "还记得我的图吗")
+
+    paths = {row[0]: row[4] for row in await attachment_rows(db)}
+    store = MediaStore.under(tmp_path)
+    assert str(paths[alice.id]).startswith(f"{alice.id}/")
+    assert str(paths[bob.id]).startswith(f"{bob.id}/")
+    assert store.read(alice.id, str(paths[alice.id])) == PNG_A
+    assert store.read(alice.id, str(paths[bob.id])) is None
+    for request, own, other in zip(
+        model.requests, (PNG_A, PNG_B, PNG_A, PNG_B), (PNG_B, PNG_A, PNG_B, PNG_A), strict=True
+    ):
+        images = [p.data for m in request.messages for p in m.parts if isinstance(p, ImagePart)]
+        assert images == [own]
+        assert other not in images
+
+
+async def test_voice_goes_as_audio_to_a_model_that_hears_and_as_text_otherwise(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    wav = b"RIFF\x00\x00\x00\x00WAVEfmt "
+    wav_url = "https://qqbot.ugcimg.cn/wav"
+    voice = IncomingAttachment(
+        kind=AttachmentKind.VOICE, url=IMAGE_URL, wav_url=wav_url, asr_text="明天几点"
+    )
+    hearing = GeminiScriptedModel("hearing", answer("八点"))
+    deaf = ScriptedModel("deaf", answer("好的"))
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({wav_url: wav}),
+        (deaf, BLIND),
+        (hearing, frozenset({Modality.AUDIO})),
+    )
+
+    await send(chat, alice, None, voice)
+    assert deaf.requests == []  # 有能听的模型时优先选它
+    await send(chat, alice, "再说一遍")  # 只有文字：用默认模型
+
+    (heard,) = hearing.requests
+    assert heard.messages[-1].parts == (TextPart("[语音：]"), AudioPart(wav, "audio/wav"))
+    # 历史里的语音只给识别文本。
+    (later,) = deaf.requests
+    assert later.messages[0] == Message.text(Role.USER, "[语音] 明天几点")
+
+
+# ---- 图片描述 ----
+
+
+def describer_of(db: Database, tmp_path: Path, model: ScriptedModel) -> Describer:
+    return Describer(
+        db,
+        MediaStore.under(tmp_path),
+        model,
+        DescribeSettings(provider=model.provider, model=model.model, timeout_seconds=1),
+        admin_openid=ADMIN,
+        clock=lambda: START,
+    )
+
+
+async def test_description_is_written_in_the_background_and_used_in_later_history(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    describing = ScriptedModel("describe", answer("一只橘猫\n趴在窗台上", usage=Usage(70, 9)))
+    describer = describer_of(db, tmp_path, describing)
+    model = ScriptedModel("main", answer("好"))
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({IMAGE_URL: PNG_A}),
+        (model, BLIND),
+        describer=describer,
+        image_turns=0,
+    )
+
+    await send(chat, alice, "看我家猫", image_attachment())
+    await describer.wait_idle()
+    await send(chat, alice, "可爱吗")
+
+    (row,) = await attachment_rows(db)
+    assert row[5:] == ("[图片：一只橘猫 趴在窗台上]", "done")
+    (request,) = describing.requests
+    assert request.messages[0].parts[0] == ImagePart(PNG_A, "image/png")
+    assert model.requests[-1].messages[0] == Message.text(
+        Role.USER, "看我家猫\n[图片：一只橘猫 趴在窗台上]"
+    )
+    assert ("describe", "describe", 70, 9) in await usage_by_purpose(db)
+
+
+async def test_failed_description_does_not_affect_the_reply(db: Database, tmp_path: Path) -> None:
+    alice = await invited(db, ALICE, "小王")
+    describing = ScriptedModel("describe", [ModelError(Provider.OPENAI, ErrorKind.SERVER)])
+    describer = describer_of(db, tmp_path, describing)
+    model = ScriptedModel("main", answer("看到了"))
+    chat = media_chat(
+        db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, SEES), describer=describer
+    )
+
+    channel = await send(chat, alice, None, image_attachment())
+    await describer.wait_idle()
+
+    assert channel.streamed == "看到了"
+    (row,) = await attachment_rows(db)
+    assert row[5:] == ("[图片]", "failed")
+    assert ("describe", "describe", None, None) in await usage_by_purpose(db)
+
+
+async def test_pending_descriptions_are_cancelled_on_shutdown(db: Database, tmp_path: Path) -> None:
+    alice = await invited(db, ALICE, "小王")
+    describing = ScriptedModel("describe", [], hang=True)
+    describer = describer_of(db, tmp_path, describing)
+    model = ScriptedModel("main", answer("好"))
+    chat = media_chat(
+        db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, SEES), describer=describer
+    )
+
+    await send(chat, alice, None, image_attachment())
+    async with asyncio.timeout(HANG_GUARD):
+        await describing.started.wait()
+        assert describer.pending == 1
+        await describer.aclose()
+
+    assert describer.pending == 0
+    assert describing.closed == 1
+    (row,) = await attachment_rows(db)
+    assert row[6] == "pending"
+
+
+# ---- 评审修正：授权复查、备用模型、未回复的消息、关停时的描述记账 ----
+
+
+async def disabler(db: Database, user: User) -> Action:
+    async def disable() -> None:
+        await db.transaction(access.set_user_status, user.id, UserStatus.DISABLED)
+
+    return disable
+
+
+async def test_access_is_rechecked_after_sending_the_notice_and_before_the_model(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    one = ScriptedModel("one", answer("不该出现"))
+    two = ScriptedModel("two", answer("不该出现"))
+    decider = FakeDecider(chances(one=0.5, two=0.5))
+    chat = media_chat(db, tmp_path, FakeDownloader({}), (one, SEES), (two, SEES), decider=decider)
+    # 附件下载失败要先发一条说明；发说明（等网络）期间用户被停用。
+    channel = FakeChannel(send_action=await disabler(db, alice))
+
+    await send(chat, alice, "看看这个", image_attachment(), channel=channel)
+
+    assert channel.sent == [texts.ATTACHMENT_FAILED]
+    assert len(decider.requests) == 1  # 说明要按选中的模型定，所以在决策之后发
+    assert one.requests == two.requests == []
+    # 没有调用模型，但附件的说明已确认送达：这一轮已经结束。
+    assert (await rows(db))[-1] == Row("assistant", "", "one", "skipped", "noticed")
+
+
+class BlockingStore(MediaStore):
+    """读附件时停下，等测试放行（读文件在工作线程里，用线程的事件）。"""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.reading = threading.Event()
+        self.release = threading.Event()
+        self.reads = 0
+
+    def read(self, user_id: int, relative: str) -> bytes | None:
+        self.reads += 1
+        self.reading.set()
+        self.release.wait(HANG_GUARD)
+        return super().read(user_id, relative)
+
+
+async def test_access_is_rechecked_after_reading_the_files_for_the_request(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("不该出现"))
+    store = BlockingStore(MediaStore.under(tmp_path).root)
+    chat = media_chat(db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, SEES), store=store)
+
+    task = asyncio.create_task(send(chat, alice, None, image_attachment()))
+    assert await asyncio.to_thread(store.reading.wait, HANG_GUARD)
+    await db.transaction(access.set_user_status, alice.id, UserStatus.DISABLED)
+    store.release.set()
+    await task
+
+    assert model.requests == []
+    assert (await rows(db))[-1] == Row("assistant", "", "main", "skipped", "withheld")
+
+
+async def test_withheld_turn_schedules_no_description(db: Database, tmp_path: Path) -> None:
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    decider = FakeDecider(chances(one=0.5, two=0.5), gate=gate)
+    describing = ScriptedModel("describe", answer("不该出现"))
+    describer = describer_of(db, tmp_path, describing)
+    one, two = ScriptedModel("one", answer("x")), ScriptedModel("two", answer("x"))
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({IMAGE_URL: PNG_A}),
+        (one, SEES),
+        (two, SEES),
+        decider=decider,
+        describer=describer,
+    )
+
+    task = asyncio.create_task(send(chat, alice, None, image_attachment()))
+    async with asyncio.timeout(HANG_GUARD):
+        await decider.started.wait()
+    await db.transaction(access.set_user_status, alice.id, UserStatus.DISABLED)
+    gate.set()
+    await task
+
+    assert describer.pending == 0
+    await describer.wait_idle()
+    assert describing.requests == []
+
+
+async def test_description_waiting_in_the_queue_is_dropped_once_access_is_gone(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    describing = ScriptedModel("describe", answer("不该出现"))
+    describer = describer_of(db, tmp_path, describing)
+    model = ScriptedModel("main", answer("好"))
+    chat = media_chat(
+        db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, BLIND), describer=describer
+    )
+    await describer.aclose()  # 先不让它描述：只借这一轮把图片存下、排成 pending
+    await send(chat, alice, None, image_attachment())
+    ((attachment_id,),) = [tuple(r) for r in await db.fetch_all("SELECT id FROM attachments")]
+    await db.transaction(access.set_paused, True, 0)  # 排队期间服务被暂停
+
+    queued = describer_of(db, tmp_path, describing)
+    queued.schedule(alice, [attachment_id])
+    await queued.wait_idle()
+
+    assert describing.requests == []
+    (row,) = await attachment_rows(db)
+    assert row[6] == "pending"
+
+
+async def test_voice_without_transcript_is_not_handed_to_a_fallback_that_cannot_hear(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    wav_url = "https://qqbot.ugcimg.cn/wav"
+    voice = IncomingAttachment(kind=AttachmentKind.VOICE, url=IMAGE_URL, wav_url=wav_url)
+    hearing = GeminiScriptedModel("hearing", [ModelError(Provider.GEMINI, ErrorKind.SERVER)])
+    deaf = ScriptedModel("deaf", answer("不该出现"))
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({wav_url: b"RIFF\x00\x00\x00\x00WAVEfmt "}),
+        (hearing, frozenset({Modality.AUDIO})),
+        (deaf, BLIND),
+        fallbacks={"hearing": "deaf"},
+    )
+
+    channel = await send(chat, alice, None, voice)
+
+    assert len(hearing.requests) == 1
+    assert deaf.requests == []
+    assert channel.sent == [texts.MODEL_FAILED]
+
+
+async def test_unanswered_message_does_not_push_the_last_turns_image_out(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("一只猫"))
+    missing = "https://multimedia.nt.qq.com.cn/download?fileid=GONE"
+    chat = media_chat(
+        db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, SEES), image_turns=1
+    )
+
+    await send(chat, alice, "这是什么", image_attachment())
+    notice_only = await send(chat, alice, None, image_attachment(missing))  # 只收到说明，没有回复
+    await send(chat, alice, "再仔细看看")
+
+    assert notice_only.log == [("send", texts.ATTACHMENT_FAILED)]
+    images = [p for m in model.requests[-1].messages for p in m.parts if isinstance(p, ImagePart)]
+    assert images == [ImagePart(PNG_A, "image/png")]
+
+
+async def test_finished_description_is_recorded_even_if_shut_down_while_writing(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    release = threading.Event()
+    blockers: list[asyncio.Task[None]] = []
+    occupied = asyncio.Event()
+
+    def block(conn: sqlite3.Connection) -> None:
+        release.wait(HANG_GUARD)
+
+    async def occupy_the_database() -> None:
+        # 模型还没结束时占住数据库线程：描述写好后的记账只能排在后面。
+        blockers.append(asyncio.create_task(db.transaction(block)))
+        await asyncio.sleep(0.05)
+        occupied.set()
+
+    describing = ScriptedModel(
+        "describe", [TextDelta("一只猫"), Usage(70, 9), occupy_the_database, DONE]
+    )
+    describer = describer_of(db, tmp_path, describing)
+    model = ScriptedModel("main", answer("好"))
+    chat = media_chat(
+        db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, BLIND), describer=describer
+    )
+
+    await send(chat, alice, None, image_attachment())
+    async with asyncio.timeout(HANG_GUARD):
+        await occupied.wait()
+        await asyncio.sleep(0.05)  # 模型结束，记账排到数据库线程后面
+        assert describing.closed == 1
+        closing = asyncio.create_task(describer.aclose())
+        await asyncio.sleep(0.05)
+        assert not closing.done()  # 关停要等排着的记账写完
+        release.set()
+        await closing
+        await blockers[0]
+
+    (row,) = await attachment_rows(db)
+    assert row[5:] == ("[图片：一只猫]", "done")
+    assert ("describe", "describe", 70, 9) in await usage_by_purpose(db)
+
+
+# ---- 第二轮评审：本轮输入、按实际请求说明、按实际文件确认、多模态请求的名额 ----
+
+READS = frozenset({Modality.FILE})
+PDF_BYTES = b"%PDF-1.4\n%fake pdf"
+
+
+async def test_unanswered_pdf_left_before_a_restart_is_part_of_this_turn(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    store = MediaStore.under(tmp_path)
+    path = store.save(alice.id, PDF_BYTES, "application/pdf")
+
+    def leave(conn: sqlite3.Connection) -> None:
+        # 上次 PDF 已落库，程序在回复前关停：只有用户消息与附件，没有回复。
+        message_id = journal.add_user_message(conn, alice.id, "", "qq-old", START)
+        item = Acquired(
+            position=0,
+            kind=AttachmentKind.FILE,
+            quoted=False,
+            status=AttachmentStatus.STORED,
+            mime_type="application/pdf",
+            size=len(PDF_BYTES),
+            path=path,
+            filename="报告.pdf",
+            text="[文件：报告.pdf，PDF，18 B]",
+        )
+        journal.add_attachment(
+            conn, user_id=alice.id, message_id=message_id, item=item, describe=False, now=START
+        )
+
+    await db.transaction(leave)
+    blind = ScriptedModel("blind", answer("不该出现"))
+    reader = ScriptedModel("reader", answer("这是一份报告"))
+    chat = media_chat(
+        db, tmp_path, FakeDownloader({}), (blind, BLIND), (reader, READS), history_turns=0
+    )
+
+    channel = await send(chat, alice, "总结一下刚才的 PDF")
+
+    assert blind.requests == []  # PDF 参加了候选筛选
+    (request,) = reader.requests
+    assert request.messages == (
+        Message(
+            Role.USER,
+            (
+                TextPart("[文件：报告.pdf，PDF，18 B]"),
+                FilePart(PDF_BYTES, "application/pdf"),
+                TextPart("\n总结一下刚才的 PDF"),
+            ),
+        ),
+    )
+    assert channel.sent == []  # 旧消息的附件不再重复说明
+
+
+async def test_notice_says_which_attachment_the_chosen_model_did_not_get(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    pdf_url = "https://grouptalk.c2c.qq.com/f/report"
+    seeing = ScriptedModel("seeing", answer("图里是猫"))
+    reader = ScriptedModel("reader", answer("不该出现"))
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({IMAGE_URL: PNG_A, pdf_url: PDF_BYTES}),
+        (seeing, SEES),
+        (reader, READS),
+    )
+    pdf = IncomingAttachment(kind=AttachmentKind.FILE, declared_type="file", url=pdf_url)
+
+    channel = await send(chat, alice, "看看这两个", image_attachment(), pdf)
+
+    assert channel.sent == [texts.FILE_UNAVAILABLE]
+    parts = seeing.requests[0].messages[-1].parts
+    assert ImagePart(PNG_A, "image/png") in parts
+    assert not any(isinstance(p, FilePart) for p in parts)
+
+
+class MissingStore(MediaStore):
+    """存得下，读不到：模拟本地文件在落库之后不见了。"""
+
+    def read(self, user_id: int, relative: str) -> bytes | None:
+        return None
+
+
+async def test_request_with_nothing_answerable_only_sends_a_notice(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("不该出现"))
+    store = MissingStore(MediaStore.under(tmp_path).root)
+    chat = media_chat(db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, SEES), store=store)
+
+    channel = await send(chat, alice, None, image_attachment())
+
+    assert model.requests == []
+    assert channel.sent == [texts.ATTACHMENT_GONE]
+    assert (await rows(db))[-1] == Row("assistant", "", "main", "skipped", "failed")
+    assert await usage(db) == []
+
+
+async def test_multimodal_requests_are_limited_for_the_whole_process(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(conversation_module, "MULTIMODAL_REQUESTS", 1)
+    alice = await invited(db, ALICE, "小王")
+    bob = await invited(db, BOB, "小李")
+    carol = await invited(db, "FAKE-OPENID-CAROL", "小张")
+    url_b = "https://multimedia.nt.qq.com.cn/download?fileid=BOB"
+    gate = asyncio.Event()
+    model = ScriptedModel("main", answer("好"), gate=gate)
+    chat = media_chat(db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A, url_b: PNG_B}), (model, SEES))
+
+    first = asyncio.create_task(send(chat, alice, None, image_attachment()))
+    async with asyncio.timeout(HANG_GUARD):
+        await model.started.wait()
+    second = asyncio.create_task(send(chat, bob, None, image_attachment(url_b)))
+    third = asyncio.create_task(send(chat, carol, "只有文字"))
+    async with asyncio.timeout(HANG_GUARD):
+        while len(model.requests) < 2:
+            model.started.clear()
+            await model.started.wait()
+    await asyncio.sleep(0.05)
+
+    # 小王的带图请求还在途：小李的带图请求等着，小张的纯文字请求不受限。
+    assert [text_of(m.messages[-1].parts[0]) for m in model.requests[1:]] == ["只有文字"]
+    assert len(model.requests) == 2
+    gate.set()
+    await asyncio.gather(first, second, third)
+    assert len(model.requests) == 3
+
+
+# ---- 第三轮评审：决策输入的额度、名额覆盖原件的占用期、备用模型补发说明 ----
+
+
+async def test_decision_input_puts_the_new_question_before_old_pending_text(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+
+    def leave(conn: sqlite3.Connection) -> None:
+        journal.add_user_message(conn, alice.id, "很长的旧消息" * 1000, "qq-old", START)
+
+    await db.transaction(leave)
+    one, two = ScriptedModel("one", answer("好")), ScriptedModel("two", answer("好"))
+    decider = FakeDecider(chances(one=0.6, two=0.4))
+    chat = media_chat(db, tmp_path, FakeDownloader({}), (one, BLIND), (two, BLIND), decider=decider)
+
+    await send(chat, alice, "这次真正要问的")
+
+    latest = json.loads(decider.requests[0].input)["latest"]
+    assert latest.endswith("这次真正要问的")
+    assert len(latest) <= 4000
+
+
+class SlowToStop(ScriptedModel):
+    """第一次调用一直不结束，被停下时关闭要花 0.2 秒（这期间它还拿着请求里的原件）；之后的调用记下第一次的流
+    关了没有，再正常回答。"""
+
+    def __init__(self) -> None:
+        super().__init__("main", [])
+        self.calls = 0
+        self.first_closed = False
+        self.seen_first_closed: list[bool] = []
+
+    async def stream(self, request: ChatRequest) -> AsyncGenerator[ChatEvent]:
+        self.calls += 1
+        self.requests.append(request)
+        self.started.set()
+        if self.calls == 1:
+            try:
+                yield TextDelta("在看")
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0.2)
+                self.first_closed = True
+            return
+        self.seen_first_closed.append(self.first_closed)
+        yield TextDelta("好")
+        yield Usage(12, 34)
+        yield DONE
+
+
+async def test_multimodal_slot_is_held_until_the_cancelled_request_has_stopped(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(conversation_module, "MULTIMODAL_REQUESTS", 1)
+    alice = await invited(db, ALICE, "小王")
+    bob = await invited(db, BOB, "小李")
+    url_b = "https://multimedia.nt.qq.com.cn/download?fileid=BOB"
+    model = SlowToStop()
+    chat = media_chat(db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A, url_b: PNG_B}), (model, SEES))
+
+    task_a = asyncio.create_task(send(chat, alice, None, image_attachment()))
+    async with asyncio.timeout(HANG_GUARD):
+        await model.started.wait()
+    task_b = asyncio.create_task(send(chat, bob, None, image_attachment(url_b)))
+    await asyncio.sleep(0.05)
+    assert model.calls == 1  # 名额被小王占着
+    task_a.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task_a
+    await asyncio.wait_for(task_b, HANG_GUARD)
+
+    assert model.seen_first_closed == [True]  # 小李开始时，小王的模型流已经停下
+
+
+async def test_fallback_sends_notices_that_are_new_for_its_request(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    wav_url = "https://qqbot.ugcimg.cn/wav"
+    missing = "https://multimedia.nt.qq.com.cn/download?fileid=GONE"
+    voice = IncomingAttachment(kind=AttachmentKind.VOICE, url=IMAGE_URL, wav_url=wav_url)
+    hearing = GeminiScriptedModel("hearing", [ModelError(Provider.GEMINI, ErrorKind.SERVER)])
+    deaf = ScriptedModel("deaf", answer("收到"))
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({wav_url: b"RIFF\x00\x00\x00\x00WAVEfmt "}),
+        (hearing, frozenset({Modality.AUDIO, Modality.IMAGE})),
+        (deaf, BLIND),
+        fallbacks={"hearing": "deaf"},
+    )
+
+    channel = await send(chat, alice, "在吗", voice, image_attachment(missing))
+
+    # 主模型前发过「附件没能下载」；备用模型收不了这条没有转写的语音，要补一句，不重复前一句。
+    assert channel.sent == [texts.ATTACHMENT_FAILED, texts.VOICE_UNRECOGNIZED]
+    assert channel.streamed == "收到"
+
+
+# ---- 第四轮评审：在途轮次的排空、读原件期间占着名额、送达不明的说明不重发 ----
+
+
+async def test_drain_waits_for_cancelled_turns_to_record_what_was_delivered(
+    db: Database,
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    # 模型流被停下时关闭要花点时间：收尾比 pyqbot 等处理函数的时间还长时，关停也要等它记完账。
+    model = ScriptedModel("main", [TextDelta("说到一半")], hang=True, close_delay=0.2)
+    chat = conversation(db, model)
+    channel = FakeChannel()
+
+    task = asyncio.create_task(say(chat, alice, "你好", channel))
+    async with asyncio.timeout(HANG_GUARD):
+        await channel.delivered.wait()
+        task.cancel()
+        await chat.drain()
+
+    assert (await rows(db))[-1] == Row("assistant", "说到一半", "main", "cancelled", "cancelled")
+    assert task.done()
+
+
+async def test_multimodal_slot_is_held_until_a_cancelled_read_has_finished(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(conversation_module, "MULTIMODAL_REQUESTS", 1)
+    alice = await invited(db, ALICE, "小王")
+    bob = await invited(db, BOB, "小李")
+    url_b = "https://multimedia.nt.qq.com.cn/download?fileid=BOB"
+    store = BlockingStore(MediaStore.under(tmp_path).root)
+    model = ScriptedModel("main", answer("好"))
+    chat = media_chat(
+        db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A, url_b: PNG_B}), (model, SEES), store=store
+    )
+
+    task_a = asyncio.create_task(send(chat, alice, None, image_attachment()))
+    assert await asyncio.to_thread(store.reading.wait, HANG_GUARD)
+    task_b = asyncio.create_task(send(chat, bob, None, image_attachment(url_b)))
+    await asyncio.sleep(0.02)
+    task_a.cancel()  # 小王读原件的线程还卡着
+    await asyncio.sleep(0.05)
+
+    assert store.reads == 1  # 名额没有提前归还，小李还不能开始读原件
+    store.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task_a
+    await asyncio.wait_for(task_b, HANG_GUARD)
+    assert store.reads == 2
+
+
+async def test_notice_whose_delivery_is_unknown_is_not_resent_for_the_fallback(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    wav_url = "https://qqbot.ugcimg.cn/wav"
+    missing = "https://multimedia.nt.qq.com.cn/download?fileid=GONE"
+    voice = IncomingAttachment(kind=AttachmentKind.VOICE, url=IMAGE_URL, wav_url=wav_url)
+    hearing = GeminiScriptedModel("hearing", [ModelError(Provider.GEMINI, ErrorKind.SERVER)])
+    deaf = ScriptedModel("deaf", answer("收到"))
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({wav_url: b"RIFF\x00\x00\x00\x00WAVEfmt "}),
+        (hearing, frozenset({Modality.AUDIO, Modality.IMAGE})),
+        (deaf, BLIND),
+        fallbacks={"hearing": "deaf"},
+    )
+    attempts: list[str] = []
+
+    def uncertain_first(text: str) -> SendError | None:
+        attempts.append(text)
+        return SendUncertainError("网络错误") if len(attempts) == 1 else None
+
+    channel = FakeChannel(send_failure=uncertain_first)
+
+    await send(chat, alice, "在吗", voice, image_attachment(missing), channel=channel)
+
+    # 第一条说明送达不明：可能已经送到，备用模型那次只补发新的那句。
+    assert attempts == [texts.ATTACHMENT_FAILED, texts.VOICE_UNRECOGNIZED]
+
+
+# ---- 终审：排队下载前复查授权、附件说明送达后这一轮算结束 ----
+
+
+async def test_attachment_queued_for_a_slot_is_not_fetched_after_access_is_withdrawn(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    release = asyncio.Event()
+    fetched: list[str] = []
+
+    class Gated:
+        async def fetch(self, url: str, *, max_bytes: int) -> AsyncGenerator[bytes]:
+            fetched.append(url)
+            await release.wait()
+            yield PNG_A
+
+        async def aclose(self) -> None:
+            pass
+
+    fetcher = Fetcher(MediaStore.under(tmp_path), Gated(), AttachmentSettings())
+    model = ScriptedModel("main", answer("不该出现"))
+    chat = media_chat(db, tmp_path, FakeDownloader({}), (model, SEES), fetcher=fetcher)
+    others = "https://multimedia.nt.qq.com.cn/other"
+    holders = [
+        asyncio.create_task(
+            fetcher.acquire(999, [image_attachment(f"{others}/{n}")], wanted=SEES_KINDS, label="x")
+        )
+        for n in range(DOWNLOAD_CONCURRENCY)
+    ]
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert fetcher.busy == DOWNLOAD_CONCURRENCY  # 槽位占满
+
+    task = asyncio.create_task(send(chat, alice, None, image_attachment()))
+    await asyncio.sleep(0.02)  # 小王的附件在排队
+    await db.transaction(access.set_user_status, alice.id, UserStatus.DISABLED)
+    release.set()
+    await asyncio.gather(task, *holders)
+
+    assert IMAGE_URL not in fetched  # 拿到槽位后复查，不再发出请求
+    assert model.requests == []
+
+
+async def test_turn_whose_attachment_notice_was_delivered_counts_as_finished(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", [], hang=True)  # 正文出来之前就关停
+    chat = media_chat(db, tmp_path, FakeDownloader({}), (model, SEES))
+    channel = FakeChannel()
+
+    task = asyncio.create_task(send(chat, alice, "看看这个", image_attachment(), channel=channel))
+    async with asyncio.timeout(HANG_GUARD):
+        await model.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert channel.sent == [texts.ATTACHMENT_FAILED]  # 失败说明已确认送达
+    assert (await rows(db))[-1] == Row("assistant", "", "main", "cancelled", "noticed")
+    (last,) = await db.fetch_all("SELECT MAX(id) FROM messages")
+    pending = await db.transaction(journal.pending_messages, alice.id, last[0] + 1)
+    assert pending == []  # 下一轮不会把它重新并入

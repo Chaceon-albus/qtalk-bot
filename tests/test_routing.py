@@ -26,6 +26,7 @@ from qtalk_bot.routing import (
     QUESTION,
     TIMEOUT,
     Choice,
+    DecisionRecord,
     Router,
     choose,
     decision_input,
@@ -414,3 +415,59 @@ async def test_logs_show_model_names_and_probabilities_but_no_message_text(
 
     assert "chat 0.70" in caplog.text
     assert SECRET not in caplog.text
+
+
+# ---- 里程碑 5a：只在候选里选 ----
+
+
+async def candidate_pick(
+    r: Router, candidates: Sequence[str], previous: str | None = None
+) -> tuple[str, DecisionRecord | None]:
+    selection = r.select((), "这是什么\n[图片]", previous, label="#1 小王", candidates=candidates)
+    async with asyncio.timeout(HANG_GUARD):
+        model = await selection.run()
+    return model, selection.record
+
+
+async def test_question_offers_only_the_candidates() -> None:
+    decider = FakeDecider(result(chat=0.3, code=0.7))
+
+    model, record = await candidate_pick(router(decider), ["chat", "code"])
+
+    assert model == "code"
+    (question,) = decider.requests[0].questions
+    assert isinstance(question, ChoiceQuestion)
+    assert [option.value for option in question.options] == ["chat", "code"]
+    assert record is not None
+    assert record.probabilities == {"chat": 0.3, "code": 0.7}
+
+
+async def test_single_candidate_needs_no_decision() -> None:
+    decider = FakeDecider(result(solve=1.0))
+
+    assert await candidate_pick(router(decider), ["chat"]) == ("chat", None)
+    assert decider.requests == []
+
+
+async def test_without_decisions_the_default_is_used_only_if_it_is_a_candidate() -> None:
+    r = router(None, settings=None)
+    assert (await candidate_pick(r, ["solve", "code"]))[0] == "solve"
+    assert (await candidate_pick(r, ["code", "chat"]))[0] == "chat"  # 按配置的顺序取第一个
+
+
+async def test_previous_model_outside_the_candidates_gets_no_switch_margin() -> None:
+    # 上一轮是 solve，但它不在候选里：不按 switch_margin 沿用，直接取概率最高的。
+    decider = FakeDecider(result(chat=0.45, code=0.55))
+
+    model, record = await candidate_pick(router(decider), ["chat", "code"], previous="solve")
+
+    assert model == "code"
+    assert record is not None
+    assert record.kept_previous is False
+
+
+async def test_failed_decision_falls_back_within_the_candidates() -> None:
+    failing = FakeDecider(TimeoutError())
+    assert (await candidate_pick(router(failing), ["chat", "code"], previous="code"))[0] == "code"
+    failing = FakeDecider(TimeoutError())
+    assert (await candidate_pick(router(failing), ["chat", "code"], previous="solve"))[0] == "chat"

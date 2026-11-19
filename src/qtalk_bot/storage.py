@@ -156,7 +156,69 @@ ALTER TABLE usage ADD COLUMN purpose TEXT NOT NULL DEFAULT 'chat'
     CHECK (purpose IN ('chat', 'decision'));
 """
 
-MIGRATIONS: tuple[Migration, ...] = (_V1_ACCESS, _V2_CHAT, _V3_DECISIONS)
+_V4_ATTACHMENTS = """
+-- 用量的用途加上 describe（给图片写描述的后台调用，它的 model 列是固定的 describe）。CHECK 约束改不了，
+-- 按 SQLite 的做法重建表：新建、复制、删旧、改名，再建回索引。列的顺序与原表相同。
+CREATE TABLE usage_new (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id),
+    message_id INTEGER REFERENCES messages (id) ON DELETE SET NULL,
+    model TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    provider_model TEXT NOT NULL,
+    input_tokens INTEGER CHECK (input_tokens >= 0),
+    output_tokens INTEGER CHECK (output_tokens >= 0),
+    created_at INTEGER NOT NULL,
+    purpose TEXT NOT NULL DEFAULT 'chat' CHECK (purpose IN ('chat', 'decision', 'describe'))
+) STRICT;
+INSERT INTO usage_new (id, user_id, message_id, model, provider, provider_model, input_tokens,
+    output_tokens, created_at, purpose)
+SELECT id, user_id, message_id, model, provider, provider_model, input_tokens, output_tokens,
+    created_at, purpose FROM usage;
+DROP TABLE usage;
+ALTER TABLE usage_new RENAME TO usage;
+CREATE INDEX usage_by_user ON usage (user_id, created_at);
+
+-- 用户消息的引用索引（平台 message_scene.ext 里的 msg_idx），按引用定位话题时用；回复与没有索引的为空。
+ALTER TABLE messages ADD COLUMN msg_idx TEXT;
+
+-- 附件：每个附件一行，属于一条用户消息（同一轮可能有多条用户消息，各自挂各自的附件）。
+-- position 是在这条消息里的顺序；quoted 为 1 表示来自被引用的消息（msg_elements）。
+-- kind 按文件头判断后的实际种类：image、voice、file，以及不支持的 video、card（卡片）、chat_history（转发的
+-- 聊天记录）、other。
+-- status 是原件的情况：stored（已存到本地，path 非空）、failed（下载失败或超时）、too_large（超过大小上限）、
+-- unsupported（认不出的格式或不支持的种类）、skipped（没有下载：没有模型用得上它）、expired（本地文件已过期
+-- 删除，path 为空）。
+-- mime_type 是按文件头判断出的实际类型，size 是实际下载的字节数（没下载时是平台声明的大小）；path 是相对于
+-- 附件目录的路径（<用户编号>/<随机名>.<扩展名>），只经这张表查到，不接受来自消息的路径。
+-- text 是文字版，历史里不给原件时就用它：图片是描述（生成前是占位），语音是识别文本，文件是简短的说明。
+-- filename 是平台给的原始文件名，属于对话内容，只进数据库，不进日志与文件路径。
+-- describe_status：图片描述的状态，pending、done、failed，不需要描述的为空。
+CREATE TABLE attachments (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id),
+    message_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    quoted INTEGER NOT NULL CHECK (quoted IN (0, 1)),
+    kind TEXT NOT NULL
+        CHECK (kind IN ('image', 'voice', 'file', 'video', 'card', 'chat_history', 'other')),
+    status TEXT NOT NULL
+        CHECK (status IN ('stored', 'failed', 'too_large', 'unsupported', 'skipped', 'expired')),
+    mime_type TEXT,
+    size INTEGER CHECK (size >= 0),
+    path TEXT,
+    filename TEXT,
+    text TEXT NOT NULL,
+    describe_status TEXT CHECK (describe_status IN ('pending', 'done', 'failed')),
+    created_at INTEGER NOT NULL,
+    CHECK ((status = 'stored') = (path IS NOT NULL)),
+    UNIQUE (message_id, position)
+) STRICT;
+CREATE INDEX attachments_by_user ON attachments (user_id, message_id);
+CREATE INDEX attachments_by_time ON attachments (created_at) WHERE path IS NOT NULL;
+"""
+
+MIGRATIONS: tuple[Migration, ...] = (_V1_ACCESS, _V2_CHAT, _V3_DECISIONS, _V4_ATTACHMENTS)
 """本程序的迁移列表。业务表由各里程碑在末尾追加，已发布的不能修改。"""
 
 

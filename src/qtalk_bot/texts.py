@@ -45,7 +45,37 @@ PAUSED = "服务暂停中，请稍后再来。"
 
 # ---- 对话 ----
 
-TEXT_ONLY = "暂时只支持文字消息，图片、语音和文件还看不懂。可以用文字说说想问什么。"
+UNSUPPORTED = (
+    "暂不支持这类消息（视频、卡片、转发的聊天记录等）。可以发文字、图片、语音或 PDF 文件给我。"
+)
+
+ATTACHMENT_FAILED = "有附件没能下载下来，可以稍后再发一次。"
+
+
+def attachment_too_large(max_size_mb: int) -> str:
+    return f"有附件超过了 {max_size_mb} MB，太大了，没能查看。"
+
+
+def attachment_too_large_for_model(limit_mb: int) -> str:
+    return (
+        f"有附件太大，超过了模型能直接查看的大小（约 {limit_mb} MB），没能交给模型。"
+        "可以压缩或缩小后再发一次。"
+    )
+
+
+ATTACHMENT_GONE = "有附件的本地文件已经不在了，没能交给模型查看，可以重新发一次。"
+
+ATTACHMENTS_OVER_BUDGET = "附件太多或太大，这次只看了其中一部分，其余的只能按文字说明处理。"
+
+IMAGE_FORMAT_UNSUPPORTED = "这张图片的格式暂不支持，换成截图或 JPG、PNG 再发一次试试。"
+
+IMAGE_UNAVAILABLE = "这次看不了图片，可以用文字描述一下图里的内容。"
+
+FILE_UNSUPPORTED = "暂不支持查看这个文件，目前只能看 PDF。"
+
+FILE_UNAVAILABLE = "暂不支持查看 PDF 文件。"
+
+VOICE_UNRECOGNIZED = "这条语音没能识别出文字，可以再说一次或者打字告诉我。"
 
 MODEL_FAILED = "抱歉，刚才没能生成回复，请稍后再试一次。"
 

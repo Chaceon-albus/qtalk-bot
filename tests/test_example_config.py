@@ -6,8 +6,10 @@ from qtalk_bot.config import (
     DEFAULT_DATA_DIR,
     DEFAULT_DECISION_MODELS,
     DEFAULT_TIMEZONE,
+    AttachmentSettings,
     ChatSettings,
     DecisionSettings,
+    DescribeSettings,
     InviteSettings,
     Provider,
     ProvidersSettings,
@@ -53,6 +55,14 @@ def test_example_config_is_valid_and_spells_out_the_defaults() -> None:
     assert example.decisions == DecisionSettings(
         provider=Provider.OPENAI, model=DEFAULT_DECISION_MODELS[Provider.OPENAI]
     )
+    assert example.attachments == AttachmentSettings()
+    # [describe] 的模型没有默认值，其余各项要与默认值一致。
+    assert example.describe == DescribeSettings(provider=Provider.OPENAI, model="gpt-6-luna")
+    # OpenAI 的模型不接受音频；示例里两个模型的输入能力与实测、文档一致。
+    assert [sorted(m.value for m in model.inputs) for model in example.models] == [
+        ["file", "image"],
+        ["audio", "file", "image"],
+    ]
 
 
 def test_example_config_shows_both_providers_and_a_fallback() -> None:

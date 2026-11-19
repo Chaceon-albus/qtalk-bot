@@ -7,9 +7,11 @@ from qtalk_bot.config import (
     DEFAULT_DECISION_INSTRUCTIONS,
     DEFAULT_DECISION_MODELS,
     DEFAULT_PERSONA,
+    AttachmentSettings,
     ChatSettings,
     ConfigError,
     DecisionSettings,
+    DescribeSettings,
     InviteSettings,
     ModelSettings,
     ProviderSettings,
@@ -22,7 +24,7 @@ from qtalk_bot.config import (
     load_secrets,
     load_settings,
 )
-from qtalk_bot.llm import Provider, gemini_decisions, openai_decisions
+from qtalk_bot.llm import Modality, Provider, gemini_decisions, openai_decisions
 
 # 假密钥：只用于断言它们不会出现在 repr 与异常文案里。
 FAKE_SECRETS = {
@@ -880,3 +882,112 @@ def test_too_many_models_and_missing_descriptions_are_reported_together(tmp_path
         "models：配置了 [decisions] 时最多 255 个模型",
         "models[3].description：配置了 [decisions] 且模型多于一个时必填",
     )
+
+
+# ---- 里程碑 5a：模型的输入能力、[attachments]、[describe] ----
+
+
+def test_inputs_default_to_text_only_and_are_read(tmp_path: Path) -> None:
+    path = models_config(
+        tmp_path,
+        model_block(name="a", provider="openai", model="m", default=True),
+        model_block(name="b", provider="gemini", model="g", inputs=["image", "audio", "file"]),
+    )
+    a, b = load_settings(path).models
+    assert a.inputs == frozenset()
+    assert b.inputs == frozenset({Modality.IMAGE, Modality.AUDIO, Modality.FILE})
+
+
+@pytest.mark.parametrize(
+    ("inputs", "problem"),
+    [
+        ('"image"', "models[0].inputs：应为字符串的数组，实际是字符串"),
+        ("[1]", "models[0].inputs[0]：应为字符串，实际是整数"),
+        ('["video"]', "models[0].inputs：取值应为 image、audio、file 之一"),
+        ('["text"]', "models[0].inputs：文字总是接收的，不用写 text"),
+        ('["image", "image"]', "models[0].inputs：image 重复了"),
+        ('["audio"]', "models[0].inputs：openai 的对话接口不接受音频，不能声明 audio"),
+    ],
+)
+def test_invalid_inputs(tmp_path: Path, inputs: str, problem: str) -> None:
+    text = f'[[models]]\nname = "a"\nprovider = "openai"\nmodel = "m"\ndefault = true\ninputs = {inputs}\n'
+    assert config_error(write_config(tmp_path, text, models=False)).problems == (problem,)
+
+
+def test_attachments_defaults_and_values(tmp_path: Path) -> None:
+    assert load_settings(write_config(tmp_path, "")).attachments == AttachmentSettings(
+        max_size_mb=20, download_timeout_seconds=30, retention_days=30, history_turns=3
+    )
+    text = (
+        "[attachments]\nmax_size_mb = 5\ndownload_timeout_seconds = 2.5\n"
+        "retention_days = 7\nhistory_turns = 0\n"
+    )
+    settings = load_settings(write_config(tmp_path, text, "b.toml"))
+    assert settings.attachments == AttachmentSettings(
+        max_size_mb=5, download_timeout_seconds=2.5, retention_days=7, history_turns=0
+    )
+    assert settings.attachments.max_bytes == 5 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ("max_size_mb = 0", "attachments.max_size_mb：应为正整数"),
+        ("max_size_mb = 101", "attachments.max_size_mb：不能大于 100"),
+        (
+            "download_timeout_seconds = 0",
+            "attachments.download_timeout_seconds：应大于 0、不大于 300",
+        ),
+        ("retention_days = 0", "attachments.retention_days：应为正整数"),
+        ("history_turns = 21", "attachments.history_turns：不能大于 20"),
+        ("extra = 1", "attachments.extra：未知的键"),
+    ],
+)
+def test_invalid_attachments(tmp_path: Path, text: str, problem: str) -> None:
+    path = write_config(tmp_path, f"[attachments]\n{text}\n")
+    assert config_error(path).problems == (problem,)
+
+
+def test_describe_is_optional_and_read(tmp_path: Path) -> None:
+    assert load_settings(write_config(tmp_path, "")).describe is None
+    text = '[describe]\nprovider = "gemini"\nmodel = "gemini-lite"\nreasoning = "low"\n'
+    describe = load_settings(write_config(tmp_path, text, "b.toml")).describe
+    assert describe == DescribeSettings(
+        provider=Provider.GEMINI, model="gemini-lite", reasoning="low"
+    )
+    assert describe is not None
+    assert describe.timeout_seconds == 60
+    assert describe.max_output_tokens == 1024
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ('model = "m"', "describe.provider：缺少这个键"),
+        ('provider = "openai"', "describe.model：缺少这个键"),
+        ('provider = "openai"\nmodel = "m"\ninstructions = " "', "describe.instructions：不能为空"),
+        (
+            'provider = "openai"\nmodel = "m"\ntimeout_seconds = 0',
+            "describe.timeout_seconds：应大于 0、不大于 600",
+        ),
+        (
+            'provider = "openai"\nmodel = "m"\nreasoning = "High"',
+            "describe.reasoning：应为小写字母开头的标识符（小写字母、数字、`_`），如 high",
+        ),
+    ],
+)
+def test_invalid_describe(tmp_path: Path, text: str, problem: str) -> None:
+    assert config_error(write_config(tmp_path, f"[describe]\n{text}\n")).problems == (problem,)
+
+
+def test_describe_provider_needs_its_key() -> None:
+    settings = Settings(
+        timezone=ZoneInfo("Asia/Shanghai"),
+        data_dir=Path("/tmp/data"),
+        models=(ModelSettings(name="a", provider=Provider.OPENAI, model="m", default=True),),
+        describe=DescribeSettings(provider=Provider.GEMINI, model="g"),
+    )
+    secrets = load_secrets({k: v for k, v in FAKE_SECRETS.items() if k != "GEMINI_API_KEY"})
+    with pytest.raises(ConfigError) as info:
+        check_provider_secrets(settings, secrets)
+    assert "GEMINI_API_KEY" in str(info.value)

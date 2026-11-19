@@ -2,6 +2,7 @@
 
 from qtalk_bot.config import (
     DecisionSettings,
+    DescribeSettings,
     ModelSettings,
     ProviderSettings,
     ProvidersSettings,
@@ -110,3 +111,22 @@ async def test_no_decision_model_without_the_decisions_table() -> None:
     settings = (ModelSettings(name="main", provider=Provider.OPENAI, model="gpt-a", default=True),)
     async with ChatModels(settings, SECRETS) as models:
         assert models.decider is None
+
+
+async def test_describer_shares_the_client_of_its_provider() -> None:
+    settings = (ModelSettings(name="main", provider=Provider.GEMINI, model="g", default=True),)
+    describe = DescribeSettings(provider=Provider.GEMINI, model="gemini-lite", reasoning="low")
+    async with ChatModels(settings, SECRETS, describe=describe) as models:
+        describer = models.describer
+        assert isinstance(describer, GeminiChatModel)
+        assert (describer.name, describer.model) == ("describe", "gemini-lite")
+        main = models["main"]
+        assert isinstance(main, GeminiChatModel)
+        assert describer._client is main._client  # pyright: ignore[reportPrivateUsage]
+        assert "describe" not in models  # 不是对话模型
+
+
+async def test_no_describer_without_the_table() -> None:
+    settings = (ModelSettings(name="main", provider=Provider.OPENAI, model="m", default=True),)
+    async with ChatModels(settings, SECRETS) as models:
+        assert models.describer is None

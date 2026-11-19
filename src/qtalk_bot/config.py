@@ -18,7 +18,7 @@ from typing import cast
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .llm import Provider
+from .llm import INPUT_LIMITS, Modality, Provider
 from .llm.decisions import MAX_OPTIONS
 
 CONFIG_ENV = "QTALK_CONFIG"
@@ -49,6 +49,21 @@ MAX_DECISION_TIMEOUT_SECONDS = 30.0
 DEFAULT_DECISION_HISTORY_TURNS = 3
 MAX_DECISION_HISTORY_TURNS = 20
 DEFAULT_SWITCH_MARGIN = 0.2
+
+DEFAULT_ATTACHMENT_MAX_SIZE_MB = 20
+MAX_ATTACHMENT_MAX_SIZE_MB = 100
+DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 30
+MAX_DOWNLOAD_TIMEOUT_SECONDS = 300
+DEFAULT_RETENTION_DAYS = 30
+MAX_RETENTION_DAYS = 3650
+DEFAULT_ATTACHMENT_HISTORY_TURNS = 3
+MAX_ATTACHMENT_HISTORY_TURNS = 20
+
+DEFAULT_DESCRIBE_INSTRUCTIONS = """用一句话客观地描述这张图片的内容，不超过 80 个字。图里有文字时摘录关键的文字。
+只输出描述本身，不要加「这张图片」之类的开头。"""
+DEFAULT_DESCRIBE_TIMEOUT_SECONDS = 60
+MAX_DESCRIBE_TIMEOUT_SECONDS = 600
+DEFAULT_DESCRIBE_MAX_OUTPUT_TOKENS = 1024
 
 _MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 _REASONING = re.compile(r"[a-z][a-z0-9_]{0,31}")
@@ -115,6 +130,8 @@ class ModelSettings:
             标识符，不维护取值表；服务商拒绝时按普通的模型调用失败处理（会换备用模型）。
         description: 一句话说明这个模型适合回答什么样的消息，是选模型那道选择题里这个选项的描述。
             配置了 `[decisions]` 且模型多于一个时必填，否则可以不写（写了也不用）。
+        inputs: 文字之外这个模型能直接接收的输入；空集表示只接收文字。带附件的消息只在能处理它们的模型
+            里选。OpenAI 的模型不能声明 `audio`（Responses API 不接受音频）。
     """
 
     name: str
@@ -124,6 +141,7 @@ class ModelSettings:
     fallback: str | None = None
     reasoning: str | None = None
     description: str | None = None
+    inputs: frozenset[Modality] = frozenset()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -146,6 +164,49 @@ class DecisionSettings:
     timeout_seconds: float = DEFAULT_DECISION_TIMEOUT_SECONDS
     history_turns: int = DEFAULT_DECISION_HISTORY_TURNS
     switch_margin: float = DEFAULT_SWITCH_MARGIN
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AttachmentSettings:
+    """`[attachments]` 表：下载、保存附件与把原件放进上下文的规则。
+
+    Attributes:
+        max_size_mb: 单个附件的大小上限（MiB）；平台声明的大小超过它就不下载，下载时边读边数，超过就停。
+        download_timeout_seconds: 下载一个附件的总时限（秒）。
+        retention_days: 附件文件在本地保存的天数；过期的文件定期删除，之后历史里只用文字版。
+        history_turns: 最近几轮里的图片在选中的模型能收图片、本地文件还在时给原件（当前这一轮不算在内）；
+            更早的只给文字版。音频与文件在历史里总是只给文字版。
+    """
+
+    max_size_mb: int = DEFAULT_ATTACHMENT_MAX_SIZE_MB
+    download_timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
+    retention_days: int = DEFAULT_RETENTION_DAYS
+    history_turns: int = DEFAULT_ATTACHMENT_HISTORY_TURNS
+
+    @property
+    def max_bytes(self) -> int:
+        return self.max_size_mb * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DescribeSettings:
+    """`[describe]` 表：给图片写一句话描述的模型。不写这个表就不生成描述，历史里一直是占位。
+
+    Attributes:
+        provider: 服务商；客户端与同一家的对话模型共用。
+        model: 服务商那边的模型名，要能接收图片。
+        reasoning: 推理强度，规则同 `[[models]]` 的 `reasoning`。
+        instructions: 写描述的提示词（作为系统提示词）。
+        timeout_seconds: 一次描述调用的时限（秒）。
+        max_output_tokens: 一次描述的输出上限（含推理）。
+    """
+
+    provider: Provider
+    model: str
+    reasoning: str | None = None
+    instructions: str = field(default=DEFAULT_DESCRIBE_INSTRUCTIONS, repr=False)
+    timeout_seconds: float = DEFAULT_DESCRIBE_TIMEOUT_SECONDS
+    max_output_tokens: int = DEFAULT_DESCRIBE_MAX_OUTPUT_TOKENS
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -226,6 +287,8 @@ class Settings:
     providers: ProvidersSettings = ProvidersSettings()
     qq: QQSettings = QQSettings()
     decisions: DecisionSettings | None = None
+    attachments: AttachmentSettings = AttachmentSettings()
+    describe: DescribeSettings | None = None
 
     @property
     def default_model(self) -> ModelSettings:
@@ -236,7 +299,7 @@ class Settings:
 
 
 def check_provider_secrets(settings: Settings, secrets: Secrets) -> None:
-    """配置里用到的每家服务商（对话模型与 `[decisions]`），对应的密钥都要已设置。
+    """配置里用到的每家服务商（对话模型、`[decisions]` 与 `[describe]`），对应的密钥都要已设置。
 
     Raises:
         ConfigError: 有服务商缺少密钥；只说变量名。
@@ -245,6 +308,8 @@ def check_provider_secrets(settings: Settings, secrets: Secrets) -> None:
     used = {model.provider for model in settings.models}
     if settings.decisions is not None:
         used.add(settings.decisions.provider)
+    if settings.describe is not None:
+        used.add(settings.describe.provider)
     problems = [
         f"配置里用到了 {provider.value} 的模型，但环境变量 {_PROVIDER_SECRETS[provider]} 未设置"
         for provider in sorted(used)
@@ -404,6 +469,20 @@ class _Table:
             return None
         return number
 
+    def string_list(self, key: str) -> list[str] | None:
+        """字符串的数组；缺省时是空列表，类型不符时记下问题并返回 `None`。"""
+        self._read.add(key)
+        value = self._data.get(key, [])
+        if not isinstance(value, list):
+            self.problem(key, f"应为字符串的数组，实际是{_type_name(value)}")
+            return None
+        items = cast(list[object], value)
+        for index, item in enumerate(items):
+            if not isinstance(item, str):
+                self.problem(f"{key}[{index}]", f"应为字符串，实际是{_type_name(item)}")
+                return None
+        return cast(list[str], items)
+
     def table(self, key: str) -> _Table | None:
         """读取子表；缺省时当作空表，类型不符时记下问题并返回 `None`。"""
         self._read.add(key)
@@ -456,6 +535,9 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
     qq_table = table.table("qq")
     qq = None if qq_table is None else _parse_qq(qq_table)
     decisions_ok, decisions = _parse_decisions(table)
+    attachments_table = table.table("attachments")
+    attachments = None if attachments_table is None else _parse_attachments(attachments_table)
+    describe_ok, describe = _parse_describe(table)
     table.finish()
     if decisions is not None and models is not None and len(models) > MAX_OPTIONS:
         # 每个模型是选模型那道选择题的一个选项，两家接口都最多 255 个。
@@ -475,6 +557,8 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         or providers is None
         or qq is None
         or not decisions_ok
+        or attachments is None
+        or not describe_ok
     ):
         return None
     return Settings(
@@ -486,7 +570,89 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         providers=providers,
         qq=qq,
         decisions=decisions,
+        attachments=attachments,
+        describe=describe,
     )
+
+
+def _parse_attachments(table: _Table) -> AttachmentSettings | None:
+    max_size_mb = _positive_int(
+        table, "max_size_mb", DEFAULT_ATTACHMENT_MAX_SIZE_MB, MAX_ATTACHMENT_MAX_SIZE_MB
+    )
+    timeout = table.number("download_timeout_seconds", DEFAULT_DOWNLOAD_TIMEOUT_SECONDS)
+    if timeout is not None and not 0 < timeout <= MAX_DOWNLOAD_TIMEOUT_SECONDS:
+        table.problem(
+            "download_timeout_seconds", f"应大于 0、不大于 {MAX_DOWNLOAD_TIMEOUT_SECONDS}"
+        )
+        timeout = None
+    retention_days = _positive_int(
+        table, "retention_days", DEFAULT_RETENTION_DAYS, MAX_RETENTION_DAYS
+    )
+    history_turns = _bounded_int(
+        table, "history_turns", DEFAULT_ATTACHMENT_HISTORY_TURNS, 0, MAX_ATTACHMENT_HISTORY_TURNS
+    )
+    table.finish()
+    if max_size_mb is None or timeout is None or retention_days is None or history_turns is None:
+        return None
+    return AttachmentSettings(
+        max_size_mb=max_size_mb,
+        download_timeout_seconds=timeout,
+        retention_days=retention_days,
+        history_turns=history_turns,
+    )
+
+
+def _parse_describe(root: _Table) -> tuple[bool, DescribeSettings | None]:
+    """可选的 `[describe]`：返回（是否没有问题，值）；没写这个表时值是 `None`。"""
+    if not root.has("describe"):
+        root.table("describe")  # 标记为已读
+        return True, None
+    table = root.table("describe")
+    if table is None:
+        return False, None
+    provider = _parse_provider_name(table)
+    model = table.required_string("model")
+    reasoning_ok, reasoning = _optional_reasoning(table)
+    instructions = table.string("instructions", DEFAULT_DESCRIBE_INSTRUCTIONS)
+    if instructions is not None and not instructions.strip():
+        table.problem("instructions", "不能为空")
+        instructions = None
+    timeout = table.number("timeout_seconds", DEFAULT_DESCRIBE_TIMEOUT_SECONDS)
+    if timeout is not None and not 0 < timeout <= MAX_DESCRIBE_TIMEOUT_SECONDS:
+        table.problem("timeout_seconds", f"应大于 0、不大于 {MAX_DESCRIBE_TIMEOUT_SECONDS}")
+        timeout = None
+    max_output_tokens = _positive_int(
+        table, "max_output_tokens", DEFAULT_DESCRIBE_MAX_OUTPUT_TOKENS, MAX_MAX_OUTPUT_TOKENS
+    )
+    table.finish()
+    if (
+        provider is None
+        or model is None
+        or not reasoning_ok
+        or instructions is None
+        or timeout is None
+        or max_output_tokens is None
+    ):
+        return False, None
+    return True, DescribeSettings(
+        provider=provider,
+        model=model,
+        reasoning=reasoning,
+        instructions=instructions,
+        timeout_seconds=timeout,
+        max_output_tokens=max_output_tokens,
+    )
+
+
+def _optional_reasoning(table: _Table) -> tuple[bool, str | None]:
+    """可选的 `reasoning`：返回（是否没有问题，值）。"""
+    if not table.has("reasoning"):
+        return True, None
+    reasoning = table.required_string("reasoning")
+    if reasoning is not None and not _REASONING.fullmatch(reasoning):
+        table.problem("reasoning", "应为小写字母开头的标识符（小写字母、数字、`_`），如 high")
+        reasoning = None
+    return reasoning is not None, reasoning
 
 
 def _parse_decisions(root: _Table) -> tuple[bool, DecisionSettings | None]:
@@ -629,6 +795,7 @@ class _ModelDraft:
     fallback: str | None
     reasoning: str | None
     description: str | None
+    inputs: frozenset[Modality]
     ok: bool  # 这一项自身没有问题
 
 
@@ -676,6 +843,7 @@ def _parse_models(root: _Table) -> tuple[ModelSettings, ...] | None:
             fallback=d.fallback,
             reasoning=d.reasoning,
             description=d.description,
+            inputs=d.inputs,
         )
         for d in drafts
     )
@@ -695,19 +863,13 @@ def _parse_model(table: _Table) -> _ModelDraft:
     if table.has("fallback"):
         fallback = table.required_string("fallback")
         fallback_ok = fallback is not None
-    reasoning: str | None = None
-    reasoning_ok = True
-    if table.has("reasoning"):
-        reasoning = table.required_string("reasoning")
-        if reasoning is not None and not _REASONING.fullmatch(reasoning):
-            table.problem("reasoning", "应为小写字母开头的标识符（小写字母、数字、`_`），如 high")
-            reasoning = None
-        reasoning_ok = reasoning is not None
+    reasoning_ok, reasoning = _optional_reasoning(table)
     description: str | None = None
     description_ok = True
     if table.has("description"):
         description = table.required_string("description")
         description_ok = description is not None
+    inputs = _parse_inputs(table, provider)
     table.finish()
     ok = (
         name is not None
@@ -717,6 +879,7 @@ def _parse_model(table: _Table) -> _ModelDraft:
         and fallback_ok
         and reasoning_ok
         and description_ok
+        and inputs is not None
     )
     return _ModelDraft(
         table=table,
@@ -728,8 +891,38 @@ def _parse_model(table: _Table) -> _ModelDraft:
         fallback=fallback,
         reasoning=reasoning,
         description=description,
+        inputs=inputs or frozenset(),
         ok=ok,
     )
+
+
+def _parse_inputs(table: _Table, provider: Provider | None) -> frozenset[Modality] | None:
+    """可选的 `inputs`：`image`、`audio`、`file` 的子集，不能重复；不写是空集（只接收文字）。"""
+    values = table.string_list("inputs")
+    if values is None:
+        return None
+    choices = "、".join(m.value for m in Modality)
+    result: set[Modality] = set()
+    ok = True
+    for value in values:
+        if value == "text":
+            table.problem("inputs", "文字总是接收的，不用写 text")
+            ok = False
+            continue
+        try:
+            modality = Modality(value)
+        except ValueError:
+            table.problem("inputs", f"取值应为 {choices} 之一")
+            ok = False
+            continue
+        if modality in result:
+            table.problem("inputs", f"{value} 重复了")
+            ok = False
+        result.add(modality)
+    if provider is not None and Modality.AUDIO in result and not INPUT_LIMITS[provider].audio_types:
+        table.problem("inputs", f"{provider.value} 的对话接口不接受音频，不能声明 audio")
+        ok = False
+    return frozenset(result) if ok else None
 
 
 def _parse_chat(table: _Table) -> ChatSettings | None:

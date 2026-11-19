@@ -5,7 +5,7 @@
 # - 配置文件的位置由环境变量 QTALK_CONFIG 指定，默认是当前目录下的 config.toml。
 # - 密钥（APP_SECRET、大模型的 key 等）不写在这里，只从环境变量读取，见 .env。
 # - 除了 [[models]] 必须至少有一项，其余每一项都可以省略，省略时取示例里的值。
-#   例外是 [decisions]：整个表删掉就不按消息选模型。
+#   例外是 [decisions] 与 [describe]：整个表删掉就不按消息选模型、不给图片写描述。
 # - 出现程序不认识的键会报错。
 
 # IANA 时区名，显示时间时使用
@@ -35,11 +35,15 @@ timeout_seconds = 120      # 一次模型调用的时限，单位秒；换备用
 # 就必须在环境变量里，否则启动时报错。只用一家时，删掉另一项和 fallback 那一行。
 # description 说明这个模型适合回答什么样的消息，按消息选模型时用它做选项的描述；
 # 配置了 [decisions] 且模型多于一个时必填。
+# inputs 是这个模型除文字外还能直接接收的输入："image"（图片）、"audio"（语音）、"file"（PDF），
+# 不写就是只收文字。带附件的消息只在能处理它们的模型之间选。
+# OpenAI 的模型不能写 "audio"：Responses API 不接受音频输入，语音会改用 QQ 自带的识别文本。
 [[models]]
 name = "sol"              # 内部名字，用于日志、用量和互相引用
 provider = "openai"
 model = "gpt-6.2-sol"     # 服务商那边的模型名
 description = "用户想解决一个具体问题：查资料、写代码、分析、做计划或做决定"
+inputs = ["image", "file"]
 default = true
 fallback = "hydrogen"     # 可选：调用失败时改用的模型，写另一项的 name
 # reasoning = "high"      # 可选：推理强度，原样传给服务商；不写用服务商的默认值。
@@ -50,6 +54,7 @@ name = "hydrogen"
 provider = "gemini"
 model = "gemini-4-hydrogen"
 description = "用户在倾诉、闲聊，或需要情感上的支持与陪伴"
+inputs = ["image", "audio", "file"]
 # reasoning = "low"       # 这款模型默认的思考级别是 high，一句话的回答也会用掉几百个输出 token
 
 # 按消息选模型：每条消息先用 Decisions API 做一道选择题，选项就是上面的模型列表。
@@ -65,6 +70,25 @@ instructions = """
 判断用户刚发来的最新一条消息最适合交给哪一个模型回答。
 输入是 JSON：history 是这之前的若干轮对话，按时间排列，role 为 user 的是用户说的话，assistant 的是助手的回复；
 latest 是用户的最新消息。按 latest 的需要选择，history 只用来理解它指的是什么。"""
+
+# 图片、语音、文件等附件
+[attachments]
+max_size_mb = 20                # 单个附件的大小上限，单位 MB，1 到 100；超过的不下载
+download_timeout_seconds = 30   # 下载一个附件的时限，单位秒，最大 300
+retention_days = 30             # 附件在本地保存几天，1 到 3650；过期的文件会被删掉，历史里改用文字版
+history_turns = 3               # 历史里最近几轮的图片仍以原图交给模型，0 到 20；更早的只给文字描述
+
+# 给图片写一句话描述，供历史里的旧图片使用。整个表删掉就不写描述，旧图片只显示为「[图片]」。
+# 这个模型要能接收图片；它的服务商的密钥必须在环境变量里。
+[describe]
+provider = "openai"             # "openai" 或 "gemini"
+model = "gpt-6-luna"            # 必填，没有默认值
+# reasoning = "low"             # 可选，规则同 [[models]]
+timeout_seconds = 60            # 一次描述的时限，单位秒，最大 600
+max_output_tokens = 1024        # 描述的输出上限
+instructions = """
+用一句话客观地描述这张图片的内容，不超过 80 个字。图里有文字时摘录关键的文字。
+只输出描述本身，不要加「这张图片」之类的开头。"""
 
 # ---- 以下各项默认都不设置；需要时去掉行首的 "# " ----
 #

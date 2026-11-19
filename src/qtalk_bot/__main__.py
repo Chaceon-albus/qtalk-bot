@@ -1,17 +1,19 @@
 """启动入口：`python -m qtalk_bot`。
 
-读配置与密钥、打开数据库、创建对话模型与决策模型、构造 `pyqbot.Bot`、注册处理函数并运行，退出时关闭
-模型的客户端与数据库。配置或数据库有误、连不上平台时打印原因并以非零状态退出，不打印 traceback。
+读配置与密钥、打开数据库、创建对话模型、决策模型与写图片描述的模型、构造 `pyqbot.Bot`、注册处理函数并运行；
+运行期间在后台定期清理过期的附件。退出时先取消后台的描述与清理任务，再关闭模型的客户端与数据库。配置或数据库有误、连不上平台时打印原因并以非零状态退出，不打印 traceback。
 """
 
 import asyncio
 import contextlib
 import logging
+import signal
 import sys
+from collections.abc import Awaitable, Callable
 
 import pyqbot
 
-from .bot import QQChat, ShareLinks, fetch_bot_name, register
+from .bot import QQChat, QQDownloader, ShareLinks, fetch_bot_name, refuse_cookies, register
 from .chat import ChatHandler
 from .config import (
     ConfigError,
@@ -22,8 +24,10 @@ from .config import (
     load_settings,
 )
 from .conversation import Conversation
+from .describe import Describer
 from .gate import Gate
 from .llm.providers import ChatModels
+from .media import Fetcher, MediaStore, run_cleanup
 from .routing import Router
 from .storage import DATABASE_FILENAME, Database, StorageError
 
@@ -40,14 +44,23 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
     """
     async with (
         await Database.open(settings.data_dir / DATABASE_FILENAME) as db,
-        ChatModels(settings.models, secrets, settings.providers, settings.decisions) as models,
+        ChatModels(
+            settings.models, secrets, settings.providers, settings.decisions, settings.describe
+        ) as models,
     ):
+        store = MediaStore.under(settings.data_dir)
         if settings.qq.base_url is None:
             bot = pyqbot.Bot(secrets.app_id, secrets.app_secret)
         else:
             bot = pyqbot.Bot(secrets.app_id, secrets.app_secret, base_url=settings.qq.base_url)
-        # 从这里起都在 Bot 的上下文里：取名字时被取消、后面准备失败，HTTP 连接也会被关闭。
-        async with bot:
+        refuse_cookies(bot)  # 附件下载与 pyqbot 共用这个客户端，见 `refuse_cookies()`
+        describer: Describer | None = None
+        fetcher: Fetcher | None = None
+        conversation: Conversation | None = None
+        cleanup: asyncio.Task[None] | None = None
+        # 从这里起无论怎样结束（取名字时被取消、后面准备失败、正常停止），都经 `_shut_down()` 关闭 Bot 的
+        # HTTP 连接并等后台收尾。
+        try:
             gate = Gate(
                 db,
                 admin_openid=secrets.admin_openid,
@@ -57,7 +70,16 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                 bot_name=await fetch_bot_name(bot),
             )
             await gate.prepare()
+            if settings.describe is not None and models.describer is not None:
+                describer = Describer(
+                    db,
+                    store,
+                    models.describer,
+                    settings.describe,
+                    admin_openid=secrets.admin_openid,
+                )
             if chat is None:
+                fetcher = Fetcher(store, QQDownloader(bot), settings.attachments)
                 conversation = Conversation(
                     db,
                     admin_openid=secrets.admin_openid,
@@ -65,11 +87,152 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                     router=Router(settings.models, settings.decisions, models.decider),
                     settings=settings.chat,
                     timezone=settings.timezone,
+                    attachments=settings.attachments,
+                    fetcher=fetcher,
+                    describer=describer,
                 )
                 chat = QQChat(conversation)
             register(bot, gate, chat)
+            cleanup = asyncio.create_task(run_cleanup(db, store, settings.attachments))
             logger.info("机器人启动")
             await bot.start()
+        except BaseException:
+            await _shut_down(bot, conversation, cleanup, describer, fetcher)
+            raise
+        if await _shut_down(bot, conversation, cleanup, describer, fetcher):
+            raise asyncio.CancelledError  # 关停期间又被取消过：收尾做完了，再把取消传出去
+
+
+SHUTDOWN_GRACE_SECONDS = 15.0
+"""关停时「排空前台、等后台收尾」这一段的总时限。pyqbot 等处理函数最多 5 秒，对话被取消后的收尾最多几秒，
+描述的记账很快；超过就记一条警告继续关停，不无限挂住。"""
+
+
+async def _shut_down(
+    bot: pyqbot.Bot,
+    conversation: Conversation | None,
+    cleanup: asyncio.Task[None] | None,
+    describer: Describer | None,
+    fetcher: Fetcher | None,
+) -> bool:
+    """按顺序关停，返回期间是否又被取消过。
+
+    顺序：
+    1. `Bot.close()`：断开网关，取消前台还在运行的处理函数（停掉网关并不会取消它们，前台的轮次可能还在下载、
+       组装、发起模型调用），但它只等处理函数 5 秒。
+    2. `Conversation.drain()`：等在途的轮次真正结束。对话被取消后最多先用几秒停模型、再用几秒等在途的分片，
+       然后写流水与用量；不等它，数据库可能先关，已送达的内容和用量就丢了。
+    3. 向后台发出停止请求：停掉清理、`Describer.stop()`、`Fetcher.stop()`。这些是同步的、无条件执行，前面
+       用完了时间也照样发出，免得后台任务在模型客户端和数据库关闭后还在跑。
+    4. 限时等后台收尾：清理任务、描述任务与它们受保护的写入、下载与响应的关闭。
+    之后由调用方（外层的 `async with`）关模型的客户端与数据库。
+
+    每一步的等待都受保护：再次取消（如连按两次 Ctrl+C）不会打断这一段；但所有等待共用
+    `SHUTDOWN_GRACE_SECONDS` 的总时限，时间用完就跳过剩下的等待（停止请求仍会发出）。
+    """
+    deadline = asyncio.get_running_loop().time() + SHUTDOWN_GRACE_SECONDS
+    interrupted = await _drain(bot.close(), deadline, "关闭 QQ 连接与前台的处理函数")
+    if conversation is not None:
+        interrupted |= await _drain(conversation.drain(), deadline, "等待在途的对话收尾")
+    if cleanup is not None:
+        cleanup.cancel()
+    if describer is not None:
+        describer.stop()
+    if fetcher is not None:
+        fetcher.stop()
+    if cleanup is not None:
+        interrupted |= await _drain(cleanup, deadline, "停掉附件清理")
+    if describer is not None:
+        interrupted |= await _drain(describer.aclose(), deadline, "等待图片描述收尾")
+    if fetcher is not None:
+        interrupted |= await _drain(fetcher.aclose(), deadline, "等待下载收尾")
+    return interrupted
+
+
+async def _drain(work: Awaitable[object], deadline: float, what: str) -> bool:
+    """等 `work` 做完，再次被取消也接着等，直到 `deadline`；超时记一条警告并放弃它。返回期间是否被取消过。"""
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(work)
+    interrupted = False
+    while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            logger.warning("关停时%s超时，不再等", what)
+            task.cancel()
+            task.add_done_callback(_retrieve)
+            return interrupted
+        try:
+            await asyncio.wait((task,), timeout=remaining)
+        except asyncio.CancelledError:
+            interrupted = True
+    if not task.cancelled() and (exc := task.exception()) is not None:
+        logger.warning("关停时%s出错：%s", what, type(exc).__name__)
+    return interrupted
+
+
+def _retrieve(task: asyncio.Future[object]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+class _Signals:
+    """接管 SIGINT 与 SIGTERM：第一次触发有序关停（取消主任务，由 `run()` 按 `_shut_down()` 收尾），之后再收到
+    只记一条日志，不打断收尾；收尾本身有 `SHUTDOWN_GRACE_SECONDS` 的总时限。
+
+    `asyncio.run()` 自己只把第一次 SIGINT 转成取消，第二次直接抛 `KeyboardInterrupt` 并取消所有任务，打断
+    有序收尾；`docker stop` 发的 SIGTERM 它也不处理。
+    """
+
+    SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+    def __init__(self, task: asyncio.Future[None]) -> None:
+        self._task = task
+        self.received = 0
+
+    def __call__(self, signum: int) -> None:
+        self.received += 1
+        name = signal.Signals(signum).name
+        if self.received == 1:
+            logger.info("收到 %s，开始关停", name)
+            self._task.cancel()
+        else:
+            logger.warning("收到 %s：正在关停，请稍候", name)
+
+    def install(self, loop: asyncio.AbstractEventLoop) -> bool:
+        """装上处理函数；平台不支持（Windows）或不在主线程时返回 `False`，保持 asyncio 默认的行为。"""
+        try:
+            for signum in self.SIGNALS:
+                loop.add_signal_handler(signum, self, signum)
+        except NotImplementedError, RuntimeError, ValueError:
+            self.uninstall(loop)
+            return False
+        return True
+
+    def uninstall(self, loop: asyncio.AbstractEventLoop) -> None:
+        for signum in self.SIGNALS:
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.remove_signal_handler(signum)
+
+
+async def _supervise(
+    work: Awaitable[None], *, on_ready: Callable[[_Signals], None] | None = None
+) -> None:
+    """运行 `work`，期间接管 SIGINT 与 SIGTERM（见 `_Signals`）。因信号而有序关停时正常返回。`on_ready` 只给
+    测试用。"""
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(work)
+    signals = _Signals(task)
+    installed = signals.install(loop)
+    if on_ready is not None:
+        on_ready(signals)
+    try:
+        await task
+    except asyncio.CancelledError:
+        if not signals.received:
+            raise
+    finally:
+        if installed:
+            signals.uninstall(loop)
 
 
 def main() -> int:
@@ -88,8 +251,8 @@ def main() -> int:
         sys.stderr.write(f"{exc}\n")
         return EXIT_CONFIG_ERROR
     try:
-        with contextlib.suppress(KeyboardInterrupt):
-            asyncio.run(run(secrets, settings))
+        with contextlib.suppress(KeyboardInterrupt):  # 没有接管信号的平台（Windows）上按 Ctrl+C
+            asyncio.run(_supervise(run(secrets, settings)))
     except StorageError as exc:
         sys.stderr.write(f"数据库有误：{exc}\n")
         return EXIT_RUNTIME_ERROR

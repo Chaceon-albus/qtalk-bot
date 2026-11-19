@@ -2,6 +2,11 @@
 
 请求关掉服务端存储（`store=False`），历史每次由本地完整带上；配置了推理强度时放进 `reasoning.effort`。
 
+附件都以 base64 内联：图片是 `{"type": "input_image", "image_url": "data:<MIME>;base64,…", "detail": "auto"}`，
+PDF 是 `{"type": "input_file", "filename": "document.pdf", "file_data": "data:application/pdf;base64,…"}`。
+Responses API 不接受音频（文档只在 Chat Completions 里写了音频输入，SDK 的 Responses 输入类型里也没有
+`input_audio`），收到 `AudioPart` 或 `INPUT_LIMITS` 之外的类型时不发请求，抛 `ModelError(UNSUPPORTED)`。
+
 处理的流式事件：
 - `response.output_text.delta`、`response.refusal.delta`：回答（或拒答说明）的文字，转成 `TextDelta`。
 - `response.completed`：`Usage` 加 `Finished(COMPLETED)`。
@@ -21,6 +26,7 @@
 """
 
 import asyncio
+import base64
 import logging
 import os
 from collections.abc import AsyncGenerator
@@ -29,21 +35,30 @@ from typing import cast
 import openai
 from openai.types.responses import (
     EasyInputMessageParam,
+    ResponseInputContentParam,
+    ResponseInputFileParam,
+    ResponseInputImageParam,
+    ResponseInputItemParam,
     ResponseInputMessageContentListParam,
-    ResponseInputTextParam,
     ResponseUsage,
 )
 from openai.types.shared_params import Reasoning, ReasoningEffort
 
 from . import (
+    INPUT_LIMITS,
+    AudioPart,
     ChatEvent,
     ChatRequest,
     ErrorKind,
+    FilePart,
     Finished,
     FinishReason,
+    ImagePart,
     Masked,
     Message,
+    Modality,
     ModelError,
+    Part,
     Provider,
     Role,
     TextDelta,
@@ -57,6 +72,11 @@ logger = logging.getLogger(__name__)
 OFFICIAL_BASE_URL = "https://api.openai.com/v1"
 CUSTOM_HEADERS_ENV = "OPENAI_CUSTOM_HEADERS"
 MAX_RETRIES = 1  # SDK 对连接错误、429、5xx 的自动重试；更多的重试交给备用模型
+
+PDF_FILENAME = (
+    "document.pdf"  # input_file 要带文件名；用固定的名字，原始文件名由调用方写在前面的文字里
+)
+_LIMITS = INPUT_LIMITS[Provider.OPENAI]
 
 # 流里 `response.failed` 的错误码中认得的几种；其余归到 FAILED，不把上游的字符串带出去。
 _FAILED_CODES = {"server_error": ErrorKind.SERVER, "rate_limit_exceeded": ErrorKind.RATE_LIMIT}
@@ -133,11 +153,12 @@ class OpenAIChatModel:
         if self._reasoning is not None:
             # SDK 把取值写成 Literal，但各款模型接受的取值不同且会变，配置里只做宽松校验，原样透传。
             reasoning = {"effort": cast(ReasoningEffort, self._reasoning)}
+        messages: list[ResponseInputItemParam] = [_message(m) for m in request.messages]
         try:
             events = await self._client.responses.create(
                 model=self._model,
                 instructions=request.system,
-                input=[_message(message) for message in request.messages],
+                input=messages,
                 max_output_tokens=request.max_output_tokens,
                 reasoning=reasoning,
                 store=False,
@@ -199,17 +220,50 @@ class OpenAIChatModel:
 
 
 def _message(message: Message) -> EasyInputMessageParam:
+    """转换一条消息；有不支持的内容时抛 `ModelError(UNSUPPORTED)`。"""
     match message.role:
         case Role.USER:
             content: ResponseInputMessageContentListParam = [_part(p) for p in message.parts]
             return {"role": "user", "content": content}
         case Role.ASSISTANT:
             # 助手的历史只存文字；以字符串给出即可，SDK 按 output_text 处理。
-            return {"role": "assistant", "content": "".join(p.text for p in message.parts)}
+            if not all(isinstance(p, TextPart) for p in message.parts):
+                raise ModelError(Provider.OPENAI, ErrorKind.UNSUPPORTED)
+            text = "".join(p.text for p in message.parts if isinstance(p, TextPart))
+            return {"role": "assistant", "content": text}
 
 
-def _part(part: TextPart) -> ResponseInputTextParam:
-    return {"type": "input_text", "text": part.text}
+def _part(part: Part) -> ResponseInputContentParam:
+    match part:
+        case TextPart(text=text):
+            return {"type": "input_text", "text": text}
+        case ImagePart(data=data, mime_type=mime):
+            _check(Modality.IMAGE, mime)
+            image: ResponseInputImageParam = {
+                "type": "input_image",
+                "image_url": _data_url(mime, data),
+                "detail": "auto",
+            }
+            return image
+        case FilePart(data=data, mime_type=mime):
+            _check(Modality.FILE, mime)
+            file: ResponseInputFileParam = {
+                "type": "input_file",
+                "filename": PDF_FILENAME,
+                "file_data": _data_url(mime, data),
+            }
+            return file
+        case AudioPart():
+            raise ModelError(Provider.OPENAI, ErrorKind.UNSUPPORTED)
+
+
+def _check(modality: Modality, mime_type: str) -> None:
+    if not _LIMITS.accepts(modality, mime_type):
+        raise ModelError(Provider.OPENAI, ErrorKind.UNSUPPORTED)
+
+
+def _data_url(mime_type: str, data: bytes) -> str:
+    return f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"
 
 
 def _usage(usage: ResponseUsage | None) -> Usage:

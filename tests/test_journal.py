@@ -9,6 +9,7 @@ import pytest
 from qtalk_bot import access, journal
 from qtalk_bot.journal import Ending, HistoryEntry, ReplyDelivery
 from qtalk_bot.llm import Provider, Role
+from qtalk_bot.media import Acquired, AttachmentKind, AttachmentStatus, DescribeStatus
 from qtalk_bot.storage import DATABASE_FILENAME, MIGRATIONS, Database
 
 
@@ -98,10 +99,11 @@ async def test_failed_replies_are_left_out_but_their_question_stays(db: Database
 
     current = await db.transaction(fill)
     history = await db.transaction(journal.recent_history, alice, current, 10)
-    assert history == [
-        HistoryEntry(Role.USER, "问1"),
-        HistoryEntry(Role.USER, "问2（没有回复记录）"),
-    ]
+    assert history == [HistoryEntry(Role.USER, "问1")]
+    # 最近一条回复之后还没有回复的消息属于当前这一轮，不算历史。
+    pending = await db.transaction(journal.pending_messages, alice, current)
+    assert pending == [HistoryEntry(Role.USER, "问2（没有回复记录）")]
+    assert [entry.turns_ago for entry in pending] == [journal.CURRENT_TURN]
 
 
 async def test_reply_rows_must_be_complete(db: Database) -> None:
@@ -188,7 +190,7 @@ async def test_existing_version_1_database_is_upgraded_in_place(tmp_path: Path) 
 
         def write(conn: sqlite3.Connection) -> list[HistoryEntry]:
             current = journal.add_user_message(conn, user.id, "升级后的第一句", "qq-1", 0)
-            return journal.recent_history(conn, user.id, current + 1, 1)
+            return journal.pending_messages(conn, user.id, current + 1)
 
         assert await db.transaction(write) == [HistoryEntry(Role.USER, "升级后的第一句")]
 
@@ -411,3 +413,237 @@ async def test_usage_summary_survives_rows_that_bypassed_the_usage_checks(db: Da
     assert alice_usage.today_input == 2**63 - 1
     assert (alice_usage.total_output, alice_usage.total_calls) == (2, 2)
     assert (bob_usage.total_input, bob_usage.total_output) == (7, 1)
+
+
+# ---- 里程碑 5a：附件、引用索引、一轮多条用户消息 ----
+
+
+def attachment(position: int = 0, *, path: str | None = None, text: str = "[图片]") -> Acquired:
+    return Acquired(
+        position=position,
+        kind=AttachmentKind.IMAGE,
+        quoted=False,
+        status=AttachmentStatus.STORED if path else AttachmentStatus.SKIPPED,
+        mime_type="image/png" if path else None,
+        size=10 if path else None,
+        path=path,
+        filename=None,
+        text=text,
+    )
+
+
+async def test_turns_are_runs_of_user_messages_followed_by_replies(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> int:
+        turn(conn, alice, "问1", "答1")
+        # 一轮里两条用户消息（攒批），回复挂在后一条上。
+        journal.add_user_message(conn, alice, "问2a", "qq-2a", 0)
+        turn(conn, alice, "问2b", "答2")
+        return journal.add_user_message(conn, alice, "问3", "qq-3", 0)
+
+    current = await db.transaction(fill)
+    history = await db.transaction(journal.recent_history, alice, current, 1)
+
+    assert [entry.content for entry in history] == ["问2a", "问2b", "答2"]
+    everything = await db.transaction(journal.recent_history, alice, current, 10)
+    assert [(entry.content, entry.turns_ago) for entry in everything] == [
+        ("问1", 1),
+        ("答1", 1),
+        ("问2a", 0),
+        ("问2b", 0),
+        ("答2", 0),
+    ]
+
+
+async def test_history_carries_attachments_of_this_user_only(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+    bob = await new_user(db, "FAKE-OPENID-BOB", "小李")
+
+    def fill(conn: sqlite3.Connection) -> tuple[int, int]:
+        mine = journal.add_user_message(conn, alice, "", "qq-1", 0, msg_idx="REFIDX_1")
+        journal.add_attachment(
+            conn,
+            user_id=alice,
+            message_id=mine,
+            item=attachment(path="1/a.png"),
+            describe=True,
+            now=0,
+        )
+        theirs = journal.add_user_message(conn, bob, "", "qq-2", 0)
+        journal.add_attachment(
+            conn,
+            user_id=bob,
+            message_id=theirs,
+            item=attachment(path="2/b.png"),
+            describe=False,
+            now=0,
+        )
+        return mine, theirs
+
+    mine, theirs = await db.transaction(fill)
+
+    (entry,) = await db.transaction(journal.current_entries, alice, [mine])
+    (record,) = entry.attachments
+    assert (record.path, record.status, record.text) == (
+        "1/a.png",
+        AttachmentStatus.STORED,
+        "[图片]",
+    )
+    # 拿别人的消息编号也查不出别人的附件。
+    assert await db.transaction(journal.message_attachments, alice, [theirs]) == {}
+    assert await db.transaction(journal.current_entries, alice, [theirs]) == []
+    assert await db.transaction(journal.pending_description, bob, record.id) is None
+    pending = await db.transaction(journal.pending_description, alice, record.id)
+    assert pending is not None
+    row = await db.fetch_one("SELECT msg_idx FROM messages WHERE id = ?", (mine,))
+    assert row is not None
+    assert row[0] == "REFIDX_1"
+
+    await db.transaction(
+        journal.set_description, bob, record.id, status=DescribeStatus.DONE, text="别人写的"
+    )
+    (entry,) = await db.transaction(journal.current_entries, alice, [mine])
+    assert entry.attachments[0].text == "[图片]"  # 别的用户改不了
+
+
+async def test_stored_attachment_needs_a_path(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def bad(conn: sqlite3.Connection) -> None:
+        message = journal.add_user_message(conn, alice, "", "qq-1", 0)
+        conn.execute(
+            "INSERT INTO attachments (user_id, message_id, position, quoted, kind, status, text,"
+            " created_at) VALUES (?, ?, 0, 0, 'image', 'stored', '[图片]', 0)",
+            (alice, message),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.transaction(bad)
+
+
+async def test_version_3_database_keeps_its_usage_and_accepts_describe(tmp_path: Path) -> None:
+    path = tmp_path / DATABASE_FILENAME
+    async with await Database.open(path, migrations=MIGRATIONS[:3]) as old:
+        user = await old.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+        await old.execute(
+            "INSERT INTO usage (user_id, model, provider, provider_model, input_tokens,"
+            " output_tokens, created_at, purpose) VALUES (?, 'decisions', 'openai', 'luna', 40,"
+            " 0, 5, 'decision')",
+            (user.id,),
+        )
+
+    async with await Database.open(path) as db:
+        row = await db.fetch_one("SELECT model, input_tokens, created_at, purpose FROM usage")
+        assert row is not None
+        assert tuple(row) == ("decisions", 40, 5, "decision")
+
+        def add(conn: sqlite3.Connection) -> None:
+            journal.add_usage(
+                conn,
+                user_id=user.id,
+                message_id=None,
+                model=journal.DESCRIBE_USAGE_MODEL,
+                provider=Provider.GEMINI,
+                provider_model="gemini-lite",
+                input_tokens=70,
+                output_tokens=9,
+                now=6,
+                purpose=journal.UsagePurpose.DESCRIBE,
+            )
+
+        await db.transaction(add)
+        with pytest.raises(sqlite3.IntegrityError):
+            await db.execute(
+                "INSERT INTO usage (user_id, model, provider, provider_model, created_at, purpose)"
+                " VALUES (?, 'x', 'openai', 'y', 0, 'other')",
+                (user.id,),
+            )
+        (summary,) = await db.transaction(journal.usage_summary, 0)
+        assert (summary.total_calls, summary.total_decision_calls) == (2, 1)
+
+
+async def test_unanswered_messages_do_not_use_up_history_turns(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> int:
+        turn(conn, alice, "问1", "答1")
+        journal.add_user_message(conn, alice, "只收到说明的一条", "qq-x", 0)
+        return journal.add_user_message(conn, alice, "追问", "qq-y", 0)
+
+    current = await db.transaction(fill)
+
+    history = await db.transaction(journal.recent_history, alice, current, 1)
+    assert [entry.content for entry in history] == ["问1", "答1"]
+    pending = await db.transaction(journal.pending_messages, alice, current)
+    assert [entry.content for entry in pending] == ["只收到说明的一条"]
+    # history_turns = 0 时历史为空，但没有回复的消息照样能取到。
+    assert await db.transaction(journal.recent_history, alice, current, 0) == []
+    assert len(await db.transaction(journal.pending_messages, alice, current)) == 1
+
+
+# ---- 第三轮评审：哪些回复算轮次的边界、待回复的消息不占历史的额度 ----
+
+
+@pytest.mark.parametrize("delivery", list(ReplyDelivery))
+def test_only_replies_that_gave_the_user_something_end_a_turn(delivery: ReplyDelivery) -> None:
+    # 有正文送达的总算；正文为空时，只有确认送达了固定说明或附件说明的（failed、rejected、noticed）才算。
+    assert journal.ends_turn("回答", delivery)
+    expected = delivery in (ReplyDelivery.FAILED, ReplyDelivery.REJECTED, ReplyDelivery.NOTICED)
+    assert journal.ends_turn("", delivery) is expected
+
+
+async def test_reply_that_gave_nothing_keeps_its_messages_in_the_next_turn(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> int:
+        turn(conn, alice, "问1", "答1")
+        # PDF 已落库、还在等名额时关停：记了一条正文为空的 cancelled 回复。
+        turn(conn, alice, "这是 PDF", "", delivery=ReplyDelivery.CANCELLED)
+        turn(conn, alice, "又一条", "", delivery=ReplyDelivery.WITHHELD)
+        return journal.add_user_message(conn, alice, "总结一下", "qq-now", 0)
+
+    current = await db.transaction(fill)
+
+    pending = await db.transaction(journal.pending_messages, alice, current)
+    assert [entry.content for entry in pending] == ["这是 PDF", "又一条"]
+    history = await db.transaction(journal.recent_history, alice, current, 1)
+    assert [entry.content for entry in history] == ["问1", "答1"]
+
+
+async def test_many_unanswered_messages_do_not_crowd_out_the_last_complete_turn(
+    db: Database,
+) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> int:
+        turn(conn, alice, "问1", "答1")
+        for n in range(2 * journal.ROWS_PER_TURN):  # 连来几十条只收到固定说明的消息
+            journal.add_user_message(conn, alice, f"说明{n}", f"qq-{n}", 0)
+        return journal.add_user_message(conn, alice, "追问", "qq-now", 0)
+
+    current = await db.transaction(fill)
+
+    history = await db.transaction(journal.recent_history, alice, current, 1)
+    assert [entry.content for entry in history] == ["问1", "答1"]
+    pending = await db.transaction(journal.pending_messages, alice, current)
+    assert len(pending) == journal.ROWS_PER_TURN  # 只取最近的
+    assert pending[-1].content == f"说明{2 * journal.ROWS_PER_TURN - 1}"
+
+
+async def test_replies_that_gave_nothing_do_not_use_up_the_history_query(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> int:
+        turn(conn, alice, "问1", "答1")
+        for n in range(journal.ROWS_PER_TURN):  # 几十条没给用户任何东西的回复
+            turn(conn, alice, f"中间{n}", "", delivery=ReplyDelivery.WITHHELD)
+        turn(conn, alice, "问2", "答2")
+        return journal.add_user_message(conn, alice, "问3", "qq-now", 0)
+
+    current = await db.transaction(fill)
+
+    history = await db.transaction(journal.recent_history, alice, current, 2)
+    contents = [entry.content for entry in history]
+    assert contents[:2] == ["问1", "答1"]  # 较早的完整问答没被挤掉
+    assert contents[-2:] == ["问2", "答2"]
