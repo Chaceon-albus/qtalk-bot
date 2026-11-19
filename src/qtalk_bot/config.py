@@ -37,9 +37,10 @@ DEFAULT_PERSONA = """你是一个友善、可靠的聊天助手，在 QQ 上和�
 用户用什么语言提问，就用什么语言回答。"""
 DEFAULT_HISTORY_TURNS = 10
 MAX_HISTORY_TURNS = 100
-DEFAULT_MAX_OUTPUT_TOKENS = 8192
 MAX_MAX_OUTPUT_TOKENS = 131072
-DEFAULT_CHAT_TIMEOUT_SECONDS = 120
+DEFAULT_CHAT_IDLE_TIMEOUT_SECONDS = 300
+DEFAULT_CHAT_TIMEOUT_SECONDS = 1800
+# QQ 单聊被动回复的有效期约 60 分钟，从用户那条消息算起；之前还有决策、下载附件等，总时限要留出余量。
 MAX_CHAT_TIMEOUT_SECONDS = 3600
 
 DEFAULT_DECISION_MODELS = {Provider.OPENAI: "gpt-6-luna", Provider.GEMINI: "gemini-decision-1"}
@@ -408,13 +409,17 @@ class ChatSettings:
     Attributes:
         persona: 人设，系统提示词的第一部分。
         history_turns: 上下文里带最近几轮（一问一答算一轮）。
-        max_output_tokens: 单次回复的输出上限（含推理所用的 token）。
-        timeout_seconds: 一次模型调用（从发出请求到流结束）的时限；换备用模型重试时重新计时。
+        max_output_tokens: 单次回复的输出上限（含推理所用的 token）；`None`（默认）时不向服务商传，由模型自己的
+            上限兜底，同 ChatGPT app 的做法。
+        idle_timeout_seconds: 空闲时限：模型流这么久没有任何动静（适配器从 SDK 收到的任何事件都算）就放弃。
+        timeout_seconds: 总时限：一次模型调用从发出请求到写完最多这么久。
+        两个时限在换备用模型重试时都重新计时。
     """
 
     persona: str = field(default=DEFAULT_PERSONA, repr=False)
     history_turns: int = DEFAULT_HISTORY_TURNS
-    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
+    max_output_tokens: int | None = None
+    idle_timeout_seconds: float = DEFAULT_CHAT_IDLE_TIMEOUT_SECONDS
     timeout_seconds: float = DEFAULT_CHAT_TIMEOUT_SECONDS
 
 
@@ -1277,8 +1282,11 @@ def _parse_chat(table: _Table) -> ChatSettings | None:
     history_turns = _bounded_int(
         table, "history_turns", DEFAULT_HISTORY_TURNS, 0, MAX_HISTORY_TURNS
     )
-    max_output_tokens = _positive_int(
-        table, "max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS, MAX_MAX_OUTPUT_TOKENS
+    max_ok, max_output_tokens = _optional_positive_int(
+        table, "max_output_tokens", MAX_MAX_OUTPUT_TOKENS
+    )
+    idle_timeout_seconds = _positive_int(
+        table, "idle_timeout_seconds", DEFAULT_CHAT_IDLE_TIMEOUT_SECONDS, MAX_CHAT_TIMEOUT_SECONDS
     )
     timeout_seconds = _positive_int(
         table, "timeout_seconds", DEFAULT_CHAT_TIMEOUT_SECONDS, MAX_CHAT_TIMEOUT_SECONDS
@@ -1287,7 +1295,8 @@ def _parse_chat(table: _Table) -> ChatSettings | None:
     if (
         persona is None
         or history_turns is None
-        or max_output_tokens is None
+        or not max_ok
+        or idle_timeout_seconds is None
         or timeout_seconds is None
     ):
         return None
@@ -1295,6 +1304,7 @@ def _parse_chat(table: _Table) -> ChatSettings | None:
         persona=persona,
         history_turns=history_turns,
         max_output_tokens=max_output_tokens,
+        idle_timeout_seconds=idle_timeout_seconds,
         timeout_seconds=timeout_seconds,
     )
 

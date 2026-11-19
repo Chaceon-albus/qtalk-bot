@@ -26,6 +26,7 @@ from qtalk_bot.llm import (
     FilePart,
     Finished,
     FinishReason,
+    Heartbeat,
     ImagePart,
     Message,
     ModelError,
@@ -140,24 +141,37 @@ def streaming(*hops: list[Payload]) -> Server:
     return Server(*(replying(events) for events in hops))
 
 
-def model_on(server: Server, *, search: bool = False, summaries: bool = False) -> GeminiChatModel:
+def model_on(
+    server: Server,
+    *,
+    search: bool = False,
+    summaries: bool = False,
+    reasoning: str | None = None,
+) -> GeminiChatModel:
     http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(server.handle))
     options = types.HttpOptions(
         httpx_async_client=http_client, retry_options=types.HttpRetryOptions(attempts=1)
     )
     client = genai.Client(api_key=FAKE_KEY, http_options=options)
     return GeminiChatModel(
-        client, name="main", model="gemini-fake", search=search, summaries=summaries
+        client,
+        name="main",
+        model="gemini-fake",
+        reasoning=reasoning,
+        search=search,
+        summaries=summaries,
     )
 
 
 async def collect(model: GeminiChatModel) -> list[ChatEvent]:
-    return [event async for event in model.stream(REQUEST)]
+    """交出的事件，去掉每个 SDK 事件之前都有的 `Heartbeat`（它另有测试）。"""
+    return [event async for event in model.stream(REQUEST) if not isinstance(event, Heartbeat)]
 
 
 async def drain(model: GeminiChatModel, into: list[ChatEvent]) -> None:
     async for event in model.stream(REQUEST):
-        into.append(event)
+        if not isinstance(event, Heartbeat):
+            into.append(event)
 
 
 async def failure(model: GeminiChatModel) -> tuple[list[ChatEvent], ModelError]:
@@ -226,7 +240,39 @@ async def test_no_output_limit_is_sent_when_the_request_has_none() -> None:
     events = [event async for event in model_on(server).stream(unlimited)]
 
     assert TextDelta("好") in events
-    assert "max_output_tokens" not in server.body().get("generation_config", {})
+    # 什么都不设时整个 generation_config 不带，不发空对象。
+    assert "generation_config" not in server.body()
+
+
+async def test_generation_config_without_a_limit_keeps_the_other_settings() -> None:
+    server = streaming(
+        [created(), start(0, "model_output"), text(0, "好"), stop(0), completed("completed")]
+    )
+    unlimited = dataclasses.replace(REQUEST, max_output_tokens=None)
+    async for _ in model_on(server, reasoning="low").stream(unlimited):
+        pass
+
+    assert server.body()["generation_config"] == {"thinking_level": "low"}
+
+
+async def test_every_sdk_event_is_preceded_by_a_heartbeat() -> None:
+    # 空闲时限按 SDK 的任何事件计：不交出内容的事件（step.stop）与不认识的事件也各给一个 Heartbeat。
+    unknown = {"event_type": "interaction.status_update", "interaction_id": "v1_fake"}
+    server = streaming(
+        [
+            created(),
+            unknown,
+            start(0, "model_output"),
+            text(0, "好"),
+            stop(0),
+            completed("completed"),
+        ]
+    )
+
+    events = [event async for event in model_on(server).stream(REQUEST)]
+
+    beat = Heartbeat()
+    assert events == [beat, beat, beat, beat, TextDelta("好"), beat, beat, Usage(None, None), DONE]
 
 
 async def test_missing_usage_is_reported_as_none() -> None:

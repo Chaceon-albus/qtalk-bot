@@ -43,6 +43,7 @@ Responses API 不接受音频（文档只在 Chat Completions 里写了音频输
 - `response.incomplete`：同上，`Finished` 的原因按 `incomplete_details.reason`。
 - `response.failed`、`error`：有用量（或快照里补上了搜索次数）时先给出 `Usage`，再抛 `ModelError`。
 其余事件（创建、`web_search_call.searching`、`reasoning_summary_part.added` 等）现在忽略。
+每个事件（含忽略的）之前先交出一个 `Heartbeat`，供调用方计算空闲时限：推理时可能很久只有这些被忽略的事件。
 
 正文与查询词都先去掉孤立的代理码位（`llm.clean_text()`）。快照、引用、结束帧里的正文、搜索的动作这些附加信息
 的字段类型不对时跳过那一项（`_tolerant()`），同一帧的用量照常读。
@@ -93,6 +94,7 @@ from . import (
     FilePart,
     Finished,
     FinishReason,
+    Heartbeat,
     ImagePart,
     Masked,
     Message,
@@ -261,6 +263,7 @@ class OpenAIChatModel:
             async with events:
                 try:
                     async for event in events:
+                        yield Heartbeat()
                         match event.type:
                             case "response.output_text.delta" | "response.refusal.delta":
                                 for found in extras.text(

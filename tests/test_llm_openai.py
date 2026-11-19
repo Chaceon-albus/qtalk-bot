@@ -27,6 +27,7 @@ from qtalk_bot.llm import (
     FilePart,
     Finished,
     FinishReason,
+    Heartbeat,
     ImagePart,
     Message,
     ModelError,
@@ -179,12 +180,14 @@ def model_on(
 
 
 async def collect(model: OpenAIChatModel) -> list[ChatEvent]:
-    return [event async for event in model.stream(REQUEST)]
+    """交出的事件，去掉每个 SDK 事件之前都有的 `Heartbeat`（它另有测试）。"""
+    return [event async for event in model.stream(REQUEST) if not isinstance(event, Heartbeat)]
 
 
 async def drain(model: OpenAIChatModel, into: list[ChatEvent]) -> None:
     async for event in model.stream(REQUEST):
-        into.append(event)
+        if not isinstance(event, Heartbeat):
+            into.append(event)
 
 
 async def failure(model: OpenAIChatModel) -> tuple[list[ChatEvent], ModelError]:
@@ -264,6 +267,23 @@ async def test_no_output_limit_is_sent_when_the_request_has_none() -> None:
 
     assert TextDelta("好") in events
     assert "max_output_tokens" not in server.body
+
+
+async def test_every_sdk_event_is_preceded_by_a_heartbeat() -> None:
+    # 空闲时限按 SDK 的任何事件计：推理时只有不交出内容的事件（created、output_item.added）或不认识的事件，
+    # 也各给一个 Heartbeat。
+    unknown = {"type": "response.future_event", "sequence_number": 1}
+    completed = {
+        "type": "response.completed",
+        "sequence_number": 5,
+        "response": response("completed", usage=usage(5, 1)),
+    }
+    server = streaming([CREATED, unknown, ITEM_ADDED, text_delta(3, "好"), completed])
+
+    events = [event async for event in model_on(server).stream(REQUEST)]
+
+    beat = Heartbeat()
+    assert events == [beat, beat, beat, beat, TextDelta("好"), beat, Usage(5, 1), DONE]
 
 
 @pytest.mark.parametrize(

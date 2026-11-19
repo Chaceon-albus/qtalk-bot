@@ -10,7 +10,8 @@
 - 输出是一串 `ChatEvent`，是带标签的联合类型。现在有文字增量（`TextDelta`）、用量（`Usage`）、结束
   （`Finished`），开了服务商内置搜索时的搜索进展（`SearchProgress`）与引用（`Citation`），以及处理过程：
   思考摘要（`ThoughtSummary`，请求了才有）与调用工具前的说明（`Commentary`，OpenAI 的 `phase` 为
-  `commentary` 的消息）。后两者不是回答的正文。**调用方必须忽略不认识的事件**（`match` 里留一个
+  `commentary` 的消息）。后两者不是回答的正文。此外，适配器每从 SDK 收到一个流式事件（不论认不认识）就先交出一个
+  `Heartbeat`，调用方据此判断流是否还有动静（对话的空闲时限）。**调用方必须忽略不认识的事件**（`match` 里留一个
   `case _: pass`），这样加事件时不必改已有的调用方。
 - 调用失败抛 `ModelError`。文案只有服务商、本地定义的错误分类（`ErrorKind`）与数字状态码，不含任何
   来自上游的文字（错误信息、错误码字段都可能回显正文或凭证），可以直接记日志。
@@ -357,8 +358,24 @@ class Finished:
     reason: FinishReason
 
 
+@dataclass(frozen=True, slots=True)
+class Heartbeat:
+    """流还有动静：适配器从 SDK 收到了一个流式事件，不论本项目认不认识它、它带没带出别的 `ChatEvent`。
+
+    每个 SDK 事件之前交出一个。它不带任何内容，只用来计算空闲时限：OpenAI 的模型推理时可能很久只有本项目
+    不关心的事件（甚至什么都没有），不能只看认识的那几种事件。不关心空闲的调用方照常忽略它。
+    """
+
+
 type ChatEvent = (
-    TextDelta | Usage | Finished | SearchProgress | Citation | ThoughtSummary | Commentary
+    TextDelta
+    | Usage
+    | Finished
+    | SearchProgress
+    | Citation
+    | ThoughtSummary
+    | Commentary
+    | Heartbeat
 )
 """流式事件。以后会加新的种类，调用方要忽略不认识的事件。"""
 

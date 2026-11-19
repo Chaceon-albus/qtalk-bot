@@ -50,6 +50,7 @@ from qtalk_bot.llm import (
     FilePart,
     Finished,
     FinishReason,
+    Heartbeat,
     ImagePart,
     InputLimits,
     Message,
@@ -371,13 +372,18 @@ def conversation(
     *,
     persona: str = DEFAULT_PERSONA,
     history_turns: int = 10,
-    max_output_tokens: int = 8192,
-    timeout_seconds: float = 120,
+    max_output_tokens: int | None = None,
+    idle_timeout_seconds: float = 300,
+    timeout_seconds: float = 1800,
+    clock: ManualClock | None = None,
 ) -> Conversation:
+    """`clock` 不为空时，模型调用的时限（以及过程消息的节流）按它计时，它也是写进流水的时间（被动回复的截止点
+    从用户消息记进流水的时刻算起）。"""
     chat = ChatSettings(
         persona=persona,
         history_turns=history_turns,
         max_output_tokens=max_output_tokens,
+        idle_timeout_seconds=idle_timeout_seconds,
         timeout_seconds=timeout_seconds,
     )
     settings = [
@@ -402,7 +408,9 @@ def conversation(
         router=Router(settings),
         settings=chat,
         timezone=SHANGHAI,
-        clock=lambda: START,
+        clock=(lambda: START) if clock is None else clock,
+        timer=None if clock is None else clock,
+        sleep=asyncio.sleep if clock is None else clock.sleep,
     )
 
 
@@ -590,6 +598,246 @@ async def test_fallback_model_is_used_on_timeout(db: Database) -> None:
     assert channel.streamed == "及时的回答"
     assert primary.closed == 1
     assert [u[0] for u in await usage(db)] == ["main", "backup"]
+
+
+async def reach(event: asyncio.Event) -> None:
+    """等流程走到置位 `event` 的那一步；走不到时按超时失败，不让测试挂住。"""
+    async with asyncio.timeout(HANG_GUARD):
+        await event.wait()
+
+
+def mark(event: asyncio.Event) -> Action:
+    """脚本里的一步：模型的流走到这里时置位 `event`。流在调用方要下一个事件时才走到这里，所以它置位时，调用方
+    已经处理完了前一个事件。"""
+
+    async def action() -> None:
+        event.set()
+
+    return action
+
+
+async def test_no_output_limit_is_sent_by_default(db: Database) -> None:
+    # 同 ChatGPT app：对话不另设输出上限，请求里不带，由模型自己的上限兜底。
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("好"))
+
+    await say(conversation(db, model), alice, "你好")
+
+    (request,) = model.requests
+    assert request.max_output_tokens is None
+
+
+async def test_idle_timeout_gives_up_on_a_silent_stream(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    clock = ManualClock()
+    primary = ScriptedModel("main", [], hang=True)
+    fallback = ScriptedModel("backup", answer("备用的回答"))
+    chat = conversation(db, primary, fallback, clock=clock)
+
+    with caplog.at_level(logging.WARNING):
+        talk = asyncio.create_task(say(chat, alice, "你好"))
+        await reach(primary.started)
+        await clock.advance_to(299)
+        assert not fallback.started.is_set()
+        await clock.advance_to(300)
+        channel = await talk
+
+    assert primary.closed == 1
+    assert channel.streamed == "备用的回答"
+    assert [u[0] for u in await usage(db)] == ["main", "backup"]
+    assert "空闲时限" in caplog.text
+    assert "总时限" not in caplog.text
+
+
+async def test_any_event_counts_as_activity_for_the_idle_timeout(db: Database) -> None:
+    # 适配器对每个 SDK 事件交出的 Heartbeat、以后才会有的事件，都让空闲时限重新计时。
+    @dataclass(frozen=True)
+    class FutureEvent:
+        pass
+
+    alice = await invited(db, ALICE, "小王")
+    clock = ManualClock()
+    gates = [asyncio.Event() for _ in range(3)]
+    seen = [asyncio.Event() for _ in range(2)]
+    future = cast(ChatEvent, FutureEvent())
+    primary = ScriptedModel(
+        "main",
+        [
+            gates[0],
+            Heartbeat(),
+            mark(seen[0]),
+            gates[1],
+            future,
+            mark(seen[1]),
+            gates[2],
+            *answer("想了很久的回答"),
+        ],
+    )
+    chat = conversation(db, primary, clock=clock)
+
+    talk = asyncio.create_task(say(chat, alice, "你好"))
+    await reach(primary.started)
+    await clock.advance_to(250)
+    gates[0].set()
+    await reach(seen[0])  # 250 秒时有动静
+    await clock.advance_to(500)  # 距开始已超过 300 秒，距上次动静没有
+    gates[1].set()
+    await reach(seen[1])  # 500 秒时又有动静
+    await clock.advance_to(799)
+    assert primary.closed == 0
+    gates[2].set()
+    channel = await talk
+
+    assert channel.streamed == "想了很久的回答"
+    assert (await rows(db))[-1] == Row(
+        "assistant", "想了很久的回答", "main", "completed", "streamed"
+    )
+
+
+async def test_total_timeout_applies_even_while_the_stream_is_active(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    clock = ManualClock()
+    gates = [asyncio.Event() for _ in range(2)]
+    seen = [asyncio.Event() for _ in range(2)]
+    primary = ScriptedModel(
+        "main",
+        [gates[0], Heartbeat(), mark(seen[0]), gates[1], Heartbeat(), mark(seen[1])],
+        hang=True,
+    )
+    chat = conversation(db, primary, clock=clock, idle_timeout_seconds=300, timeout_seconds=600)
+
+    with caplog.at_level(logging.WARNING):
+        talk = asyncio.create_task(say(chat, alice, "你好"))
+        await reach(primary.started)
+        await clock.advance_to(250)
+        gates[0].set()
+        await reach(seen[0])
+        await clock.advance_to(500)
+        gates[1].set()
+        await reach(seen[1])
+        await clock.advance_to(599)
+        assert primary.closed == 0
+        await clock.advance_to(600)  # 距上次动静只有 100 秒，但总时限到了
+        channel = await talk
+
+    assert primary.closed == 1
+    assert channel.sent == [texts.MODEL_FAILED]
+    assert (await rows(db))[-1] == Row("assistant", "", "main", "timeout", "failed")
+    assert "总时限" in caplog.text
+    assert "空闲时限" not in caplog.text
+
+
+async def test_fallback_model_restarts_both_timers(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    clock = ManualClock()
+    primary = ScriptedModel("main", [], hang=True)
+    gates = [asyncio.Event() for _ in range(2)]
+    seen = asyncio.Event()
+    fallback = ScriptedModel(
+        "backup", [gates[0], Heartbeat(), mark(seen), gates[1], *answer("备用的回答")]
+    )
+    chat = conversation(
+        db, primary, fallback, clock=clock, idle_timeout_seconds=300, timeout_seconds=500
+    )
+
+    talk = asyncio.create_task(say(chat, alice, "你好"))
+    await reach(primary.started)
+    await clock.advance_to(300)  # 主模型超过空闲时限
+    await reach(fallback.started)
+    # 备用模型的两个时限都从 300 秒起算：沿用主模型的计时，总时限 500 秒时就到了。
+    await clock.advance_to(550)
+    assert fallback.closed == 0
+    gates[0].set()
+    await reach(seen)
+    await clock.advance_to(799)  # 备用模型的总时限在 800 秒、空闲时限在 850 秒
+    assert fallback.closed == 0
+    gates[1].set()
+    channel = await talk
+
+    assert primary.closed == 1
+    assert channel.streamed == "备用的回答"
+    assert (await rows(db))[-1] == Row("assistant", "备用的回答", "backup", "completed", "streamed")
+
+
+async def test_watchdog_leaves_a_stream_that_is_already_closing_alone(db: Database) -> None:
+    # 静默到 299.9 秒时被取消（关停），读流进入清理；清理跨过空闲到期的 300 秒时，看门任务不再取消一次。
+    alice = await invited(db, ALICE, "小王")
+    clock = ManualClock()
+    primary = ScriptedModel("main", [], hang=True, close_delay=0.2)
+    chat = conversation(db, primary, clock=clock)
+
+    talk = asyncio.create_task(say(chat, alice, "你好"))
+    await reach(primary.started)
+    await clock.advance_to(299.9)
+    talk.cancel()
+    await reach(primary.closing)  # 读流已经在被取消后的清理里
+    await clock.advance_to(300)
+    async with asyncio.timeout(HANG_GUARD):
+        with pytest.raises(asyncio.CancelledError):
+            await talk
+
+    assert primary.cleaned == 1  # 清理没有被看门任务打断
+    assert (await rows(db))[-1] == Row("assistant", "", "main", "cancelled", "cancelled")
+
+
+async def test_fallback_total_timeout_is_cut_to_the_reply_deadline(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    # 消息在 0 秒记进流水，被动回复的截止点是 55 分钟（3300 秒）。主模型用掉 3000 秒，备用模型只剩 300 秒。
+    assert conversation_module.REPLY_DEADLINE_SECONDS == 3300
+    alice = await invited(db, ALICE, "小王")
+    clock = ManualClock()
+    primary = ScriptedModel("main", [], hang=True)
+    fallback = ScriptedModel("backup", [], hang=True)
+    chat = conversation(
+        db, primary, fallback, clock=clock, idle_timeout_seconds=3600, timeout_seconds=3000
+    )
+
+    with caplog.at_level(logging.WARNING):
+        talk = asyncio.create_task(say(chat, alice, "你好"))
+        await reach(primary.started)
+        await clock.advance_to(3000)
+        await reach(fallback.started)
+        await clock.advance_to(3299)
+        assert fallback.closed == 0
+        await clock.advance_to(3300)
+        channel = await talk
+
+    assert fallback.closed == 1
+    assert channel.sent == [texts.MODEL_FAILED]
+    assert (await rows(db))[-1] == Row("assistant", "", "backup", "timeout", "failed")
+    assert "已按被动回复的截止点截短" in caplog.text
+
+
+async def test_no_fallback_when_too_little_time_is_left_before_the_reply_deadline(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    # 主模型的总时限到期时离截止点只剩 40 秒，不够一次有意义的调用：不换备用模型，照常给说明。
+    alice = await invited(db, ALICE, "小王")
+    clock = ManualClock()
+    primary = ScriptedModel("main", [], hang=True)
+    fallback = ScriptedModel("backup", answer("来不及的回答"))
+    chat = conversation(
+        db, primary, fallback, clock=clock, idle_timeout_seconds=3600, timeout_seconds=3260
+    )
+
+    with caplog.at_level(logging.WARNING):
+        talk = asyncio.create_task(say(chat, alice, "你好"))
+        await reach(primary.started)
+        await clock.advance_to(3259)
+        assert primary.closed == 0
+        await clock.advance_to(3260)
+        channel = await talk
+
+    assert fallback.requests == []
+    assert channel.sent == [texts.MODEL_FAILED]
+    assert (await rows(db))[-1] == Row("assistant", "", "main", "timeout", "failed")
+    assert await usage(db) == [("main", None, None)]
+    assert "不再换备用模型" in caplog.text
 
 
 async def test_fallback_model_is_used_when_primary_returns_nothing(db: Database) -> None:

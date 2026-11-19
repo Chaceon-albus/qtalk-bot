@@ -100,6 +100,8 @@ def test_commented_out_examples_are_valid_once_uncommented(tmp_path: Path) -> No
     settings = load_settings(config)
 
     assert [model.reasoning for model in settings.models] == ["high", "low"]
+    # 对话的输出上限默认不设，注释掉的示例去掉注释后照常生效。
+    assert settings.chat.max_output_tokens == 32768
     assert settings.decisions is not None
     assert settings.decisions.model == "gpt-6-luna"
     assert settings.memory is not None

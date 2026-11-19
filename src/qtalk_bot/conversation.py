@@ -190,6 +190,12 @@ TYPING_PULSE_SECONDS = 8
 """每次「正在输入」的时长（秒）。不一口气请求很久（平台允许 60 秒），而是有进展时再请求一次：程序卡住、没有进展时
 它很快到期，用户看到的是「输一会、停一会」。两次之间至少隔这么久；机器人发出消息时它会自动消失。"""
 GRACE_SECONDS = 3.0  # 被取消后收拢后台任务（在途的分片、结束分片）的时限
+# 一轮回复要在这个时刻之前送达：从回复所挂的那条用户消息记进流水时算起。QQ 单聊被动回复的有效期约 60 分钟
+# （pyqbot 的 errata：实测 55 分钟后仍能回复），留 5 分钟给超时之后发说明、结束流式消息，以及两边时钟的误差。
+REPLY_DEADLINE_SECONDS = 55 * 60
+# 每次模型调用至少给这么久：离截止点不到这么久时不再换备用模型（高推理加搜索，一分钟内很难写出有用的回答），
+# 第一次调用的总时限也不短于它（宁可略微越过留出的余量，也给用户一次机会）。
+MIN_CALL_SECONDS = 60.0
 
 
 class SendError(Exception):
@@ -407,6 +413,57 @@ class _Run:
         )
 
 
+class _Expiry(Enum):
+    """一次模型调用超过了哪一段时限。"""
+
+    IDLE = "空闲"
+    TOTAL = "总"
+
+
+class _Deadlines:
+    """一次模型调用的两段时限：流 `idle` 秒没有任何动静（`touch()`），或从开始算起超过 `total` 秒，就取消读流的
+    任务，并在 `expired` 里记下是哪一段。时钟与等待由 `Conversation` 注入，测试可以换成可控的。
+
+    用法同 `asyncio.timeout()`：读流的任务在开始时记下 `task.cancelling()`，接到取消时只有 `expired` 不为空、且
+    `task.uncancel()` 回到开始时的值，才是这里的超时；否则是别处的取消，照常传播。
+
+    到期时如果读流的任务已经在被别处取消（`task.cancelling()` 大于开始时的值），就不再取消它：它正在收尾（如 SDK
+    异步关闭响应流），再取消一次会打断清理；那次取消的发起方自己限时等它。
+    """
+
+    def __init__(self, timer: Timer, sleep: Sleep, idle: float, total: float) -> None:
+        self._timer = timer
+        self._sleep = sleep
+        self._idle = idle
+        self._total = total
+        self._started = self._active = timer()
+        self.expired: _Expiry | None = None
+
+    def touch(self) -> None:
+        """流里出现了事件（任何事件，含 `Heartbeat`）。"""
+        self._active = self._timer()
+
+    async def watch(self, task: asyncio.Task[object], cancelling: int) -> None:
+        """在后台盯着：醒来时重新算两个到期时刻，有动静就接着等，到期就取消 `task`（`cancelling` 是它开始时的
+        `cancelling()`）。"""
+        while True:
+            now = self._timer()
+            total_at = self._started + self._total
+            idle_at = self._active + self._idle
+            if now >= total_at:
+                expired = _Expiry.TOTAL
+            elif now >= idle_at:
+                expired = _Expiry.IDLE
+            else:
+                await self._sleep(min(total_at, idle_at) - now)
+                continue
+            if task.cancelling() > cancelling:
+                return  # 已经在被别处取消、正在收尾
+            self.expired = expired
+            task.cancel()
+            return
+
+
 @dataclass(frozen=True, slots=True)
 class _Outcome:
     content: str = field(repr=False)
@@ -424,6 +481,9 @@ class _Begun:
     decision_history: list[HistoryEntry] = field(repr=False)  # 附件已写成简短的标记
     previous: str | None  # 这个用户上一轮实际回答的模型
     topics: TopicQuery | None = None  # 分话题时这一轮的话题题；不分话题时为 `None`
+    received_at: float | None = (
+        None  # 回复所挂的那条消息记进流水的时刻（`Conversation` 的墙上时钟）
+    )
 
     @property
     def last_message_id(self) -> int:
@@ -444,10 +504,13 @@ class _Turn:
         process_ahead: bool = False,
         timer: Timer,
         sleep: Sleep = asyncio.sleep,
+        reply_by: float | None = None,
     ) -> None:
         self.channel = channel
         self.user = user
         self.selection = selection
+        # 回复要在这个时刻（墙上时钟）之前送达，见 `REPLY_DEADLINE_SECONDS`；不知道时为 `None`，不限。
+        self.reply_by = reply_by
         self.control = TurnControl() if control is None else control
         self._timer = timer
         self.pulses: set[asyncio.Task[None]] = set()  # 开始之后再发的「正在输入」
@@ -847,6 +910,9 @@ class Conversation:
             process_ahead=any(model.show_process for model in models),
             timer=self._timer,
             sleep=self._sleep,
+            reply_by=None
+            if begun.received_at is None
+            else begun.received_at + REPLY_DEADLINE_SECONDS,
         )
         cancelled: asyncio.CancelledError | None = None
         try:
@@ -1093,7 +1159,17 @@ class Conversation:
                 ),
                 pinned=pinned,
             )
-        return _Begun(tuple(message_ids), now, history, current, decisions, previous, query)
+        received_at = journal.message_time(conn, user.id, message_ids[-1])
+        return _Begun(
+            tuple(message_ids),
+            now,
+            history,
+            current,
+            decisions,
+            previous,
+            query,
+            None if received_at is None else float(received_at),
+        )
 
     def _topic_context(
         self,
@@ -1364,7 +1440,9 @@ class Conversation:
                 turn.pulse()
                 guard = MarkdownGuard()
                 try:
-                    attempt = await self._attempt(turn, model, request, guard, given)
+                    attempt = await self._attempt(
+                        turn, model, request, guard, given, total=self._call_limit(turn)
+                    )
                 except asyncio.CancelledError:
                     # 先停下仍拿着请求（原件）的读模型任务，再归还名额；排队的分片先丢掉（同 _wind_down）。
                     del request
@@ -1374,6 +1452,16 @@ class Conversation:
                 del request  # 归还名额之前丢掉对请求（原件）的引用
             turn.attempts.append(attempt)
             retry = not attempt.has_answer and not turn.outbox.handed and index + 1 < len(models)
+            if retry and (left := self._time_left(turn)) is not None and left < MIN_CALL_SECONDS:
+                # 离被动回复的截止点太近：备用模型来不及写出回答，直接给说明，免得说明也赶不上。
+                logger.warning(
+                    "模型 %s 没能回复用户 %s（%s），离被动回复的截止点只剩 %d 秒，不再换备用模型",
+                    model.name,
+                    turn.user.label,
+                    attempt.ending.value,
+                    max(0, int(left)),
+                )
+                retry = False
             if retry:
                 # 还没有任何内容交给 QQ：丢掉排队的部分与 guard 里攒着的，换备用模型从头来。
                 turn.outbox.discard()
@@ -1393,6 +1481,18 @@ class Conversation:
                 turn.outbox.push(guard.closing_fence() + section)
             break
         return False
+
+    def _time_left(self, turn: _Turn) -> float | None:
+        """离这一轮被动回复的截止点还有多少秒（可能为负）；不知道截止点时为 `None`。"""
+        return None if turn.reply_by is None else turn.reply_by - self._clock()
+
+    def _call_limit(self, turn: _Turn) -> float:
+        """这次调用的总时限：`timeout_seconds` 与离截止点的剩余时间中较小的，但不短于 `MIN_CALL_SECONDS`。"""
+        limit = self._settings.timeout_seconds
+        left = self._time_left(turn)
+        if left is not None:
+            limit = min(limit, max(left, MIN_CALL_SECONDS))
+        return limit
 
     async def _notify(self, turn: _Turn, notices: Sequence[str]) -> None:
         """发出还没发过的说明（按内容去重）。
@@ -1426,6 +1526,8 @@ class Conversation:
         request: ChatRequest,
         guard: MarkdownGuard,
         given: frozenset[int] = frozenset(),
+        *,
+        total: float,
     ) -> _Attempt:
         run = _Run(model, given)
         turn.run = run
@@ -1453,7 +1555,9 @@ class Conversation:
                 stages.add((type(event), key))
                 turn.pulse()
 
-        consumer = asyncio.create_task(self._consume(model, request, run, sink, note, progress))
+        consumer = asyncio.create_task(
+            self._consume(model, request, run, sink, note, progress, total=total)
+        )
         turn.consumer = consumer
         broken = asyncio.create_task(turn.outbox.broken.wait())
         try:
@@ -1480,13 +1584,23 @@ class Conversation:
         sink: Callable[[str], None],
         note: Callable[[ProcessEvent], None] = lambda _: None,
         progress: Callable[[ChatEvent], None] = lambda _: None,
+        *,
+        total: float,
     ) -> None:
+        """读一次模型调用的流。受两段时限约束（`_Deadlines`）：空闲时限按流里的任何事件（含适配器交出的
+        `Heartbeat`）重新计时，总时限 `total`（见 `_call_limit()`）从这里开始算；每次调用（含换备用模型）都重新
+        计时。"""
+        task = asyncio.current_task()
+        assert task is not None
+        cancelling = task.cancelling()
+        settings = self._settings
+        deadlines = _Deadlines(self._timer, self._sleep, settings.idle_timeout_seconds, total)
+        watcher = asyncio.create_task(deadlines.watch(task, cancelling))
+        finished = False
         try:
-            async with (
-                asyncio.timeout(self._settings.timeout_seconds),
-                aclosing(model.stream(request)) as events,
-            ):
+            async with aclosing(model.stream(request)) as events:
                 async for event in events:
+                    deadlines.touch()
                     progress(event)
                     match event:
                         case TextDelta(text=text):
@@ -1497,16 +1611,38 @@ class Conversation:
                             run.usage = event
                         case Finished(reason=reason):
                             run.ending = _FINISH_ENDINGS[reason]
+                            finished = True
                         case Commentary() | SearchProgress():
                             note(event)  # 思考摘要（万一服务商仍给了）不展示也不存档
                         case _:
-                            pass
+                            pass  # 含 Heartbeat：上面已经算作动静
         except ModelError as exc:
             logger.warning("模型 %s 调用失败：%s", model.name, exc)
             run.ending = Ending.ERROR
-        except TimeoutError:
-            logger.warning("模型 %s 超过 %g 秒没有完成", model.name, self._settings.timeout_seconds)
-            run.ending = Ending.TIMEOUT
+        except asyncio.CancelledError:
+            expired = deadlines.expired
+            if expired is None or task.uncancel() > cancelling:
+                raise  # 别处的取消（关停、发送出错后停止读模型）
+            if not finished:  # 已经正常结束、只是关闭响应流时到期的，不算超时
+                match expired:
+                    case _Expiry.IDLE:
+                        logger.warning(
+                            "模型 %s 超过 %g 秒没有任何动静（空闲时限），放弃这次调用",
+                            model.name,
+                            settings.idle_timeout_seconds,
+                        )
+                    case _Expiry.TOTAL:
+                        logger.warning(
+                            "模型 %s 超过 %g 秒没有写完（总时限%s），放弃这次调用",
+                            model.name,
+                            total,
+                            "，已按被动回复的截止点截短"
+                            if total < settings.timeout_seconds
+                            else "",
+                        )
+                run.ending = Ending.TIMEOUT
+        finally:
+            watcher.cancel()
 
     async def _deliver(self, turn: _Turn) -> _Outcome:
         outbox, channel, user = turn.outbox, turn.channel, turn.user

@@ -366,7 +366,7 @@ class RequestBuilder:
         history: Sequence[HistoryEntry],
         current: Sequence[HistoryEntry],
         image_turns: int,
-        max_output_tokens: int,
+        max_output_tokens: int | None,
         models: Sequence[ModelSettings] = (),
         announce: Collection[int] | None = None,
         max_size_mb: int = 20,

@@ -1034,3 +1034,25 @@ async def test_version_6_database_gets_an_empty_searches_column(tmp_path: Path) 
         assert tuple(row) == (5, 6, None)
         (summary,) = await db.transaction(journal.usage_summary, 0)
         assert (summary.total_calls, summary.total_searches) == (1, 0)
+
+
+async def test_message_time_is_read_only_for_this_users_own_messages(db: Database) -> None:
+    # 被动回复的截止点从回复所挂的那条消息记进流水的时刻算起；只认这个用户自己的用户消息。
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+    bob = await new_user(db, "FAKE-OPENID-BOB", "小李")
+
+    def fill(conn: sqlite3.Connection) -> tuple[int, int, int]:
+        question = turn(conn, alice, "问", "答", now=1000)
+        later = journal.add_user_message(conn, alice, "又问", "qq-2", 1234)
+        theirs = journal.add_user_message(conn, bob, "别人的", "qq-3", 1500)
+        return question, later, theirs
+
+    question, later, theirs = await db.transaction(fill)
+
+    assert await db.transaction(journal.message_time, alice, later) == 1234
+    assert await db.transaction(journal.message_time, alice, question) == 1000
+    assert (
+        await db.transaction(journal.message_time, alice, question + 1) is None
+    )  # 回复不是用户消息
+    assert await db.transaction(journal.message_time, alice, theirs) is None
+    assert await db.transaction(journal.message_time, alice, 10**6) is None

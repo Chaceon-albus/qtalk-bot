@@ -17,7 +17,7 @@
 `result[].search_suggestions`，一段 HTML/CSS）。QQ 渲染不了 HTML，用户已决定照常打开搜索，所以这段 HTML 一律
 忽略，不发给用户，也不保存。
 
-处理的流式事件：
+处理的流式事件（每个事件，含不认识的，之前先交出一个 `Heartbeat`，供调用方计算空闲时限）：
 - `step.start`：记下每个步骤（按 `index`）的类型。`google_search_call` 步骤给出
   `SearchProgress(STARTED)`（调用编号取步骤的 `id`；文档的示例里这时没有查询词）；`google_search_result`
   步骤按 `call_id` 给出对应搜索的 `SearchProgress(COMPLETED)`；`model_output` 步骤若已带文本块，其中的正文
@@ -63,7 +63,7 @@ import asyncio
 import base64
 import logging
 from collections.abc import AsyncGenerator, Callable
-from typing import cast
+from typing import TypedDict, cast
 
 from google import genai
 from google.genai import interactions, types
@@ -79,6 +79,7 @@ from . import (
     FilePart,
     Finished,
     FinishReason,
+    Heartbeat,
     ImagePart,
     Masked,
     Message,
@@ -113,6 +114,13 @@ _FAILED_STATUSES = frozenset(("failed", "cancelled"))
 _GOOGLE_SEARCH: interactions.GoogleSearchParam = {"type": "google_search"}
 
 THINKING_SUMMARIES: interactions.ThinkingSummaries = "auto"
+
+
+class _Options(TypedDict, total=False):
+    """`create` 的可选参数：没有的键就不传。"""
+
+    generation_config: interactions.GenerationConfigParam
+    tools: list[interactions.ToolParam]
 
 
 def create_client(
@@ -190,32 +198,26 @@ class GeminiChatModel:
             config["thinking_level"] = cast(interactions.ThinkingLevel, self._reasoning)
         if self._summaries:
             config["thinking_summaries"] = THINKING_SUMMARIES
+        # SDK 的 `create` 只认传了的关键字参数（没有表示「不传」的公开哨兵值），可选的参数放进 TypedDict 展开：
+        # 什么都不设时整个 `generation_config` 不带，不发空对象。
+        options: _Options = {}
+        if config:
+            options["generation_config"] = config
+        if self._search:
+            options["tools"] = [_GOOGLE_SEARCH]
         # `create` 的 `timeout` 参数类型来自 SDK 对 httpx 的可选导入，pyright 看作 Unknown；`model` 的类型是
         # 已知模型名的 Literal 加 SDK 自己的 str 子类，配置里的任意模型名只能 cast 过去。
         inputs = [_step(message) for message in request.messages]
-        # SDK 的 `create` 只认传了的关键字参数（没有表示「不传」的哨兵值），所以带不带工具分两种写法。
         model = cast(interactions.Model, self._model)
-        interactions_api = self._client.aio.interactions
         try:
-            if self._search:
-                events = await interactions_api.create(  # pyright: ignore[reportUnknownMemberType]
-                    model=model,
-                    input=inputs,
-                    system_instruction=request.system,
-                    generation_config=config,
-                    tools=[_GOOGLE_SEARCH],
-                    store=False,
-                    stream=True,
-                )
-            else:
-                events = await interactions_api.create(  # pyright: ignore[reportUnknownMemberType]
-                    model=model,
-                    input=inputs,
-                    system_instruction=request.system,
-                    generation_config=config,
-                    store=False,
-                    stream=True,
-                )
+            events = await self._client.aio.interactions.create(  # pyright: ignore[reportUnknownMemberType]
+                model=model,
+                input=inputs,
+                system_instruction=request.system,
+                store=False,
+                stream=True,
+                **options,
+            )
         except Exception as exc:  # noqa: BLE001  SDK 的异常类在私有模块里，见模块 docstring
             raise _error(exc) from None
         searches = _Searches(self._search)
@@ -229,6 +231,7 @@ class GeminiChatModel:
             async with events:
                 try:
                     async for event in events:
+                        yield Heartbeat()
                         match event:
                             case interactions.InteractionCreatedEvent():
                                 texts.end_hop()  # 自动续写的新一跳开始

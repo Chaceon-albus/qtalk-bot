@@ -30,7 +30,7 @@ class Ending(StrEnum):
     MAX_TOKENS = "max_tokens"  # 达到输出上限，没写完
     INCOMPLETE = "incomplete"  # 其它原因没写完，如内容过滤
     ERROR = "error"  # 调用失败或流中途出错
-    TIMEOUT = "timeout"  # 超过 `[chat] timeout_seconds`
+    TIMEOUT = "timeout"  # 超过 `[chat]` 的空闲时限或总时限（总时限可能被被动回复的截止点截短）
     EMPTY = "empty"  # 正常结束，但只有空白
     ABORTED = "aborted"  # 发送回答时出了说不准是否送达的错误，主动停止
     CANCELLED = "cancelled"  # 处理被取消（如关停）
@@ -648,6 +648,15 @@ def not_faces_only(
     ).fetchall()
     kept = {int(row["id"]) for row in rows}
     return tuple(message_id for message_id in message_ids if message_id in kept)
+
+
+def message_time(conn: sqlite3.Connection, user_id: int, message_id: int) -> int | None:
+    """这个用户的一条用户消息记进流水的时刻（即收到它的时刻）；不是他的或没有这条时返回 `None`。"""
+    row = conn.execute(
+        "SELECT created_at FROM messages WHERE user_id = ? AND role = 'user' AND id = ?",
+        (user_id, message_id),
+    ).fetchone()
+    return None if row is None else int(row["created_at"])
 
 
 def current_entries(

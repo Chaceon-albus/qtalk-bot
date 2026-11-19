@@ -450,7 +450,13 @@ def test_secret_in_models_is_rejected_without_echoing(tmp_path: Path) -> None:
 
 def test_chat_defaults() -> None:
     chat = ChatSettings()
-    assert (chat.history_turns, chat.max_output_tokens, chat.timeout_seconds) == (10, 8192, 120)
+    # 输出上限默认不设（不向服务商传）；时限是空闲 300 秒、总共 1800 秒。
+    assert (
+        chat.history_turns,
+        chat.max_output_tokens,
+        chat.idle_timeout_seconds,
+        chat.timeout_seconds,
+    ) == (10, None, 300, 1800)
     assert chat.persona == DEFAULT_PERSONA
     assert DEFAULT_PERSONA not in repr(chat)
 
@@ -458,12 +464,25 @@ def test_chat_defaults() -> None:
 def test_chat_values_are_read(tmp_path: Path) -> None:
     text = (
         '[chat]\npersona = """\n你是小助手。\n"""\n'
-        "history_turns = 0\nmax_output_tokens = 1000\ntimeout_seconds = 30\n"
+        "history_turns = 0\nmax_output_tokens = 1000\nidle_timeout_seconds = 20\n"
+        "timeout_seconds = 30\n"
     )
     chat = load_settings(write_config(tmp_path, text)).chat
     assert chat == ChatSettings(
-        persona="你是小助手。\n", history_turns=0, max_output_tokens=1000, timeout_seconds=30
+        persona="你是小助手。\n",
+        history_turns=0,
+        max_output_tokens=1000,
+        idle_timeout_seconds=20,
+        timeout_seconds=30,
     )
+
+
+def test_chat_output_limit_is_optional(tmp_path: Path) -> None:
+    # 不写就不设上限；写了照常校验上下限。
+    chat = load_settings(write_config(tmp_path, '[chat]\npersona = "你好"\n')).chat
+    assert chat.max_output_tokens is None
+    chat = load_settings(write_config(tmp_path, "[chat]\nmax_output_tokens = 131072\n")).chat
+    assert chat.max_output_tokens == 131072
 
 
 @pytest.mark.parametrize(
@@ -473,6 +492,13 @@ def test_chat_values_are_read(tmp_path: Path) -> None:
         ("[chat]\nhistory_turns = -1\n", "chat.history_turns：不能小于 0"),
         ("[chat]\nhistory_turns = 101\n", "chat.history_turns：不能大于 100"),
         ("[chat]\nmax_output_tokens = 0\n", "chat.max_output_tokens：应为正整数"),
+        ("[chat]\nmax_output_tokens = 131073\n", "chat.max_output_tokens：不能大于 131072"),
+        ("[chat]\nidle_timeout_seconds = 0\n", "chat.idle_timeout_seconds：应为正整数"),
+        ("[chat]\nidle_timeout_seconds = 3601\n", "chat.idle_timeout_seconds：不能大于 3600"),
+        (
+            "[chat]\nidle_timeout_seconds = 2.5\n",
+            "chat.idle_timeout_seconds：应为整数，实际是浮点数",
+        ),
         ("[chat]\ntimeout_seconds = 3601\n", "chat.timeout_seconds：不能大于 3600"),
         ("[chat]\ntimeout_seconds = 1.5\n", "chat.timeout_seconds：应为整数，实际是浮点数"),
         ("[chat]\nturns = 3\n", "chat.turns：未知的键"),

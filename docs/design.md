@@ -188,7 +188,7 @@
 - 流式回复被平台拒绝：把全文改用纯文本的普通消息再发一次，仍然失败就发固定说明。
 - 发送出错、说不准是否送达：立即停止读模型，不改发，免得用户收到重复内容。
 - 机器人关停时：限时收拢在途的发送，把已确认送达的部分和已知用量写进流水。这是尽力而为，事件循环提前结束时仍会丢。
-- 超时按每次模型调用计（`timeout_seconds`），换备用模型时重新计时。
+- 超时按每次模型调用计，换备用模型时重新计时。（时限已改成空闲与总共两段，见「对话的输出上限与时限」。）
 
 Markdown 的处理：把形如链接、目标却不是 http(s) 地址的那对圆括号换成全角括号，代码块和行内代码里的内容不动。没有用反斜杠转义，因为 QQ 会把 `\(…\)` 当成行内公式。全角括号能否通过平台审核还没有实测。
 
@@ -200,7 +200,7 @@ Markdown 的处理：把形如链接、目标却不是 http(s) 地址的那对�
 | `max_tokens` | 达到输出上限 |
 | `incomplete` | 其它原因没写完，如内容过滤 |
 | `error` | 调用失败或流中途出错 |
-| `timeout` | 超过 `timeout_seconds` |
+| `timeout` | 超过空闲时限或总时限 |
 | `empty` | 正常结束，但只有空白 |
 | `aborted` | 发送出错后主动停止 |
 | `cancelled` | 处理被取消 |
@@ -227,7 +227,7 @@ Markdown 的处理：把形如链接、目标却不是 http(s) 地址的那对�
 配置（完整的写法见 `config.example.toml`）：
 
 - `[[models]]`：`name`（内部名字）、`provider`（`openai` / `gemini`）、`model`、`default`、可选的 `fallback` 与 `reasoning`。至少一项，恰好一个默认。`reasoning` 原样传给服务商，本地不维护取值表。
-- `[chat]`：`persona`、`history_turns`（默认 10）、`max_output_tokens`（默认 8192）、`timeout_seconds`（默认 120）。
+- `[chat]`：`persona`、`history_turns`（默认 10）、`max_output_tokens`（默认 8192）、`timeout_seconds`（默认 120）。后两项已按「对话的输出上限与时限」修改：`max_output_tokens` 默认不设，时限分成 `idle_timeout_seconds`（默认 300）与 `timeout_seconds`（默认 1800）。
 - `[providers.openai]`、`[providers.gemini]`：可选的 `base_url` 与 `proxy`。代理支持 http、https、socks5、socks5h，地址不进 `repr`、日志与报错。
 - `[qq]`：可选的 `base_url`。QQ 侧的代理等 pyqbot 加上参数后再做。
 - 启动时交叉校验：配置里用到哪家服务商，对应的密钥就必须在环境变量里。
@@ -465,7 +465,7 @@ Gemini 的 Decisions 在 `v1beta` 下，而对话用的 Interactions 在 `v1` �
 
 - 模块 `memory.py`（`Summarizer`），写法照 `describe.py`：后台任务、真正调用之前在事务里复查授权、受保护的记账、`stop()` / `aclose()` 收尾。接在 `__main__.py` 的关停顺序里，与 `Describer` 并列（第 6、7 步）。关停只取消一次（评审修正）：`aclose()` 在已经 `stop()` 过时只等待、不再取消，免得打断模型响应流被第一次取消后的异步关闭；`Describer.aclose()` 同样改了。
 - 配置 `[memory]`：`provider`、`model` 必填；`reasoning` 默认不传；`timeout_seconds` 默认 120（最大 600）；`max_output_tokens` 默认不设；`instructions` 默认题面写在 `config.DEFAULT_MEMORY_INSTRUCTIONS` 与示例里。只在配置了 `[decisions]` 时生效；有 `[memory]` 没有 `[decisions]` 时不报错，忽略它并在启动时记一条警告（同 `[topics]`），也不要求它的服务商的密钥。模型与同一家的对话模型共用客户端（`ChatModels.memorizer`）。
-- **后台任务默认不设输出上限**（用户 2026-11-19 决定：后台用 gpt-6-luna 的任务几乎不花钱）：`[describe]` 的 `max_output_tokens`、`file_max_output_tokens` 与 `[memory]` 的 `max_output_tokens` 都改成可选，不写就不向服务商传（`llm.ChatRequest.max_output_tokens` 可以为空，OpenAI 不带 `max_output_tokens`，Gemini 的 `generation_config` 里不带 `max_output_tokens`），由模型自己的上限兜底，失控时由 `timeout_seconds` 兜底；写了才传，含推理所用的 token。`[chat].max_output_tokens` 不变，仍默认 8192。
+- **后台任务默认不设输出上限**（用户 2026-11-19 决定：后台用 gpt-6-luna 的任务几乎不花钱）：`[describe]` 的 `max_output_tokens`、`file_max_output_tokens` 与 `[memory]` 的 `max_output_tokens` 都改成可选，不写就不向服务商传（`llm.ChatRequest.max_output_tokens` 可以为空，OpenAI 不带 `max_output_tokens`，Gemini 的 `generation_config` 里不带 `max_output_tokens`），由模型自己的上限兜底，失控时由 `timeout_seconds` 兜底；写了才传，含推理所用的 token。`[chat].max_output_tokens` 当时不变，仍默认 8192（之后也改成默认不设，见「对话的输出上限与时限」）。
 - 排队：每个用户一个后台任务，依次处理排着的话题（按排的顺序、不重复）；正在写的话题又排进来，写完后再写一次；整个进程同时最多 `memory.CONCURRENCY`（2）个调用。只有正常结束（没有被取消）、写了归属的一轮才排。
 - 输入：JSON（`title`、`summary`、`turns`），`turns` 是这个话题里覆盖范围之后的各轮文字版（用户消息是正文加附件的 `text`，回复是 `content`，只发了说明的回复不带），最多最近 20 轮，每条最多 2000 字，合计最多 12000 字，超出时丢掉更早的。没有新的轮次就不调用。
 - 按轮次取（评审修正，`journal.topic_turns_after()`）：`summarized_through` 记的是覆盖到的那一轮的回复，下一次取回复编号更大的那些轮，带上它们各自 `reply_to` 覆盖的用户消息，不论用户消息的编号大小。回答进行中发来的下一轮问题编号比上一轮的回复小（问1、问2、答1、答2），只按消息编号取会漏掉问2。只发了说明的回复照样是轮次的边界，它的问题照常带上。覆盖范围推进到这次带上的各轮里最大的回复编号，所以超出上限被丢掉的更早轮次之后不会补写。
@@ -504,6 +504,25 @@ Gemini 的 Decisions 在 `v1beta` 下，而对话用的 Interactions 在 `v1` �
   - 前提全部满足才发：过程消息、回答、附件说明都还没交给 QQ；距上一次实际发出至少 8 秒（时刻记在 `TurnControl.typed_at`，插话重来时接着用）；这条消息发「正在输入」不到 3 次（`process.MAX_TYPINGS`）；发完仍给回答，以及这一轮还可能发的过程消息（含备用模型的）留足被动回复的余量。
   - 过程消息与回答的第一片等在途的「正在输入」发完再发，免得「正在输入」晚于内容到达。一轮结束或被打断时取消还在途的，限时等它们收尾。
 - 需要实测：流式消息能否用 `stream_msg_id` 撤回、2 分钟从哪一片算起；同一条用户消息能否先后回两条流式消息；引用段落的渲染；8 秒的「正在输入」脉冲用起来是否自然。
+
+### 对话的输出上限与时限
+
+用户 2026-11-19 决定，向 ChatGPT app 看齐：它在 Thinking 模式下不在模型之外另设单条回答的输出上限（总上下文 256K = 输入 128K + 最多输出 128K，正好是模型自己的上限），长回答写几分钟也照样等。原来的 `max_output_tokens = 8192`（含推理）会让高推理强度的难题推理到一半就被截断，`timeout_seconds = 120`（从开始调用到写完）也容易被高推理加搜索加长回答超过。
+
+- **输出上限默认不设**：`[chat].max_output_tokens` 改成可选，不写就不向服务商传（OpenAI 不带 `max_output_tokens`，Gemini 的 `generation_config` 里不带），由模型自己的上限兜底；写了照常传，校验范围不变（1 到 131072），含推理所用的 token。做法与 6a 的「后台任务默认不设输出上限」相同。Gemini 不传时实际是 65,536（见「查证过的外部事实」的「模型」）。
+- Gemini 的 `generation_config` 什么都不设时（没有上限、没有推理强度、不要思考摘要）整个字段不带，不再发空对象 `{}`；后台任务同样适用。
+- **时限分两段**，代替「`timeout_seconds` 秒内写完」：
+  - 空闲时限 `[chat].idle_timeout_seconds`（默认 300，1 到 3600）：模型流这么久没有任何动静就放弃。「动静」以适配器从 SDK 收到的任何事件为准，而不只是本项目认识的那几种：适配器每收到一个 SDK 流式事件（含不认识的）就先交出一个 `llm.Heartbeat`，调用方照「忽略不认识的事件」的约定处理它，只有对话拿它重新计时。OpenAI 推理时可能很久只有本项目不关心的事件。
+  - 总时限 `[chat].timeout_seconds`（沿用键名，默认改成 1800，上限仍是 3600）：一次调用从发出请求到写完最多这么久。QQ 被动回复的有效期是从用户那条消息算起的 60 分钟，前面还有决策、下载附件，换备用模型又要重新计时，所以留出余量。
+  - 换备用模型时两个时限都重新计时。超时之后的处理（给用户的说明、记账、`Ending.TIMEOUT`）沿用原来的超时路径，只是触发条件变了；日志写明是空闲时限还是总时限。
+- 实现（`conversation._Deadlines`）：读流的任务旁边起一个看门的任务，按注入的单调时钟（`Conversation` 的 `timer` 与 `sleep`，测试换成可控的）算两个到期时刻，到期就取消读流的任务；读流的任务按 `asyncio.timeout()` 的办法（`cancelling()` / `uncancel()`）区分这里的超时与别处的取消（关停、发送出错后停读）。流已经给出 `Finished`、只是关闭响应流时到期的，不算超时。
+- **整轮赶在被动回复窗口之前**（评审补充）：每次调用独立计时不变，但一轮另有一个送达截止点，是回复所挂的那条用户消息记进流水的时刻（`messages.created_at`，`Conversation` 注入的墙上时钟）加 `REPLY_DEADLINE_SECONDS`（55 分钟：被动回复约 60 分钟有效，留 5 分钟给超时后的说明、结束流式消息和时钟误差）。否则配了备用模型时，主、备各用满 1800 秒（只有心跳、没有正文）就会用完同一条消息的 60 分钟，备用模型最后写出的回答或两次超时后的说明都会因原消息过期被拒。
+  - 每次调用的总时限取 `timeout_seconds` 与离截止点的剩余时间中较小的，但不短于 `MIN_CALL_SECONDS`（60 秒）：第一次调用总会给一次机会，宁可略微越过留出的余量。截短了的总时限超时时，日志注明「已按被动回复的截止点截短」。
+  - 换备用模型之前离截止点不到 `MIN_CALL_SECONDS` 就不再换（高推理加搜索一分钟内很难写出有用的回答），直接走原来的超时说明，日志记剩余秒数。
+  - 流水里取不到那条消息的时刻时（不应发生）不设截止点。
+- 看门任务到期时，如果读流的任务已经在被别处取消（插话、关停、发送出错后停读，`task.cancelling()` 大于开始时的值），就不再取消它：它正在收尾（SDK 异步关闭响应流），再取消一次会打断清理；那次取消的发起方自己限时等它（评审修正）。正常写完之后关闭响应流时仍在计时，关闭卡住时由时限兜底（已经给出 `Finished` 的不算超时）。
+- 两个时限的大小不做交叉校验：空闲时限不小于总时限时，等于只有总时限。
+- 后台任务（`[describe]`、`[memory]`）仍是单段的 `timeout_seconds`，不变。
 
 ### 给管理员的提醒（`alerts.py`）
 
@@ -777,6 +796,8 @@ inputs = ["text", "image", "audio", "file"]   # 这个模型能直接接收的�
 - QQ 的小黄脸等系统表情以什么形式到达，是否也是 `<faceType=…>` 标记、带不带图片附件。
 - 单聊消息里的昵称字段有没有值。官方示例里是空串，pyqbot 的样本里有值，但可能是脱敏后的占位。
 - 单条消息的长度上限，长回复要不要拆条。
+- QQ 单条流式消息最长能写多少字、能持续多久（对话不再设输出上限、总时限放宽到 30 分钟之后，长回答更常见）。超出时可能要拆成几条，每条占一次被动回复。
+- 高推理强度（如 `gpt-6.2-sol` 开 `high`）加搜索时，模型流里最长会隔多久没有任何 SDK 事件（SSE 的注释行这类 keep-alive 一般被 SDK 吞掉，交不到适配器，不算动静），据此确认 300 秒的空闲时限够不够。
 - 已是好友的人点邀请链接、机器人离线时有人添加，这两种情况会不会收到 `FRIEND_ADD`。
 - 同一条用户消息能不能先后回两条流式消息。
 - 流式消息能不能撤回，2 分钟从哪一片算起。单聊里撤回后会留下一条撤回提示（pyqbot 实测过普通消息）。
@@ -813,6 +834,8 @@ inputs = ["text", "image", "audio", "file"]   # 这个模型能直接接收的�
 | `gpt-6.2-sol` | 文本、图片 | 支持 |
 | `gpt-6-luna` | 文本、图片 | 支持 |
 | `gemini-4-hydrogen` | 文本、图片、音频、视频、PDF | 支持 |
+
+输出上限（2026-11-19 查）：Interactions API 不传 `max_output_tokens` 时，Gemini 4 系列（含 `gemini-4-hydrogen`）每次回答最多生成 65,536 个 token（思考加输出），流式与非流式、前台与后台都一样；要超过 64K 得显式把 `max_output_tokens` 设到 65,536 以上（「long decode」，最多 1,048,576，与输入共用上下文），SDK 默认的自动续写会接着读后续各跳。出处是 [Long decode](https://aistudio.google.com/docs/long-decode) 的「Output limits」表；[gemini-4-hydrogen 模型页](https://aistudio.google.com/docs/models/gemini-4-hydrogen) 写的是「65,536（默认，同步）/ 最多 1,048,576（long decode）」；[Interactions 接口文档](https://aistudio.google.com/api-reference/interactions-api) 的 `max_output_tokens` 只写了含义，没写默认值。OpenAI 一侧没有查。
 
 语音转写：OpenAI 是 `gpt-transcribe`，Gemini 是 `gemini-3.5-transcribe`；Gemini 的通用模型也能直接收音频。
 
