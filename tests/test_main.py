@@ -199,6 +199,63 @@ def test_data_dir_that_is_a_file_exits_nonzero_without_traceback(
     assert "Traceback" not in err
 
 
+def test_new_data_dir_is_private(config: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def start(self: pyqbot.Bot) -> None:
+        pass
+
+    monkeypatch.setattr(pyqbot.Bot, "start", start)
+    assert entry.main() == 0
+    assert (config.parent / "data").stat().st_mode & 0o777 == 0o700
+
+
+def test_existing_data_dir_loses_group_and_other_access(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    data = tmp_path / "data"
+    data.mkdir()
+    data.chmod(0o755)
+
+    entry.private_data_dir(data)
+
+    assert data.stat().st_mode & 0o777 == 0o700
+    assert "权限从 755 收紧到 700" in caplog.text
+    caplog.clear()
+    entry.private_data_dir(data)  # 已经收紧过就什么也不做
+    assert caplog.text == ""
+
+
+def test_data_dir_that_cannot_be_tightened_only_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # 例如 docker 挂进来的目录属于别的账户：照常启动，只记警告。
+    data = tmp_path / "data"
+    data.mkdir()
+    data.chmod(0o755)
+
+    def refuse(self: Path, mode: int, *, follow_symlinks: bool = True) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(Path, "chmod", refuse)
+    entry.private_data_dir(data)
+
+    assert "数据目录" in caplog.text
+    assert "权限没能收紧：Operation not permitted" in caplog.text
+
+
+def test_data_dir_that_is_a_file_is_left_for_the_database_to_reject(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("我是一个普通文件")
+    blocker.chmod(0o644)
+
+    entry.private_data_dir(blocker)
+
+    assert blocker.stat().st_mode & 0o777 == 0o644
+    assert caplog.text == ""
+
+
 def test_corrupt_database_exits_nonzero_without_echoing_it(
     config: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

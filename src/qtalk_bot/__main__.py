@@ -12,6 +12,7 @@ import logging
 import signal
 import sys
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 import pyqbot
 
@@ -62,6 +63,22 @@ def memory_settings(settings: Settings) -> MemorySettings | None:
     return settings.memory
 
 
+def private_data_dir(path: Path) -> None:
+    """数据目录（流水、附件原件、备份都在里面）只给运行机器人的账户访问：不存在时以 0700 新建，已有的去掉组与
+    其他人的权限。收紧失败（例如 docker 挂进来的目录属于别的账户）只记警告、照常启动；路径是文件时什么也不做，
+    留给打开数据库时报错。"""
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        mode = path.stat().st_mode & 0o777
+        if mode & 0o077:
+            path.chmod(mode & 0o700)
+            logger.info("数据目录 %s 的权限从 %o 收紧到 %o", path, mode, mode & 0o700)
+    except FileExistsError:
+        return
+    except OSError as exc:
+        logger.warning("数据目录 %s 的权限没能收紧：%s", path, exc.strerror or type(exc).__name__)
+
+
 def _make_bot(secrets: Secrets, settings: Settings) -> pyqbot.Bot:
     """按 `[qq]` 构造 `pyqbot.Bot`：没配的项不传，用 pyqbot 的默认值。代理也作用于网关与附件下载
     （`bot.http_client`）；地址里的账号密码由 pyqbot 保证不进它的 `repr`、日志与异常。"""
@@ -81,6 +98,7 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
     调用方要先用 `check_provider_secrets()` 确认用到的服务商都有密钥。
     """
     memory = memory_settings(settings)
+    private_data_dir(settings.data_dir)
     async with (
         await Database.open(settings.data_dir / DATABASE_FILENAME) as db,
         ChatModels(
