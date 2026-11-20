@@ -43,7 +43,7 @@ image_generation = true           # 可选，默认关：这个模型能用画�
 - Gemini `gemini-nano-banana-2.1`（Interactions API，`response_format` 为 `{"type": "image", "image_size": "1K", "aspect_ratio": "1:1"}`）：约 16 秒出一张 1K 的 JPEG；图片输出 1120 token，另有 708 个思考 token 也计费，按价格页约 0.04 美元；同时回一段文字介绍。
 - OpenAI（`gpt-6.2-sol` 加内置 `image_generation` 工具）：起初 `gpt-image-2.6-flare`、`gpt-image-2.6-sunburst`、`gpt-image-2.5-flare` 都返回 403 `model_not_found`（项目没有这个模型的访问权限）。用户在项目里打开 2.6 的 flare 与 sunburst 后，flare 约 4 分钟后生效：低质量 1024×1024 连主模型共约 10 秒，图片输出 824 token（比旧模型低质量的 272 多），按每百万 $30 约 0.025 美元。sunburst 随后也生效：同样的请求约 13.5 秒，图片输出同样是 824 token、价格相同（各只试了一次，快慢只作参考）。
 
-步骤：
+步骤（1–8 已完成，9 待做）：
 
 1. 查官方文档定细节：两家函数调用的完整循环（OpenAI 在 `store=False` 下怎样把推理项带回后续请求、`function_call_output` 带图片的格式；Gemini Interactions 的函数调用与带图片的函数结果），两家出图与改图的接口与参数，审核拒绝时的返回。
 2. 配置：上面的两处，更新 `config.example.toml`（`.env.example` 不变）与相应的测试。
@@ -54,3 +54,31 @@ image_generation = true           # 可选，默认关：这个模型能用画�
 7. 改图：上下文里的图带编号，函数参数引用编号。
 8. 测试：两条不变量、限额、失败路径；QQ 上传与两家模型都用替身。
 9. 实测：`tests/live` 加出图用例（两家，经用户同意）；之后 QQ 端到端实测。
+
+## 实现（2026-11-19）
+
+模型层（`llm/`，两家对话适配器通用，不限于画图）：
+
+- 通用类型 `FunctionTool`、`FunctionCall`（参数是 JSON 文本，Gemini 给的对象序列化成文本）、`FunctionResult`（文字与图片，图片限 png、jpeg、webp）、`ToolRunner`；`ChatRequest.tools` 与 `ChatRequest.tool_runner`，`ChatModel.stream()` 的签名不变。新事件 `FunctionCallStarted`。
+- 适配器在内部执行多跳：模型调用函数时 `await tool_runner(call)`，把结果交回、再发下一跳，对调用方仍是同一次 `stream()`，用量与搜索次数跨跳累计。函数执行时上一跳的连接已经释放，执行前后各交一个 `Heartbeat`；`tool_runner` 的异常（含取消）原样往外抛。
+- `store=False` 下下一跳带回上一跳的全部输出、按原顺序：OpenAI 是全部输出项（`item.to_dict(mode="json", warnings=False)`，含推理项的 `encrypted_content`、消息的 `phase`、`web_search_call`、`function_call`），带函数的各跳显式传 `include=["reasoning.encrypted_content"]`；Gemini 是从流里重建、再用完成快照补全的全部模型步骤（带签名的 thought、搜索步骤、`function_call`），排除快照里回显的输入步骤。回放前去掉无法编码的孤立代理码位（签名、密文、参数原样保留）。
+- 函数调用最多 5 轮（`MAX_FUNCTION_ROUNDS`），之后的一跳要求不再调用：OpenAI 开着内置搜索时用 `allowed_tools` 只放行 `web_search`，否则 `tool_choice: "none"`；Gemini 用 `"none"`（SDK 的 `allowed_tools` 只能列函数名，内置搜索放不进去，所以这一跳连搜索也关了）。
+- 续发时按服务商的内联上限累计原附件与函数结果图（`InlineBudget`），放不下的结果图换成一句说明。
+- Gemini 等待函数结果时的状态按 `requires_action` 处理（文档没写，按 SDK 的自动续写推断）。
+
+出图模块（`imagegen.py`）：
+
+- OpenAI 用 Images API：没有参考图时 `images.generate`，有参考图时 `images.edit`（多张 `image[]`）；`n=1`、`output_format="jpeg"`，配置了 `openai_quality` 才传 `quality`。内容审核拒绝认 `error.code == "moderation_blocked"`。
+- Gemini 用 Interactions 非流式：`response_format` 带方向与（配置了时）分辨率，参考图放在输入里；先判最终状态再取 `output_image`。安全拦截优先看结构化的原因（`interaction.errors[].code`、HTTP 错误体的 `error.details[].reason`），文案兜底只限 HTTP 400（文档没写拦截时的表现，属于推断）。参考图按内联上限累计。
+- 参考图最多 4 张。时限在模块内部；失败一律抛脱敏的 `ModelError`。出图请求**不自动重试**（OpenAI 用 `max_retries=0` 的客户端副本，Gemini 另建一个 `attempts=1` 的客户端），免得结果不明时出两张、扣两张的钱；对话的重试策略不变。
+
+接线（`conversation.py` 的 `_Drawer`，函数说明与参数校验在 `drawing.py`）：
+
+- 函数名 `generate_image`，严格模式参数：`prompt`（画面描述，最多 4000 字）、`aspect`（square、portrait、landscape）、`reference_image_ids`（整数数组，可为空）。每轮最多出图 3 张（`MAX_IMAGES_PER_TURN`）。
+- 每次调用依次：解析参数 → 一个事务里复查授权、校验参考编号（既在这次的「可以引用的图片」里，又能按这个用户取到）、按限额查当天次数（按配置的时区；管理员不受限）→ 被动回复余量 → 过程消息「正在画图🎨」→ 读参考图（带参考图时占一个多模态名额；这次调用已经占着时不再另占，免得几轮互相等着）→ 读完再复查授权 → 出图（期间暂停对话的空闲时限，总时限照算）→ 立即记出图用量 → 存盘 → claim 后经 pyqbot 上传、再回复图片 → 交回结果前再复查授权。
+- 任何一次授权复查失败都抛内部异常停下这次模型调用，不再发下一跳（那是又一次计费的调用）；排队的正文立即停发，已开始的流式消息正常结束，送达状态 withheld，这次调用的结局记 cancelled；已经发生的出图用量与已送达的图照样记录。
+- 失败（参数不对、限额用完、余量不够、审核拒绝、超时、其它失败、发送被拒）都以 `is_error` 的中文说明交回，由模型向用户解释；说明里不带服务商、状态码与文件名。
+- 发图的通道：`ReplyChannel.send_image(data, mime_type, replying)`。上传阶段的任何错误算发送被拒（上传不会把消息发给用户）；发起回复之前调用 `replying()`，之后被取消（总时限、关停）的图按送达说不准处理：记进附件表，并且不换备用模型。
+- 一轮收尾：发出过图后不换备用模型、不被插话重开；模型只发了图没写文字也算答了。新的送达状态 `images`：没有送达任何文字回答、但至少有一张图已确认发给用户，它和 failed、rejected、noticed 一样算一轮结束，图留在之后的历史里。文字回答失败时照常发失败说明，图照样记录。存了盘却没发出的图不记录，留给孤儿清理。
+- 日志只记出图的模型、耗时、字节数与失败分类，不记画面描述、参数原文与文件名。
+
