@@ -56,7 +56,7 @@ Responses API 不接受音频（文档只在 Chat Completions 里写了音频输
   `usage.input_tokens_details.cached_tokens`。
 - `response.incomplete`：同上，`Finished` 的原因按 `incomplete_details.reason`。
 - `response.failed`、`error`：有用量（或快照里补上了搜索次数）时先给出 `Usage`，再抛 `ModelError`。`response.failed`
-  的错误码按 `_FAILED_CODES` 分类（服务端出错、限流、内容策略拦截），其余是 `FAILED`。
+  的错误码按 `_FAILED_CODES` 分类（服务端出错、限流、内容策略拦截、输入的图片有问题），其余是 `FAILED`。
 其余事件（创建、`web_search_call.searching`、`reasoning_summary_part.added` 等）现在忽略。
 每个事件（含忽略的）之前先交出一个 `Heartbeat`，供调用方计算空闲时限：推理时可能很久只有这些被忽略的事件。
 
@@ -181,6 +181,20 @@ _FAILED_CODES = {
     "bio_policy": ErrorKind.BLOCKED,
     "misalignment_policy_violation": ErrorKind.BLOCKED,
     "image_content_policy_violation": ErrorKind.BLOCKED,
+    # 输入的图片有问题（同一份取值列表里图片类的其余各种）：是输入的问题，不计入模型的连续失败。
+    "invalid_image": ErrorKind.BAD_REQUEST,
+    "invalid_image_format": ErrorKind.BAD_REQUEST,
+    "invalid_base64_image": ErrorKind.BAD_REQUEST,
+    "invalid_image_url": ErrorKind.BAD_REQUEST,
+    "image_too_large": ErrorKind.BAD_REQUEST,
+    "image_too_small": ErrorKind.BAD_REQUEST,
+    "image_parse_error": ErrorKind.BAD_REQUEST,
+    "invalid_image_mode": ErrorKind.BAD_REQUEST,
+    "image_file_too_large": ErrorKind.BAD_REQUEST,
+    "unsupported_image_media_type": ErrorKind.BAD_REQUEST,
+    "empty_image_file": ErrorKind.BAD_REQUEST,
+    "failed_to_download_image": ErrorKind.BAD_REQUEST,
+    "image_file_not_found": ErrorKind.BAD_REQUEST,
 }
 
 # 内置的联网搜索。`user_location` 只写 `type`：不写时服务商假定用户在美国。

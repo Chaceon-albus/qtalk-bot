@@ -420,8 +420,49 @@ async def test_policy_failures_are_blocked(code: str) -> None:
     assert_clean(error)
 
 
+IMAGE_INPUT_CODES = [
+    "invalid_image",
+    "invalid_image_format",
+    "invalid_base64_image",
+    "invalid_image_url",
+    "image_too_large",
+    "image_too_small",
+    "image_parse_error",
+    "invalid_image_mode",
+    "image_file_too_large",
+    "unsupported_image_media_type",
+    "empty_image_file",
+    "failed_to_download_image",
+    "image_file_not_found",
+]
+
+
+@pytest.mark.parametrize("code", IMAGE_INPUT_CODES)
+async def test_bad_input_images_are_bad_requests(code: str) -> None:
+    failed = {
+        "type": "response.failed",
+        "sequence_number": 3,
+        "response": response("failed", error={"code": code, "message": SECRET_TEXT}),
+    }
+    _, error = await failure(model_on(streaming([CREATED, failed])))
+    assert error.kind is ErrorKind.BAD_REQUEST
+    assert_clean(error)
+
+
+def test_every_known_failure_code_is_classified() -> None:
+    # SDK 的取值列表里，除了数据驻留与向量库超时这两种服务端的情况，都有明确的分类。
+    from typing import get_args
+
+    from openai.types.responses.response_error import ResponseError
+
+    codes = set(get_args(ResponseError.model_fields["code"].annotation))
+    unmapped = codes - set(openai_responses._FAILED_CODES)  # pyright: ignore[reportPrivateUsage]
+    assert unmapped == {"data_residency_mismatch", "vector_store_timeout"}
+
+
 @pytest.mark.parametrize(
-    ("code", "kind"), [("server_error", ErrorKind.SERVER), ("invalid_image", ErrorKind.FAILED)]
+    ("code", "kind"),
+    [("server_error", ErrorKind.SERVER), ("vector_store_timeout", ErrorKind.FAILED)],
 )
 async def test_other_failure_codes_keep_their_kind(code: str, kind: ErrorKind) -> None:
     failed = {
