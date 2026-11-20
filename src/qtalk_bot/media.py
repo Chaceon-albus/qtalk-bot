@@ -450,6 +450,7 @@ class Relocation(StrEnum):
     RENAMED = "整体改名"
     MERGED = "逐个文件移过去"
     CONFLICT = "新旧目录里有同名、内容不同的文件（或同名的不是普通文件），没有动"
+    SAME_DIRECTORY = "新旧目录是同一个目录（例如绑定挂载），没有动"
     SYMLINK = "旧目录是符号链接，没有动"
     NOT_A_DIRECTORY = "旧目录不是目录，没有动"
     TARGET_UNSAFE = "新目录是符号链接或不是目录，没有动"
@@ -647,11 +648,17 @@ class MediaStore:
         """删掉无主的用户目录，返回删了几个：根目录下名字是 32 位十六进制或全数字（迁移前的旧目录）、不在 `owned`
         里、目录本身与里面所有东西的修改时间都早于 `cutoff`（Unix 秒，附件的保存期限）的目录。其它名字的目录、
         普通文件与符号链接不碰。`owned` 要包括所有用户的目录名与还没搬完的旧目录的编号（`relocate()`）。只能在启动时
-        搬完旧目录之后调用。看不清（遍历出错、无权访问）的目录，以及它本身或里面任何一层是挂载点（`st_dev` 与根目录
-        不同）的目录，整个跳过，什么都不删；删不掉的只记日志。"""
+        搬完旧目录之后调用。看不清（遍历出错、无权访问）的目录，以及它本身或里面任何一层是挂载点的目录，整个跳过，
+        什么都不删；删不掉的只记日志。
+
+        挂载点有两道判断：读得到 `/proc/self/mountinfo`（Linux）时，按其中的挂载点认出候选目录本身或里面的挂载点，
+        包括同一文件系统里的绑定挂载（它的 `st_dev` 与根目录相同）；另外每一层都比较 `st_dev`，读不到 mountinfo 的系统
+        上只有这一道。"""
         root = _lstat(self.root)
         if root is None or not stat.S_ISDIR(root.st_mode):
             return 0
+        mounts = _mount_points()
+        real_root = Path(os.path.realpath(self.root))
         removed = 0
         for directory in self.root.iterdir():
             name = directory.name
@@ -661,7 +668,7 @@ class MediaStore:
                 found = os.lstat(directory)
                 if not stat.S_ISDIR(found.st_mode):  # 符号链接与普通文件不碰
                     continue
-                if found.st_dev != root.st_dev:
+                if found.st_dev != root.st_dev or _has_mount(real_root / name, mounts):
                     raise _MountPointError
                 if _newest_mtime(directory, root.st_dev) >= cutoff:
                     continue
@@ -725,24 +732,29 @@ class MediaStore:
         if not stat.S_ISDIR(root.st_mode):
             return Relocation.ROOT_UNSAFE
         legacy = self.root / str(user_id)
-        found = _lstat(legacy)
         existing = _lstat(target)
+        # 先校验已经存在的新目录，再看旧目录：上次整体改名后 fsync 失败、留下了记录，这次新名字若被占着，不能当成
+        # 「没有旧目录」就算搬完。
+        if existing is not None and not stat.S_ISDIR(existing.st_mode):  # 符号链接或普通文件
+            return Relocation.TARGET_UNSAFE
+        found = _lstat(legacy)
         if found is None:
             _fsync_dir(self.root)
-            if existing is not None and stat.S_ISDIR(existing.st_mode):
+            if existing is not None:
                 _fsync_dir(target)
             return Relocation.NOTHING
         if stat.S_ISLNK(found.st_mode):
             return Relocation.SYMLINK
         if not stat.S_ISDIR(found.st_mode):
             return Relocation.NOT_A_DIRECTORY
-        if existing is not None and not stat.S_ISDIR(existing.st_mode):  # 符号链接或普通文件
-            return Relocation.TARGET_UNSAFE
         if existing is None:
             os.rename(legacy, target)
             _fsync_dir(self.root)
             _fsync_dir(target)
             return Relocation.RENAMED
+        if (found.st_dev, found.st_ino) == (existing.st_dev, existing.st_ino):
+            # 例如新目录是旧目录的绑定挂载：每个文件都会和自己比成相同，去重会删掉唯一的一份。
+            return Relocation.SAME_DIRECTORY
         moves: list[Path] = []
         duplicates: list[Path] = []
         for entry in sorted(legacy.iterdir()):
@@ -753,6 +765,11 @@ class MediaStore:
                 duplicates.append(entry)
             else:
                 return Relocation.CONFLICT
+        if duplicates:
+            # 删旧副本之前先让保留的那份连同目录项落盘：它可能是运维者刚复制进来的，只在页缓存里。
+            for entry in duplicates:
+                _fsync_file(target / entry.name)
+            _fsync_dir(target)
         for entry in duplicates:
             entry.unlink()
         for entry in moves:
@@ -794,8 +811,20 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+def _fsync_file(path: Path) -> None:
+    """把文件的内容同步到盘上。不跟随符号链接（调用方已用 `lstat()` 确认是普通文件）。"""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+COMPARE_BLOCK_BYTES = 1024 * 1024
+
+
 def _same_regular_file(legacy: Path, target: Path, target_stat: os.stat_result) -> bool:
-    """两边都是普通文件（不是符号链接），大小与字节都相同。"""
+    """两边都是普通文件（不是符号链接），大小与字节都相同。打开时不跟随符号链接，打开后再确认一次是普通文件。"""
     legacy_stat = os.lstat(legacy)
     if not (stat.S_ISREG(legacy_stat.st_mode) and stat.S_ISREG(target_stat.st_mode)):
         return False
@@ -805,16 +834,72 @@ def _same_regular_file(legacy: Path, target: Path, target_stat: os.stat_result) 
     left, right = os.open(legacy, flags), None
     try:
         right = os.open(target, flags)
-        while True:
-            a, b = os.read(left, 1024 * 1024), os.read(right, 1024 * 1024)
-            if a != b:
-                return False
-            if not a:
-                return True
+        if not (stat.S_ISREG(os.fstat(left).st_mode) and stat.S_ISREG(os.fstat(right).st_mode)):
+            return False
+        left_fd, right_fd = left, right
+        return same_content(
+            lambda n: os.read(left_fd, n), lambda n: os.read(right_fd, n), COMPARE_BLOCK_BYTES
+        )
     finally:
         os.close(left)
         if right is not None:
             os.close(right)
+
+
+def same_content(
+    read_left: Callable[[int], bytes], read_right: Callable[[int], bytes], block: int
+) -> bool:
+    """按块比较两份内容是否相同。每块都读满 `block` 字节或读到结尾再比较，不受底层读取短读的影响。"""
+    while True:
+        a, b = _read_block(read_left, block), _read_block(read_right, block)
+        if a != b:
+            return False
+        if len(a) < block:  # 两边同时读到了结尾
+            return True
+
+
+def _read_block(read: Callable[[int], bytes], size: int) -> bytes:
+    """反复调用 `read`，直到凑满 `size` 字节或读到结尾（返回空串）。"""
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining > 0:
+        chunk = read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+MOUNTINFO = Path("/proc/self/mountinfo")
+"""Linux 上本进程能看到的挂载点。别的系统上没有这个文件，清理无主目录时只靠比较 `st_dev`。"""
+
+_MOUNT_ESCAPE = re.compile(r"\\([0-7]{3})")
+
+
+def parse_mount_points(text: str) -> list[str]:
+    """从 mountinfo 的内容里取出每个挂载点（第 5 列），还原其中的八进制转义（如 `\\040` 是空格）。格式不对的行跳过。"""
+    points: list[str] = []
+    for line in text.splitlines():
+        fields = line.split(" ")
+        if len(fields) < 5 or not fields[4].startswith("/"):
+            continue
+        points.append(_MOUNT_ESCAPE.sub(lambda match: chr(int(match[1], 8)), fields[4]))
+    return points
+
+
+def _mount_points() -> list[Path] | None:
+    """本进程能看到的全部挂载点；读不到 mountinfo（不是 Linux，或读取出错）时返回 `None`。"""
+    try:
+        text = MOUNTINFO.read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        return None
+    return [Path(point) for point in parse_mount_points(text)]
+
+
+def _has_mount(directory: Path, mounts: list[Path] | None) -> bool:
+    """`directory`（真实路径）本身或里面有挂载点。"""
+    return mounts is not None and any(m == directory or m.is_relative_to(directory) for m in mounts)
 
 
 def _raise(exc: OSError) -> None:

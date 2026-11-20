@@ -7,7 +7,7 @@ import os
 import sqlite3
 import stat
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Generator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator
 from pathlib import Path
 
 import pytest
@@ -1541,7 +1541,8 @@ async def test_directories_are_synced_before_the_record_is_deleted(
 
 
 def fake_device(monkeypatch: pytest.MonkeyPatch, mount: Path) -> None:
-    """让 `mount` 的 `lstat()` 报告另一个设备号，模拟挂载点。"""
+    """让 `mount` 的 `lstat()` 报告另一个设备号，模拟挂载点；同时让 mountinfo 读不到，只靠比较设备号。"""
+    monkeypatch.setattr(media, "MOUNTINFO", mount.parent / "no-such-mountinfo")
     real_lstat = os.lstat
 
     def lstat(path: str | os.PathLike[str], *args: object, **kwargs: object) -> os.stat_result:
@@ -1663,3 +1664,253 @@ async def test_purge_removes_unowned_directories_after_retention(
     assert young.exists()  # 没过保存期限
     assert store.user_dir(alice.media_dir).is_dir()
     assert store.read(alice.media_dir, mine) is None  # 没有记录、超过一小时：按孤儿删了文件
+
+
+# ---- 第三轮评审：同设备的绑定挂载、保留副本先落盘、同一目录、新目录先校验、短读 ----
+
+
+def test_mount_points_are_parsed_with_octal_escapes() -> None:
+    text = (
+        "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+        "35 22 8:1 /srv/files /data/attachments/my\\040mount rw - ext4 /dev/sda1 rw\n"
+        "36 22 0:5 / /data/tab\\011and\\134back\\012line rw - tmpfs tmpfs rw\n"
+        "37 22 0:6 / /data/中文 rw - tmpfs tmpfs rw\n"
+        "\n"
+        "garbage\n"
+        "1 2 3 4 relative-not-a-mount rw\n"
+    )
+
+    assert media.parse_mount_points(text) == [
+        "/",
+        "/data/attachments/my mount",
+        "/data/tab\tand\\back\nline",
+        "/data/中文",
+    ]
+
+
+def mountinfo_with(tmp_path: Path, *points: Path) -> Path:
+    """一份 mountinfo 替身：根文件系统加上 `points` 这些挂载点（空格按内核的写法转义）。"""
+    lines = ["22 1 8:1 / / rw - ext4 /dev/sda1 rw"]
+    for n, point in enumerate(points, start=40):
+        escaped = str(point).replace("\\", "\\134").replace(" ", "\\040")
+        lines.append(f"{n} 22 8:1 /srv {escaped} rw - ext4 /dev/sda1 rw")
+    path = tmp_path / "mountinfo"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("where", ["itself", "nested"])
+def test_same_device_bind_mounts_from_mountinfo_are_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, where: str
+) -> None:
+    # 同一文件系统里的绑定挂载：st_dev 与根目录相同，只有 mountinfo 认得出。
+    store = MediaStore.under(tmp_path)
+    unowned = store.root / ("e" * 32)
+    (unowned / "deep" / "my mount").mkdir(parents=True)
+    (unowned / "visible.png").write_bytes(b"x")
+    (unowned / "deep" / "my mount" / "in-use.dat").write_bytes(b"y")
+    other = legacy_dir(store, 12, "old.png")
+    sibling = store.root / ("e" * 31 + "f")  # 名字是候选目录名的前缀加一位，不受影响
+    sibling.mkdir()
+    for path in (unowned, other, sibling):
+        aged(path, 100)
+    real = Path(os.path.realpath(store.root))
+    mounted = (
+        real / unowned.name if where == "itself" else real / unowned.name / "deep" / "my mount"
+    )
+    monkeypatch.setattr(media, "MOUNTINFO", mountinfo_with(tmp_path, Path("/proc"), mounted))
+
+    with caplog.at_level(logging.WARNING):
+        removed = store.sweep_unowned(set(), 1000)
+
+    assert removed == 2
+    assert not other.exists()
+    assert not sibling.exists()
+    assert (unowned / "visible.png").exists()  # 一个也没删
+    assert (unowned / "deep" / "my mount" / "in-use.dat").exists()
+    assert "无主的附件目录里有挂载点，跳过，不删" in caplog.text
+
+
+def test_unreadable_mountinfo_falls_back_to_device_numbers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = MediaStore.under(tmp_path)
+    unowned = store.root / ("e" * 32)
+    unowned.mkdir(parents=True)
+    aged(unowned, 100)
+    monkeypatch.setattr(media, "MOUNTINFO", tmp_path / "missing")
+
+    assert store.sweep_unowned(set(), 1000) == 1  # 没有挂载点：照常删
+    assert not unowned.exists()
+
+
+async def test_retained_duplicate_is_synced_before_the_old_copy_is_removed(
+    tmp_path: Path, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = MediaStore.under(tmp_path)
+    alice = await new_user(db)
+    await register(db, alice)
+    target = store.user_dir(alice.media_dir)
+    target.mkdir(parents=True)
+    (target / "same.png").write_bytes(b"same.png")  # 运维者刚复制进来的那份
+    legacy = legacy_dir(store, alice.id, "same.png", "other.png")
+    events: list[str] = []
+    real_file, real_dir = media._fsync_file, media._fsync_dir  # pyright: ignore[reportPrivateUsage]
+
+    def fsync_file(path: Path) -> None:
+        events.append(
+            f"文件 {path.parent.name}/{path.name}，旧副本{'在' if (legacy / path.name).exists() else '没了'}"
+        )
+        real_file(path)
+
+    def fsync_dir(path: Path) -> None:
+        state = "在" if (legacy / "same.png").exists() else "没了"
+        events.append(f"目录 {path.name}，旧副本{state}")
+        real_dir(path)
+
+    monkeypatch.setattr(media, "_fsync_file", fsync_file)
+    monkeypatch.setattr(media, "_fsync_dir", fsync_dir)
+    await media.relocate_user_dirs(db, store)
+
+    assert events[:2] == [
+        f"文件 {alice.media_dir}/same.png，旧副本在",
+        f"目录 {alice.media_dir}，旧副本在",
+    ]
+    assert events[2:] == [
+        f"目录 {alice.media_dir}，旧副本没了",
+        f"目录 {alice.id}，旧副本没了",
+        f"目录 {store.root.name}，旧副本没了",
+    ]
+    assert store.read(alice.media_dir, "same.png") == b"same.png"
+    assert store.read(alice.media_dir, "other.png") == b"other.png"
+    assert await pending(db) == []
+
+
+async def test_failed_sync_of_the_retained_copy_keeps_the_old_one(
+    tmp_path: Path, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = MediaStore.under(tmp_path)
+    alice = await new_user(db)
+    await register(db, alice)
+    store.user_dir(alice.media_dir).mkdir(parents=True)
+    (store.user_dir(alice.media_dir) / "same.png").write_bytes(b"same.png")
+    legacy = legacy_dir(store, alice.id, "same.png")
+
+    def failing(path: Path) -> None:
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(media, "_fsync_file", failing)
+    with pytest.raises(media.RelocationError, match="Input/output error"):
+        await media.relocate_user_dirs(db, store)
+
+    assert (legacy / "same.png").exists()
+    assert await pending(db) == [alice.id]
+
+
+async def test_old_and_new_paths_to_the_same_directory_are_refused(
+    tmp_path: Path, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 新目录是旧目录的绑定挂载：两个路径的设备号与 inode 相同。用替身让 lstat 报告同一个目录。
+    store = MediaStore.under(tmp_path)
+    alice = await new_user(db)
+    await register(db, alice)
+    legacy = legacy_dir(store, alice.id, "only.png")
+    target = store.user_dir(alice.media_dir)
+    target.mkdir()
+    (target / "only.png").write_bytes(b"only.png")  # 同一个目录里的同一个文件，经两个路径看到
+    real_lstat = media._lstat  # pyright: ignore[reportPrivateUsage]
+
+    def lstat(path: Path) -> os.stat_result | None:
+        return real_lstat(legacy if path == target else path)
+
+    monkeypatch.setattr(media, "_lstat", lstat)
+    assert store.relocate(alice.id, alice.media_dir) is media.Relocation.SAME_DIRECTORY
+    with pytest.raises(media.RelocationError, match="新旧目录是同一个目录"):
+        await media.relocate_user_dirs(db, store)
+
+    assert (legacy / "only.png").exists()  # 什么都没删
+    assert (target / "only.png").exists()
+    assert await pending(db) == [alice.id]
+
+
+@pytest.mark.parametrize("occupant", ["symlink", "file"])
+async def test_missing_legacy_dir_with_an_unsafe_target_is_refused(
+    tmp_path: Path, db: Database, occupant: str
+) -> None:
+    # 上次整体改名之后 fsync 失败、留下了记录；这次旧目录已经没了，新名字却被占着。
+    store = MediaStore.under(tmp_path)
+    alice = await new_user(db)
+    await register(db, alice)
+    store.root.mkdir()
+    target = store.root / alice.media_dir
+    if occupant == "symlink":
+        os.symlink(tmp_path / "nowhere", target)
+    else:
+        target.write_bytes(b"not a directory")
+
+    assert store.relocate(alice.id, alice.media_dir) is media.Relocation.TARGET_UNSAFE
+    with pytest.raises(media.RelocationError, match="新目录是符号链接或不是目录"):
+        await media.relocate_user_dirs(db, store)
+    assert await pending(db) == [alice.id]
+
+    target.unlink()
+    await media.relocate_user_dirs(db, store)  # 处理好之后重启
+    assert await pending(db) == []
+
+
+def test_unsafe_root_is_judged_before_a_missing_legacy_dir(tmp_path: Path) -> None:
+    store = MediaStore.under(tmp_path)
+    os.symlink(tmp_path / "nowhere", store.root)
+    assert store.relocate(3, D1) is media.Relocation.ROOT_UNSAFE
+
+
+def chunked(data: bytes, sizes: list[int]) -> Callable[[int], bytes]:
+    """替身：按 `sizes` 依次短读（每次最多给这么多），用完之后按请求的长度给。"""
+    position = 0
+    plan = iter(sizes)
+
+    def read(n: int) -> bytes:
+        nonlocal position
+        limit = next(plan, n)
+        chunk = data[position : position + min(n, limit)]
+        position += len(chunk)
+        return chunk
+
+    return read
+
+
+@pytest.mark.parametrize("block", [4, 7, 64])
+def test_short_reads_do_not_look_like_different_content(block: int) -> None:
+    data = bytes(range(50))
+
+    assert media.same_content(chunked(data, [3, 1, 2]), chunked(data, []), block)
+    assert media.same_content(chunked(data, []), chunked(data, [1] * 60), block)
+    assert not media.same_content(chunked(data, [3]), chunked(data[:-1] + b"\xff", [2, 2]), block)
+    assert not media.same_content(chunked(data, [5]), chunked(data[:-1], []), block)
+    assert media.same_content(chunked(b"", []), chunked(b"", [0]), block)
+
+
+def test_identical_files_compare_equal_despite_short_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = MediaStore.under(tmp_path)
+    content = bytes(range(256)) * 50
+    store.user_dir(D1).mkdir(parents=True)
+    (store.user_dir(D1) / "same.png").write_bytes(content)
+    legacy = legacy_dir(store, 3)
+    (legacy / "same.png").write_bytes(content)
+    real_read = os.read
+    calls = 0
+
+    def short_read(fd: int, n: int) -> bytes:
+        nonlocal calls
+        calls += 1
+        return real_read(fd, min(n, 1000 if calls % 2 else 333))  # 两侧交替短读，长度不同
+
+    monkeypatch.setattr(media.os, "read", short_read)
+    monkeypatch.setattr(media, "COMPARE_BLOCK_BYTES", 4096)
+    result = store.relocate(3, D1)
+    monkeypatch.undo()
+
+    assert result is media.Relocation.MERGED
+    assert (store.user_dir(D1) / "same.png").read_bytes() == content
