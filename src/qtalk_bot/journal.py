@@ -468,24 +468,30 @@ def set_given(
     )
 
 
-def referenced_paths(conn: sqlite3.Connection) -> set[str]:
-    """附件表仍引用的全部文件（相对路径）。"""
+def referenced_paths(conn: sqlite3.Connection) -> set[tuple[str, str]]:
+    """附件表仍引用的全部文件：（所属用户的目录名，文件名）。"""
     return {
-        row["path"] for row in conn.execute("SELECT path FROM attachments WHERE path IS NOT NULL")
+        (row["media_dir"], row["path"])
+        for row in conn.execute(
+            "SELECT users.media_dir, attachments.path FROM attachments"
+            " JOIN users ON users.id = attachments.user_id WHERE attachments.path IS NOT NULL"
+        )
     }
 
 
-def expire_attachments(conn: sqlite3.Connection, cutoff: int) -> list[tuple[int, str]]:
-    """把 `cutoff` 之前存下、文件还在的附件改成 `expired`，返回它们的（用户编号，相对路径）。"""
+def expire_attachments(conn: sqlite3.Connection, cutoff: int) -> list[tuple[str, str]]:
+    """把 `cutoff` 之前存下、文件还在的附件改成 `expired`，返回它们的（所属用户的目录名，文件名）。"""
     rows = conn.execute(
-        "SELECT id, user_id, path FROM attachments WHERE path IS NOT NULL AND created_at < ?",
+        "SELECT attachments.id, attachments.user_id, attachments.path, users.media_dir"
+        " FROM attachments JOIN users ON users.id = attachments.user_id"
+        " WHERE attachments.path IS NOT NULL AND attachments.created_at < ?",
         (cutoff,),
     ).fetchall()
     conn.executemany(
         "UPDATE attachments SET status = 'expired', path = NULL WHERE id = ? AND user_id = ?",
         [(row["id"], row["user_id"]) for row in rows],
     )
-    return [(row["user_id"], row["path"]) for row in rows]
+    return [(row["media_dir"], row["path"]) for row in rows]
 
 
 def add_reply(

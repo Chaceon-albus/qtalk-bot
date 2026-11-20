@@ -4,7 +4,9 @@
 它们自己不开启、不提交事务。时间一律是 Unix 秒（UTC 整数），由调用方传入，便于测试。
 """
 
+import secrets
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 
@@ -30,7 +32,8 @@ class InviteState(Enum):
 class User:
     """用户表里的一行。`openid` 不进 `repr`，日志里用 `id` 和 `name`。
 
-    有没有权限看 `has_access()`：现任管理员，或经邀请加入（`invite_id` 非空）的人。
+    有没有权限看 `has_access()`：现任管理员，或经邀请加入（`invite_id` 非空）的人。`media_dir` 是这个用户的附件
+    目录名（32 位十六进制的随机名，建用户时生成，永不复用），不是秘密，管理命令里会显示。
     """
 
     id: int
@@ -40,6 +43,7 @@ class User:
     status: UserStatus
     welcomed_at: int | None
     joined_at: int
+    media_dir: str
 
     @property
     def label(self) -> str:
@@ -99,7 +103,41 @@ def claim_event(conn: sqlite3.Connection, key: str, now: int) -> bool:
 
 # ---- 用户 ----
 
-_USER_COLUMNS = "id, openid, name, invite_id, status, welcomed_at, joined_at"
+_USER_COLUMNS = "id, openid, name, invite_id, status, welcomed_at, joined_at, media_dir"
+
+
+MEDIA_DIR_ATTEMPTS = 5
+"""给新用户取目录名最多试几次。随机名撞上已有的目录理论上不会发生；一直撞上多半是附件根目录无权访问（按「已存在」
+处理），这时建不了用户，抛 `MediaDirUnavailableError`。"""
+
+type DirTaken = Callable[[str], bool]
+"""附件根目录下这个名字是否已被占用：已经存在，或无法确认不存在（如无权访问）时返回真。由接线层注入
+（`media.MediaStore.dir_taken()`），本模块不碰文件系统。"""
+
+
+class MediaDirUnavailableError(Exception):
+    """试了 `MEDIA_DIR_ATTEMPTS` 次都没能取到未被占用的附件目录名，没有建用户。"""
+
+
+def new_media_dir(conn: sqlite3.Connection, dir_taken: DirTaken | None = None) -> str:
+    """新用户的附件目录名：32 位十六进制的随机名，与附件文件名、邀请码的做法一致。
+
+    名字已被别的用户用过，或 `dir_taken` 说附件根目录下已经有它（包括无法确认的情况）时换一个，不删除任何东西：
+    名字写进库之前没有人会往这个目录里写，所以这里的检查没有竞态。
+
+    Raises:
+        MediaDirUnavailableError: 试了 `MEDIA_DIR_ATTEMPTS` 次都被占用。
+    """
+    for _ in range(MEDIA_DIR_ATTEMPTS):
+        candidate = secrets.token_hex(16)
+        if conn.execute("SELECT 1 FROM users WHERE media_dir = ?", (candidate,)).fetchone():
+            continue
+        if dir_taken is not None and dir_taken(candidate):
+            continue
+        return candidate
+    raise MediaDirUnavailableError(
+        f"试了 {MEDIA_DIR_ATTEMPTS} 次都没能取到未被占用的附件目录名，没有建用户；请检查附件目录的权限"
+    )
 
 
 def _user(row: sqlite3.Row) -> User:
@@ -111,6 +149,7 @@ def _user(row: sqlite3.Row) -> User:
         status=UserStatus(row["status"]),
         welcomed_at=row["welcomed_at"],
         joined_at=row["joined_at"],
+        media_dir=row["media_dir"],
     )
 
 
@@ -129,15 +168,47 @@ def list_users(conn: sqlite3.Connection) -> list[User]:
     return [_user(row) for row in rows]
 
 
-def ensure_user(conn: sqlite3.Connection, openid: str, name: str, now: int) -> User:
-    """取回 `openid` 对应的用户，没有时以 `name` 新建一个（不经过邀请，用于管理员）。"""
-    conn.execute(
-        "INSERT INTO users (openid, name, joined_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
-        (openid, name, now),
-    )
+def media_dirs(conn: sqlite3.Connection) -> set[str]:
+    """所有用户的附件目录名（清理无主目录时据此认出哪些目录有主）。"""
+    return {row["media_dir"] for row in conn.execute("SELECT media_dir FROM users")}
+
+
+def pending_relocations(conn: sqlite3.Connection) -> list[tuple[int, str]]:
+    """迁移 V16 登记、还没搬完的旧目录：（用户编号，新的目录名），按编号排序。之后新建的用户不在其中。"""
+    return [
+        (row["user_id"], row["media_dir"])
+        for row in conn.execute("SELECT user_id, media_dir FROM media_relocations ORDER BY user_id")
+    ]
+
+
+def finish_relocation(conn: sqlite3.Connection, user_id: int) -> None:
+    """这个用户的旧目录已经搬完（或本来就没有），不再需要搬。"""
+    conn.execute("DELETE FROM media_relocations WHERE user_id = ?", (user_id,))
+
+
+def ensure_user(
+    conn: sqlite3.Connection,
+    openid: str,
+    name: str,
+    now: int,
+    *,
+    dir_taken: DirTaken | None = None,
+) -> User:
+    """取回 `openid` 对应的用户，没有时以 `name` 新建一个（不经过邀请，用于管理员）。新用户的目录名见
+    `new_media_dir()`。
+
+    先查后插，不用 `ON CONFLICT DO NOTHING`：编号是 AUTOINCREMENT，被忽略的插入也会消耗一个编号（管理员每条消息
+    都会走到这里）。调用方在事务里调用，查与插之间没有别的写者。
+    """
     user = get_user_by_openid(conn, openid)
-    assert user is not None  # 同一个事务里刚刚确保过
-    return user
+    if user is not None:
+        return user
+    row = conn.execute(
+        "INSERT INTO users (openid, name, joined_at, media_dir) VALUES (?, ?, ?, ?)"  # noqa: S608  只拼列名常量
+        f" RETURNING {_USER_COLUMNS}",
+        (openid, name, now, new_media_dir(conn, dir_taken)),
+    ).fetchone()
+    return _user(row)
 
 
 def set_user_status(conn: sqlite3.Connection, user_id: int, status: UserStatus) -> None:
@@ -266,11 +337,19 @@ def revoke_invite(conn: sqlite3.Connection, invite_id: int, now: int) -> None:
     )
 
 
-def redeem_invite(conn: sqlite3.Connection, code: str, openid: str, now: int) -> RedeemResult:
+def redeem_invite(
+    conn: sqlite3.Connection,
+    code: str,
+    openid: str,
+    now: int,
+    *,
+    dir_taken: DirTaken | None = None,
+) -> RedeemResult:
     """用邀请码给 `openid` 授权：校验未撤销、未过期、次数未用完，然后计数、建用户、清掉拒绝记录。
 
     `openid` 已经有一行但没有权限（如换下来的旧管理员）时，在那一行上补邀请与名字、恢复正常状态，
-    不新建行。调用方要先确认 `openid` 还没有权限，并且与这次调用在同一个事务里。
+    不新建行（目录名照旧）。调用方要先确认 `openid` 还没有权限，并且与这次调用在同一个事务里。新用户的目录名见
+    `new_media_dir()`。
     """
     invite = get_invite_by_code(conn, code)
     if invite is None:
@@ -282,9 +361,9 @@ def redeem_invite(conn: sqlite3.Connection, code: str, openid: str, now: int) ->
     existing = get_user_by_openid(conn, openid)
     if existing is None:
         row = conn.execute(
-            "INSERT INTO users (openid, name, invite_id, joined_at) VALUES (?, ?, ?, ?)"  # noqa: S608  只拼列名常量
+            "INSERT INTO users (openid, name, invite_id, joined_at, media_dir) VALUES (?, ?, ?, ?, ?)"  # noqa: S608  只拼列名常量
             f" RETURNING {_USER_COLUMNS}",
-            (openid, invite.note, invite.id, now),
+            (openid, invite.note, invite.id, now, new_media_dir(conn, dir_taken)),
         ).fetchone()
     else:
         assert existing.invite_id is None, "调用方应先确认这个用户还没有经邀请加入"

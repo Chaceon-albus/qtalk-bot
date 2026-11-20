@@ -50,6 +50,8 @@ from qtalk_bot.prompt import NO_REFERABLE, REFERABLE_GUIDE
 from qtalk_bot.storage import DATABASE_FILENAME, Database
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n-png-"
+D1 = "1" * 32  # 测试用的用户目录名
+D2 = "2" * 32
 NOW = datetime(2027, 1, 15, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
 _ids = itertools.count(1)
 
@@ -92,7 +94,7 @@ def record(
             kind
         )
     if status is AttachmentStatus.STORED and path is None:
-        path = f"1/{next(_ids)}.bin"
+        path = f"{next(_ids)}.bin"
     if status is not AttachmentStatus.STORED:
         path = None
     return AttachmentRecord(
@@ -304,12 +306,12 @@ def builder(
     current: list[HistoryEntry],
     *,
     image_turns: int = 3,
-    user_id: int = 1,
+    media_dir: str = D1,
     models: list[ModelSettings] | None = None,
 ) -> RequestBuilder:
     return RequestBuilder(
         store,
-        user_id=user_id,
+        media_dir=media_dir,
         persona="人设",
         now=NOW,
         history=history,
@@ -321,9 +323,9 @@ def builder(
 
 
 def stored_image(
-    store: MediaStore, *, user_id: int = 1, data: bytes = PNG_BYTES
+    store: MediaStore, *, media_dir: str = D1, data: bytes = PNG_BYTES
 ) -> AttachmentRecord:
-    path = store.save(user_id, data, PNG)
+    path = store.save(media_dir, data, PNG)
     return record(IMAGE, path=path, size=len(data), text="[图片：一只猫]", description="一只猫")
 
 
@@ -371,7 +373,7 @@ async def test_purged_file_falls_back_to_the_text_version(tmp_path: Path) -> Non
     store = MediaStore.under(tmp_path)
     image = stored_image(store)
     assert image.path is not None
-    store.delete(1, image.path)  # 表里还是 stored，文件却没了
+    store.delete(D1, image.path)  # 表里还是 stored，文件却没了
 
     request = (await builder(store, [], [user("", image)]).build(SEES)).request
 
@@ -381,9 +383,9 @@ async def test_purged_file_falls_back_to_the_text_version(tmp_path: Path) -> Non
 async def test_audio_and_files_in_history_are_always_text(tmp_path: Path) -> None:
     store = MediaStore.under(tmp_path)
     voice = record(
-        VOICE, path=store.save(1, b"RIFF\0\0\0\0WAVE", WAV), text="[语音] 你好", given=True
+        VOICE, path=store.save(D1, b"RIFF\0\0\0\0WAVE", WAV), text="[语音] 你好", given=True
     )
-    pdf = record(FILE, path=store.save(1, b"%PDF-1.4", PDF), size=8, filename="a.pdf", given=True)
+    pdf = record(FILE, path=store.save(D1, b"%PDF-1.4", PDF), size=8, filename="a.pdf", given=True)
     assert pdf.text == "[文件：a.pdf，PDF，8 B]"
     history = [user("", voice, pdf, turns_ago=0), reply("收到")]
 
@@ -425,13 +427,19 @@ async def test_consecutive_user_messages_of_a_turn_are_merged(tmp_path: Path) ->
 
 
 async def test_one_users_context_never_gets_another_users_file(tmp_path: Path) -> None:
-    # AGENTS.md 的第二条不变量：即使附件记录里是指向别人目录的路径，也读不到。
+    # AGENTS.md 的第二条不变量：即使附件记录里是别人的文件名、指向别人目录的路径，也读不到。
     store = MediaStore.under(tmp_path)
-    bobs = store.save(2, b"\x89PNG\r\n\x1a\nBOB-SECRET", PNG)
-    forged = [bobs, f"1/../{bobs}", str(store.root / bobs)]
+    bobs = store.save(D2, b"\x89PNG\r\n\x1a\nBOB-SECRET", PNG)
+    forged = [
+        bobs,
+        f"{D2}/{bobs}",
+        f"../{D2}/{bobs}",
+        f"..\\{D2}\\{bobs}",
+        str(store.root / D2 / bobs),
+    ]
     records = [record(IMAGE, path=path, text="[图片]") for path in forged]
 
-    request = (await builder(store, [], [user("", *records)], user_id=1).build(SEES)).request
+    request = (await builder(store, [], [user("", *records)], media_dir=D1).build(SEES)).request
 
     assert all(isinstance(part, TextPart) for m in request.messages for part in m.parts)
     assert b"BOB-SECRET" not in repr(request).encode()
@@ -451,7 +459,7 @@ def test_too_large_for_the_model_is_not_called_a_format_problem() -> None:
 async def test_notices_follow_what_the_chosen_model_actually_gets(tmp_path: Path) -> None:
     store = MediaStore.under(tmp_path)
     image = stored_image(store)
-    pdf = record(FILE, path=store.save(1, b"%PDF-1.4\n", PDF), size=9, text="[文件：PDF，9 B]")
+    pdf = record(FILE, path=store.save(D1, b"%PDF-1.4\n", PDF), size=9, text="[文件：PDF，9 B]")
     current = [user("看看这两个", image, pdf)]
     # 得分相同的两个候选：一个只收图片，一个只收 PDF。
     plan = plan_turn([SEES, READS], current, max_size_mb=20)
@@ -466,7 +474,7 @@ async def test_notices_follow_what_the_chosen_model_actually_gets(tmp_path: Path
 async def test_budget_and_answerability_use_the_bytes_actually_read(tmp_path: Path) -> None:
     store = MediaStore.under(tmp_path)
     huge = b"\x89PNG\r\n\x1a\n" + b"\0" * (15 * 1024 * 1024)  # base64 后超过 Gemini 的预算
-    path = store.save(1, huge, PNG)
+    path = store.save(D1, huge, PNG)
     stale = record(IMAGE, path=path, size=100, text="[图片]")  # 记录的是恢复备份前的大小
 
     built = await builder(store, [], [user("", stale)], models=[ALL]).build(ALL)
@@ -480,8 +488,8 @@ async def test_missing_files_make_a_bare_image_or_silent_voice_unanswerable(
     tmp_path: Path,
 ) -> None:
     store = MediaStore.under(tmp_path)
-    gone_image = record(IMAGE, path="1/gone.png", text="[图片]")
-    gone_voice = record(VOICE, path="1/gone.wav", text="[语音，未识别出文字]")
+    gone_image = record(IMAGE, path="gone.png", text="[图片]")
+    gone_voice = record(VOICE, path="gone.wav", text="[语音，未识别出文字]")
 
     image_only = await builder(store, [], [user("", gone_image)], models=[ALL]).build(ALL)
     voice_only = await builder(store, [], [user("", gone_voice)], models=[ALL]).build(ALL)
@@ -654,9 +662,9 @@ def test_decision_marker_leaves_out_the_summary() -> None:
 
 
 def drawn_record(
-    store: MediaStore, description: str = "一只橘猫", *, user_id: int = 1
+    store: MediaStore, description: str = "一只橘猫", *, media_dir: str = D1
 ) -> AttachmentRecord:
-    path = store.save(user_id, PNG_BYTES, PNG)
+    path = store.save(media_dir, PNG_BYTES, PNG)
     return replace(
         record(IMAGE, path=path, size=len(PNG_BYTES), text=generated_image_text(description)),
         description=description,
@@ -748,9 +756,9 @@ async def test_referable_images_are_capped_and_skip_missing_files(tmp_path: Path
     images = [stored_image(store) for _ in range(MAX_REFERABLE_IMAGES + 2)]
     gone = stored_image(store)
     assert gone.path is not None
-    store.delete(1, gone.path)  # 表里还是 stored，文件却没了
+    store.delete(D1, gone.path)  # 表里还是 stored，文件却没了
     expired = record(IMAGE, AttachmentStatus.EXPIRED, text="[图片：旧的]")
-    pdf = record(FILE, path=store.save(1, b"%PDF-1.4", PDF), size=8)
+    pdf = record(FILE, path=store.save(D1, b"%PDF-1.4", PDF), size=8)
     history = [user("", *images[:6], turns_ago=0), reply("好")]
     current = [user("", *images[6:], gone, expired, pdf)]
 
@@ -797,8 +805,10 @@ async def test_another_users_images_never_reach_the_catalog(tmp_path: Path) -> N
     # 目录、`referable` 与消息里。
     store = MediaStore.under(tmp_path)
     async with await Database.open(tmp_path / DATABASE_FILENAME) as db:
-        alice = (await db.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)).id
-        bob = (await db.transaction(access.ensure_user, "FAKE-OPENID-BOB", "小李", 0)).id
+        alice_user = await db.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+        bob_user = await db.transaction(access.ensure_user, "FAKE-OPENID-BOB", "小李", 0)
+        alice, bob = alice_user.id, bob_user.id
+        dirs = {alice: alice_user.media_dir, bob: bob_user.media_dir}
 
         def one_turn(conn: sqlite3.Connection, user_id: int, tag: str) -> tuple[int, int]:
             question = journal.add_user_message(conn, user_id, f"{tag}画猫", f"qq-{tag}", 0)
@@ -813,7 +823,7 @@ async def test_another_users_images_never_reach_the_catalog(tmp_path: Path) -> N
                     status=AttachmentStatus.STORED,
                     mime_type=PNG,
                     size=len(PNG_BYTES),
-                    path=store.save(user_id, PNG_BYTES, PNG),
+                    path=store.save(dirs[user_id], PNG_BYTES, PNG),
                     filename=None,
                     text=f"[图片：{tag}的照片]",
                 ),
@@ -836,7 +846,7 @@ async def test_another_users_images_never_reach_the_catalog(tmp_path: Path) -> N
                 message_id=reply_id,
                 images=[
                     GeneratedImage(
-                        path=store.save(user_id, PNG_BYTES, PNG),
+                        path=store.save(dirs[user_id], PNG_BYTES, PNG),
                         mime_type=PNG,
                         size=len(PNG_BYTES),
                         description=f"{tag}的猫",
@@ -857,7 +867,9 @@ async def test_another_users_images_never_reach_the_catalog(tmp_path: Path) -> N
         history = await db.transaction(journal.recent_history, alice, current, 10)
         pending = await db.transaction(journal.pending_messages, alice, current + 1)
 
-    built = await builder(store, history, pending, user_id=alice).build(SEES, referable_images=True)
+    built = await builder(store, history, pending, media_dir=alice_user.media_dir).build(
+        SEES, referable_images=True
+    )
 
     assert set(built.referable) == mine
     assert [e.turns_ago for e in pending] == [CURRENT_TURN]
@@ -872,10 +884,13 @@ async def test_another_users_images_never_reach_the_catalog(tmp_path: Path) -> N
 
 async def test_forged_paths_are_never_referable(tmp_path: Path) -> None:
     store = MediaStore.under(tmp_path)
-    bobs = store.save(2, b"\x89PNG\r\n\x1a\nBOB-SECRET", PNG)
-    forged = [record(IMAGE, path=path, text="[图片]") for path in (bobs, f"1/../{bobs}")]
+    bobs = store.save(D2, b"\x89PNG\r\n\x1a\nBOB-SECRET", PNG)
+    forged = [
+        record(IMAGE, path=path, text="[图片]")
+        for path in (bobs, f"../{D2}/{bobs}", f"{D2}/{bobs}", str(store.root / D2 / bobs))
+    ]
 
-    built = await builder(store, [], [user("", *forged)], user_id=1).build(
+    built = await builder(store, [], [user("", *forged)], media_dir=D1).build(
         SEES, referable_images=True
     )
 

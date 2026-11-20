@@ -227,11 +227,11 @@ class SpyStore(MediaStore):
 
     def __init__(self, root: Path) -> None:
         super().__init__(root)
-        self.reads: list[tuple[int, str]] = []
+        self.reads: list[tuple[str, str]] = []
 
-    def read(self, user_id: int, relative: str) -> bytes | None:
-        self.reads.append((user_id, relative))
-        return super().read(user_id, relative)
+    def read(self, media_dir: str, name: str) -> bytes | None:
+        self.reads.append((media_dir, name))
+        return super().read(media_dir, name)
 
 
 @pytest.fixture
@@ -249,11 +249,11 @@ class BlockingStore(MediaStore):
         self.entered = threading.Event()
         self.release = threading.Event()
 
-    def read(self, user_id: int, relative: str) -> bytes | None:
+    def read(self, media_dir: str, name: str) -> bytes | None:
         if self.block:
             self.entered.set()
             self.release.wait(HANG_GUARD)
-        return super().read(user_id, relative)
+        return super().read(media_dir, name)
 
 
 class WatchedChannel(FakeChannel):
@@ -474,7 +474,7 @@ async def test_a_full_drawing_turn(db: Database, tmp_path: Path) -> None:
     attachment_id, reply_id, path, description, delivery = drawn
     assert description == "一只橘猫趴在窗台上"
     assert delivery == "streamed"
-    assert store.read(alice.id, path) == picture(1)
+    assert store.read(alice.media_dir, path) == picture(1)
     process = await db.fetch_one("SELECT process FROM messages WHERE id = ?", (reply_id,))
     assert process is not None
     assert "[画图]" in process["process"]
@@ -524,7 +524,7 @@ async def test_editing_an_image_the_user_sent(db: Database, tmp_path: Path) -> N
 
     def plant(conn: sqlite3.Connection) -> int:
         message_id = journal.add_user_message(conn, alice.id, "这是我家的猫", "qq-1", START)
-        path = store.save(alice.id, sent, "image/png")
+        path = store.save(alice.media_dir, sent, "image/png")
         journal.add_attachment(
             conn,
             user_id=alice.id,
@@ -590,7 +590,7 @@ async def test_another_users_image_cannot_be_referenced_or_read(
     assert f"#{bobs_image}" in text_parts(result)
     assert len(generator.calls) == 1  # 只有小李自己那次
     assert channel.images == []
-    assert all(user_id != bob.id and path != bobs_path for user_id, path in store.reads)
+    assert all(media_dir != bob.media_dir and name != bobs_path for media_dir, name in store.reads)
     for request in model.requests:
         assert picture(1) not in request_images(request)
         assert "秘密" not in request.system
@@ -895,7 +895,7 @@ async def test_cancelled_before_the_saved_image_was_sent_does_not_record_it(
     assert channel.images == []
     assert await drawn_rows(db) == []  # 存了盘的文件留给孤儿清理
     assert len(await image_usage(db)) == 1  # 出图的用量照记
-    assert list(store.user_dir(alice.id).iterdir())  # 文件确实存过
+    assert list(store.user_dir(alice.media_dir).iterdir())  # 文件确实存过
     reply = (await rows(db))[-1]
     assert reply.delivery == "cancelled"
 

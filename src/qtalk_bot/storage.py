@@ -17,6 +17,7 @@ import asyncio
 import inspect
 import os
 import re
+import secrets
 import sqlite3
 import tempfile
 import threading
@@ -557,6 +558,77 @@ CREATE INDEX decisions_by_message ON decisions (message_id);
 CREATE INDEX topics_by_summarized_through ON topics (summarized_through);
 """
 
+_V16_USERS = """
+-- 用户的附件目录改用随机名（2026-11-20）：原来是 attachments/<用户编号>/，编号一旦复用（如从备份恢复后计数器回退），
+-- 新用户会继承旧用户的附件目录。media_dir 是 32 位十六进制的随机名（secrets.token_hex(16)），建用户时生成，永不复用；
+-- 编号改成 AUTOINCREMENT，删除后不再复用。同第 14 版按 SQLite 的做法重建表：迁移期间外键是关着的；新建、按原编号
+-- 复制、删旧、改名。列的顺序与原表相同，media_dir 加在最后。别的表对 users 的引用按表名解析，改名之后照常指向新表；
+-- users 没有另建的索引（openid、media_dir 的唯一约束自带）。
+CREATE TABLE users_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    openid TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    invite_id INTEGER REFERENCES invites (id),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled')),
+    disabled_notice_sent INTEGER NOT NULL DEFAULT 0 CHECK (disabled_notice_sent IN (0, 1)),
+    welcomed_at INTEGER,
+    joined_at INTEGER NOT NULL,
+    media_dir TEXT NOT NULL UNIQUE
+        CHECK (length(media_dir) = 32 AND media_dir NOT GLOB '*[^0-9a-f]*')
+) STRICT
+"""
+
+_V16_FINISH = (
+    "DROP TABLE users",
+    "ALTER TABLE users_new RENAME TO users",
+    # 待搬的旧目录：迁移时登记的每个用户一行（编号 → 新的目录名），启动时 media.relocate_user_dirs() 只按这张表把
+    # attachments/<user_id>/ 搬到 attachments/<media_dir>/，某个用户搬完（含没有旧目录）就删掉那一行；没搬完的留着，
+    # 下次启动接着试，它的数字目录也不算无主目录。之后新建的用户永远不进这张表：从 V16 之前的备份恢复后，盘上可能
+    # 留着备份之后才加入的用户的数字目录，新用户拿到同一个编号也不会认领它。
+    """CREATE TABLE media_relocations (
+    user_id INTEGER PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
+    media_dir TEXT NOT NULL
+) STRICT""",
+    "INSERT INTO media_relocations (user_id, media_dir) SELECT id, media_dir FROM users",
+)
+
+
+def _v16_media_dirs(conn: sqlite3.Connection) -> None:
+    """第 16 版：`users` 加 `media_dir` 与 AUTOINCREMENT（见 `_V16_USERS`）；`attachments.path` 去掉 `<用户编号>/`
+    前缀，只留文件名，目录由所属用户的 `media_dir` 决定。
+
+    先校验每一行附件：前缀必须是它自己的 `user_id/`，剩下的必须是合法的文件名（`media.valid_filename()`：不含
+    路径分隔符、`..`，不以 `.` 开头）。有任何一行不符就让迁移失败（整体回滚、拒绝启动），不猜。盘上的目录由启动时的
+    `media.relocate_user_dirs()` 按这里登记的 `media_relocations` 搬，不在这里做：迁移只改数据库。
+    """
+    from .media import valid_filename  # 避免循环导入：media 导入了本模块
+
+    renamed: list[tuple[str, int]] = []
+    for attachment_id, user_id, path in conn.execute(
+        "SELECT id, user_id, path FROM attachments WHERE path IS NOT NULL ORDER BY id"
+    ):
+        prefix = f"{user_id}/"
+        name = path.removeprefix(prefix)
+        if not path.startswith(prefix) or not valid_filename(name):
+            raise StorageError(
+                f"附件 #{attachment_id} 的路径不是它所属用户目录下的文件名，拒绝迁移；请先人工核对附件表"
+            )
+        renamed.append((name, attachment_id))
+    conn.executemany("UPDATE attachments SET path = ? WHERE id = ?", renamed)
+    conn.execute(_V16_USERS)
+    users = conn.execute(
+        "SELECT id, openid, name, invite_id, status, disabled_notice_sent, welcomed_at, joined_at"
+        " FROM users ORDER BY id"
+    ).fetchall()
+    conn.executemany(
+        "INSERT INTO users_new (id, openid, name, invite_id, status, disabled_notice_sent,"
+        " welcomed_at, joined_at, media_dir) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [(*tuple(row), secrets.token_hex(16)) for row in users],
+    )
+    for statement in _V16_FINISH:
+        conn.execute(statement)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     _V1_ACCESS,
     _V2_CHAT,
@@ -573,6 +645,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     _V13_PROFILES,
     _V14_AUTOINCREMENT,
     _V15_PROFILE_VERSIONS,
+    _v16_media_dirs,
 )
 """本程序的迁移列表。业务表由各里程碑在末尾追加，已发布的不能修改。"""
 

@@ -2073,7 +2073,8 @@ async def test_image_only_message_is_answered_with_the_image(db: Database, tmp_p
         None,
     )
     assert isinstance(path, str)
-    assert path.startswith(f"{alice.id}/")
+    assert "/" not in path  # 附件表只存文件名，目录由用户的 media_dir 决定
+    assert MediaStore.under(tmp_path).read(alice.media_dir, path) == PNG_A
     msg_idx = await db.fetch_one("SELECT msg_idx FROM messages WHERE role = 'user'")
     assert msg_idx is not None
     assert msg_idx[0] == "REFIDX_abc"
@@ -2214,7 +2215,7 @@ async def test_files_of_users_who_lost_access_meanwhile_are_removed(
     assert await rows(db) == [Row("user", "", None, None, None)]
     assert [row[2:5] for row in await attachment_rows(db)] == [("failed", None, None)]
     store = MediaStore.under(tmp_path)
-    assert not any(store.user_dir(alice.id).iterdir())
+    assert not any(store.user_dir(alice.media_dir).iterdir())
 
 
 async def test_each_users_attachments_stay_in_their_own_directory_and_context(
@@ -2234,10 +2235,11 @@ async def test_each_users_attachments_stay_in_their_own_directory_and_context(
 
     paths = {row[0]: row[4] for row in await attachment_rows(db)}
     store = MediaStore.under(tmp_path)
-    assert str(paths[alice.id]).startswith(f"{alice.id}/")
-    assert str(paths[bob.id]).startswith(f"{bob.id}/")
-    assert store.read(alice.id, str(paths[alice.id])) == PNG_A
-    assert store.read(alice.id, str(paths[bob.id])) is None
+    assert alice.media_dir != bob.media_dir
+    assert store.read(alice.media_dir, str(paths[alice.id])) == PNG_A
+    assert store.read(bob.media_dir, str(paths[bob.id])) == PNG_B
+    assert store.read(alice.media_dir, str(paths[bob.id])) is None
+    assert store.read(bob.media_dir, str(paths[alice.id])) is None
     for request, own, other in zip(
         model.requests, (PNG_A, PNG_B, PNG_A, PNG_B), (PNG_B, PNG_A, PNG_B, PNG_A), strict=True
     ):
@@ -2928,11 +2930,11 @@ class BlockingStore(MediaStore):
         self.release = threading.Event()
         self.reads = 0
 
-    def read(self, user_id: int, relative: str) -> bytes | None:
+    def read(self, media_dir: str, name: str) -> bytes | None:
         self.reads += 1
         self.reading.set()
         self.release.wait(HANG_GUARD)
-        return super().read(user_id, relative)
+        return super().read(media_dir, name)
 
 
 async def test_access_is_rechecked_after_reading_the_files_for_the_request(
@@ -3103,7 +3105,7 @@ async def test_unanswered_pdf_left_before_a_restart_is_part_of_this_turn(
 ) -> None:
     alice = await invited(db, ALICE, "小王")
     store = MediaStore.under(tmp_path)
-    path = store.save(alice.id, PDF_BYTES, "application/pdf")
+    path = store.save(alice.media_dir, PDF_BYTES, "application/pdf")
 
     def leave(conn: sqlite3.Connection) -> None:
         # 上次 PDF 已落库，程序在回复前关停：只有用户消息与附件，没有回复。
@@ -3174,7 +3176,7 @@ async def test_notice_says_which_attachment_the_chosen_model_did_not_get(
 class MissingStore(MediaStore):
     """存得下，读不到：模拟本地文件在落库之后不见了。"""
 
-    def read(self, user_id: int, relative: str) -> bytes | None:
+    def read(self, media_dir: str, name: str) -> bytes | None:
         return None
 
 
@@ -3303,8 +3305,8 @@ async def test_multimodal_slot_is_held_until_the_cancelled_request_has_stopped(
 class InflatingStore(MediaStore):
     """读出来比记录的大：模拟本地文件与记录的大小不一致（如恢复了备份）。"""
 
-    def read(self, user_id: int, relative: str) -> bytes | None:
-        data = super().read(user_id, relative)
+    def read(self, media_dir: str, name: str) -> bytes | None:
+        data = super().read(media_dir, name)
         return None if data is None else data + b"\0" * (15 * 1024 * 1024)
 
 
@@ -3458,7 +3460,9 @@ async def test_attachment_queued_for_a_slot_is_not_fetched_after_access_is_withd
     others = "https://multimedia.nt.qq.com.cn/other"
     holders = [
         asyncio.create_task(
-            fetcher.acquire(999, [image_attachment(f"{others}/{n}")], wanted=SEES_KINDS, label="x")
+            fetcher.acquire(
+                "9" * 32, [image_attachment(f"{others}/{n}")], wanted=SEES_KINDS, label="x"
+            )
         )
         for n in range(DOWNLOAD_CONCURRENCY)
     ]
@@ -3889,7 +3893,7 @@ async def test_message_cancelled_mid_download_stays_in_the_journal_as_a_failed_d
     assert [row.content for row in await rows(db)] == ["看看这张", "还在吗"]
     assert [row[2:5] for row in await attachment_rows(db)] == [("failed", None, None)]
     store = MediaStore.under(tmp_path)
-    assert not any(store.user_dir(alice.id).iterdir())  # 没有留下下载到一半的文件
+    assert not any(store.user_dir(alice.media_dir).iterdir())  # 没有留下下载到一半的文件
 
     # 重启后两条都是待回复的，下一轮带上它们，图片按「没能下载」说明。
     channel = await send(chat, alice, "总结一下")

@@ -44,7 +44,10 @@ async def test_openid_is_unique_and_hidden_from_repr(db: Database) -> None:
     assert ALICE not in repr(user)
     assert user.label == f"#{user.id} 小王"
     with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
-        await db.execute("INSERT INTO users (openid, name, joined_at) VALUES (?, 'x', 0)", (ALICE,))
+        await db.execute(
+            "INSERT INTO users (openid, name, joined_at, media_dir) VALUES (?, 'x', 0, ?)",
+            (ALICE, "f" * 32),
+        )
 
 
 async def test_invite_code_is_hidden_from_repr(db: Database) -> None:

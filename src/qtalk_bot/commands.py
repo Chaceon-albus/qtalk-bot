@@ -155,7 +155,15 @@ def _list_users(conn: sqlite3.Connection, context: CommandContext) -> Rich:
         else:
             status = texts.STATUS_ACTIVE
         joined = format_time(user.joined_at, context.timezone)
-        rows.append(texts.UserRow(user_id=user.id, name=user.name, status=status, joined=joined))
+        rows.append(
+            texts.UserRow(
+                user_id=user.id,
+                name=user.name,
+                status=status,
+                joined=joined,
+                media_dir=user.media_dir,
+            )
+        )
     return texts.users_message(rows)
 
 

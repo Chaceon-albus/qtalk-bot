@@ -7,7 +7,7 @@ import os
 import sqlite3
 import stat
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Generator
 from pathlib import Path
 
 import pytest
@@ -37,7 +37,7 @@ from qtalk_bot.media import (
     purge_expired,
     text_version,
 )
-from qtalk_bot.storage import DATABASE_FILENAME, Database
+from qtalk_bot.storage import DATABASE_FILENAME, MIGRATIONS, Database, StorageError
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"\x00" * 16
@@ -45,6 +45,9 @@ PDF_BYTES = b"%PDF-1.4\n%fake"
 WAV_BYTES = b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 16
 SECRET_URL = "https://multimedia.nt.qq.com.cn/download?fileid=SECRETTOKEN"
 SECRET_NAME = "秘密的文件名.pdf"
+D1 = "1" * 32  # 测试用的用户目录名
+D2 = "2" * 32
+D7 = "7" * 32
 
 
 @pytest.mark.parametrize(
@@ -138,33 +141,96 @@ def mode(path: Path) -> int:
 
 def test_files_go_into_private_per_user_directories(tmp_path: Path) -> None:
     store = MediaStore.under(tmp_path)
-    a = store.save(1, PNG_BYTES, PNG)
-    b = store.save(2, PNG_BYTES, PNG)
+    a = store.save(D1, PNG_BYTES, PNG)
+    b = store.save(D2, PNG_BYTES, PNG)
 
-    assert a.startswith("1/")
+    assert "/" not in a  # 附件表只存文件名
     assert a.endswith(".png")
-    assert b.startswith("2/")
-    assert a.split("/")[1] != b.split("/")[1]  # 随机名，同一个内容也不撞
+    assert a != b  # 随机名，同一个内容也不撞
+    assert (store.root / D1 / a).is_file()
+    assert (store.root / D2 / b).is_file()
     assert mode(store.root) == 0o700
-    assert mode(store.user_dir(1)) == 0o700
-    path = store.locate(1, a)
+    assert mode(store.user_dir(D1)) == 0o700
+    path = store.locate(D1, a)
     assert path is not None
     assert mode(path) == 0o600
-    assert store.read(1, a) == PNG_BYTES
+    assert store.read(D1, a) == PNG_BYTES
+    assert store.read(D2, a) is None  # 文件名在别人的目录里不存在
 
 
 def test_paths_outside_the_users_directory_are_treated_as_missing(tmp_path: Path) -> None:
     store = MediaStore.under(tmp_path)
-    bobs = store.save(2, PNG_BYTES, PNG)
-    store.save(1, JPEG_BYTES, JPEG)
-    name = bobs.split("/")[1]
+    bobs = store.save(D2, PNG_BYTES, PNG)
+    mine = store.save(D1, JPEG_BYTES, JPEG)
 
-    for forged in (bobs, f"1/../2/{name}", f"../attachments/{bobs}", str(store.root / bobs), "1"):
-        assert store.locate(1, forged) is None
-        assert store.read(1, forged) is None
+    assert store.read(D1, bobs) is None  # 别人的文件名，在自己目录里不存在
+    for forged in (
+        f"{D2}/{bobs}",
+        f"../{D2}/{bobs}",
+        f"..\\{D2}\\{bobs}",
+        f"../attachments/{D2}/{bobs}",
+        str(store.root / D2 / bobs),
+        "..",
+        ".",
+        "",
+        f".{mine}",
+        f"{mine}\0",
+        f"./{mine}",
+    ):
+        assert store.locate(D1, forged) is None
+        assert store.read(D1, forged) is None
     # 用户 1 的目录里放一个指向用户 2 文件的符号链接，也读不到。
-    os.symlink(store.root / bobs, store.user_dir(1) / "link.png")
-    assert store.read(1, "1/link.png") is None
+    os.symlink(store.root / D2 / bobs, store.user_dir(D1) / "link.png")
+    assert store.read(D1, "link.png") is None
+    assert store.read(D1, mine) == JPEG_BYTES
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".hidden.png",
+        "a/b.png",
+        "a\\b.png",
+        "..",
+        "../x.png",
+        "a..b.png",
+        "x\0.png",
+        ".partial-x",
+        "",
+    ],
+)
+def test_unsafe_filenames_are_refused_for_read_and_delete(tmp_path: Path, name: str) -> None:
+    store = MediaStore.under(tmp_path)
+    store.save(D1, PNG_BYTES, PNG)  # 建好目录
+    with contextlib.suppress(OSError, ValueError):
+        (store.user_dir(D1) / ".hidden.png").write_bytes(PNG_BYTES)
+
+    assert not media.valid_filename(name)
+    assert store.locate(D1, name) is None
+    assert store.read(D1, name) is None
+    store.delete(D1, name)
+    assert (store.user_dir(D1) / ".hidden.png").exists()
+
+
+@pytest.mark.parametrize(
+    "media_dir",
+    ["1", "7", "A" * 32, "g" * 32, "1" * 31, "1" * 33, "..", f"{'1' * 31}/", "", f"../{'1' * 32}"],
+)
+def test_user_directory_names_are_validated(tmp_path: Path, media_dir: str) -> None:
+    store = MediaStore.under(tmp_path)
+    (store.root / "1").mkdir(parents=True)
+    (store.root / "1" / "old.png").write_bytes(PNG_BYTES)  # 迁移前的数字目录
+
+    assert not media.valid_media_dir(media_dir)
+    with pytest.raises(ValueError, match="用户目录名无效"):
+        store.user_dir(media_dir)
+    with pytest.raises(OSError, match="用户目录名无效"):
+        store.save(media_dir, PNG_BYTES, PNG)
+    assert store.locate(media_dir, "old.png") is None
+    assert store.read(media_dir, "old.png") is None
+    store.delete(media_dir, "old.png")
+    assert (store.root / "1" / "old.png").exists()
+    assert media.valid_media_dir("0123456789abcdef" * 2)
 
 
 # ---- 下载 ----
@@ -218,7 +284,7 @@ def image(url: str = SECRET_URL, **extra: object) -> IncomingAttachment:
 async def acquire_one(
     f: Fetcher, item: IncomingAttachment, wanted: frozenset[AttachmentKind] = ALL
 ) -> Acquired:
-    (result,) = await f.acquire(7, [item], wanted=wanted, label="#7 小王")
+    (result,) = await f.acquire(D7, [item], wanted=wanted, label="#7 小王")
     return result
 
 
@@ -230,8 +296,8 @@ async def test_declared_type_is_not_trusted(tmp_path: Path) -> None:
     assert (result.status, result.kind, result.mime_type) == (AttachmentStatus.STORED, "image", PNG)
     assert result.size == len(PNG_BYTES)
     assert result.path is not None
-    assert result.path.startswith("7/")
-    assert f.store.read(7, result.path) == PNG_BYTES
+    assert "/" not in result.path
+    assert f.store.read(D7, result.path) == PNG_BYTES
 
 
 async def test_file_that_is_really_an_image_becomes_an_image(tmp_path: Path) -> None:
@@ -257,7 +323,7 @@ async def test_unrecognized_format_is_unsupported_and_not_kept(tmp_path: Path) -
         None,
     )
     assert result.text == "[文件：a.docx，15 B，暂不支持查看这种文件]"
-    assert not f.store.user_dir(7).exists() or not any(f.store.user_dir(7).iterdir())
+    assert not f.store.user_dir(D7).exists() or not any(f.store.user_dir(D7).iterdir())
 
 
 async def test_download_timeout(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -357,20 +423,25 @@ async def db(tmp_path: Path) -> AsyncIterator[Database]:
         yield database
 
 
+async def new_user(db: Database, openid: str = "FAKE-OPENID-ALICE") -> access.User:
+    return await db.transaction(access.ensure_user, openid, "小王", 0)
+
+
 async def test_cleanup_removes_only_expired_files(tmp_path: Path, db: Database) -> None:
     store = MediaStore.under(tmp_path)
-    old_path = store.save(1, PNG_BYTES, PNG)
-    new_path = store.save(1, JPEG_BYTES, JPEG)
-    orphan_old = store.save(2, PNG_BYTES, PNG)  # 没写进流水的孤儿文件
-    orphan_new = store.save(2, PNG_BYTES, PNG)
-    for relative in (old_path, orphan_old):
-        located = store.locate(int(relative.split("/")[0]), relative)
+    alice = await new_user(db)
+    bob = await new_user(db, "FAKE-OPENID-BOB")
+    old_path = store.save(alice.media_dir, PNG_BYTES, PNG)
+    new_path = store.save(alice.media_dir, JPEG_BYTES, JPEG)
+    orphan_old = store.save(bob.media_dir, PNG_BYTES, PNG)  # 没写进流水的孤儿文件
+    orphan_new = store.save(bob.media_dir, PNG_BYTES, PNG)
+    for owner, name in ((alice, old_path), (bob, orphan_old)):
+        located = store.locate(owner.media_dir, name)
         assert located is not None
         os.utime(located, (100, 100))
 
     def fill(conn: sqlite3.Connection) -> None:
-        user = access.ensure_user(conn, "FAKE-OPENID-ALICE", "小王", 0)
-        assert user.id == 1
+        user = alice
         message_id = journal.add_user_message(conn, user.id, "", "qq-1", 0)
         for position, (path, created) in enumerate(((old_path, 100), (new_path, 5000))):
             item = Acquired(
@@ -393,10 +464,10 @@ async def test_cleanup_removes_only_expired_files(tmp_path: Path, db: Database) 
     removed = await purge_expired(db, store, cutoff=1000, now=int(time.time()))
 
     assert removed == 2
-    assert store.read(1, old_path) is None
-    assert store.read(1, new_path) == JPEG_BYTES
-    assert store.read(2, orphan_old) is None
-    assert store.read(2, orphan_new) == PNG_BYTES
+    assert store.read(alice.media_dir, old_path) is None
+    assert store.read(alice.media_dir, new_path) == JPEG_BYTES
+    assert store.read(bob.media_dir, orphan_old) is None
+    assert store.read(bob.media_dir, orphan_new) == PNG_BYTES
     rows = await db.fetch_all("SELECT status, path FROM attachments ORDER BY position")
     assert [tuple(row) for row in rows] == [("expired", None), ("stored", new_path)]
 
@@ -404,8 +475,8 @@ async def test_cleanup_removes_only_expired_files(tmp_path: Path, db: Database) 
 # ---- 评审修正：落盘、并发、符号链接、清扫、单件失败、预筛 ----
 
 
-def leftovers(store: MediaStore, user_id: int) -> list[str]:
-    directory = store.user_dir(user_id)
+def leftovers(store: MediaStore, media_dir: str) -> list[str]:
+    directory = store.user_dir(media_dir)
     return sorted(path.name for path in directory.iterdir()) if directory.exists() else []
 
 
@@ -418,7 +489,7 @@ async def test_download_is_streamed_to_a_private_temp_file_and_stops_at_the_limi
     class Watching(FakeDownloader):
         async def fetch(self, url: str, *, max_bytes: int) -> AsyncGenerator[bytes]:
             async for chunk in super().fetch(url, max_bytes=max_bytes):
-                for path in store.user_dir(7).iterdir():
+                for path in store.user_dir(D7).iterdir():
                     seen_temp.append((path.name, mode(path)))
                 yield chunk
 
@@ -432,7 +503,7 @@ async def test_download_is_streamed_to_a_private_temp_file_and_stops_at_the_limi
     assert downloader.yielded <= 1024 * 1024 + 4096
     assert seen_temp
     assert all(name.startswith(".partial-") and m == 0o600 for name, m in seen_temp)
-    assert leftovers(store, 7) == []  # 临时文件已删
+    assert leftovers(store, D7) == []  # 临时文件已删
 
 
 async def test_download_concurrency_is_shared_by_the_whole_process(tmp_path: Path) -> None:
@@ -462,7 +533,7 @@ async def test_download_concurrency_is_shared_by_the_whole_process(tmp_path: Pat
 
     tasks = [
         asyncio.create_task(f.acquire(user, batch, wanted=ALL, label="#x"))
-        for user, batch in zip((1, 2), batches, strict=True)
+        for user, batch in zip((D1, D2), batches, strict=True)
     ]
     for _ in range(20):
         await asyncio.sleep(0)
@@ -481,21 +552,21 @@ async def test_one_attachment_failing_on_disk_does_not_abandon_the_others(
     original = store.commit
     calls = 0
 
-    def flaky(user_id: int, temp: str, mime_type: str) -> str:
+    def flaky(media_dir: str, temp: str, mime_type: str) -> str:
         nonlocal calls
         calls += 1
         if calls == 1:
             raise OSError(28, "No space left on device")
-        return original(user_id, temp, mime_type)
+        return original(media_dir, temp, mime_type)
 
     monkeypatch.setattr(store, "commit", flaky)
 
     with caplog.at_level(logging.INFO):
-        results = await f.acquire(7, [image(url) for url in urls], wanted=ALL, label="#7")
+        results = await f.acquire(D7, [image(url) for url in urls], wanted=ALL, label="#7")
 
     assert sorted(r.status for r in results) == ["failed", "stored", "stored"]
-    stored = sorted(r.path.split("/")[1] for r in results if r.path is not None)
-    assert leftovers(store, 7) == stored  # 失败那件的临时文件也删了，没有孤儿
+    stored = sorted(r.path for r in results if r.path is not None)
+    assert leftovers(store, D7) == stored  # 失败那件的临时文件也删了，没有孤儿
     assert "OSError" in caplog.text
 
 
@@ -507,21 +578,21 @@ async def test_symlinked_storage_directories_are_refused(tmp_path: Path, linked:
     store = MediaStore.under(tmp_path / "data")
     if linked == "user":
         store.root.mkdir(parents=True)
-        os.symlink(elsewhere, store.user_dir(7))
+        os.symlink(elsewhere, store.user_dir(D7))
     else:
         store.root.parent.mkdir(parents=True)
         os.symlink(elsewhere, store.root)
-        os.mkdir(elsewhere / "7")
-        (elsewhere / "7" / "secret.png").write_bytes(PNG_BYTES)
-    relative = "7/secret.png"
+        os.mkdir(elsewhere / D7)
+        (elsewhere / D7 / "secret.png").write_bytes(PNG_BYTES)
+    relative = "secret.png"
     before = sorted(str(p) for p in elsewhere.rglob("*"))
 
     with pytest.raises(OSError, match="符号链接"):
-        store.save(7, PNG_BYTES, PNG)
-    assert store.locate(7, relative) is None
-    assert store.read(7, relative) is None
-    store.delete(7, relative)
-    target = elsewhere / "secret.png" if linked == "user" else elsewhere / "7" / "secret.png"
+        store.save(D7, PNG_BYTES, PNG)
+    assert store.locate(D7, relative) is None
+    assert store.read(D7, relative) is None
+    store.delete(D7, relative)
+    target = elsewhere / "secret.png" if linked == "user" else elsewhere / D7 / "secret.png"
     assert target.exists()
     assert mode(elsewhere) == 0o755  # 没有沿链接改权限
     f = Fetcher(store, FakeDownloader({SECRET_URL: PNG_BYTES}), AttachmentSettings())
@@ -533,13 +604,14 @@ async def test_sweep_keeps_files_the_database_still_references(
     tmp_path: Path, db: Database
 ) -> None:
     store = MediaStore.under(tmp_path)
-    first = store.save(1, PNG_BYTES, PNG)  # 第一张图落盘早，记录写得晚
-    located = store.locate(1, first)
+    alice = await new_user(db)
+    first = store.save(alice.media_dir, PNG_BYTES, PNG)  # 第一张图落盘早，记录写得晚
+    located = store.locate(alice.media_dir, first)
     assert located is not None
     os.utime(located, (900, 900))
 
     def fill(conn: sqlite3.Connection) -> None:
-        user = access.ensure_user(conn, "FAKE-OPENID-ALICE", "小王", 0)
+        user = alice
         message_id = journal.add_user_message(conn, user.id, "", "qq-1", 1100)
         item = Acquired(
             position=0,
@@ -559,7 +631,7 @@ async def test_sweep_keeps_files_the_database_still_references(
     await db.transaction(fill)
 
     assert await purge_expired(db, store, cutoff=1000, now=int(time.time())) == 0
-    assert store.read(1, first) == PNG_BYTES
+    assert store.read(alice.media_dir, first) == PNG_BYTES
 
 
 async def test_pdf_declared_as_image_is_fetched_when_only_files_are_wanted(
@@ -589,8 +661,8 @@ class Ledger:
         self.closed: list[int] = []
         create = store.create_temp
 
-        def counting_create(user_id: int) -> tuple[int, str]:
-            fd, relative = create(user_id)
+        def counting_create(media_dir: str) -> tuple[int, str]:
+            fd, relative = create(media_dir)
             self.created.append(fd)
             return fd, relative
 
@@ -635,7 +707,7 @@ async def test_cancellation_at_any_step_leaves_nothing_behind(
     downloader = Stepping(stage)
     f = Fetcher(store, downloader, AttachmentSettings())
 
-    task = asyncio.create_task(f.acquire(7, [image()], wanted=ALL, label="#7"))
+    task = asyncio.create_task(f.acquire(D7, [image()], wanted=ALL, label="#7"))
     async with asyncio.timeout(5):
         await downloader.reached.wait()
     assert f.busy == 1
@@ -645,7 +717,7 @@ async def test_cancellation_at_any_step_leaves_nothing_behind(
 
     # 收尾是同步的：取消一返回，描述符已经关了（只关一次），临时文件删了，槽位还了。
     ledger.assert_each_closed_once()
-    assert leftovers(store, 7) == []
+    assert leftovers(store, D7) == []
     assert f.busy == 0
     async with asyncio.timeout(1):
         await f.aclose()  # 不会挂住
@@ -664,7 +736,7 @@ async def test_timeout_mid_download_leaves_nothing_behind(
 
     assert result.status is AttachmentStatus.FAILED
     ledger.assert_each_closed_once()
-    assert leftovers(store, 7) == []
+    assert leftovers(store, D7) == []
     assert f.busy == 0
 
 
@@ -673,13 +745,13 @@ async def test_cancellation_while_waiting_for_a_slot_takes_no_slot(tmp_path: Pat
     hanging = Stepping("before_first_chunk")
     f = Fetcher(store, hanging, AttachmentSettings())
     holders = [
-        asyncio.create_task(f.acquire(1, [image()], wanted=ALL, label="#1"))
+        asyncio.create_task(f.acquire(D1, [image()], wanted=ALL, label="#1"))
         for _ in range(DOWNLOAD_CONCURRENCY)
     ]
     for _ in range(10):
         await asyncio.sleep(0)
     assert f.busy == DOWNLOAD_CONCURRENCY
-    waiting = asyncio.create_task(f.acquire(2, [image()], wanted=ALL, label="#2"))
+    waiting = asyncio.create_task(f.acquire(D2, [image()], wanted=ALL, label="#2"))
     await asyncio.sleep(0)
 
     waiting.cancel()
@@ -688,8 +760,8 @@ async def test_cancellation_while_waiting_for_a_slot_takes_no_slot(tmp_path: Pat
     await asyncio.gather(waiting, *holders, return_exceptions=True)
 
     assert f.busy == 0
-    assert leftovers(store, 1) == []
-    assert leftovers(store, 2) == []
+    assert leftovers(store, D1) == []
+    assert leftovers(store, D2) == []
     async with asyncio.timeout(1):
         await f.aclose()
 
@@ -717,12 +789,12 @@ async def test_unexpected_error_waits_for_the_other_attachments_to_exit(tmp_path
 
     with pytest.raises(RuntimeError, match="意外"):
         await f.acquire(
-            7, [image(done_url), image(hang_url), image(SECRET_URL)], wanted=ALL, label="#7"
+            D7, [image(done_url), image(hang_url), image(SECRET_URL)], wanted=ALL, label="#7"
         )
 
     # 抛出之前其它附件都已经真正退出：挂着的那个被取消并收拾了，下载完的那个也删了。
     assert f.busy == 0
-    assert leftovers(store, 7) == []
+    assert leftovers(store, D7) == []
 
 
 async def test_failing_chmod_leaves_no_file_or_descriptor(
@@ -747,7 +819,7 @@ async def test_failing_chmod_leaves_no_file_or_descriptor(
 
     assert result.status is AttachmentStatus.FAILED
     assert len(closed) == 1
-    assert leftovers(store, 7) == []
+    assert leftovers(store, D7) == []
 
 
 async def test_failing_cleanup_does_not_override_the_result(
@@ -758,12 +830,12 @@ async def test_failing_cleanup_does_not_override_the_result(
     downloader = FakeDownloader({SECRET_URL: DownloadError("HTTP 500"), good: PNG_BYTES})
     f = Fetcher(store, downloader, AttachmentSettings())
 
-    def refuse(user_id: int, relative: str) -> None:
+    def refuse(media_dir: str, name: str) -> None:
         raise PermissionError(13, "Permission denied")
 
-    monkeypatch.setattr(store, "delete", refuse)  # 目录在下载期间变得不可写
+    monkeypatch.setattr(store, "discard_temp", refuse)  # 目录在下载期间变得不可写
     with caplog.at_level(logging.INFO):
-        results = await f.acquire(7, [image(), image(good)], wanted=ALL, label="#7")
+        results = await f.acquire(D7, [image(), image(good)], wanted=ALL, label="#7")
 
     assert [r.status for r in results] == [AttachmentStatus.FAILED, AttachmentStatus.STORED]
     assert "清理附件的临时文件失败：PermissionError" in caplog.text
@@ -786,7 +858,7 @@ async def test_failing_close_still_removes_the_temp_file_and_returns_the_slot(
         raise OSError(5, "Input/output error")
 
     monkeypatch.setattr(media, "_close_fd", failing_close)
-    task = asyncio.create_task(f.acquire(7, [image()], wanted=ALL, label="#7"))
+    task = asyncio.create_task(f.acquire(D7, [image()], wanted=ALL, label="#7"))
     async with asyncio.timeout(5):
         await downloader.reached.wait()
     with caplog.at_level(logging.INFO):
@@ -795,7 +867,7 @@ async def test_failing_close_still_removes_the_temp_file_and_returns_the_slot(
             await task
 
     assert f.busy == 0
-    assert leftovers(store, 7) == []
+    assert leftovers(store, D7) == []
     assert "关闭附件的临时文件失败：OSError" in caplog.text
     async with asyncio.timeout(1):
         await f.aclose()
@@ -806,10 +878,13 @@ async def test_unreferenced_files_older_than_an_hour_are_orphans(
 ) -> None:
     store = MediaStore.under(tmp_path)
     now = int(time.time())
-    stale = store.save(1, PNG_BYTES, PNG)  # 两小时前存下、没进数据库（例如批量下载被再次取消）
-    recent = store.save(1, PNG_BYTES, PNG)  # 十分钟前存下，可能正要写进数据库
+    alice = await new_user(db)
+    stale = store.save(
+        alice.media_dir, PNG_BYTES, PNG
+    )  # 两小时前存下、没进数据库（例如批量下载被再次取消）
+    recent = store.save(alice.media_dir, PNG_BYTES, PNG)  # 十分钟前存下，可能正要写进数据库
     for relative, age in ((stale, 7200), (recent, 600)):
-        located = store.locate(1, relative)
+        located = store.locate(alice.media_dir, relative)
         assert located is not None
         os.utime(located, (now - age, now - age))
 
@@ -817,8 +892,8 @@ async def test_unreferenced_files_older_than_an_hour_are_orphans(
     removed = await purge_expired(db, store, cutoff=now - 30 * 24 * 3600, now=now)
 
     assert removed == 1
-    assert store.read(1, stale) is None
-    assert store.read(1, recent) == PNG_BYTES
+    assert store.read(alice.media_dir, stale) is None
+    assert store.read(alice.media_dir, recent) == PNG_BYTES
     assert media.CLEANUP_INTERVAL_SECONDS == 3600
 
 
@@ -856,12 +931,12 @@ class OneChunk:
 
 async def test_reading_a_named_pipe_does_not_block(tmp_path: Path) -> None:
     store = MediaStore.under(tmp_path)
-    store.save(1, PNG_BYTES, PNG)  # 建好用户目录
-    fifo = store.user_dir(1) / "restored.png"
+    store.save(D1, PNG_BYTES, PNG)  # 建好用户目录
+    fifo = store.user_dir(D1) / "restored.png"
     os.mkfifo(fifo)  # 恢复或迁移后，被引用的路径变成了命名管道
     try:
         async with asyncio.timeout(2):
-            data = await asyncio.to_thread(store.read, 1, "1/restored.png")
+            data = await asyncio.to_thread(store.read, D1, "restored.png")
         assert data is None  # 不是普通文件，当作不存在
     finally:
         # 万一有读者卡在管道上，打开写端再关掉，让它读到文件结束，测试进程才能正常退出。
@@ -926,17 +1001,17 @@ async def test_drawn_images_follow_the_same_cleanup_rules(tmp_path: Path, db: Da
     # 生成的图先落盘、后记录：记进附件表的按保存期限清理，没能记进去的（如这一轮没写回复就结束）按孤儿删掉。
     store = MediaStore.under(tmp_path)
     now = int(time.time())
-    recorded_old = store.save(1, PNG_BYTES, PNG)
-    recorded_new = store.save(1, PNG_BYTES, PNG)
-    unrecorded = store.save(1, PNG_BYTES, PNG)
+    alice = await new_user(db)
+    recorded_old = store.save(alice.media_dir, PNG_BYTES, PNG)
+    recorded_new = store.save(alice.media_dir, PNG_BYTES, PNG)
+    unrecorded = store.save(alice.media_dir, PNG_BYTES, PNG)
     for relative in (recorded_old, recorded_new, unrecorded):
-        located = store.locate(1, relative)
+        located = store.locate(alice.media_dir, relative)
         assert located is not None
         os.utime(located, (now - 7200, now - 7200))
 
     def fill(conn: sqlite3.Connection) -> None:
-        user = access.ensure_user(conn, "FAKE-OPENID-ALICE", "小王", 0)
-        assert user.id == 1
+        user = alice
         question = journal.add_user_message(conn, user.id, "画两张", "qq-1", 0)
         reply_id = journal.add_reply(
             conn,
@@ -962,8 +1037,435 @@ async def test_drawn_images_follow_the_same_cleanup_rules(tmp_path: Path, db: Da
     removed = await purge_expired(db, store, cutoff=1000, now=now)
 
     assert removed == 2
-    assert store.read(1, recorded_old) is None
-    assert store.read(1, unrecorded) is None
-    assert store.read(1, recorded_new) == PNG_BYTES
+    assert store.read(alice.media_dir, recorded_old) is None
+    assert store.read(alice.media_dir, unrecorded) is None
+    assert store.read(alice.media_dir, recorded_new) == PNG_BYTES
     rows = await db.fetch_all("SELECT status, path FROM attachments ORDER BY position")
     assert [tuple(r) for r in rows] == [("expired", None), ("stored", recorded_new)]
+
+
+# ---- 用户附件目录改用随机名：搬旧目录、新用户的目录检查、无主目录 ----
+
+
+def legacy_dir(store: MediaStore, user_id: int, *names: str) -> Path:
+    """迁移前的数字目录，里面放上 `names` 这些文件（内容是文件名）。"""
+    directory = store.root / str(user_id)
+    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    for name in names:
+        (directory / name).write_bytes(name.encode())
+    return directory
+
+
+def test_relocate_renames_a_lone_legacy_directory(tmp_path: Path) -> None:
+    store = MediaStore.under(tmp_path)
+    legacy = legacy_dir(store, 3, "a.png", ".partial-left")
+
+    assert store.relocate(3, D1) is media.Relocation.RENAMED
+
+    assert not legacy.exists()
+    assert store.read(D1, "a.png") == b"a.png"
+    assert (store.user_dir(D1) / ".partial-left").exists()  # 残留的临时文件随目录过去，由孤儿清理删
+    assert mode(store.user_dir(D1)) == 0o700
+    assert store.relocate(3, D1) is media.Relocation.NOTHING  # 重复运行什么也不做
+    assert store.read(D1, "a.png") == b"a.png"
+
+
+def test_relocate_merges_when_both_directories_exist(tmp_path: Path) -> None:
+    store = MediaStore.under(tmp_path)
+    store.user_dir(D1).mkdir(parents=True)
+    (store.user_dir(D1) / "moved.png").write_bytes(b"moved.png")  # 上次已经移过去的
+    legacy = legacy_dir(store, 3, "b.png", "c.pdf")
+
+    assert store.relocate(3, D1) is media.Relocation.MERGED
+
+    assert not legacy.exists()
+    assert sorted(p.name for p in store.user_dir(D1).iterdir()) == ["b.png", "c.pdf", "moved.png"]
+    assert store.relocate(3, D1) is media.Relocation.NOTHING
+
+
+def test_relocate_leaves_a_name_clash_in_the_legacy_directory(tmp_path: Path) -> None:
+    store = MediaStore.under(tmp_path)
+    store.user_dir(D1).mkdir(parents=True)
+    (store.user_dir(D1) / "same.png").write_bytes(b"new")
+    legacy = legacy_dir(store, 3, "same.png", "other.png")
+
+    assert store.relocate(3, D1) is media.Relocation.INCOMPLETE
+
+    assert store.read(D1, "same.png") == b"new"  # 不覆盖
+    assert store.read(D1, "other.png") == b"other.png"
+    assert [p.name for p in legacy.iterdir()] == ["same.png"]
+
+
+def test_relocate_does_not_touch_symlinks_or_non_directories(tmp_path: Path) -> None:
+    store = MediaStore.under(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "secret.png").write_bytes(b"secret")
+    store.root.mkdir(parents=True)
+    os.symlink(elsewhere, store.root / "3")
+    (store.root / "4").write_bytes(b"not a directory")
+    legacy_dir(store, 5, "a.png")
+    os.symlink(elsewhere, store.root / D2)  # 新目录是符号链接
+
+    assert store.relocate(3, D1) is media.Relocation.SYMLINK
+    assert store.relocate(4, D1) is media.Relocation.NOT_A_DIRECTORY
+    assert store.relocate(5, D2) is media.Relocation.TARGET_UNSAFE
+
+    assert (store.root / "3").is_symlink()
+    assert not store.user_dir(D1).exists()
+    assert sorted(p.name for p in elsewhere.iterdir()) == ["secret.png"]  # 没有往链接目标里搬东西
+    assert (store.root / "5" / "a.png").exists()
+
+
+def test_relocate_finishes_on_the_next_run_after_failing_midway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = MediaStore.under(tmp_path)
+    store.user_dir(D1).mkdir(parents=True)
+    legacy = legacy_dir(store, 3, "a.png", "b.png", "c.png")
+    real_rename = os.rename
+    calls = 0
+
+    def flaky(source: os.PathLike[str] | str, target: os.PathLike[str] | str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise PermissionError(13, "Permission denied")
+        real_rename(source, target)
+
+    monkeypatch.setattr(media.os, "rename", flaky)
+    with pytest.raises(PermissionError):
+        store.relocate(3, D1)
+    monkeypatch.undo()
+    assert len(list(store.user_dir(D1).iterdir())) == 1  # 搬到一半
+
+    assert store.relocate(3, D1) is media.Relocation.MERGED
+
+    assert not legacy.exists()
+    assert sorted(p.name for p in store.user_dir(D1).iterdir()) == ["a.png", "b.png", "c.png"]
+
+
+def test_relocate_refuses_invalid_directory_names(tmp_path: Path) -> None:
+    store = MediaStore.under(tmp_path)
+    legacy_dir(store, 3, "a.png")
+    with pytest.raises(ValueError, match="用户目录名无效"):
+        store.relocate(3, "../escape")
+    assert (store.root / "3" / "a.png").exists()
+
+
+async def register(db: Database, *users: access.User) -> None:
+    """像迁移 V16 那样把这些用户登记进待搬的映射。"""
+    for user in users:
+        await db.execute(
+            "INSERT INTO media_relocations (user_id, media_dir) VALUES (?, ?)",
+            (user.id, user.media_dir),
+        )
+
+
+async def pending(db: Database) -> list[int]:
+    return [user_id for user_id, _ in await db.transaction(access.pending_relocations)]
+
+
+async def test_relocate_user_dirs_moves_only_registered_users(
+    tmp_path: Path, db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = MediaStore.under(tmp_path)
+    alice = await new_user(db)
+    bob = await new_user(db, "FAKE-OPENID-BOB")
+    carol = await new_user(db, "FAKE-OPENID-CAROL")
+    dave = await new_user(db, "FAKE-OPENID-DAVE")  # V16 之后才建的用户，不在映射里
+    await register(db, alice, bob, carol)
+    legacy_dir(store, alice.id, "a.png")
+    store.user_dir(bob.media_dir).mkdir(parents=True)
+    legacy_dir(store, bob.id, "b.png")
+    os.symlink(tmp_path, store.root / str(carol.id))
+    someone_elses = legacy_dir(store, dave.id, "not-daves.png")
+
+    with caplog.at_level(logging.INFO):
+        await media.relocate_user_dirs(db, store)
+        await media.relocate_user_dirs(db, store)  # 幂等
+
+    assert store.read(alice.media_dir, "a.png") == b"a.png"
+    assert store.read(bob.media_dir, "b.png") == b"b.png"
+    assert not (store.root / str(alice.id)).exists()
+    assert not (store.root / str(bob.id)).exists()
+    assert (store.root / str(carol.id)).is_symlink()
+    assert (someone_elses / "not-daves.png").exists()  # 不按当前编号认领
+    assert not store.user_dir(dave.media_dir).exists()
+    assert await pending(db) == [carol.id]  # 没搬完的留着
+    assert caplog.text.count("旧目录是符号链接，没有动") == 2  # 每次启动都提醒
+    assert "FAKE-OPENID" not in caplog.text
+
+
+async def test_restored_backup_does_not_hand_a_later_users_directory_to_a_new_user(
+    tmp_path: Path,
+) -> None:
+    # 从第 15 版的备份恢复：库里只有用户 1、2，盘上还有备份之后加入的用户 3 的数字目录。
+    from tests.test_storage import legacy_user
+
+    path = tmp_path / DATABASE_FILENAME
+    async with await Database.open(path, migrations=MIGRATIONS[:15]) as old:
+        for openid in ("FAKE-OPENID-A", "FAKE-OPENID-B"):
+            await old.transaction(legacy_user, openid, "某某", 0)
+    store = MediaStore.under(tmp_path)
+    legacy_dir(store, 1, "one.png")
+    legacy_dir(store, 2, "two.png")
+    later = legacy_dir(store, 3, "later-users.png")
+
+    async with await Database.open(path) as db:
+        await media.relocate_user_dirs(db, store)
+        newcomer = await db.transaction(access.ensure_user, "FAKE-OPENID-NEW", "新人", 0)
+        assert newcomer.id == 3  # 计数器随备份回退，拿到了同一个编号
+        await media.relocate_user_dirs(db, store)  # 重启
+
+        assert (later / "later-users.png").exists()
+        assert not store.user_dir(newcomer.media_dir).exists()
+        assert await pending(db) == []
+        aged(later, 100)
+        await purge_expired(db, store, cutoff=1000, now=int(time.time()))
+
+    assert not later.exists()  # 过了保存期限，按无主目录删掉
+
+
+async def test_relocation_checkpoints_before_renaming(
+    tmp_path: Path, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = MediaStore.under(tmp_path)
+    alice = await new_user(db)
+    await register(db, alice)
+    legacy_dir(store, alice.id, "a.png")
+    events: list[str] = []
+    real_checkpoint = Database.checkpoint
+    real_rename = os.rename
+
+    async def checkpoint(self: Database) -> bool:
+        events.append("检查点")
+        return await real_checkpoint(self)
+
+    def rename(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
+        events.append("改名")
+        real_rename(source, target)
+
+    monkeypatch.setattr(Database, "checkpoint", checkpoint)
+    monkeypatch.setattr(media.os, "rename", rename)
+
+    await media.relocate_user_dirs(db, store)
+    await media.relocate_user_dirs(db, store)  # 没有待搬的了：不再做检查点
+
+    assert events == ["检查点", "改名"]
+
+
+@pytest.mark.parametrize("failure", ["incomplete", "error"])
+async def test_failed_checkpoint_stops_before_renaming(
+    tmp_path: Path, db: Database, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    store = MediaStore.under(tmp_path)
+    alice = await new_user(db)
+    await register(db, alice)
+    legacy = legacy_dir(store, alice.id, "a.png")
+
+    async def checkpoint(self: Database) -> bool:
+        if failure == "error":
+            raise sqlite3.OperationalError("database is locked")
+        return False
+
+    monkeypatch.setattr(Database, "checkpoint", checkpoint)
+    with pytest.raises(media.RelocationError, match="检查点"):
+        await media.relocate_user_dirs(db, store)
+
+    assert (legacy / "a.png").exists()
+    assert not store.user_dir(alice.media_dir).exists()
+    assert await pending(db) == [alice.id]
+
+
+async def test_relocate_user_dirs_failure_is_a_storage_error(
+    tmp_path: Path, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = MediaStore.under(tmp_path)
+    alice = await new_user(db)
+    await register(db, alice)
+    legacy_dir(store, alice.id, "a.png")
+
+    def refuse(source: object, target: object) -> None:
+        raise PermissionError(13, "Permission denied", str(source))
+
+    monkeypatch.setattr(media.os, "rename", refuse)
+    with pytest.raises(
+        media.RelocationError, match="附件目录没能搬到新名字：Permission denied"
+    ) as caught:
+        await media.relocate_user_dirs(db, store)
+    assert isinstance(caught.value, StorageError)
+    assert str(tmp_path) not in str(caught.value)
+    assert await pending(db) == [alice.id]
+
+
+@contextlib.contextmanager
+def no_access(path: Path) -> Generator[None]:
+    """暂时拿掉 `path` 的全部权限（测试结束时恢复，免得 pytest 删不掉临时目录）。"""
+    original = stat.S_IMODE(path.stat().st_mode)
+    path.chmod(0)
+    try:
+        yield
+    finally:
+        path.chmod(original)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root 不受目录权限限制")
+async def test_unreadable_attachments_root_is_not_treated_as_missing(
+    tmp_path: Path, db: Database
+) -> None:
+    store = MediaStore.under(tmp_path)
+    alice = await new_user(db)
+    await register(db, alice)
+    legacy_dir(store, alice.id, "a.png")
+
+    with no_access(store.root):
+        with pytest.raises(PermissionError):
+            store.relocate(alice.id, alice.media_dir)
+        with pytest.raises(media.RelocationError, match="Permission denied"):
+            await media.relocate_user_dirs(db, store)
+        assert store.dir_taken(D1)  # 无法确认不存在：按已存在处理
+
+    assert await pending(db) == [alice.id]
+    assert (store.root / str(alice.id) / "a.png").exists()
+
+
+def test_dir_taken_tells_missing_from_existing(tmp_path: Path) -> None:
+    store = MediaStore.under(tmp_path)
+    assert not store.dir_taken(D1)  # 根目录都还没有
+    store.user_dir(D1).mkdir(parents=True)
+    (store.root / D2).write_bytes(b"file")
+    os.symlink(tmp_path / "nowhere", store.root / D7)
+
+    assert store.dir_taken(D1)
+    assert store.dir_taken(D2)
+    assert store.dir_taken(D7)  # 悬空的符号链接也算占用
+    assert not store.dir_taken("3" * 32)
+    assert store.dir_taken("not-a-valid-name")
+    assert sorted(p.name for p in store.root.iterdir()) == sorted([D1, D2, D7])  # 只看不改
+
+
+@pytest.mark.parametrize("blocker", ["symlink", "file", "clash"])
+async def test_unfinished_legacy_directories_are_kept_and_retried(
+    tmp_path: Path, db: Database, caplog: pytest.LogCaptureFixture, blocker: str
+) -> None:
+    store = MediaStore.under(tmp_path)
+    alice = await new_user(db)
+    await register(db, alice)
+    legacy = legacy_dir(store, alice.id, "a.png")
+    target = store.root / alice.media_dir
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    match blocker:
+        case "symlink":
+            os.symlink(elsewhere, target)
+        case "file":
+            target.write_bytes(b"not a directory")
+        case _:
+            target.mkdir()
+            (target / "a.png").write_bytes(b"same name")
+
+    with caplog.at_level(logging.WARNING):
+        await media.relocate_user_dirs(db, store)
+    aged(legacy, 100)  # 恢复出来的原件保留着很早的修改时间
+    await purge_expired(db, store, cutoff=1000, now=int(time.time()))
+
+    assert (legacy / "a.png").exists()  # 唯一的原件不按无主目录删
+    assert await pending(db) == [alice.id]
+    assert "下次启动再试" in caplog.text
+
+    # 修好之后，下次启动接着搬完。
+    if target.is_symlink() or target.is_file():
+        target.unlink()
+    else:
+        (target / "a.png").unlink()
+    await media.relocate_user_dirs(db, store)
+    assert store.read(alice.media_dir, "a.png") == b"a.png"
+    assert not legacy.exists()
+    assert await pending(db) == []
+    assert sorted(p.name for p in elsewhere.iterdir()) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root 不受目录权限限制")
+def test_unowned_directory_that_cannot_be_fully_walked_is_skipped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = MediaStore.under(tmp_path)
+    unowned = store.root / ("e" * 32)
+    (unowned / "locked").mkdir(parents=True)
+    (unowned / "visible.png").write_bytes(b"x")
+    (unowned / "locked" / "fresh.png").write_bytes(b"y")
+    aged(unowned, 100)
+    os.utime(unowned / "locked" / "fresh.png", None)  # 读不了的子目录里有一张新文件
+
+    with caplog.at_level(logging.WARNING), no_access(unowned / "locked"):
+        assert store.sweep_unowned(set(), 1000) == 0
+
+    assert (unowned / "visible.png").exists()  # 一个也没删
+    assert (unowned / "locked" / "fresh.png").exists()
+    assert "没能删掉无主的附件目录：PermissionError" in caplog.text
+
+
+def aged(path: Path, when: float) -> None:
+    for item in (*path.rglob("*"), path):
+        os.utime(item, (when, when), follow_symlinks=False)
+
+
+def test_unowned_directories_are_removed_only_after_the_retention_period(tmp_path: Path) -> None:
+    store = MediaStore.under(tmp_path)
+    old, fresh = 1_000, 5_000
+    cutoff = 2_000
+    stale_random = store.root / ("a" * 32)
+    stale_random.mkdir(parents=True)
+    (stale_random / "x.png").write_bytes(b"x")
+    stale_numeric = legacy_dir(store, 12, "y.png")
+    recently_touched = store.root / ("b" * 32)
+    recently_touched.mkdir()
+    (recently_touched / "z.png").write_bytes(b"z")
+    owned = store.root / D1
+    owned.mkdir()
+    (owned / "mine.png").write_bytes(b"mine")
+    other_name = store.root / "backup-copy"
+    other_name.mkdir()
+    upper = store.root / ("g" * 32)  # 不是十六进制（大小写不敏感的文件系统上不能拿大写字母测）
+    upper.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    linked = store.root / ("c" * 32)
+    os.symlink(elsewhere, linked)
+    loose_file = store.root / ("d" * 32)
+    loose_file.write_bytes(b"file")
+    for path in (stale_random, stale_numeric, recently_touched, owned, other_name, upper):
+        aged(path, old)
+    aged(elsewhere, old)
+    os.utime(loose_file, (old, old))
+    os.utime(recently_touched / "z.png", (fresh, fresh))  # 里面有新文件，目录本身是旧的
+
+    assert store.sweep_unowned({D1}, cutoff) == 2
+
+    assert not stale_random.exists()
+    assert not stale_numeric.exists()
+    for kept in (recently_touched, owned, other_name, upper, loose_file, elsewhere):
+        assert kept.exists(), kept
+    assert linked.is_symlink()
+
+
+async def test_purge_removes_unowned_directories_after_retention(
+    tmp_path: Path, db: Database
+) -> None:
+    store = MediaStore.under(tmp_path)
+    alice = await new_user(db)
+    mine = store.save(alice.media_dir, PNG_BYTES, PNG)
+    aged(store.user_dir(alice.media_dir), 100)  # 用户自己的目录再旧也不删（文件是孤儿则另按孤儿删）
+    leftover = store.root / ("e" * 32)  # 例如从备份恢复后对不上的目录
+    leftover.mkdir()
+    (leftover / "old.png").write_bytes(PNG_BYTES)
+    aged(leftover, 100)
+    young = legacy_dir(store, 77, "new.png")
+
+    await purge_expired(db, store, cutoff=1000, now=int(time.time()))
+
+    assert not leftover.exists()
+    assert young.exists()  # 没过保存期限
+    assert store.user_dir(alice.media_dir).is_dir()
+    assert store.read(alice.media_dir, mine) is None  # 没有记录、超过一小时：按孤儿删了文件

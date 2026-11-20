@@ -1252,7 +1252,7 @@ class Conversation:
         )
         builder = RequestBuilder(
             None if self._fetcher is None else self._fetcher.store,
-            user_id=user.id,
+            media_dir=user.media_dir,
             persona=self._settings.persona,
             now=datetime.fromtimestamp(begun.now, self._timezone),
             history=begun.history,
@@ -1371,13 +1371,17 @@ class Conversation:
             return await self._db.transaction(self._allowed, user)
 
         return await self._fetcher.acquire(
-            user.id, message.attachments, wanted=self._wanted, label=user.label, allowed=allowed
+            user.media_dir,
+            message.attachments,
+            wanted=self._wanted,
+            label=user.label,
+            allowed=allowed,
         )
 
     def _discard(self, user: User, acquired: Sequence[Sequence[Acquired]]) -> None:
         if self._fetcher is not None:
             for items in acquired:
-                self._fetcher.discard(user.id, items)
+                self._fetcher.discard(user.media_dir, items)
 
     def _describable(
         self, kind: AttachmentKind, status: AttachmentStatus, mime: str | None, size: int | None
@@ -1882,7 +1886,7 @@ class Conversation:
                 continue
             if inline_size(record.size or 0) > budget:
                 continue
-            data = await _read_whole(store, user.id, record.path)
+            data = await _read_whole(store, user.media_dir, record.path)
             if data is None or inline_size(len(data)) > budget:
                 continue
             budget -= inline_size(len(data))
@@ -2106,7 +2110,7 @@ class Conversation:
                 failed += 1
                 continue
             try:
-                await asyncio.to_thread(store.delete, user.id, path)
+                await asyncio.to_thread(store.delete, user.media_dir, path)
             except OSError:
                 failed += 1
         if failed:
@@ -2911,7 +2915,7 @@ class _Drawer:
                 data = (
                     None
                     if record.path is None
-                    else await _read_whole(self._store, user.id, record.path)
+                    else await _read_whole(self._store, user.media_dir, record.path)
                 )
                 if data is None or record.mime_type is None:
                     logger.info("用户 %s 要参照的图片读不出来，不画图", user.label)
@@ -2959,7 +2963,7 @@ class _Drawer:
         """把图存进这个用户的附件目录。存不下时只记日志：图照样发给用户，只是不记进附件表。"""
         user = self._turn.user
         try:
-            path = await asyncio.to_thread(self._store.save, user.id, data, mime_type)
+            path = await asyncio.to_thread(self._store.save, user.media_dir, data, mime_type)
         except Exception as exc:  # noqa: BLE001  见 docstring；文案可能带路径，只记类型
             logger.warning("给用户 %s 画的图没能存盘：%s", user.label, type(exc).__name__)
             return None
@@ -3470,10 +3474,10 @@ class _UserLocks:
                 self._locks[user_id] = (lock, holders - 1)
 
 
-async def _read_whole(store: MediaStore, user_id: int, relative: str) -> bytes | None:
+async def _read_whole(store: MediaStore, media_dir: str, name: str) -> bytes | None:
     """在线程里读一个原件。被取消时也等这次读完再让取消传出去，免得归还多模态名额之后内存里还多一份（同
     `context.RequestBuilder._read()`）。"""
-    reading = asyncio.ensure_future(asyncio.to_thread(store.read, user_id, relative))
+    reading = asyncio.ensure_future(asyncio.to_thread(store.read, media_dir, name))
     try:
         return await asyncio.shield(reading)
     except asyncio.CancelledError:

@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
+from tests.test_storage import legacy_user
 
 from qtalk_bot import access, journal
 from qtalk_bot.journal import Ending, HistoryEntry, ReplyDelivery, UsageTotals
@@ -195,7 +196,7 @@ async def test_usage_rows_store_null_rather_than_zero(db: Database) -> None:
 async def test_existing_version_1_database_is_upgraded_in_place(tmp_path: Path) -> None:
     path = tmp_path / DATABASE_FILENAME
     async with await Database.open(path, migrations=MIGRATIONS[:1]) as old:
-        await old.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+        await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
 
     async with await Database.open(path) as db:
         (user,) = await db.transaction(access.list_users)
@@ -381,7 +382,7 @@ async def test_version_2_database_gets_the_decisions_table_and_chat_purpose(
 ) -> None:
     path = tmp_path / DATABASE_FILENAME
     async with await Database.open(path, migrations=MIGRATIONS[:2]) as old:
-        user = await old.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+        user = await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
         await old.execute(
             "INSERT INTO usage (user_id, model, provider, provider_model, created_at)"
             " VALUES (?, 'main', 'openai', 'gpt-fake', 0)",
@@ -482,7 +483,7 @@ async def test_history_carries_attachments_of_this_user_only(db: Database) -> No
             conn,
             user_id=alice,
             message_id=mine,
-            item=attachment(path="1/a.png"),
+            item=attachment(path="a.png"),
             describe=True,
             now=0,
         )
@@ -491,7 +492,7 @@ async def test_history_carries_attachments_of_this_user_only(db: Database) -> No
             conn,
             user_id=bob,
             message_id=theirs,
-            item=attachment(path="2/b.png"),
+            item=attachment(path="b.png"),
             describe=False,
             now=0,
         )
@@ -502,7 +503,7 @@ async def test_history_carries_attachments_of_this_user_only(db: Database) -> No
     (entry,) = await db.transaction(journal.current_entries, alice, [mine])
     (record,) = entry.attachments
     assert (record.path, record.status, record.text) == (
-        "1/a.png",
+        "a.png",
         AttachmentStatus.STORED,
         "[图片]",
     )
@@ -541,7 +542,7 @@ async def test_stored_attachment_needs_a_path(db: Database) -> None:
 async def test_version_3_database_keeps_its_usage_and_accepts_describe(tmp_path: Path) -> None:
     path = tmp_path / DATABASE_FILENAME
     async with await Database.open(path, migrations=MIGRATIONS[:3]) as old:
-        user = await old.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+        user = await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
         await old.execute(
             "INSERT INTO usage (user_id, model, provider, provider_model, input_tokens,"
             " output_tokens, created_at, purpose) VALUES (?, 'decisions', 'openai', 'luna', 40,"
@@ -760,7 +761,7 @@ async def test_reply_covers_only_messages_up_to_its_reply_to(db: Database) -> No
 async def test_version_4_database_gets_the_reply_index_and_faces_only(tmp_path: Path) -> None:
     path = tmp_path / DATABASE_FILENAME
     async with await Database.open(path, migrations=MIGRATIONS[:4]) as old:
-        user = await old.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+        user = await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
 
         def fill(conn: sqlite3.Connection) -> None:
             # 第 4 版的表还没有 faces_only 列，照当时的写法插入。
@@ -837,7 +838,7 @@ async def test_version_5_database_gets_descriptions_and_narrower_faces_only(
 ) -> None:
     path = tmp_path / DATABASE_FILENAME
     async with await Database.open(path, migrations=MIGRATIONS[:5]) as old:
-        user = await old.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+        user = await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
 
         def fill(conn: sqlite3.Connection) -> tuple[int, int]:
             # 第 5 版：表情标记加 PDF 的消息也记成了 faces_only；描述只在 text 里。
@@ -892,7 +893,7 @@ async def test_set_description_keeps_the_description_apart_from_the_text(db: Dat
             conn,
             user_id=alice,
             message_id=message,
-            item=attachment(path="1/a.png"),
+            item=attachment(path="a.png"),
             describe=True,
             now=0,
         )
@@ -931,9 +932,9 @@ async def test_set_given_rewrites_the_turns_attachments_for_this_user_only(
         return message, record.id
 
     def fill(conn: sqlite3.Connection) -> tuple[int, int, int, int, int, int]:
-        m1, a1 = add(conn, alice, "1/a.png")
-        m2, a2 = add(conn, alice, "1/b.png")
-        mb, ab = add(conn, bob, "2/c.png")
+        m1, a1 = add(conn, alice, "a.png")
+        m2, a2 = add(conn, alice, "b.png")
+        mb, ab = add(conn, bob, "c.png")
         # 别人的消息与附件编号混进来也改不了。
         journal.set_given(conn, alice, [m1, m2, mb], {a1, ab})
         return m1, m2, a1, a2, mb, ab
@@ -956,7 +957,7 @@ async def test_version_4_stickers_are_recognized_again_by_version_6(tmp_path: Pa
     path = tmp_path / DATABASE_FILENAME
     raw = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
     async with await Database.open(path, migrations=MIGRATIONS[:4]) as old:
-        user = await old.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+        user = await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
 
         def fill(conn: sqlite3.Connection) -> list[int]:
             ids: list[int] = []
@@ -1047,7 +1048,7 @@ async def test_negative_search_count_is_rejected_by_the_table(db: Database) -> N
 async def test_version_6_database_gets_an_empty_searches_column(tmp_path: Path) -> None:
     path = tmp_path / DATABASE_FILENAME
     async with await Database.open(path, migrations=MIGRATIONS[:6]) as old:
-        user = await old.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+        user = await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
         await old.execute(
             "INSERT INTO usage (user_id, model, provider, provider_model, input_tokens,"
             " output_tokens, created_at) VALUES (?, 'main', 'openai', 'gpt-fake', 5, 6, 7)",
@@ -1096,7 +1097,7 @@ def drawn(path: str, description: str = "一只橘猫趴在窗台上") -> Genera
 async def test_version_10_usage_rows_survive_and_image_is_accepted(tmp_path: Path) -> None:
     path = tmp_path / DATABASE_FILENAME
     async with await Database.open(path, migrations=MIGRATIONS[:10]) as old:
-        user = await old.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+        user = await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
         await old.execute(
             "INSERT INTO usage (user_id, model, provider, provider_model, input_tokens,"
             " output_tokens, created_at, purpose, searches)"
@@ -1164,7 +1165,7 @@ async def test_generated_images_hang_on_the_reply_and_come_back_with_the_history
             conn,
             user_id=alice,
             message_id=reply_id,
-            images=[drawn("1/a.png"), drawn("1/b.png", "  第二张\n 换个姿势  ")],
+            images=[drawn("a.png"), drawn("b.png", "  第二张\n 换个姿势  ")],
             now=60,
         )
         return reply_id, records, journal.add_user_message(conn, alice, "再改改", "qq-2", 70)
@@ -1184,8 +1185,8 @@ async def test_generated_images_hang_on_the_reply_and_come_back_with_the_history
         " FROM attachments ORDER BY position"
     )
     assert [tuple(r) for r in rows] == [
-        (0, "stored", "done", 0, 60, PNG, 123, "1/a.png"),
-        (1, "stored", "done", 0, 60, PNG, 123, "1/b.png"),
+        (0, "stored", "done", 0, 60, PNG, 123, "a.png"),
+        (1, "stored", "done", 0, 60, PNG, 123, "b.png"),
     ]
 
     history = await db.transaction(journal.recent_history, alice, current, 5)
@@ -1199,7 +1200,7 @@ async def test_generated_images_hang_on_the_reply_and_come_back_with_the_history
     # 同一条回复上再记一张时接着往后排。
     more = await db.transaction(
         lambda conn: journal.add_generated_images(
-            conn, user_id=alice, message_id=reply_id, images=[drawn("1/c.png")], now=61
+            conn, user_id=alice, message_id=reply_id, images=[drawn("c.png")], now=61
         )
     )
     row = await db.fetch_one("SELECT position FROM attachments WHERE id = ?", (more[0].id,))
@@ -1214,7 +1215,7 @@ async def test_a_reply_with_only_drawn_images_still_shows_in_the_history(db: Dat
     def fill(conn: sqlite3.Connection) -> int:
         question = turn(conn, alice, "画只猫", "", delivery=ReplyDelivery.FAILED)
         journal.add_generated_images(
-            conn, user_id=alice, message_id=question + 1, images=[drawn("1/a.png")], now=0
+            conn, user_id=alice, message_id=question + 1, images=[drawn("a.png")], now=0
         )
         turn(conn, alice, "问2", "", delivery=ReplyDelivery.FAILED)  # 没画图的照旧不带
         return journal.add_user_message(conn, alice, "再改改", "qq-x", 0)
@@ -1237,7 +1238,7 @@ async def test_a_reply_whose_only_delivery_was_drawn_images_ends_the_turn(db: Da
     def fill(conn: sqlite3.Connection) -> int:
         question = turn(conn, alice, "画只猫", "", delivery=ReplyDelivery.IMAGES)
         journal.add_generated_images(
-            conn, user_id=alice, message_id=question + 1, images=[drawn("1/a.png")], now=0
+            conn, user_id=alice, message_id=question + 1, images=[drawn("a.png")], now=0
         )
         return journal.add_user_message(conn, alice, "把刚才那张改一下", "qq-x", 0)
 
@@ -1269,14 +1270,14 @@ async def test_generated_images_only_go_on_this_users_own_reply(db: Database) ->
                 journal.add_generated_images,
                 user_id=alice,
                 message_id=message_id,
-                images=[drawn("1/a.png")],
+                images=[drawn("a.png")],
                 now=0,
             )
     # 用户消息不行，即使是本人的。
     with pytest.raises(ValueError, match="助手回复"):
         await db.transaction(
             lambda conn: journal.add_generated_images(
-                conn, user_id=bob, message_id=bobs_question, images=[drawn("2/a.png")], now=0
+                conn, user_id=bob, message_id=bobs_question, images=[drawn("a.png")], now=0
             )
         )
     assert await db.fetch_all("SELECT id FROM attachments") == []
@@ -1289,7 +1290,7 @@ async def test_referable_image_is_only_this_users_stored_image(db: Database) -> 
     def fill(conn: sqlite3.Connection) -> tuple[int, int, int, int]:
         question = turn(conn, alice, "画", "好")
         (mine,) = journal.add_generated_images(
-            conn, user_id=alice, message_id=question + 1, images=[drawn("1/a.png")], now=0
+            conn, user_id=alice, message_id=question + 1, images=[drawn("a.png")], now=0
         )
         sent = journal.add_attachment(
             conn,
@@ -1302,7 +1303,7 @@ async def test_referable_image_is_only_this_users_stored_image(db: Database) -> 
                 status=AttachmentStatus.STORED,
                 mime_type=JPEG,
                 size=5,
-                path="1/sent.jpg",
+                path="sent.jpg",
                 filename=None,
                 text="[图片]",
             ),
@@ -1320,7 +1321,7 @@ async def test_referable_image_is_only_this_users_stored_image(db: Database) -> 
                 status=AttachmentStatus.STORED,
                 mime_type="application/pdf",
                 size=5,
-                path="1/a.pdf",
+                path="a.pdf",
                 filename="a.pdf",
                 text="[文件]",
             ),
@@ -1329,7 +1330,7 @@ async def test_referable_image_is_only_this_users_stored_image(db: Database) -> 
         )
         theirs_q = turn(conn, bob, "画", "好")
         (theirs,) = journal.add_generated_images(
-            conn, user_id=bob, message_id=theirs_q + 1, images=[drawn("2/a.png")], now=0
+            conn, user_id=bob, message_id=theirs_q + 1, images=[drawn("a.png")], now=0
         )
         return mine.id, sent.id, pdf.id, theirs.id
 
@@ -1337,7 +1338,7 @@ async def test_referable_image_is_only_this_users_stored_image(db: Database) -> 
 
     found = await db.transaction(journal.referable_image, alice, mine)
     assert found is not None
-    assert (found.generated, found.path) == (True, "1/a.png")
+    assert (found.generated, found.path) == (True, "a.png")
     user_sent = await db.transaction(journal.referable_image, alice, sent)
     assert user_sent is not None
     assert not user_sent.generated
@@ -1345,8 +1346,17 @@ async def test_referable_image_is_only_this_users_stored_image(db: Database) -> 
     assert await db.transaction(journal.referable_image, alice, theirs) is None
     # 过期之后也取不到。
     expired = await db.transaction(journal.expire_attachments, 1)
+    alices = await db.transaction(access.get_user, alice)
+    bobs = await db.transaction(access.get_user, bob)
+    assert alices is not None
+    assert bobs is not None
     assert sorted(expired) == sorted(
-        [(alice, "1/a.png"), (alice, "1/sent.jpg"), (alice, "1/a.pdf"), (bob, "2/a.png")]
+        [
+            (alices.media_dir, "a.png"),
+            (alices.media_dir, "sent.jpg"),
+            (alices.media_dir, "a.pdf"),
+            (bobs.media_dir, "a.png"),
+        ]
     )
     assert await db.transaction(journal.referable_image, alice, mine) is None
 
@@ -1435,7 +1445,7 @@ async def test_usage_summary_counts_images_apart_from_model_calls(db: Database) 
 async def test_version_11_usage_rows_survive_with_an_empty_cached_column(tmp_path: Path) -> None:
     path = tmp_path / DATABASE_FILENAME
     async with await Database.open(path, migrations=MIGRATIONS[:11]) as old:
-        user = await old.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+        user = await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
         await old.execute(
             "INSERT INTO usage (user_id, model, provider, provider_model, input_tokens,"
             " output_tokens, created_at, purpose, searches)"

@@ -51,6 +51,7 @@ def user(user_id: int, name: str) -> User:
         status=UserStatus.ACTIVE,
         welcomed_at=0,
         joined_at=0,
+        media_dir=f"{user_id:032x}",
     )
 
 

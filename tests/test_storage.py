@@ -9,6 +9,7 @@ import threading
 import time
 from collections.abc import AsyncIterator, Iterator
 from contextlib import closing, suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,21 @@ from qtalk_bot.storage import (
 )
 
 HANG_GUARD = 5  # 秒：并发相关的测试回归时应失败而不是挂起
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyUser:
+    id: int
+
+
+def legacy_user(conn: sqlite3.Connection, openid: str, name: str, now: int) -> LegacyUser:
+    """在第 16 版之前的库里建一个用户（那时 `users` 还没有 `media_dir`，`access.ensure_user()` 用不了）。"""
+    row = conn.execute(
+        "INSERT INTO users (openid, name, joined_at) VALUES (?, ?, ?) RETURNING id",
+        (openid, name, now),
+    ).fetchone()
+    return LegacyUser(row[0])
+
 
 CREATE_PARENTS = "CREATE TABLE parents (id INTEGER PRIMARY KEY, name TEXT NOT NULL);"
 CREATE_CHILDREN = """
@@ -747,3 +763,172 @@ async def test_backup_ignores_stale_wal_left_next_to_target(db: Database, tmp_pa
     with closing(sqlite3.connect(target)) as conn:
         names = [row[0] for row in conn.execute("SELECT name FROM parents")]
     assert names == ["fresh"]
+
+
+# ---- 第 16 版：用户的附件目录改用随机名 ----
+
+
+async def _v15_database(path: Path, attachment_paths: dict[int, list[str]]) -> None:
+    """第 15 版的库：用户 1、2、3（3 没有任何数据），每个用户按 `attachment_paths` 挂附件，另有一张已过期的附件、
+    话题与档案，好检查引用 users 的各张表。"""
+    from qtalk_bot import journal, topics
+
+    async with await Database.open(path, migrations=MIGRATIONS[:15]) as old:
+        for openid, name in (("FAKE-OPENID-A", "小王"), ("FAKE-OPENID-B", "小李")):
+            await old.transaction(legacy_user, openid, name, 0)
+        await old.transaction(legacy_user, "FAKE-OPENID-C", "小张", 0)
+
+        def plant(conn: sqlite3.Connection) -> None:
+            for user_id, paths in attachment_paths.items():
+                message = journal.add_user_message(conn, user_id, "看图", f"qq-{user_id}", 0)
+                for position, stored in enumerate(paths):
+                    conn.execute(
+                        "INSERT INTO attachments (user_id, message_id, position, quoted, kind,"
+                        " status, path, text, created_at)"
+                        " VALUES (?, ?, ?, 0, 'image', 'stored', ?, '[图片]', 0)",
+                        (user_id, message, position, stored),
+                    )
+                conn.execute(
+                    "INSERT INTO attachments (user_id, message_id, position, quoted, kind, status,"
+                    " path, text, created_at) VALUES (?, ?, ?, 0, 'image', 'expired', NULL,"
+                    " '[图片]', 0)",
+                    (user_id, message, len(paths)),
+                )
+                topics.create_topic(conn, user_id, "看图", now=0, last_message_id=message)
+                conn.execute(
+                    "INSERT INTO profiles (user_id, content, version, updated_at)"
+                    " VALUES (?, '- 称呼：某某', 1, 0)",
+                    (user_id,),
+                )
+
+        await old.transaction(plant)
+
+
+def _schema(path: Path) -> dict[str, str]:
+    with sqlite3.connect(path) as conn:
+        rows: list[tuple[str, str | None]] = conn.execute(
+            "SELECT name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    conn.close()
+    return {name: sql or "" for name, sql in rows}
+
+
+async def test_version_16_gives_users_random_dirs_and_strips_attachment_prefixes(
+    db_path: Path,
+) -> None:
+    from qtalk_bot import access, media
+
+    await _v15_database(db_path, {1: ["1/a.png", "1/b.jpg"], 2: ["2/a.png"]})
+    before = _schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        users_before = conn.execute(
+            "SELECT id, openid, name, invite_id, status, disabled_notice_sent, welcomed_at,"
+            " joined_at FROM users ORDER BY id"
+        ).fetchall()
+    conn.close()
+
+    async with await Database.open(db_path) as db:
+        users = await db.transaction(access.list_users)
+        rows = await db.fetch_all(
+            "SELECT user_id, path, status FROM attachments ORDER BY user_id, position"
+        )
+        copied = await db.fetch_all(
+            "SELECT id, openid, name, invite_id, status, disabled_notice_sent, welcomed_at,"
+            " joined_at FROM users ORDER BY id"
+        )
+        assert await db.fetch_all("PRAGMA foreign_key_check") == []
+        relocations = await db.transaction(access.pending_relocations)
+        sequence = await db.fetch_one("SELECT seq FROM sqlite_sequence WHERE name = 'users'")
+        assert await db.fetch_one("SELECT 1 FROM sqlite_sequence WHERE name = 'users_new'") is None
+        # 引用 users 的外键照常生效。
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            await db.execute(
+                "INSERT INTO messages (user_id, role, content, created_at)"
+                " VALUES (99, 'user', '', 0)"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+            await db.execute(
+                "INSERT INTO users (openid, name, joined_at, media_dir) VALUES ('x', 'x', 0, ?)",
+                ("../" + "a" * 29,),
+            )
+
+    assert user_version(db_path) == len(MIGRATIONS) == 16
+    assert [tuple(row) for row in copied] == [tuple(row) for row in users_before]
+    dirs = [user.media_dir for user in users]
+    assert all(media.valid_media_dir(d) for d in dirs)
+    assert len(set(dirs)) == 3
+    assert [tuple(row) for row in rows] == [
+        (1, "a.png", "stored"),
+        (1, "b.jpg", "stored"),
+        (1, None, "expired"),
+        (2, "a.png", "stored"),
+        (2, None, "expired"),
+    ]
+    assert sequence is not None
+    assert sequence[0] == 3
+    after = _schema(db_path)
+    assert "AUTOINCREMENT" in after["users"]
+    assert "media_dir" in after["users"]
+    # 索引一个不少，没有多出 users_new 之类；只多了待搬的映射表，登记了迁移时的每个用户。
+    assert set(after) == set(before) | {"media_relocations"}
+    assert relocations == [(user.id, user.media_dir) for user in users]
+    for name, sql in before.items():
+        if name != "users":
+            assert after[name] == sql, name  # 别的表（含对 users 的外键）原样不动
+    assert "REFERENCES users" in after["messages"]
+
+
+async def test_version_16_ids_are_not_reused_after_deleting_the_largest(db_path: Path) -> None:
+    from qtalk_bot import access
+
+    await _v15_database(db_path, {1: ["1/a.png"]})
+
+    async with await Database.open(db_path) as db:
+        await db.execute("DELETE FROM users WHERE id = 3")  # 编号最大、没有任何数据的那个
+        newcomer = await db.transaction(access.ensure_user, "FAKE-OPENID-D", "小赵", 0)
+        again = await db.transaction(access.ensure_user, "FAKE-OPENID-D", "小赵", 0)
+        another = await db.transaction(access.ensure_user, "FAKE-OPENID-E", "小钱", 0)
+        relocations = await db.transaction(access.pending_relocations)
+
+    assert newcomer.id == 4
+    assert again == newcomer  # 已有的不再插入，也不消耗编号
+    assert another.id == 5
+    assert [user_id for user_id, _ in relocations] == [1, 2]  # 删掉的连带删除；新用户不进待搬的映射
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "2/a.png",  # 别的用户的前缀
+        "a.png",  # 没有前缀
+        "1/../2/a.png",
+        "1/sub/a.png",
+        "1/..",
+        "1/.partial-x",
+        "1/",
+        "11/a.png",
+        "1\\a.png",
+    ],
+)
+async def test_version_16_refuses_paths_outside_the_users_own_directory(
+    db_path: Path, bad: str
+) -> None:
+    await _v15_database(db_path, {1: ["1/ok.png", bad], 2: ["2/ok.png"]})
+    before = _schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        paths_before = conn.execute("SELECT id, path FROM attachments ORDER BY id").fetchall()
+    conn.close()
+
+    with pytest.raises(
+        StorageError, match=r"迁移到版本 16 失败.*附件 #2 的路径不是它所属用户目录下的文件名"
+    ):
+        await Database.open(db_path)
+
+    assert user_version(db_path) == 15
+    assert _schema(db_path) == before
+    with sqlite3.connect(db_path) as conn:
+        paths_after = conn.execute("SELECT id, path FROM attachments ORDER BY id").fetchall()
+    conn.close()
+    assert paths_after == paths_before
+    assert "users_new" not in table_names(db_path)
+    assert "media_relocations" not in table_names(db_path)

@@ -179,7 +179,7 @@ class Describer:
         if not self.accepts(record.kind, record.mime_type, record.size):
             await self._settle(user, record, DescribeStatus.FAILED)
             return
-        data = await asyncio.to_thread(self._store.read, user.id, record.path)
+        data = await asyncio.to_thread(self._store.read, user.media_dir, record.path)
         if data is None or record.mime_type is None:
             await self._settle(user, record, DescribeStatus.FAILED)
             return

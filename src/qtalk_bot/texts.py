@@ -286,8 +286,8 @@ STATUS_ADMIN = "管理员"
 STATUS_NO_ACCESS = "无权限"
 
 
-def user_line(*, user_id: int, name: str, status: str, joined: str) -> str:
-    return f"#{user_id} {name}：{status}，{joined} 加入"
+def user_line(*, user_id: int, name: str, status: str, joined: str, media_dir: str) -> str:
+    return f"#{user_id} {name}：{status}，{joined} 加入，附件目录 {media_dir}"
 
 
 def user_list(lines: list[str]) -> str:
@@ -300,14 +300,27 @@ class UserRow:
     name: str
     status: str
     joined: str
+    media_dir: str
+    """附件目录名（`attachments/` 下的随机名），排查时由目录找到用户用。不是秘密。"""
 
 
 def users_message(rows: Sequence[UserRow]) -> Rich:
     markdown = "**用户**\n\n" + "\n".join(
-        f"- `#{r.user_id}` {escape_markdown(r.name)}：{r.status}，{r.joined} 加入" for r in rows
+        f"- `#{r.user_id}` {escape_markdown(r.name)}：{r.status}，{r.joined} 加入，"
+        f"附件目录 `{r.media_dir}`"
+        for r in rows
     )
     plain = user_list(
-        [user_line(user_id=r.user_id, name=r.name, status=r.status, joined=r.joined) for r in rows]
+        [
+            user_line(
+                user_id=r.user_id,
+                name=r.name,
+                status=r.status,
+                joined=r.joined,
+                media_dir=r.media_dir,
+            )
+            for r in rows
+        ]
     )
     return Rich(markdown, plain)
 

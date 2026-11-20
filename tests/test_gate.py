@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from qtalk_bot import access, commands, journal, texts
+from qtalk_bot import access, commands, journal, media, texts
 from qtalk_bot.access import EVENT_RETENTION_SECONDS, Invite, User, UserStatus
 from qtalk_bot.config import InviteSettings
 from qtalk_bot.gate import (
@@ -84,7 +84,13 @@ class Harness:
         self.links = Links()
         self.delivery = Delivery.SENT
         self._codes = itertools.count(1)
+        self.asked: list[str] = []  # Gate 问过是否已被占用的目录名
+        self.taken: set[str] | None = set()  # 是 None 时一律「已被占用」
         self.gate = self.build_gate()
+
+    def _dir_taken(self, media_dir: str) -> bool:
+        self.asked.append(media_dir)
+        return self.taken is None or media_dir in self.taken
 
     def build_gate(self, invites: InviteSettings | None = None) -> Gate:
         return Gate(
@@ -96,6 +102,7 @@ class Harness:
             bot_name=BOT_NAME,
             clock=self.clock,
             new_code=lambda: code_for(next(self._codes)),
+            dir_taken=self._dir_taken,
         )
 
     async def message(self, openid: str, content: str, message_id: str | None = None) -> Outcome:
@@ -1105,12 +1112,16 @@ async def test_users_lists_everyone_with_status_and_join_time(h: Harness) -> Non
     await h.friend_add(BOB, await h.invite("小李"))
     await h.admin("/disable 3")
     reply = await h.admin_reply("/users")
+    users = await h.db.transaction(access.list_users)
+    dirs = [user.media_dir for user in users]
+    assert all(media.valid_media_dir(d) for d in dirs)
+    assert len(set(dirs)) == 3
     assert reply.markdown
     assert reply.text == (
         "**用户**\n\n"
-        "- `#1` 管理员：管理员，2027-01-15 16:00 加入\n"
-        "- `#2` 小王：正常，2027-01-15 16:00 加入\n"
-        "- `#3` 小李：已停用，2027-01-15 17:00 加入"
+        f"- `#1` 管理员：管理员，2027-01-15 16:00 加入，附件目录 `{dirs[0]}`\n"
+        f"- `#2` 小王：正常，2027-01-15 16:00 加入，附件目录 `{dirs[1]}`\n"
+        f"- `#3` 小李：已停用，2027-01-15 17:00 加入，附件目录 `{dirs[2]}`"
     )
     assert reply.fallbacks == (
         texts.user_list(
@@ -1120,16 +1131,28 @@ async def test_users_lists_everyone_with_status_and_join_time(h: Harness) -> Non
                     name=texts.ADMIN_NAME,
                     status=texts.STATUS_ADMIN,
                     joined="2027-01-15 16:00",
+                    media_dir=dirs[0],
                 ),
                 texts.user_line(
-                    user_id=2, name="小王", status=texts.STATUS_ACTIVE, joined="2027-01-15 16:00"
+                    user_id=2,
+                    name="小王",
+                    status=texts.STATUS_ACTIVE,
+                    joined="2027-01-15 16:00",
+                    media_dir=dirs[1],
                 ),
                 texts.user_line(
-                    user_id=3, name="小李", status=texts.STATUS_DISABLED, joined="2027-01-15 17:00"
+                    user_id=3,
+                    name="小李",
+                    status=texts.STATUS_DISABLED,
+                    joined="2027-01-15 17:00",
+                    media_dir=dirs[2],
                 ),
             ]
         ),
     )
+    for secret in (ADMIN, ALICE, BOB):
+        assert secret not in reply.text
+        assert all(secret not in text for text in reply.fallbacks)
 
 
 async def test_short_prompts_stay_plain_text(h: Harness) -> None:
@@ -1196,6 +1219,87 @@ async def test_former_admin_redeeming_through_link_reuses_the_row(h: Harness) ->
     user = await successor.user(ADMIN)
     assert user is not None
     assert user.id == old_admin.id
+
+
+# ---- 用户附件目录改用随机名：新用户的目录名 ----
+
+
+async def test_new_users_get_distinct_random_directories_that_are_not_taken(
+    h: Harness,
+) -> None:
+    await h.gate.prepare()
+    await h.gate.prepare()
+    await h.admin("/users")  # 管理员每条消息都会确保有一行，不算新用户
+    await h.friend_add(ALICE, await h.invite("小王"))
+    await h.message(ALICE, "你好")
+    await h.friend_add(ALICE, await h.invite("又一个"))  # 已经授权的人不会再建行
+    await h.message(BOB, await h.invite("小李"))
+    await h.message("FAKE-OPENID-CAROL", "我没有邀请")
+
+    users = await h.db.transaction(access.list_users)
+    assert [u.openid for u in users] == [ADMIN, ALICE, BOB]
+    dirs = [u.media_dir for u in users]
+    assert all(media.valid_media_dir(d) for d in dirs)
+    assert len(set(dirs)) == len(dirs)
+    assert h.asked == dirs  # 每个新用户问一次，已有的用户不问
+
+
+async def test_taken_directory_names_are_skipped(h: Harness) -> None:
+    class FirstTwoTaken:
+        def __init__(self) -> None:
+            self.asked: list[str] = []
+
+        def __call__(self, media_dir: str) -> bool:
+            self.asked.append(media_dir)
+            return len(self.asked) <= 2  # 已经存在，或无权访问（同样按已存在处理）
+
+    taken = FirstTwoTaken()
+    code = await h.invite("小王")
+    h.gate = Gate(
+        h.db,
+        admin_openid=ADMIN,
+        timezone=SHANGHAI,
+        invites=InviteSettings(),
+        share_link=h.links,
+        bot_name=BOT_NAME,
+        clock=h.clock,
+        dir_taken=taken,
+    )
+
+    assert reply_text(await h.friend_add(ALICE, code)) == texts.welcome("小王")
+
+    user = await h.user(ALICE)
+    assert user is not None
+    assert len(taken.asked) == 3
+    assert user.media_dir == taken.asked[2]
+    assert user.media_dir not in taken.asked[:2]
+
+
+async def test_no_user_is_created_when_every_name_is_taken(h: Harness) -> None:
+    code = await h.invite("小王")
+    h.taken = None  # 例如附件根目录无权访问：一律按已存在处理
+
+    with pytest.raises(access.MediaDirUnavailableError, match="没能取到未被占用的附件目录名"):
+        await h.friend_add(ALICE, code)
+
+    assert await h.user(ALICE) is None
+    assert (await h.invite_row(code)).used_count == 0  # 整个事务回滚
+    assert len(h.asked) == 1 + access.MEDIA_DIR_ATTEMPTS  # 管理员一次，小王试满次数
+    assert len(set(h.asked)) == len(h.asked)
+
+
+async def test_former_admin_redeeming_keeps_the_directory(h: Harness) -> None:
+    old_admin = await h.gate.prepare()
+    successor = Harness(h.db, admin_openid=NEW_ADMIN)
+    code = await successor.invite("老张")
+    successor.asked.clear()  # 新管理员自己的那一行
+
+    await successor.friend_add(ADMIN, code)
+
+    user = await successor.user(ADMIN)
+    assert user is not None
+    assert user.media_dir == old_admin.media_dir  # 同一行，目录照旧
+    assert successor.asked == []
 
 
 # ---- 评审修正：时间在事务里取 ----

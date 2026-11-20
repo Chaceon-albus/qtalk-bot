@@ -6,8 +6,9 @@ from pathlib import Path
 
 import pytest
 from tests.test_conversation import ALICE, BOB, START, invited
+from tests.test_storage import legacy_user
 
-from qtalk_bot import access, profiles
+from qtalk_bot import profiles
 from qtalk_bot.profiles import PROFILE_LIMIT, Profile, ProfileTooLongError, clean_profile
 from qtalk_bot.storage import DATABASE_FILENAME, MIGRATIONS, Database
 
@@ -126,7 +127,7 @@ def test_repr_has_no_content() -> None:
 async def test_version_12_database_gains_an_empty_profiles_table(tmp_path: Path) -> None:
     path = tmp_path / DATABASE_FILENAME
     async with await Database.open(path, migrations=MIGRATIONS[:12]) as old:
-        user = await old.transaction(access.ensure_user, ALICE, "小王", 0)
+        user = await old.transaction(legacy_user, ALICE, "小王", 0)
         with pytest.raises(sqlite3.OperationalError):
             await old.fetch_all("SELECT * FROM profiles")
 

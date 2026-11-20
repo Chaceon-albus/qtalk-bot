@@ -10,6 +10,9 @@
 改动（兑换、拒绝记录、命令）在同一个事务里提交；已经记过的直接丢弃，不回复、不重复执行。代价是
 「至多一次」：事务提交后、回复发出前进程退出，这次回复就丢了，但不会重复。
 
+新用户：兑换邀请、首次见到管理员时在事务里建用户，目录名由 `access.new_media_dir()` 生成；`dir_taken`（接线层注入，
+见 `media.MediaStore.dir_taken()`）说附件根目录下已经有这个名字时换一个，不删除任何东西。
+
 回复之后的收尾：有的回复要按发送结果再改一次数据库，由接线层发完后调用 `Gate.settle()`。
 一个结果可以是按顺序发出的几条回复（`Reply.then`），每条各自收尾。
 欢迎语确认发出后才记下「已告知」；「只回一次」的拒绝语与停用说明在事务里先占位（并发时仍只回
@@ -27,7 +30,7 @@ from enum import Enum
 from zoneinfo import ZoneInfo
 
 from . import access, commands, texts
-from .access import Invite, InviteState, User, UserStatus
+from .access import DirTaken, Invite, InviteState, User, UserStatus
 from .commands import CommandContext
 from .config import InviteSettings
 from .storage import Database
@@ -191,8 +194,10 @@ class Gate:
         bot_name: str = texts.DEFAULT_BOT_NAME,
         clock: Callable[[], int] = _now,
         new_code: Callable[[], str] = _new_code,
+        dir_taken: DirTaken | None = None,
     ) -> None:
         self._db = db
+        self._dir_taken = dir_taken
         self._admin_openid = admin_openid
         self._timezone = timezone
         if _EMBEDDED_CODE.search(bot_name):
@@ -210,7 +215,13 @@ class Gate:
         """确保现任管理员在用户表里有一行（启动时调用一次），返回它。"""
 
         def ensure(conn: sqlite3.Connection) -> User:
-            return access.ensure_user(conn, self._admin_openid, texts.ADMIN_NAME, self._clock())
+            return access.ensure_user(
+                conn,
+                self._admin_openid,
+                texts.ADMIN_NAME,
+                self._clock(),
+                dir_taken=self._dir_taken,
+            )
 
         return await self._db.transaction(ensure)
 
@@ -290,7 +301,9 @@ class Gate:
     def _admin_message(
         self, conn: sqlite3.Connection, message: IncomingMessage, now: int
     ) -> _Decision:
-        admin = access.ensure_user(conn, self._admin_openid, texts.ADMIN_NAME, now)
+        admin = access.ensure_user(
+            conn, self._admin_openid, texts.ADMIN_NAME, now, dir_taken=self._dir_taken
+        )
         command = commands.parse_command(message.content)
         if command is None:
             code = normalize_invite_code(message.content)
@@ -308,7 +321,7 @@ class Gate:
     def _redeem(
         self, conn: sqlite3.Connection, code: str, openid: str, now: int, *, via: str
     ) -> _Decision:
-        match access.redeem_invite(conn, code, openid, now):
+        match access.redeem_invite(conn, code, openid, now, dir_taken=self._dir_taken):
             case User() as user:
                 return self._welcome(user, f"经{via}兑换了邀请")
             case InviteState() as state:

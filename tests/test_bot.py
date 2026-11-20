@@ -1401,7 +1401,8 @@ async def test_image_message_is_downloaded_shown_to_the_model_and_recorded(
     )
     assert row is not None
     assert tuple(row)[:4] == (alice.id, "image", "stored", "image/png")
-    assert str(row["path"]).startswith(f"{alice.id}/")
+    assert "/" not in str(row["path"])  # 附件表只存文件名
+    assert MediaStore.under(tmp_path).read(alice.media_dir, str(row["path"])) is not None
     assert row["filename"] == "我的秘密照片.png"
     logs = formatted_logs(caplog)
     assert "SECRETTOKEN" not in logs
@@ -2276,7 +2277,7 @@ async def test_stuck_response_close_does_not_hold_the_download_slot(
 
     async with asyncio.timeout(HANG_GUARD):
         (result,) = await fetcher.acquire(
-            1, [item], wanted=frozenset({AttachmentKind.IMAGE}), label="#1"
+            "1" * 32, [item], wanted=frozenset({AttachmentKind.IMAGE}), label="#1"
         )
         assert result.status.value == "failed"  # 超时照常生效
         assert fetcher.busy == 0  # 槽位还了，没被卡住的关闭挡住

@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
+from tests.test_storage import legacy_user
 
 from qtalk_bot import access, journal, topics
 from qtalk_bot.journal import Ending, HistoryEntry, ReplyDelivery
@@ -76,7 +77,7 @@ async def test_version_8_database_gets_topic_tables_and_an_empty_ref_column(
 ) -> None:
     path = tmp_path / DATABASE_FILENAME
     async with await Database.open(path, migrations=MIGRATIONS[:8]) as old:
-        user = await old.transaction(access.ensure_user, ALICE, "小王", 0)
+        user = await old.transaction(legacy_user, ALICE, "小王", 0)
         await old.transaction(journal.add_user_message, user.id, "旧消息", "qq-1", 0)
 
     async with await Database.open(path) as db:

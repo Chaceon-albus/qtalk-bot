@@ -20,6 +20,7 @@ from tests.test_conversation import (
     invited,
     text_of,
 )
+from tests.test_storage import legacy_user
 
 from qtalk_bot import access, journal, memory, topics
 from qtalk_bot.access import User, UserStatus
@@ -538,7 +539,7 @@ async def test_shutdown_cancels_the_work_keeps_the_usage_and_leaves_no_task(
 async def test_version_9_usage_rows_survive_and_memory_is_accepted(tmp_path: Path) -> None:
     path = tmp_path / DATABASE_FILENAME
     async with await Database.open(path, migrations=MIGRATIONS[:9]) as old:
-        user = await old.transaction(access.ensure_user, ALICE, "小王", 0)
+        user = await old.transaction(legacy_user, ALICE, "小王", 0)
         await old.execute(
             "INSERT INTO usage (user_id, model, provider, provider_model, input_tokens,"
             " output_tokens, created_at, purpose, searches)"

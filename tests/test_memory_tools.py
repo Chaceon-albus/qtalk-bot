@@ -39,6 +39,7 @@ from tests.test_conversation_images import (
 from tests.test_conversation_profile import Writer
 from tests.test_conversation_topics import Picker, say, topic_answer
 from tests.test_memory import add_turn
+from tests.test_storage import legacy_user
 
 from qtalk_bot import access, describe, journal, profiles, texts, topics
 from qtalk_bot import conversation as conversation_module
@@ -508,8 +509,8 @@ def button_data(channel: FakeChannel) -> tuple[str, str]:
 
 
 async def attach_image(db: Database, store: MediaStore, user: User, topic_id: int) -> str:
-    """给话题里的那条回复挂一张真的图片文件，返回它的相对路径。"""
-    path = await asyncio.to_thread(store.save, user.id, b"\xff\xd8\xff\xe0jpeg", JPEG)
+    """给话题里的那条回复挂一张真的图片文件，返回它的文件名。"""
+    path = await asyncio.to_thread(store.save, user.media_dir, b"\xff\xd8\xff\xe0jpeg", JPEG)
 
     def write(conn: sqlite3.Connection) -> None:
         (reply,) = conn.execute(
@@ -638,6 +639,7 @@ async def test_confirming_by_button_erases_the_topic_and_the_request_turn(
     first, second = await two_topics(chat, db, alice)
     bobs = await two_topics(chat, db, bob)
     path = await attach_image(db, store, alice, first)
+    assert (store.user_dir(alice.media_dir) / path).is_file()
 
     # 话题乙已经有摘要；提出要求的那一轮归到乙（复述里有甲的标题）。
     def summarize(conn: sqlite3.Connection) -> None:
@@ -670,7 +672,7 @@ async def test_confirming_by_button_erases_the_topic_and_the_request_turn(
     assert await contents(db, alice) == ["小王的乙话题", "好"]
     assert await topic_ids(db, alice) == [second]
     assert await db.fetch_all("SELECT * FROM attachments") == []
-    assert not (store.root / path).exists()
+    assert not (store.user_dir(alice.media_dir) / path).exists()
     remaining = await db.transaction(topics.get_topic, alice.id, second)
     assert remaining is not None
     assert (remaining.title, remaining.summary, remaining.summarized_through) == (None, None, None)
@@ -1166,7 +1168,7 @@ async def test_erase_topic_takes_replies_in_other_topics_with_their_files(db: Da
             conn,
             user_id=alice.id,
             message_id=reply,
-            images=[DrawnImage(path=f"{alice.id}/a.jpg", mime_type=JPEG, size=1, description="")],
+            images=[DrawnImage(path="a.jpg", mime_type=JPEG, size=1, description="")],
             now=START,
         )
         doomed = topics.create_topic(conn, alice.id, "甲", now=START, last_message_id=reply)
@@ -1184,7 +1186,7 @@ async def test_erase_topic_takes_replies_in_other_topics_with_their_files(db: Da
 
     assert erased is not None
     assert (erased.user_messages, erased.replies, erased.attachments) == (1, 1, 1)
-    assert erased.paths == (f"{alice.id}/a.jpg",)
+    assert erased.paths == ("a.jpg",)
     assert await db.fetch_all("SELECT * FROM messages") == []
     # 「乙」只有那条随之删掉的回复，变空了，一并删掉（它的临时标题可能取自被删的消息）。
     assert kept not in [t.id for t in await db.transaction(topics.recent_topics, alice.id, 5)]
@@ -1239,7 +1241,7 @@ async def test_describe_usage_survives_a_deleted_message(db: Database) -> None:
             conn,
             user_id=alice.id,
             message_id=reply,
-            images=[DrawnImage(path=f"{alice.id}/a.jpg", mime_type=JPEG, size=1, description="")],
+            images=[DrawnImage(path="a.jpg", mime_type=JPEG, size=1, description="")],
             now=START,
         )
         conn.execute("DELETE FROM messages WHERE id = ?", (question,))
@@ -1472,7 +1474,7 @@ async def test_ids_are_not_reused_after_deleting_the_largest(db: Database) -> No
             conn,
             user_id=alice.id,
             message_id=reply,
-            images=[DrawnImage(path=f"{alice.id}/a.jpg", mime_type=JPEG, size=1, description="")],
+            images=[DrawnImage(path="a.jpg", mime_type=JPEG, size=1, description="")],
             now=START,
         )
         topic = topics.create_topic(conn, alice.id, "甲", now=START, last_message_id=reply)
@@ -1483,7 +1485,7 @@ async def test_ids_are_not_reused_after_deleting_the_largest(db: Database) -> No
             conn,
             user_id=alice.id,
             message_id=reply2,
-            images=[DrawnImage(path=f"{alice.id}/b.jpg", mime_type=JPEG, size=1, description="")],
+            images=[DrawnImage(path="b.jpg", mime_type=JPEG, size=1, description="")],
             now=START,
         )
         topic2 = topics.create_topic(conn, alice.id, "乙", now=START, last_message_id=reply2)
@@ -1498,7 +1500,7 @@ async def test_ids_are_not_reused_after_deleting_the_largest(db: Database) -> No
 async def test_version_13_database_keeps_data_ids_and_foreign_keys(tmp_path: Path) -> None:
     path = tmp_path / DATABASE_FILENAME
     async with await Database.open(path, migrations=MIGRATIONS[:13]) as old:
-        user = await old.transaction(access.ensure_user, ALICE, "小王", 0)
+        user = await old.transaction(legacy_user, ALICE, "小王", 0)
 
         def plant(conn: sqlite3.Connection) -> tuple[int, int, int, int]:
             message, reply = _plain_turn(conn, user.id, "问")
@@ -1536,6 +1538,8 @@ async def test_version_13_database_keeps_data_ids_and_foreign_keys(tmp_path: Pat
             for table in ("messages", "attachments", "topics")
         }
 
+    # 第 16 版把附件的路径改成只有文件名（目录由用户的 media_dir 决定），其余不变。
+    before["attachments"] = [(*row[:9], "a.jpg", *row[10:]) for row in before["attachments"]]
     async with await Database.open(path) as db:
         for table, rows in before.items():
             after = await db.fetch_all(f"SELECT * FROM {table} ORDER BY id")  # noqa: S608  表名是常量
@@ -1680,7 +1684,7 @@ async def test_profiles_from_the_committed_version_13_upgrade(tmp_path: Path) ->
     # 2e222bf 提交时的第 13 版（content != '' 的约束、没有版本号）：升级后已有档案的版本号从 1 起，空内容可以写。
     path = tmp_path / DATABASE_FILENAME
     async with await Database.open(path, migrations=MIGRATIONS[:13]) as old:
-        user = await old.transaction(access.ensure_user, ALICE, "小王", 0)
+        user = await old.transaction(legacy_user, ALICE, "小王", 0)
         await old.execute(
             "INSERT INTO profiles (user_id, content, updated_at) VALUES (?, ?, ?)",
             (user.id, "- 称呼：小王", 5),

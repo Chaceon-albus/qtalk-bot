@@ -378,7 +378,7 @@ class RequestBuilder:
         self,
         store: MediaStore | None,
         *,
-        user_id: int,
+        media_dir: str,
         persona: str,
         now: datetime,
         history: Sequence[HistoryEntry],
@@ -392,7 +392,7 @@ class RequestBuilder:
         drawing_possible: bool = True,
     ) -> None:
         self._store = store
-        self._user_id = user_id
+        self._media_dir = media_dir  # 这个用户的附件目录名
         self._persona = persona
         self._now = now
         self._history = history
@@ -514,7 +514,7 @@ class RequestBuilder:
             for record, age in candidates:
                 if len(kept) == MAX_REFERABLE_IMAGES:
                     break
-                path = None if record.path is None else store.locate(self._user_id, record.path)
+                path = None if record.path is None else store.locate(self._media_dir, record.path)
                 if path is not None and path.is_file():
                     kept.append((record, age))
             return kept
@@ -537,7 +537,7 @@ class RequestBuilder:
         让调用方归还多模态名额，下一轮就开始读原件，内存里同时多出一份。读一个文件受大小约束，很快结束。"""
         assert self._store is not None
         reading = asyncio.ensure_future(
-            asyncio.to_thread(self._store.read, self._user_id, relative)
+            asyncio.to_thread(self._store.read, self._media_dir, relative)
         )
         try:
             return await asyncio.shield(reading)
