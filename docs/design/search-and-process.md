@@ -33,7 +33,7 @@ QQ 侧的限制（官方文档快照与 pyqbot 的实测）：
 
 - `[[models]].search`（默认 `false`）打开时，调用这个模型带上服务商内置的搜索：OpenAI 是 `{"type": "web_search", "user_location": {"type": "approximate"}}`（只写 `type`，免得服务商默认用户在美国），Gemini 是 `{"type": "google_search"}`。模型不支持或服务商拒绝时按普通的调用失败处理。写描述的模型不带搜索。
 - 新的流式事件（`llm`）：`SearchProgress(call_id, stage, queries)`，同一次搜索依次是开始、零到多次更新（Gemini 在搜索过程中给出查询词）、完成（OpenAI 只在这时给出查询词）；`Citation(url, title)`，同一次调用里同一个来源只给一次。7b 用它们展示「正在搜索：……」。
-- 搜索次数：OpenAI 按 `action` 为 `search` 的调用数（`open_page`、`find_in_page` 不算，失败的照样算）；Gemini 按这次调用里（含自动续写的各跳）不重复的非空查询词数。每执行一次就交出一个新的累计 `Usage`，被打断时次数不丢。用量表的 `searches` 列（迁移 V7）：带了搜索工具的调用记整数，没带的记空；`/usage` 显示今天和累计的搜索次数。
+- 搜索次数：OpenAI 按 `action` 为 `search` 的调用数（`open_page`、`find_in_page` 不算，失败的照样算）；Gemini 按这次调用里（含自动续写的各跳）不重复的非空查询词数。每执行一次就交出一个新的累计 `Usage`，被打断时次数不丢。用量表的 `searches` 列（迁移 V7）：带了搜索工具的调用记整数，没带的记空；`/usage` 显示本月和累计的搜索次数（第七次实测后由「今天」改为「本月」，见[「接入与授权」](access.md)）。
 - 「来源」（`citations.py`）：回答有正文时，在正文之后、中断说明之前追加，最多 5 条，按规整后的链接去重。每条是 Markdown 链接：链接只接受 `http(s)://主机`、不带用户信息、主机是 ASCII 且不是 IPv6 字面量、不超过 500 字符，主机之后的括号、引号等特殊字符与非 ASCII 字符做百分号编码；标题压成一行、超过 60 字截断、没有标题时用主机名，再经 `escape_markdown()` 转义。它算进用户实际看到的内容；改发纯文本时写成「标题 链接」。
 - Gemini 的「搜索建议」（一段 HTML）忽略，不发给用户；这与它的条款不符，用户知情并决定照常打开。
 - 日志不记查询词与引用的链接，只记次数。

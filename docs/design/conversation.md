@@ -81,7 +81,9 @@ Markdown 的处理：把形如链接、目标却不是 http(s) 地址的那对�
 | `withheld` | 换备用模型前发现用户已不能使用，就此停止 |
 | `cancelled` | 处理被取消（关停） |
 
-用量：每次模型调用记一条，含用户、模型的内部名字、当时的服务商与实际的模型名、输入与输出的 token 数。服务商没有返回时记空，不估算；失败的调用也记一条。`/usage` 按用户列出今天和累计的次数与 token 数。
+用量：每次模型调用记一条，含用户、模型的内部名字、当时的服务商与实际的模型名、输入与输出的 token 数。服务商没有返回时记空，不估算；失败的调用也记一条。`/usage` 的显示见[「接入与授权」的管理员命令](access.md)。
+
+缓存命中的输入 token（迁移 V12 的 `cached_input_tokens` 列，含在输入 token 里）：OpenAI 取 `usage.input_tokens_details.cached_tokens`，Gemini 取 `usage.total_cached_tokens`（SDK 说明它是提示里被缓存的部分），两家 Decisions 与出图有就取；多跳时逐跳累加。一跳的缓存数超过这一跳的输入、或这一跳没报告输入时，这一跳的缓存数当作没报告。旧行为空。
 
 配置（完整的写法见 `config.example.toml`）：
 
