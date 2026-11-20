@@ -106,7 +106,7 @@ QUEUED = "收到，等上一个问题答完就看这条。"
 PROCESS_SEARCHING = "正在搜索🔍"
 """一次搜索那一行的开头；得知查询词后接一个空格和查询词，多个查询词之间用「、」。"""
 
-PROCESS_DRAWING = "正在画图🎨"
+PROCESS_DRAWING = "正在绘制🎨"
 """程序执行一次画图函数时过程消息里的一行。"""
 
 PROCESS_MORE = "……"

@@ -289,7 +289,7 @@ def test_each_drawing_gets_its_own_line_and_only_a_mark_in_the_transcript() -> N
     assert not notes.add(comment("m#0", "先构思一下"))  # 第一句还没结束
     assert notes.add(Drawing("d1"))  # 前一段说明因此定了下来
     assert notes.add(Drawing("d2"))
-    assert notes.take() == [Piece("先构思一下"), Piece("正在画图🎨"), Piece("正在画图🎨")]
+    assert notes.take() == [Piece("先构思一下"), Piece("正在绘制🎨"), Piece("正在绘制🎨")]
     assert not notes.add(Drawing("d3"), display=False)
     assert notes.take() == []
     assert notes.transcript() == "[说明] 先构思一下\n\n[画图]\n\n[画图]\n\n[画图]"

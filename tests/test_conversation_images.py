@@ -434,7 +434,7 @@ async def test_a_full_drawing_turn(db: Database, tmp_path: Path) -> None:
     assert request.tool_runner is not None
     assert NO_REFERABLE in request.system  # 还没有能引用的图
     assert generator.calls == [("一只橘猫趴在窗台上", Aspect.SQUARE, ())]
-    # 过程消息里有一行「正在画图🎨」，图在回答之前发出。
+    # 过程消息里有一行「正在绘制🎨」，图在回答之前发出。
     assert texts.PROCESS_DRAWING in channel.process_text
     assert channel.images == [picture(1)]
     kinds = channel.kinds
