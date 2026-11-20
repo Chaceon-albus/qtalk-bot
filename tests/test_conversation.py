@@ -3479,7 +3479,7 @@ async def test_messages_after_the_answer_began_showing_are_the_next_turn(db: Dat
         Message.text(Role.ASSISTANT, "答"),
         Message.text(Role.USER, "二\n三"),
     )
-    assert channels[1].log == []
+    assert channels[1].log == [("send", texts.QUEUED)]  # 排到下一轮：回一句收到
     assert channels[2].streamed == "答"
     user_ids = [r["id"] for r in await db.fetch_all("SELECT id FROM messages WHERE role = 'user'")]
     assert [target for _, target in await reply_targets(db)] == [user_ids[0], user_ids[2]]
@@ -4027,7 +4027,11 @@ async def test_new_question_is_answered_after_the_current_turn(db: Database) -> 
         ["讲讲二分查找", "明天天气怎么样"],
     ]
     assert first.kinds == ["typing", "stream", "finish"]
-    assert second.kinds == ["typing", "stream", "finish"]
+    # 排到下一轮：经新消息自己的通道回一句收到，在它自己那一轮的「正在输入」与回答之前。
+    assert second.kinds == ["send", "typing", "stream", "finish"]
+    assert second.sent == [texts.QUEUED]
+    assert second.budget.replies == 2  # 那句收到计进新消息自己的被动回复次数
+    assert texts.QUEUED not in [row.content for row in await rows(db)]
     ids = await user_ids(db)
     assert [target for _, target in await reply_targets(db)] == ids
     assert [row[5] for row in await decision_rows(db)] == ["new"]

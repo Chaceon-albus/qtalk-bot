@@ -1,7 +1,7 @@
 """何时开始一轮回答，以及回答进行中用户插话（steer）时怎么办。
 
-不依赖 pyqbot 与 SDK：收消息、回答一轮、判断插话、询问附件都经 `Responder`（就是 `conversation.Conversation`），
-时钟与等待可以注入，测试里不必真的等。
+不依赖 pyqbot 与 SDK：收消息、回答一轮、判断插话、询问附件、回一句收到都经 `Responder`（就是
+`conversation.Conversation`），时钟与等待可以注入，测试里不必真的等。
 
 **每条消息**到达时立刻交给 `Responder.receive()`：复查授权、下载附件、写进流水。进程意外退出时消息也已经在
 流水里，重启后是待回复的消息，用户发下一条时一并回答。复查授权没通过（没写进流水）的消息不参加下面的任何
@@ -38,6 +38,12 @@
 - 判断有了结论、但没有重来（新问题、装不下、停下或停不下）之后，这一轮剩下的时间里再来的消息都排到下一轮，
   不再判断；已达到重来上限时同样不再判断。判断期间又来的消息不另判，跟着这次的结论走（重来就一起带上）。
 - 单独的图片或文件不触发判断；重来时一并带上，否则留到下一轮按上面「空闲时」的规则等文字。
+- **排到下一轮时回一句收到**（`Responder.acknowledge()`，`texts.QUEUED`）：文字或语音真的排到了下一轮（判为
+  新问题；显示中判断失败、没有配置或停不下；装不下；已经不再判断时到达的，含 `max_restarts` 为 0），就在后台经
+  这条消息自己的通道立刻回一句，不调用模型、不进流水。每轮只回一次（重来之后接着算）：这一轮里第一条排队的
+  回，之后的不回。带上它重来的、停下了正在显示的回答的不回（过程消息或回答末尾已有说明；停下之后再来的也不回，
+  它们紧接着就开轮）；判断还没有结论时不回；判断期间这一轮先结束了的不回（新消息立刻自己开轮）。单独的图片或文件不触发。
+  下一轮开始之前先等这句发完（最多 `GRACE_SECONDS`），免得它排在那一轮的「正在输入」、过程与回答之后。
 
 只显示了过程消息（`process.py`）不算回答已开始显示，照常可以重来；重来时把上一次的 `TurnControl` 交给新的
 （`previous`），被重来的过程消息由最后答完的那一次处理，上次实际发出「正在输入」的时刻（`TurnControl.typed_at`）
@@ -46,9 +52,9 @@
 
 同一个用户的这些事在一个任务里依次处理，不同用户的互不影响。
 
-**关停**：`stop()` 取消所有用户的任务：等待中的附件、防抖的计时、正在进行的插话判断直接放弃（消息已在流水
-里，重启后是待回复的消息），正在回答的轮次被取消（对话自己收尾记账）。判断与回答同时被取消，再各自收尾；
-`drain()` 等这些任务都结束，不留下没人管的任务。
+**关停**：`stop()` 取消所有用户的任务：等待中的附件、防抖的计时、正在进行的插话判断、还没发完的那句收到直接
+放弃（消息已在流水里，重启后是待回复的消息），正在回答的轮次被取消（对话自己收尾记账）。判断与回答同时被取消，
+再各自收尾；`drain()` 等这些任务都结束，不留下没人管的任务。
 """
 
 import asyncio
@@ -60,7 +66,7 @@ from typing import Protocol
 
 from .access import User
 from .config import AttachmentTimeoutAction, TurnSettings
-from .conversation import ChatInput, Received, ReplyChannel, TurnControl
+from .conversation import GRACE_SECONDS, ChatInput, Received, ReplyChannel, TurnControl
 from .journal import ROWS_PER_TURN
 from .media import SUPPORTED_KINDS, AttachmentKind
 from .routing import Steer
@@ -152,7 +158,10 @@ def next_step(
 
 
 class Responder(Protocol):
-    """收消息、回答一轮、判断插话、询问附件，`conversation.Conversation` 符合它。"""
+    """收消息、回答一轮、判断插话、询问附件、给排到下一轮的消息回一句收到，`conversation.Conversation` 符合它。
+
+    `acknowledge()` 由这里在后台的任务里调用，可能与 `respond()`（正在回答的这一轮）同时进行；它自己复查授权、
+    检查被动回复的次数，发不出去只记日志。"""
 
     async def receive(
         self, user: User, message: ChatInput, channel: ReplyChannel
@@ -169,6 +178,8 @@ class Responder(Protocol):
     async def judge(self, user: User, answering: Sequence[int], latest: Sequence[int]) -> Steer: ...
 
     async def ask(self, user: User, messages: Sequence[int], channel: ReplyChannel) -> None: ...
+
+    async def acknowledge(self, user: User, message_id: int, channel: ReplyChannel) -> None: ...
 
 
 type Clock = Callable[[], float]
@@ -205,6 +216,10 @@ class _UserState:
     worker: asyncio.Task[None] | None = None
     wake: asyncio.Future[None] | None = None
     asked: bool = False  # 这一组等待中的附件已经做过超时动作
+    acknowledged: bool = False  # 当前这一轮已经给排队的消息回过收到（或停下了回答，不必再回）
+    acknowledging: asyncio.Task[None] | None = None  # 最近一次回收到的后台任务，下一轮开始前等它
+    # 回过收到的消息（流水里的编号）。一轮装不下、留到再下一轮的消息不再重复回；开轮时只留还在队列里的。
+    acknowledged_ids: set[int] = field(default_factory=set[int])
 
     def poke(self) -> None:
         if self.wake is not None and not self.wake.done():
@@ -229,6 +244,7 @@ class Batcher:
         self._sleep = sleep
         self._users: dict[int, _UserState] = {}
         self._workers: set[asyncio.Task[None]] = set()
+        self._acknowledgements: set[asyncio.Task[None]] = set()  # 后台回收到的任务
         self._closed = False
 
     async def submit(self, user: User, message: ChatInput, channel: ReplyChannel) -> None:
@@ -267,14 +283,15 @@ class Batcher:
             logger.info(
                 "关停：放弃 %d 个用户等待中的消息，它们已在流水里，重启后是待回复的消息", waiting
             )
-        for task in self._workers:
+        for task in (*self._workers, *self._acknowledgements):
             task.cancel()
 
     async def drain(self) -> None:
-        """关停时调用：`stop()`（已经停过就不再取消），然后等各用户的任务都结束（含被取消的轮次的收尾与记账）。"""
+        """关停时调用：`stop()`（已经停过就不再取消），然后等各用户的任务与回收到的任务都结束（含被取消的轮次的
+        收尾与记账）。"""
         self.stop()
-        while self._workers:
-            await asyncio.wait(set(self._workers))
+        while pending := self._workers | self._acknowledgements:
+            await asyncio.wait(pending)
 
     def _now(self) -> float:
         return asyncio.get_running_loop().time() if self._clock is None else self._clock()
@@ -323,6 +340,11 @@ class Batcher:
             if isinstance(step, Wait):
                 await self._until(state, step.until)
                 continue
+            if isinstance(step, Start) and state.acknowledging is not None:
+                # 先等上一轮回的那句收到发完（最多 `GRACE_SECONDS`），再按那时的队列重新选这一轮带上的消息：
+                # 等待期间到达的消息属于这一轮，不能被当成这一轮进行中的插话。
+                await self._after_acknowledgement(state)
+                continue
             if isinstance(step, Start):
                 # 只按通过了接收复查的消息开始：还在收的先等它们收完（没写进流水的会从队列里撤掉），再重新算。
                 # 否则一条刚被停用、没通过复查的文字也能把等待中的附件带着开轮。
@@ -370,6 +392,9 @@ class Batcher:
     async def _turn(self, state: _UserState, taken: list[_Arrival]) -> None:
         """回答一轮：等带上的消息都收完，交给 `Responder.respond()`；回答还没开始显示时插话判为补充，带上新消息
         重来。"""
+        state.acknowledged = False
+        waiting = {a.recorded.message_id for a in state.arrivals if a.recorded is not None}
+        state.acknowledged_ids &= waiting
         user = state.user
         restarts = 0
         control: TurnControl | None = None
@@ -428,18 +453,25 @@ class Batcher:
                     verdict = _verdict(judging, user)
                     judging = None
                     assert trigger is not None
+                    judged = trigger
                     needed = state.arrivals.index(trigger) + 1
                     trigger = None
                     room = _room(control)
                     if verdict is Steer.NEW:
                         logger.info("用户 %s 插话：判为新问题，当前这一轮答完后再答", user.label)
                         settled = True
+                        self._acknowledge(state, judged)
                     elif control.displayed:  # 显示中判断的，或判断期间回答开始显示了
                         settled = True
-                        self._cut(user, control, verdict)
+                        if self._cut(user, control, verdict):
+                            # 回答末尾已有说明，新消息紧接着自己开轮：它和之后再来的都不另回收到。
+                            state.acknowledged = True
+                        else:
+                            self._acknowledge(state, judged)
                     elif needed > room:
                         logger.info("用户 %s 插话：重来的请求装不下新消息，排到下一轮", user.label)
                         settled = True
+                        self._acknowledge(state, judged)
                     else:
                         preempted = control.preempt()
                         assert preempted  # 刚看过还没开始显示，其间没有让出事件循环
@@ -453,9 +485,12 @@ class Batcher:
                         del state.arrivals[:room]
                         return extra
                     continue
-                if (
+                if settled:
+                    # 不再判断：收完的文字或语音一定排到下一轮。
+                    if not state.acknowledged and (found := _trigger(state.arrivals)) is not None:
+                        self._acknowledge(state, found[1])
+                elif (
                     judging is None
-                    and not settled
                     and control.included is not None
                     and (found := _trigger(state.arrivals)) is not None
                 ):
@@ -466,6 +501,7 @@ class Batcher:
                             "用户 %s 插话：重来的请求装不下新消息，不判断，排到下一轮", user.label
                         )
                         settled = True
+                        self._acknowledge(state, trigger)
                         trigger = None
                     else:
                         latest = [
@@ -488,18 +524,86 @@ class Batcher:
             if judging is not None:
                 _verdict(judging, user)  # 取回结果，免得事件循环原样打印异常
 
-    def _cut(self, user: User, control: TurnControl, verdict: Steer) -> None:
+    def _cut(self, user: User, control: TurnControl, verdict: Steer) -> bool:
         """回答已经开始显示时插话的结论：判为补充就试着停下这段回答（`TurnControl.cut()`），新消息都留在等待中，
-        这一轮结束后作为下一轮；判断失败或没有配置时不停（显示到一半停下会丢掉一段好回答）。"""
+        这一轮结束后作为下一轮；判断失败或没有配置时不停（显示到一半停下会丢掉一段好回答）。返回是否停下了。"""
         if verdict is Steer.ASSUMED:
             logger.info(
                 "用户 %s 插话：判断失败或没有配置，回答已经开始显示，不停下，新消息排到下一轮",
                 user.label,
             )
-        elif control.cut():
+            return False
+        if control.cut():
             logger.info("用户 %s 插话：判为补充，停下已在显示的回答，新消息另起一轮", user.label)
-        else:
-            logger.info("用户 %s 插话：判为补充，但这段回答停不下来，新消息排到下一轮", user.label)
+            return True
+        logger.info("用户 %s 插话：判为补充，但这段回答停不下来，新消息排到下一轮", user.label)
+        return False
+
+    def _acknowledge(self, state: _UserState, arrival: _Arrival) -> None:
+        """`arrival`（收完、写进了流水的文字或语音）连同它之前的消息排到了下一轮：这一轮还没回过收到时，在后台的
+        任务里回一句（`Responder.acknowledge()`），不挡住看着这一轮的循环。回给其中最早一条还没回过的文字或语音
+        （评审修正：插话判断看最新一条，回执按到达的顺序）；都回过了（上一轮装不下留下来的）就不回，也不占这一轮
+        的名额。"""
+        if state.acknowledged or self._closed:
+            return
+        target: _Arrival | None = None
+        for candidate in state.arrivals:
+            received = candidate.recorded
+            if (
+                candidate.kind is InputKind.TEXT
+                and received is not None
+                and received.message_id not in state.acknowledged_ids
+            ):
+                target = candidate
+                break
+            if candidate is arrival:
+                break
+        if target is None:
+            if arrival in state.arrivals:
+                return  # 都回过了
+            target = arrival  # 防御：不在队列里（正常不会发生）
+        received = target.recorded
+        assert received is not None
+        if received.message_id in state.acknowledged_ids:
+            return
+        state.acknowledged = True
+        state.acknowledged_ids.add(received.message_id)
+        task = asyncio.create_task(
+            self._send_acknowledgement(state.user, received.message_id, target.channel)
+        )
+        state.acknowledging = task
+        self._acknowledgements.add(task)
+        task.add_done_callback(self._acknowledgements.discard)
+        task.add_done_callback(_retrieve)
+
+    async def _send_acknowledgement(
+        self, user: User, message_id: int, channel: ReplyChannel
+    ) -> None:
+        try:
+            await self._responder.acknowledge(user, message_id, channel)
+        except Exception as exc:  # noqa: BLE001  回不出去不影响之后的轮次；文案可能带正文，只记类型
+            logger.warning("给用户 %s 排队的消息回收到时出错：%s", user.label, type(exc).__name__)
+
+    async def _after_acknowledgement(self, state: _UserState) -> None:
+        """下一轮开始之前，等上一轮给排队的消息回的那句收到发完，最多 `GRACE_SECONDS`：它要排在这一轮的
+        「正在输入」、过程与回答之前。一般早已发完（它在上一轮进行中就发出了）；发送卡住时不再等，接受极小概率的
+        乱序，不让一句收到拖住回答。"""
+        task, state.acknowledging = state.acknowledging, None
+        if task is None or task.done():
+            return
+        sleeper = asyncio.ensure_future(self._sleep(GRACE_SECONDS))
+        try:
+            await asyncio.wait((task, sleeper), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if not sleeper.done():
+                sleeper.cancel()
+                await asyncio.wait((sleeper,))  # 不留下没人管的任务
+        if not task.done():
+            logger.info(
+                "给用户 %s 回的收到 %g 秒还没发完，不再等它，开始下一轮",
+                state.user.label,
+                GRACE_SECONDS,
+            )
 
     async def _woken(
         self, state: _UserState, task: asyncio.Task[None], judging: asyncio.Task[Steer] | None

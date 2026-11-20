@@ -209,7 +209,10 @@ class FakeResponder:
 
     停下已在显示的回答（`TurnControl.cut()`）：`cuttable` 为真时停得下，这一轮不再等 `answer_gate`，先等
     `cut_tail`（不为空时；模拟停下之后还要发说明、结束流式消息）再正常结束；`cut_calls` 是被要求停下的次数，
-    `cut` 是停下了的那几轮（`started` 里的下标）。"""
+    `cut` 是停下了的那几轮（`started` 里的下标）。
+
+    回收到（`acknowledge()`）：记进 `acknowledged`（到达时记下，`ack_gate` 不为空时等它再算发完），`ack_failure`
+    不为空时抛出它；`acks_cancelled` 是被取消的次数。"""
 
     clock: ManualClock
     refused: set[int] = field(default_factory=set[int])
@@ -237,6 +240,11 @@ class FakeResponder:
     cut_tail: asyncio.Event | None = None
     cut_calls: int = 0
     cut: list[int] = field(default_factory=list[int])
+    acknowledged: list[Answered] = field(default_factory=list[Answered])
+    acks_done: int = 0
+    acks_cancelled: int = 0
+    ack_gate: asyncio.Event | None = None
+    ack_failure: Exception | None = None
     _ids: itertools.count[int] = field(default_factory=lambda: itertools.count(1))
 
     async def receive(
@@ -312,6 +320,19 @@ class FakeResponder:
     async def ask(self, user: User, messages: Sequence[int], channel: ReplyChannel) -> None:
         assert isinstance(channel, Channel)
         self.asked.append(Answered(user.id, list(messages), channel.name, self.clock.now))
+
+    async def acknowledge(self, user: User, message_id: int, channel: ReplyChannel) -> None:
+        assert isinstance(channel, Channel)
+        self.acknowledged.append(Answered(user.id, [message_id], channel.name, self.clock.now))
+        try:
+            if self.ack_gate is not None:
+                await self.ack_gate.wait()
+        except asyncio.CancelledError:
+            self.acks_cancelled += 1
+            raise
+        if self.ack_failure is not None:
+            raise self.ack_failure
+        self.acks_done += 1
 
 
 async def either(*events: asyncio.Event) -> None:
@@ -1154,3 +1175,369 @@ async def test_text_refused_on_receipt_does_not_carry_waiting_pictures_into_a_tu
     # 图片回到等待：之后通过复查的文字照常把它带上。
     await submit(chat, ALICE, text("这是什么"), "问题")
     assert turns(responder) == [([1, 2], "问题")]
+
+
+# -- 排到下一轮时回一句收到 --
+
+
+def acks(responder: FakeResponder) -> list[tuple[list[int], str]]:
+    return [(a.messages, a.channel) for a in responder.acknowledged]
+
+
+@pytest.mark.parametrize("shown", [False, True])
+async def test_new_question_is_acknowledged_at_once_on_its_own_channel(
+    clock: ManualClock, shown: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    responder = FakeResponder(clock, verdicts=[Steer.NEW], cuttable=True)
+    chat = batcher_of(responder)
+    await answering(chat, responder)
+    if shown:
+        assert responder.controls[0].claim()
+
+    await submit(chat, ALICE, text("明天天气怎么样"), "新问题")
+    assert acks(responder) == [([2], "新问题")]
+    assert responder.acks_done == 1
+    assert len(responder.started) == 1  # 当前这一轮还在回答，没有等它答完
+    assert responder.answer_gate is not None
+    responder.answer_gate.set()
+    await settle()
+
+    assert [(a.messages, a.channel) for a in responder.answered] == [
+        ([1], "问一"),
+        ([2], "新问题"),
+    ]
+    assert len(responder.acknowledged) == 1
+    assert "明天" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("verdict", "cuttable"),
+    [(Steer.ASSUMED, True), (RuntimeError("意外"), True), (Steer.SUPPLEMENT, False)],
+    ids=["assumed", "failed", "uncuttable"],
+)
+async def test_message_left_for_the_next_turn_while_showing_is_acknowledged(
+    clock: ManualClock, verdict: Verdict, cuttable: bool
+) -> None:
+    responder = FakeResponder(clock, verdicts=[verdict], cuttable=cuttable)
+    chat = batcher_of(responder)
+    await answering(chat, responder)
+    assert responder.controls[0].claim()
+
+    await submit(chat, ALICE, text("二"), "二")
+
+    assert responder.cut == []
+    assert acks(responder) == [([2], "二")]
+
+
+async def test_supplement_that_restarts_the_turn_is_not_acknowledged(clock: ManualClock) -> None:
+    responder = FakeResponder(clock, verdicts=[Steer.SUPPLEMENT])
+    chat = batcher_of(responder)
+    await answering(chat, responder)
+
+    await submit(chat, ALICE, text("用 Python 写"), "补充")
+    assert turns(responder) == [([1], "问一"), ([1, 2], "补充")]
+    assert responder.answer_gate is not None
+    responder.answer_gate.set()
+    await settle()
+
+    assert responder.acknowledged == []
+
+
+async def test_supplement_that_cuts_the_shown_answer_is_not_acknowledged(
+    clock: ManualClock,
+) -> None:
+    responder = FakeResponder(clock, cuttable=True, cut_tail=asyncio.Event())
+    chat = batcher_of(responder)
+    await answering(chat, responder)
+    assert responder.controls[0].claim()
+
+    await submit(chat, ALICE, text("用 Python"), "补充")
+    assert responder.cut == [0]
+    await submit(chat, ALICE, text("再补一句"), "再补")  # 停下之后再来的紧接着一起开轮，也不回
+    assert responder.cut_tail is not None
+    responder.cut_tail.set()
+    await settle()
+
+    assert turns(responder) == [([1], "问一"), ([2, 3], "再补")]
+    assert responder.acknowledged == []
+
+
+async def test_judgment_still_pending_is_not_acknowledged_yet(clock: ManualClock) -> None:
+    responder = FakeResponder(clock, verdicts=[Steer.NEW], judge_gate=asyncio.Event())
+    chat = batcher_of(responder)
+    await answering(chat, responder)
+
+    await submit(chat, ALICE, text("二"), "二")
+    assert len(responder.judged) == 1
+    assert responder.acknowledged == []  # 等结论
+    assert responder.judge_gate is not None
+    responder.judge_gate.set()
+    await settle()
+
+    assert acks(responder) == [([2], "二")]
+
+
+async def test_only_the_first_queued_message_of_a_turn_is_acknowledged(
+    clock: ManualClock,
+) -> None:
+    responder = FakeResponder(clock, verdicts=[Steer.NEW])
+    chat = batcher_of(responder)
+    await answering(chat, responder)
+
+    await submit(chat, ALICE, text("二"), "二")
+    await submit(chat, ALICE, text("三"), "三")
+    await submit(chat, ALICE, text("四"), "四")
+
+    assert acks(responder) == [([2], "二")]
+
+
+async def test_acknowledgement_goes_to_the_earliest_queued_message(clock: ManualClock) -> None:
+    # 两条在看着这一轮的循环醒来之前都收完：判断看最新一条，回执给最早一条（评审修正）。
+    responder = FakeResponder(clock, verdicts=[Steer.NEW])
+    chat = batcher_of(responder)
+    await answering(chat, responder)
+
+    async with asyncio.timeout(HANG_GUARD):
+        await chat.submit(ALICE, text("二"), Channel("二"))
+        await chat.submit(ALICE, text("三"), Channel("三"))
+    await settle()
+
+    assert acks(responder) == [([2], "二")]
+
+
+async def test_message_left_over_from_a_full_turn_is_not_acknowledged_again(
+    clock: ManualClock,
+) -> None:
+    # 一轮装不下、留到再下一轮的消息已经回过收到，下一轮开始后不再重复回（评审修正）。
+    responder = FakeResponder(clock)
+    chat = batcher_of(responder, TurnSettings(max_restarts=0))
+    await answering(chat, responder)
+    for index in range(batching.MAX_BATCH):
+        await submit(chat, ALICE, picture(), f"图{index}")
+    await submit(chat, ALICE, text("这些是什么"), "问题")
+    assert acks(responder) == [([batching.MAX_BATCH + 2], "问题")]
+
+    old = responder.answer_gate
+    assert old is not None
+    responder.answer_gate = asyncio.Event()
+    old.set()
+    await settle()
+    assert len(turns(responder)) == 2  # 下一轮只带走 32 张图，那句文字还留在队列里
+    assert acks(responder) == [([batching.MAX_BATCH + 2], "问题")]
+
+    await submit(chat, ALICE, text("再问一句"), "再问")  # 这一轮真正新排队的仍可以回
+    assert acks(responder) == [
+        ([batching.MAX_BATCH + 2], "问题"),
+        ([batching.MAX_BATCH + 3], "再问"),
+    ]
+
+
+async def test_message_during_the_acknowledgement_wait_joins_the_next_turn(
+    clock: ManualClock,
+) -> None:
+    # 上一轮结束、那句收到还在路上时又来一条：它属于下一轮，不被当成下一轮进行中的插话（评审修正）。
+    responder = FakeResponder(clock, ack_gate=asyncio.Event())
+    chat = batcher_of(responder, TurnSettings(max_restarts=0))
+    await answering(chat, responder)
+    await submit(chat, ALICE, text("二"), "二")
+    assert acks(responder) == [([2], "二")]
+    assert responder.answer_gate is not None
+    responder.answer_gate.set()
+    await settle()
+    assert len(responder.started) == 1  # 下一轮先等那句收到
+
+    await submit(chat, ALICE, text("三"), "三")
+    assert responder.ack_gate is not None
+    responder.ack_gate.set()
+    await settle()
+
+    assert turns(responder) == [([1], "问一"), ([2, 3], "三")]
+    assert acks(responder) == [([2], "二")]
+
+
+async def test_acknowledgement_counts_across_restarts_and_each_turn_has_its_own(
+    clock: ManualClock,
+) -> None:
+    responder = FakeResponder(clock)
+    chat = batcher_of(responder, TurnSettings(max_restarts=1))
+    await answering(chat, responder)
+
+    await submit(chat, ALICE, text("补一"), "补一")  # 重来一次，到了上限：之后的都排到下一轮
+    assert responder.acknowledged == []
+    await submit(chat, ALICE, text("二"), "二")
+    await submit(chat, ALICE, text("三"), "三")
+    assert acks(responder) == [([3], "二")]
+
+    old = responder.answer_gate
+    assert old is not None
+    responder.answer_gate = asyncio.Event()
+    old.set()
+    await settle()
+    assert turns(responder)[-1] == ([3, 4], "三")  # 下一轮在回答，它自己可以再回一次
+    await submit(chat, ALICE, text("五"), "五")  # 补充，重来
+    await submit(chat, ALICE, text("六"), "六")
+
+    assert acks(responder) == [([3], "二"), ([6], "六")]
+
+
+@pytest.mark.parametrize("why", ["restart_limit", "zero_restarts", "no_room"])
+async def test_messages_that_are_no_longer_judged_are_acknowledged(
+    clock: ManualClock, why: str
+) -> None:
+    settings = {
+        "restart_limit": TurnSettings(max_restarts=1),
+        "zero_restarts": TurnSettings(max_restarts=0),
+        "no_room": DEFAULT,
+    }[why]
+    # 重启后流水里遗留了 31 条待回复的消息：这一轮实际带满 32 条，再来的装不下，不判断。
+    leftover = list(range(100, 131)) if why == "no_room" else []
+    responder = FakeResponder(clock, leftover=leftover)
+    chat = batcher_of(responder, settings)
+    await answering(chat, responder)
+    if why == "restart_limit":
+        await submit(chat, ALICE, text("补一"), "补一")  # 重来一次，到了上限
+        assert responder.preempted == 1
+    judged = len(responder.judged)
+
+    await submit(chat, ALICE, text("又一句"), "又一句")
+
+    assert len(responder.judged) == judged  # 不再判断
+    assert [channel for _, channel in acks(responder)] == ["又一句"]
+    assert responder.answer_gate is not None
+    responder.answer_gate.set()
+    await settle()
+    assert turns(responder)[-1][1] == "又一句"  # 排到了下一轮
+
+
+async def test_turn_that_ends_during_the_judgment_acknowledges_nothing(
+    clock: ManualClock,
+) -> None:
+    responder = FakeResponder(clock, verdicts=[Steer.NEW], judge_gate=asyncio.Event())
+    chat = batcher_of(responder)
+    await answering(chat, responder)
+
+    await submit(chat, ALICE, text("二"), "二")
+    assert len(responder.judged) == 1
+    assert responder.answer_gate is not None
+    responder.answer_gate.set()  # 判断还没结论，这一轮先答完了：新消息立刻自己开轮
+    await settle()
+    assert responder.judge_gate is not None
+    responder.judge_gate.set()
+    await settle()
+
+    assert responder.judges_cancelled == 1
+    assert [a.messages for a in responder.answered] == [[1], [2]]
+    assert responder.acknowledged == []
+
+
+async def test_lone_picture_during_a_turn_is_not_acknowledged(clock: ManualClock) -> None:
+    responder = FakeResponder(clock)
+    chat = batcher_of(responder, TurnSettings(max_restarts=0))
+    await answering(chat, responder)
+
+    await submit(chat, ALICE, picture(), "图")
+    assert responder.acknowledged == []
+    await submit(chat, ALICE, text("看这张"), "看这张")
+
+    assert acks(responder) == [([3], "看这张")]
+
+
+async def test_refused_message_during_a_turn_is_not_acknowledged(clock: ManualClock) -> None:
+    # AGENTS.md 的第一条不变量：没写进流水（已不能使用对话）的消息得不到任何回复。
+    responder = FakeResponder(clock)
+    chat = batcher_of(responder, TurnSettings(max_restarts=0))
+    await answering(chat, responder)
+    refused = text("停用之后")
+    responder.refused_messages.add(refused.message_id)
+
+    await submit(chat, ALICE, refused, "停用之后")
+    assert responder.answer_gate is not None
+    responder.answer_gate.set()
+    await settle()
+
+    assert responder.acknowledged == []
+    assert turns(responder) == [([1], "问一")]
+
+
+async def test_failed_acknowledgement_is_only_logged(
+    clock: ManualClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    responder = FakeResponder(clock, verdicts=[Steer.NEW], ack_failure=RuntimeError("用户的正文"))
+    chat = batcher_of(responder)
+    await answering(chat, responder)
+
+    await submit(chat, ALICE, text("二"), "二")
+    assert responder.answer_gate is not None
+    responder.answer_gate.set()
+    await settle()
+
+    assert [a.messages for a in responder.answered] == [[1], [2]]
+    assert "RuntimeError" in caplog.text
+    assert "用户的正文" not in caplog.text
+
+
+async def test_next_turn_waits_for_the_acknowledgement_in_flight(clock: ManualClock) -> None:
+    responder = FakeResponder(clock, verdicts=[Steer.NEW], ack_gate=asyncio.Event())
+    chat = batcher_of(responder)
+    await answering(chat, responder)
+    await submit(chat, ALICE, text("二"), "二")
+    assert len(responder.acknowledged) == 1
+    assert responder.answer_gate is not None
+    responder.answer_gate.set()
+    await settle()
+    assert len(responder.started) == 1  # 那句收到还在路上：下一轮先等它
+
+    await clock.advance_to(batching.GRACE_SECONDS - 0.1)
+    assert len(responder.started) == 1
+    assert responder.ack_gate is not None
+    responder.ack_gate.set()
+    await settle()
+
+    assert responder.acks_done == 1
+    assert turns(responder) == [([1], "问一"), ([2], "二")]
+
+
+async def test_next_turn_stops_waiting_for_a_stuck_acknowledgement(
+    clock: ManualClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    responder = FakeResponder(clock, verdicts=[Steer.NEW], ack_gate=asyncio.Event())
+    chat = batcher_of(responder)
+    before = asyncio.all_tasks()
+    await answering(chat, responder)
+    await submit(chat, ALICE, text("二"), "二")
+    assert responder.answer_gate is not None
+    responder.answer_gate.set()
+    await settle()
+    assert len(responder.started) == 1
+
+    await clock.advance_to(batching.GRACE_SECONDS)
+
+    assert turns(responder) == [([1], "问一"), ([2], "二")]
+    assert "不再等它" in caplog.text
+    async with asyncio.timeout(HANG_GUARD):
+        await chat.drain()
+    assert responder.acks_cancelled == 1
+    assert asyncio.all_tasks() == before
+
+
+async def test_stop_gathers_the_acknowledgement_in_flight(
+    clock: ManualClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    responder = FakeResponder(clock, verdicts=[Steer.NEW], ack_gate=asyncio.Event())
+    chat = batcher_of(responder)
+    before = asyncio.all_tasks()
+    await answering(chat, responder)
+    await submit(chat, ALICE, text("二"), "二")
+    assert len(responder.acknowledged) == 1
+
+    async with asyncio.timeout(HANG_GUARD):
+        await chat.drain()
+    await settle()
+
+    assert responder.acks_cancelled == 1
+    assert responder.cancelled == 1
+    assert not workers(chat)
+    assert asyncio.all_tasks() == before
+    assert "出错" not in caplog.text  # 被取消不算出错，也没有留下未取回的异常

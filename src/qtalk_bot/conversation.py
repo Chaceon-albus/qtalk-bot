@@ -4,8 +4,8 @@
 附件经 `media.Fetcher`（下载经接线层实现的 `media.Downloader`），回复经 `ReplyChannel`（接线层用 pyqbot 实现，
 见 `bot.py`），图片描述经 `describe.Describer`，插话的判断经 `routing.SteerJudge`。什么时候开始一轮、插话时
 要不要重来或停下由 `batching.py` 决定：它对每条消息调用一次 `receive()`，每开始（或重新开始）一轮调用一次
-`respond()`，插话时调用 `judge()`，单独的附件等不到下文时调用 `ask()`；`handle()` 是收消息与回答一轮连在一起的
-写法。
+`respond()`，插话时调用 `judge()`，单独的附件等不到下文时调用 `ask()`，回答进行中来的新消息排到下一轮时调用
+`acknowledge()`；`handle()` 是收消息与回答一轮连在一起的写法。
 
 **收消息**（`receive()`，每条消息一次，消息到达时就做）：
 1. 文字里的表情标记直接去掉（`faces.clean()`）。只由表情组成的消息（`faces.is_sticker()`：表情包、单独的
@@ -816,6 +816,29 @@ class Conversation:
                 _TurnChannel(channel), texts.attachments_waiting(images, files), user
             )
             logger.info("用户 %s 发来的附件等不到下文，问了一句", user.label)
+
+    async def acknowledge(self, user: User, message_id: int, channel: ReplyChannel) -> None:
+        """一轮回答进行中来的新消息排到了下一轮：回一句收到（`texts.QUEUED`），不调用模型。
+
+        `message_id` 是那条新消息，`channel` 回复它。先在事务里复查授权，已不能使用对话就不发；发完要给这条消息
+        自己那一轮的回答留不足 `process.ANSWER_RESERVE` 次被动回复时也不发。和 `ask()` 一样不写进流水、不进之后
+        的上下文；发送失败只记日志。由 `drain()` 等待。
+        """
+        async with self._tracking():
+            if not await self._db.transaction(self._allowed, user):
+                logger.info(
+                    "用户 %s 已不能使用对话，排到下一轮的消息 %d 不回收到", user.label, message_id
+                )
+                return
+            if not channel.budget.affords(1):
+                logger.info(
+                    "用户 %s 的消息 %d 排到下一轮，被动回复次数要留给回答，不回收到",
+                    user.label,
+                    message_id,
+                )
+                return
+            if await _send_notice(_TurnChannel(channel), texts.QUEUED, user):
+                logger.info("用户 %s 的新消息排到下一轮，回了一句收到", user.label)
 
     async def handle(
         self, user: User, messages: Sequence[ChatInput], channel: ReplyChannel
