@@ -19,6 +19,7 @@ from qtalk_bot.llm.decisions import (
     Refusal,
     YesNoAnswer,
 )
+from qtalk_bot.model_watch import WatchedDecisionModel
 from qtalk_bot.routing import (
     CANCELLED,
     HISTORY_ENTRY_CHARS,
@@ -112,7 +113,7 @@ class Ticker:
 
 
 def router(
-    decider: FakeDecider | None,
+    decider: FakeDecider | WatchedDecisionModel | None,
     *,
     models: Sequence[ModelSettings] = MODELS,
     settings: DecisionSettings | None = SETTINGS,
@@ -592,3 +593,58 @@ async def test_cancelled_steer_judgment_leaves_a_cancelled_record() -> None:
 
     assert call.record is not None
     assert (call.record.error, call.record.chosen) == (CANCELLED, "supplement")
+
+
+# ---- 调用方的时限到期计入模型的失败（里程碑 9）----
+
+
+class Recorder:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, ErrorKind | None]] = []
+
+    def succeeded(self, provider: Provider, model: str) -> None:
+        self.events.append(("ok", None))
+
+    def failed(self, provider: Provider, model: str, error: ModelError) -> None:
+        self.events.append(("failed", error.kind))
+
+
+async def test_decision_timeout_is_reported_as_a_model_failure() -> None:
+    settings = DecisionSettings(provider=Provider.OPENAI, model="m", timeout_seconds=0.05)
+    recorder = Recorder()
+    decider = FakeDecider(result(solve=0.1, chat=0.9, code=0.0), gate=asyncio.Event())
+
+    await pick(router(WatchedDecisionModel(decider, recorder), settings=settings), previous="chat")
+
+    assert recorder.events == [("failed", ErrorKind.CONNECTION)]
+
+
+async def test_cancelled_decision_is_not_reported() -> None:
+    recorder = Recorder()
+    decider = FakeDecider(result(solve=0.1, chat=0.9, code=0.0), gate=asyncio.Event())
+    selection = router(WatchedDecisionModel(decider, recorder)).select(
+        [], "你好", "code", label="#1 小王"
+    )
+
+    task = asyncio.create_task(selection.run())
+    async with asyncio.timeout(HANG_GUARD):
+        await decider.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert recorder.events == []
+
+
+async def test_steer_timeout_is_reported_as_a_model_failure() -> None:
+    settings = DecisionSettings(provider=Provider.OPENAI, model="m", timeout_seconds=0.05)
+    recorder = Recorder()
+    decider = FakeDecider(steer_result(0.1), gate=asyncio.Event())
+    call = SteerJudge(settings, WatchedDecisionModel(decider, recorder)).prepare(
+        ["一"], ["二"], label="#1 小王"
+    )
+
+    async with asyncio.timeout(HANG_GUARD):
+        assert await call.run() is Steer.ASSUMED
+
+    assert recorder.events == [("failed", ErrorKind.CONNECTION)]

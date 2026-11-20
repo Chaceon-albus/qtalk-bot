@@ -11,8 +11,10 @@ from qtalk_bot.config import (
     DEFAULT_PERSONA,
     DEFAULT_PROFILE_INSTRUCTIONS,
     MAX_ATTACHMENT_WAIT_SECONDS,
+    AlertSettings,
     AttachmentSettings,
     AttachmentTimeoutAction,
+    BackupSettings,
     ChatSettings,
     ConfigError,
     DecisionSettings,
@@ -1588,3 +1590,57 @@ def test_image_generation_provider_needs_its_key() -> None:
         check_provider_secrets(settings, secrets)
     assert info.value.problems == ("配置里用到了 gemini 的模型，但环境变量 GEMINI_API_KEY 未设置",)
     check_provider_secrets(settings, load_secrets(FAKE_SECRETS))
+
+
+# ---- [backup] 与 [alerts]（里程碑 9）----
+
+
+def test_backup_and_alerts_default_when_omitted(tmp_path: Path) -> None:
+    settings = load_settings(write_config(tmp_path, ""))
+    assert settings.backup == BackupSettings(interval_hours=24, keep=7)
+    assert settings.alerts == AlertSettings(model_failures=5, disk_free_min_mb=1024)
+
+
+def test_backup_and_alerts_values_are_read(tmp_path: Path) -> None:
+    text = (
+        "[backup]\ninterval_hours = 6\nkeep = 30\n"
+        "[alerts]\nmodel_failures = 2\ndisk_free_min_mb = 0\n"
+    )
+    settings = load_settings(write_config(tmp_path, text))
+    assert settings.backup == BackupSettings(interval_hours=6, keep=30)
+    assert settings.alerts == AlertSettings(model_failures=2, disk_free_min_mb=0)
+
+
+def test_backup_and_alerts_may_set_only_some_keys(tmp_path: Path) -> None:
+    settings = load_settings(write_config(tmp_path, "[backup]\nkeep = 3\n[alerts]\n"))
+    assert settings.backup == BackupSettings(keep=3)
+    assert settings.alerts == AlertSettings()
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ("[backup]\ninterval_hours = 0\n", "backup.interval_hours：应为正整数"),
+        ("[backup]\ninterval_hours = 8761\n", "backup.interval_hours：不能大于 8760"),
+        ("[backup]\ninterval_hours = 1.5\n", "backup.interval_hours：应为整数，实际是浮点数"),
+        ("[backup]\nkeep = 0\n", "backup.keep：应为正整数"),
+        ("[backup]\nkeep = 366\n", "backup.keep：不能大于 365"),
+        ("[backup]\ndir = 'x'\n", "backup.dir：未知的键"),
+        ("[alerts]\nmodel_failures = 0\n", "alerts.model_failures：应为正整数"),
+        ("[alerts]\nmodel_failures = 101\n", "alerts.model_failures：不能大于 100"),
+        ("[alerts]\ndisk_free_min_mb = -1\n", "alerts.disk_free_min_mb：不能小于 0"),
+        ("[alerts]\ndisk_free_min_mb = 1048577\n", "alerts.disk_free_min_mb：不能大于 1048576"),
+        ("[alerts]\ngateway_down_minutes = 10\n", "alerts.gateway_down_minutes：未知的键"),
+        ("backup = 1\n", "backup：应为表，实际是整数"),
+        ("alerts = 'x'\n", "alerts：应为表，实际是字符串"),
+    ],
+)
+def test_backup_and_alerts_problems(tmp_path: Path, text: str, problem: str) -> None:
+    assert problem in config_error(write_config(tmp_path, text)).problems
+
+
+def test_backup_and_alerts_problems_are_reported_together(tmp_path: Path) -> None:
+    text = "[backup]\nkeep = 0\n[alerts]\nmodel_failures = 0\n"
+    problems = config_error(write_config(tmp_path, text)).problems
+    assert "backup.keep：应为正整数" in problems
+    assert "alerts.model_failures：应为正整数" in problems

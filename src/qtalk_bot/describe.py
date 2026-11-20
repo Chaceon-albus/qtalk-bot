@@ -60,6 +60,7 @@ from .media import (
     file_text,
     image_text,
 )
+from .model_watch import report_timeout
 from .storage import Database
 
 logger = logging.getLogger(__name__)
@@ -207,6 +208,7 @@ class Describer:
         parts: list[str] = []
         usage: Usage | None = None
         finished = False
+        ended = False  # 收到了 Finished（不论原因）
         cancelled: asyncio.CancelledError | None = None
         try:
             async with (
@@ -220,6 +222,7 @@ class Describer:
                         case Usage():
                             usage = event
                         case Finished(reason=reason):
+                            ended = True
                             finished = reason is not FinishReason.OTHER
                         case _:
                             pass
@@ -227,6 +230,8 @@ class Describer:
             logger.warning("给用户 %s 的%s失败：%s", user.label, what, exc)
         except TimeoutError:
             logger.warning("给用户 %s 的%s超时", user.label, what)
+            if not ended:  # 收到结局之后只是关闭流时到期的，不怪模型
+                report_timeout(self._model)
         except asyncio.CancelledError as exc:
             cancelled = exc
         # 正常结束与被取消共用这一次记账：已经调用过模型，用量照记（失败的调用也记一条）；被取消时描述保持

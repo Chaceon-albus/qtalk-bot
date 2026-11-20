@@ -46,6 +46,7 @@ from qtalk_bot.journal import DECISION_USAGE_MODEL
 from qtalk_bot.llm import (
     AudioPart,
     ChatEvent,
+    ChatModel,
     ChatRequest,
     Citation,
     ErrorKind,
@@ -86,6 +87,7 @@ from qtalk_bot.media import (
     IncomingAttachment,
     MediaStore,
 )
+from qtalk_bot.model_watch import ModelObserver, WatchedChatModel
 from qtalk_bot.process import MAX_PASSIVE_REPLIES, ReplyBudget
 from qtalk_bot.prompt import FORMAT_GUIDE
 from qtalk_bot.routing import QUESTION, STEER_QUESTION, Router, SteerJudge
@@ -404,9 +406,10 @@ def conversation(
     idle_timeout_seconds: float = 300,
     timeout_seconds: float = 1800,
     clock: ManualClock | None = None,
+    observer: ModelObserver | None = None,
 ) -> Conversation:
     """`clock` 不为空时，模型调用的时限（以及过程消息的节流）按它计时，它也是写进流水的时间（被动回复的截止点
-    从用户消息记进流水的时刻算起）。"""
+    从用户消息记进流水的时刻算起）。`observer` 不为空时，模型像 `ChatModels` 给了观察者时那样包一层。"""
     chat = ChatSettings(
         persona=persona,
         history_turns=history_turns,
@@ -423,12 +426,16 @@ def conversation(
             fallback=None if fallback is None else fallback.name,
         )
     ]
-    models = {primary.name: primary}
+
+    def watched(model: ScriptedModel) -> ChatModel:
+        return model if observer is None else WatchedChatModel(model, observer)
+
+    models: dict[str, ChatModel] = {primary.name: watched(primary)}
     if fallback is not None:
         settings.append(
             ModelSettings(name=fallback.name, provider=fallback.provider, model=fallback.model)
         )
-        models[fallback.name] = fallback
+        models[fallback.name] = watched(fallback)
     return Conversation(
         db,
         admin_openid=ADMIN,
@@ -839,6 +846,63 @@ async def test_fallback_total_timeout_is_cut_to_the_reply_deadline(
     assert channel.sent == [texts.MODEL_FAILED]
     assert (await rows(db))[-1] == Row("assistant", "", "backup", "timeout", "failed")
     assert "已按被动回复的截止点截短" in caplog.text
+
+
+class Recorder:
+    """模型成败的观察者替身：记下（结局，模型名，错误分类）。"""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, ErrorKind | None]] = []
+
+    def succeeded(self, provider: Provider, model: str) -> None:
+        self.events.append(("ok", model, None))
+
+    def failed(self, provider: Provider, model: str, error: ModelError) -> None:
+        self.events.append(("failed", model, error.kind))
+
+
+async def test_idle_timeout_is_reported_as_a_failure_of_that_model(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    clock, recorder = ManualClock(), Recorder()
+    primary = ScriptedModel("main", [], hang=True)
+    fallback = ScriptedModel("backup", answer("备用的回答"))
+    chat = conversation(db, primary, fallback, clock=clock, observer=recorder)
+
+    talk = asyncio.create_task(say(chat, alice, "你好"))
+    await reach(primary.started)
+    await clock.advance_to(300)
+    await talk
+
+    assert recorder.events == [
+        ("failed", primary.model, ErrorKind.CONNECTION),
+        ("ok", fallback.model, None),
+    ]
+
+
+async def test_total_timeout_is_reported_unless_cut_by_the_reply_deadline(db: Database) -> None:
+    # 主模型用满了自己的总时限：计一次失败。备用模型的总时限被被动回复的截止点截短：不怪它。
+    alice = await invited(db, ALICE, "小王")
+    clock, recorder = ManualClock(), Recorder()
+    primary = ScriptedModel("main", [], hang=True)
+    fallback = ScriptedModel("backup", [], hang=True)
+    chat = conversation(
+        db,
+        primary,
+        fallback,
+        clock=clock,
+        idle_timeout_seconds=3600,
+        timeout_seconds=3000,
+        observer=recorder,
+    )
+
+    talk = asyncio.create_task(say(chat, alice, "你好"))
+    await reach(primary.started)
+    await clock.advance_to(3000)
+    await reach(fallback.started)
+    await clock.advance_to(3300)
+    await talk
+
+    assert recorder.events == [("failed", primary.model, ErrorKind.CONNECTION)]
 
 
 async def test_no_fallback_when_too_little_time_is_left_before_the_reply_deadline(
@@ -2316,12 +2380,19 @@ async def test_decision_that_hears_gets_the_voice_even_when_no_chat_model_hears(
 # ---- 图片描述 ----
 
 
-def describer_of(db: Database, tmp_path: Path, model: ScriptedModel) -> Describer:
+def describer_of(
+    db: Database,
+    tmp_path: Path,
+    model: ScriptedModel,
+    *,
+    observer: ModelObserver | None = None,
+    timeout: float = 1,
+) -> Describer:
     return Describer(
         db,
         MediaStore.under(tmp_path),
-        model,
-        DescribeSettings(provider=model.provider, model=model.model, timeout_seconds=1),
+        model if observer is None else WatchedChatModel(model, observer),
+        DescribeSettings(provider=model.provider, model=model.model, timeout_seconds=timeout),
         admin_openid=ADMIN,
         clock=lambda: START,
     )
@@ -2376,6 +2447,52 @@ async def test_failed_description_does_not_affect_the_reply(db: Database, tmp_pa
     (row,) = await attachment_rows(db)
     assert row[5:] == ("[图片]", "failed")
     assert ("describe", "describe", None, None) in await usage_by_purpose(db)
+
+
+async def test_description_timeout_is_reported_but_shutdown_is_not(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    recorder = Recorder()
+    describing = ScriptedModel("describe", [], hang=True)
+    describer = describer_of(db, tmp_path, describing, observer=recorder, timeout=0.05)
+    model = ScriptedModel("main", answer("看到了"))
+    chat = media_chat(
+        db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, SEES), describer=describer
+    )
+
+    await send(chat, alice, None, image_attachment())
+    await describer.wait_idle()
+    assert recorder.events == [("failed", describing.model, ErrorKind.CONNECTION)]
+
+    slow = ScriptedModel("describe", [], hang=True)
+    stopping = describer_of(db, tmp_path, slow, observer=recorder, timeout=60)
+    chat = media_chat(
+        db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, SEES), describer=stopping
+    )
+    await send(chat, alice, None, image_attachment())
+    async with asyncio.timeout(HANG_GUARD):
+        await slow.started.wait()
+        await stopping.aclose()
+    assert len(recorder.events) == 1  # 关停取消的不计
+
+
+async def test_description_closing_timeout_after_the_answer_is_not_reported(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    recorder = Recorder()
+    describing = ScriptedModel("describe", answer("一只猫"), close_delay=1)
+    describer = describer_of(db, tmp_path, describing, observer=recorder, timeout=0.05)
+    model = ScriptedModel("main", answer("看到了"))
+    chat = media_chat(
+        db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, SEES), describer=describer
+    )
+
+    await send(chat, alice, None, image_attachment())
+    await describer.wait_idle()
+
+    assert recorder.events == [("ok", describing.model, None)]
 
 
 async def test_pending_descriptions_are_cancelled_on_shutdown(db: Database, tmp_path: Path) -> None:

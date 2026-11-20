@@ -214,6 +214,15 @@ async def test_openai_moderation_is_blocked() -> None:
     assert (exc.provider, exc.kind, exc.status_code) == (Provider.OPENAI, ErrorKind.BLOCKED, 400)
 
 
+async def test_openai_insufficient_quota_is_marked() -> None:
+    error = {"message": SECRET_TEXT, "type": "insufficient_quota", "code": "insufficient_quota"}
+    server = Server(lambda _: httpx2.Response(429, json={"error": error}))
+
+    exc = await failure(openai_on(server).generate(PROMPT, Aspect.SQUARE))
+
+    assert (exc.kind, exc.status_code, exc.quota_exhausted) == (ErrorKind.RATE_LIMIT, 429, True)
+
+
 async def test_openai_other_user_errors_are_bad_requests() -> None:
     error = {"message": SECRET_TEXT, "type": "image_generation_user_error", "code": "other"}
     server = Server(lambda _: httpx2.Response(400, json={"error": error}))

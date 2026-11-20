@@ -337,6 +337,40 @@ async def test_refusal_text_is_passed_on() -> None:
     assert events[0] == TextDelta("这个我帮不了。")
 
 
+def refusal_message(*, text: str | None = None) -> Payload:
+    content: list[Payload] = [{"type": "refusal", "refusal": "这个我帮不了。"}]
+    if text is not None:
+        content.append({"type": "output_text", "text": text, "annotations": []})
+    return {
+        "type": "message",
+        "id": "msg_fake",
+        "status": "completed",
+        "role": "assistant",
+        "content": content,
+    }
+
+
+@pytest.mark.parametrize(
+    ("output", "refused"),
+    [
+        ([refusal_message()], True),
+        ([refusal_message(text="不过可以换个说法。")], False),
+        ([], False),
+    ],
+)
+async def test_completed_refusal_is_marked_on_finished(
+    output: list[Payload], refused: bool
+) -> None:
+    # 只供模型的成败统计用：拒答照常以 COMPLETED 结束、说明照常交出。
+    completed = {
+        "type": "response.completed",
+        "sequence_number": 4,
+        "response": response("completed", usage=usage(1, 1), output=output),
+    }
+    events = await collect(model_on(streaming([CREATED, completed])))
+    assert events[-1] == Finished(FinishReason.COMPLETED, refused=refused)
+
+
 async def test_failed_response_reports_usage_then_raises() -> None:
     failed = {
         "type": "response.failed",
@@ -364,6 +398,39 @@ async def test_unknown_error_code_is_not_echoed() -> None:
     _, error = await failure(model_on(streaming([CREATED, failed])))
     assert error.kind is ErrorKind.FAILED
     assert_clean(error)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "invalid_prompt",
+        "bio_policy",
+        "misalignment_policy_violation",
+        "image_content_policy_violation",
+    ],
+)
+async def test_policy_failures_are_blocked(code: str) -> None:
+    failed = {
+        "type": "response.failed",
+        "sequence_number": 3,
+        "response": response("failed", error={"code": code, "message": SECRET_TEXT}),
+    }
+    _, error = await failure(model_on(streaming([CREATED, failed])))
+    assert error.kind is ErrorKind.BLOCKED
+    assert_clean(error)
+
+
+@pytest.mark.parametrize(
+    ("code", "kind"), [("server_error", ErrorKind.SERVER), ("invalid_image", ErrorKind.FAILED)]
+)
+async def test_other_failure_codes_keep_their_kind(code: str, kind: ErrorKind) -> None:
+    failed = {
+        "type": "response.failed",
+        "sequence_number": 3,
+        "response": response("failed", error={"code": code, "message": SECRET_TEXT}),
+    }
+    _, error = await failure(model_on(streaming([CREATED, failed])))
+    assert error.kind is kind
 
 
 async def test_error_event_in_stream_raises() -> None:
@@ -1957,3 +2024,49 @@ async def test_round_limit_keeps_web_search_allowed() -> None:
 
 
 ONLY_SEARCH: Payload = {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "web_search"}]}
+
+
+# ---- 额度用尽（里程碑 9 的告警用）----
+
+QUOTA_ERROR: Payload = {
+    "message": SECRET_TEXT,
+    "type": "insufficient_quota",
+    "param": None,
+    "code": "insufficient_quota",
+}
+
+
+async def test_insufficient_quota_is_marked_and_keeps_the_status_kind() -> None:
+    server = Server(lambda _: httpx2.Response(429, json={"error": QUOTA_ERROR}))
+
+    _, error = await failure(model_on(server))
+
+    # 面向用户的处理只看 kind，照旧是限流；额度用尽另外标出来。
+    assert (error.kind, error.status_code, error.quota_exhausted) == (
+        ErrorKind.RATE_LIMIT,
+        429,
+        True,
+    )
+    assert_clean(error)
+
+
+async def test_plain_rate_limit_is_not_quota_exhaustion() -> None:
+    error_body = {"message": SECRET_TEXT, "type": "requests", "code": "rate_limit_exceeded"}
+    server = Server(lambda _: httpx2.Response(429, json={"error": error_body}))
+
+    _, error = await failure(model_on(server))
+
+    assert (error.kind, error.quota_exhausted) == (ErrorKind.RATE_LIMIT, False)
+
+
+async def test_insufficient_quota_in_an_error_event_is_marked() -> None:
+    error_event = {
+        "type": "error",
+        "sequence_number": 1,
+        "code": "insufficient_quota",
+        "message": SECRET_TEXT,
+        "param": None,
+    }
+    _, error = await failure(model_on(streaming([CREATED, error_event])))
+    assert (error.kind, error.quota_exhausted) == (ErrorKind.FAILED, True)
+    assert_clean(error)

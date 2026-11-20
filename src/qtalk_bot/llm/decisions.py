@@ -210,8 +210,9 @@ class DecisionError(ModelError):
         status_code: int | None = None,
         *,
         usage: Usage | None = None,
+        quota_exhausted: bool = False,
     ) -> None:
-        super().__init__(provider, kind, status_code)
+        super().__init__(provider, kind, status_code, quota_exhausted=quota_exhausted)
         self.usage = usage
 
 

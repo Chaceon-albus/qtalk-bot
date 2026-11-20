@@ -36,6 +36,7 @@ from qtalk_bot.llm import (
     Usage,
 )
 from qtalk_bot.memory import Summarizer, parse
+from qtalk_bot.model_watch import WatchedChatModel
 from qtalk_bot.prompt import MEMORY_NOTICE, Memory, memory_section
 from qtalk_bot.storage import DATABASE_FILENAME, MIGRATIONS, Database
 
@@ -52,7 +53,9 @@ def written(text: str = GOOD, usage: Usage | None = None) -> list[Step]:
     return [TextDelta(text), Usage(80, 20) if usage is None else usage, DONE]
 
 
-def summarizer(db: Database, model: ScriptedModel, *, timeout: float = 5) -> Summarizer:
+def summarizer(
+    db: Database, model: ScriptedModel | WatchedChatModel, *, timeout: float = 5
+) -> Summarizer:
     return Summarizer(
         db,
         model,
@@ -329,6 +332,43 @@ async def test_timeout_is_a_failure(db: Database) -> None:
     assert await memory_usage(db) == [
         (await last_user_id(db), MEMORY_USAGE_MODEL, "memory-model", 5, 0)
     ]
+
+
+class Recorder:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, ErrorKind | None]] = []
+
+    def succeeded(self, provider: Provider, model: str) -> None:
+        self.events.append(("ok", None))
+
+    def failed(self, provider: Provider, model: str, error: ModelError) -> None:
+        self.events.append(("failed", error.kind))
+
+
+async def test_timeout_is_reported_as_a_model_failure(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    topic_id = await turn(db, alice, "问", "答")
+    recorder = Recorder()
+    model = WatchedChatModel(ScriptedModel("memory", [], hang=True), recorder)
+    worker = summarizer(db, model, timeout=0.05)
+
+    worker.schedule(alice, topic_id)
+    await idle(worker)
+
+    assert recorder.events == [("failed", ErrorKind.CONNECTION)]
+
+
+async def test_timeout_while_closing_a_finished_stream_is_not_reported(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    topic_id = await turn(db, alice, "问", "答")
+    recorder = Recorder()
+    model = WatchedChatModel(ScriptedModel("memory", written(), close_delay=1), recorder)
+    worker = summarizer(db, model, timeout=0.05)
+
+    worker.schedule(alice, topic_id)
+    await idle(worker)
+
+    assert recorder.events == [("ok", None)]  # 收到结局之后只是关闭流时到期：不怪模型
 
 
 async def last_user_id(db: Database) -> int:

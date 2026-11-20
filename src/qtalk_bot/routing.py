@@ -69,6 +69,7 @@ from .llm.decisions import (
     YesNoAnswer,
     YesNoQuestion,
 )
+from .model_watch import report_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -515,6 +516,7 @@ class Selection:
             raise
         except TimeoutError:
             error = TIMEOUT
+            report_timeout(plan.decider)
         except DecisionError as exc:
             error, usage = exc.kind.value, exc.usage
         except ModelError as exc:
@@ -855,6 +857,7 @@ class SteerCall:
             raise
         except TimeoutError:
             error = TIMEOUT
+            report_timeout(plan.decider)
         except DecisionError as exc:
             error, usage = exc.kind.value, exc.usage
         except ModelError as exc:

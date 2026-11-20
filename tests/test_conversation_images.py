@@ -55,6 +55,7 @@ from qtalk_bot.imagegen import Aspect
 from qtalk_bot.imagegen import GeneratedImage as ImageResult
 from qtalk_bot.llm import (
     ChatEvent,
+    ChatModel,
     ChatRequest,
     ErrorKind,
     Finished,
@@ -80,6 +81,7 @@ from qtalk_bot.media import (
     Fetcher,
     MediaStore,
 )
+from qtalk_bot.model_watch import ModelObserver, WatchedChatModel
 from qtalk_bot.process import MAX_PASSIVE_REPLIES
 from qtalk_bot.prompt import NO_REFERABLE, REFERABLE_GUIDE
 from qtalk_bot.routing import Router
@@ -327,7 +329,11 @@ def drawing_chat(
     clock: ManualClock | None = None,
     idle_timeout_seconds: float = 300,
     timeout_seconds: float = 1800,
+    observer: ModelObserver | None = None,
 ) -> Conversation:
+    def watched(chat_model: DrawingModel) -> ChatModel:
+        return chat_model if observer is None else WatchedChatModel(chat_model, observer)
+
     models = [
         ModelSettings(
             name=model.name,
@@ -339,7 +345,7 @@ def drawing_chat(
             show_process=show_process,
         )
     ]
-    chat_models: dict[str, DrawingModel] = {model.name: model}
+    chat_models: dict[str, ChatModel] = {model.name: watched(model)}
     if fallback is not None:
         models.append(
             ModelSettings(
@@ -349,7 +355,7 @@ def drawing_chat(
                 image_generation=image_generation,
             )
         )
-        chat_models[fallback.name] = fallback
+        chat_models[fallback.name] = watched(fallback)
     attachments = AttachmentSettings()
     return Conversation(
         db,
@@ -1137,6 +1143,46 @@ async def test_total_timeout_while_the_image_reply_is_in_flight_does_not_redraw(
     assert len(await drawn_rows(db)) == 1
     reply = (await rows(db))[-1]
     assert reply.finish == "timeout"
+
+
+class Recorder:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, ErrorKind | None]] = []
+
+    def succeeded(self, provider: Provider, model: str) -> None:
+        self.events.append(("ok", None))
+
+    def failed(self, provider: Provider, model: str, error: ModelError) -> None:
+        self.events.append(("failed", error.kind))
+
+
+async def test_total_timeout_while_a_function_runs_is_not_blamed_on_the_chat_model(
+    db: Database, tmp_path: Path
+) -> None:
+    # 总时限在执行画图函数（等发图）时到期：那时没有在等对话模型，不计它的失败。
+    alice = await invited(db, ALICE, "小王")
+    clock, recorder = ManualClock(), Recorder()
+    model = DrawingModel("main", [draw(), *answer("不该出现")])
+    chat = drawing_chat(
+        db,
+        MediaStore.under(tmp_path),
+        model,
+        FakeGenerator(),
+        clock=clock,
+        timeout_seconds=100,
+        observer=recorder,
+    )
+    channel = ReplyInFlightChannel()
+    task = asyncio.create_task(say(chat, alice, "画只猫", channel))
+    async with asyncio.timeout(HANG_GUARD):
+        await channel.replying.wait()
+
+    await clock.advance_to(150)
+    async with asyncio.timeout(HANG_GUARD):
+        await task
+
+    assert (await rows(db))[-1].finish == "timeout"
+    assert recorder.events == []
 
 
 async def test_revoked_drawing_stops_the_queued_text_at_once(db: Database, tmp_path: Path) -> None:

@@ -522,6 +522,73 @@ def download_host_refused(user_label: str, shown: str, *, is_host: bool) -> str:
     )
 
 
+# 里程碑 9 的告警：只写服务商、模型名（配置里的服务商模型名）、错误分类与状态码，不写请求内容、链接、路径与 openid。
+
+
+def _status(status_code: int | None) -> str:
+    return "" if status_code is None else f"，状态码 {status_code}"
+
+
+def model_auth_failed(provider: str, model: str, status_code: int | None) -> str:
+    return (
+        f"【告警】{provider} 的模型 {model} 鉴权失败{_status(status_code)}。"
+        "请检查对应的 API key 是否有效、有没有这个模型的权限。"
+    )
+
+
+def model_quota_exhausted(provider: str, model: str, status_code: int | None) -> str:
+    return (
+        f"【告警】{provider} 的模型 {model} 额度用尽{_status(status_code)}。"
+        "请到服务商的控制台查看余额与用量上限。"
+    )
+
+
+def model_failing(
+    provider: str, model: str, failures: int, kind: str, status_code: int | None
+) -> str:
+    """`kind` 是最近一次失败的分类（`llm.error_label()`）。"""
+    return (
+        f"【告警】{provider} 的模型 {model} 已连续失败 {failures} 次，"
+        f"最近一次：{kind}{_status(status_code)}。"
+    )
+
+
+def model_recovered(provider: str, model: str) -> str:
+    return f"【已恢复】{provider} 的模型 {model} 又调用成功了。"
+
+
+def backup_failed(reason: str, retry_minutes: int) -> str:
+    """`reason` 是不含路径的原因（如「磁盘剩余空间不足」、系统的错误说明或 SQLite 的错误名）。"""
+    return f"【告警】数据库的定时备份失败：{reason}。{retry_minutes} 分钟后再试。"
+
+
+BACKUP_RECOVERED = "【已恢复】数据库的定时备份又成功了。"
+
+
+def backup_cleanup_failed(reason: str, retry_minutes: int) -> str:
+    """`reason` 同 `backup_failed()`。新备份照常做，只是超龄或多出的旧备份没能删掉。"""
+    return (
+        f"【告警】清理旧的数据库备份失败：{reason}。超龄的备份里可能有用户要求忘掉的内容，请检查备份目录的权限；"
+        f"{retry_minutes} 分钟后再试。"
+    )
+
+
+BACKUP_CLEANUP_RECOVERED = "【已恢复】旧的数据库备份又能正常清理了。"
+
+BACKUP_LOW_DISK = "磁盘剩余空间不足"
+
+
+def disk_low(free_mb: int, threshold_mb: int) -> str:
+    return (
+        f"【告警】数据目录所在的磁盘只剩 {free_mb} MB，低于告警阈值 {threshold_mb} MB。"
+        "空间用完时数据库写不进去，备份也会失败。"
+    )
+
+
+def disk_recovered(free_mb: int, threshold_mb: int) -> str:
+    return f"【已恢复】数据目录所在的磁盘剩余 {free_mb} MB，回到告警阈值 {threshold_mb} MB 以上。"
+
+
 # ---- 忘掉话题的确认按钮（里程碑 6b） ----
 
 FORGET_CONFIRM_LABEL = "确认删除"

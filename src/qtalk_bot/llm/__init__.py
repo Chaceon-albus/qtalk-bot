@@ -498,9 +498,15 @@ class FinishReason(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class Finished:
-    """模型正常结束（不是出错）。之后不会再有事件。"""
+    """模型正常结束（不是出错）。之后不会再有事件。
+
+    `refused` 表示服务商明确标出这次的回答只是拒答（OpenAI 的消息里只有 `refusal` 内容块、没有正文），这时
+    `reason` 照旧是 `COMPLETED`，拒答的说明照常作为 `TextDelta` 交出。只用于统计模型的成败，不影响回复；认不出
+    拒答的服务商（Gemini）总是 `False`。
+    """
 
     reason: FinishReason
+    refused: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -568,6 +574,11 @@ _ERROR_LABELS = {
 }
 
 
+def error_label(kind: ErrorKind) -> str:
+    """错误分类的中文说明，如「被限流」。"""
+    return _ERROR_LABELS[kind]
+
+
 def kind_for_status(status_code: int | None) -> ErrorKind:
     """按 HTTP 状态码分类。"""
     match status_code:
@@ -587,14 +598,25 @@ class ModelError(Exception):
     """模型调用失败：网络错误、服务商返回错误、流中途出错或没有正常结束。
 
     文案只含服务商、`ErrorKind` 与 HTTP 状态码（100–599 的整数，其余不要）。
+
+    `quota_exhausted` 表示服务商明确说额度用尽（OpenAI 错误体的 `code` 是 `insufficient_quota`，HTTP 状态通常是
+    429，`kind` 照旧按状态码分类）。只用于给管理员告警，不影响面向用户的回复；Gemini 分辨不出，总是 `False`。
     """
 
-    def __init__(self, provider: Provider, kind: ErrorKind, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        provider: Provider,
+        kind: ErrorKind,
+        status_code: int | None = None,
+        *,
+        quota_exhausted: bool = False,
+    ) -> None:
         if not (isinstance(status_code, int) and 100 <= status_code <= 599):
             status_code = None
         self.provider = provider
         self.kind = kind
         self.status_code = status_code
+        self.quota_exhausted = quota_exhausted
         status = "" if status_code is None else f"，状态码 {status_code}"
         super().__init__(f"{provider.value} 调用失败：{_ERROR_LABELS[kind]}{status}")
 

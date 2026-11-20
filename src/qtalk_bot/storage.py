@@ -8,6 +8,9 @@
   已发布的迁移不能修改或删除，只能在末尾追加。
 - 取消是尽力而为：操作一旦交给数据库线程就可能已经执行并提交，调用方不能把取消当作「没有发生」。
 - 本模块新建的数据库文件与备份文件权限为 0600（库里有 openid 与聊天内容）；已存在的文件不改权限。
+- 迁移前备份：`Database.open(before_migration=...)` 在打开已有的库、要升级表结构时先调用这个钩子（在数据库线程里，
+  拿到连接、真实路径、旧版本与放弃信号），由调用方决定备份放在哪里、留几份；钩子失败就不迁移。新建的空库（版本 0）
+  不调用。`open()` 被取消时设置放弃信号：正在做的备份在下一步之前放弃，开始迁移之前也再看一次，不在取消之后才升级。
 """
 
 import asyncio
@@ -16,6 +19,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing
@@ -28,10 +32,30 @@ DEFAULT_BUSY_TIMEOUT = 5.0  # 秒
 THREAD_NAME_PREFIX = "qtalk-db"
 FILE_MODE = 0o600
 
+BACKUP_STEP_PAGES = 1024
+"""在线备份每一步复制的页数（默认 4 KiB 一页，约 4 MiB）。每步之间检查一次是否要放弃，被取消的备份很快停下。"""
+
 type Params = Sequence[object] | Mapping[str, object]
 type Migration = str | Callable[[sqlite3.Connection], None]
 """一个迁移：SQL 脚本，或在事务里拿到连接执行的同步函数。都不得自行提交或回滚：执行期间装着授权
 回调，事务控制语句在编译时就被拒绝，整个迁移回滚。"""
+
+type BeforeMigration = Callable[[sqlite3.Connection, Path, int, threading.Event], None]
+"""迁移前的钩子：在数据库线程里调用，参数是连接、数据库的真实路径、当前的版本号（大于 0、小于最新版本）与放弃
+信号（`open()` 被取消时设置，交给 `backup_connection(abort=...)`）。可以用 `backup_connection()` 把库备份到别处。
+抛出异常就不迁移，`Database.open()` 按 `StorageError` 报出。"""
+
+PARTIAL_SUFFIX = ".partial"
+"""`backup_connection()` 的临时文件名是 `.<目标文件名>.<随机串>.partial`（`tempfile.mkstemp()`），见 `partial_target()`。"""
+_PARTIAL_NAME = re.compile(r"\.(?P<target>.+)\.[a-z0-9_]+" + re.escape(PARTIAL_SUFFIX))
+
+
+def partial_target(name: str) -> str | None:
+    """`name` 是 `backup_connection()` 留下的临时文件名时返回它的目标文件名，否则返回 `None`。强杀进程时临时文件
+    来不及删，调用方可以据此在启动时清掉自己目录里的残留。"""
+    match = _PARTIAL_NAME.fullmatch(name)
+    return None if match is None else match["target"]
+
 
 _V1_ACCESS = """
 -- 邀请：code 是 secrets.token_hex(16)；revoked_at 非空即已撤销。
@@ -580,6 +604,7 @@ class Database:
         *,
         migrations: Sequence[Migration] = MIGRATIONS,
         busy_timeout: float = DEFAULT_BUSY_TIMEOUT,
+        before_migration: BeforeMigration | None = None,
     ) -> Self:
         """打开（必要时创建）数据库文件，设置连接参数并应用尚未应用的迁移。
 
@@ -587,18 +612,24 @@ class Database:
 
         `path` 是符号链接时跟随它：`Database.path` 是打开后确定的真实路径。
 
+        `before_migration` 只在已有的库（版本大于 0）要升级时调用一次，在第一个迁移之前；见 `BeforeMigration`。
+
         Raises:
             StorageError: 数据库的版本高于 `migrations` 的长度或为负数（此时不改动文件），
-                某个迁移失败，无法启用 WAL，或打开阶段的文件与 SQLite 错误（如上级路径是普通文件、
-                文件不是有效的数据库），后者的原始异常在 `__cause__` 里。
+                `before_migration` 失败（此时不迁移），某个迁移失败，无法启用 WAL，或打开阶段的文件与
+                SQLite 错误（如上级路径是普通文件、文件不是有效的数据库），后者的原始异常在 `__cause__` 里。
         """
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=THREAD_NAME_PREFIX)
-        opening = executor.submit(_open_connection, Path(path), busy_timeout, migrations)
+        abort = threading.Event()
+        opening = executor.submit(
+            _open_connection, Path(path), busy_timeout, migrations, before_migration, abort
+        )
         waiting = asyncio.wrap_future(opening)
         try:
             # shield：被取消时连接仍在打开，不能连带取消。
             file, conn = await asyncio.shield(waiting)
         except asyncio.CancelledError:
+            abort.set()  # 正在做的迁移前备份在下一步之前放弃，也不再开始迁移
             # shield 被取消后不再理会 waiting：它之后若以异常结束，要由这里取走，否则事件循环会报
             # 「Future exception was never retrieved」。
             waiting.add_done_callback(_retrieve_exception)
@@ -707,17 +738,28 @@ class Database:
 
         return await self._run(run)
 
-    async def backup(self, target: str | os.PathLike[str]) -> None:
+    async def backup(
+        self, target: str | os.PathLike[str], *, abort: threading.Event | None = None
+    ) -> None:
         """把数据库在线备份到 `target`，已存在的文件会被替换。上级目录不存在时会创建。
 
         先写到同目录下独占创建的临时文件，完成后再改名，中途失败不会留下残缺的备份。备份文件不用 WAL；
         目标旁边残留的 `-wal`、`-shm`（旧备份被打开写过时留下的）会被删除。
 
+        被取消时通知数据库线程在下一步（`BACKUP_STEP_PAGES` 页）之前放弃，删掉临时文件；已经改名完成的备份是完整的，
+        留着。调用方也可以传入自己的 `abort`，设置它就同样放弃（例如关停时同步发出，不必等取消送达），抛
+        `BackupAbortedError`。
+
         Raises:
             ValueError: `target` 是数据库文件本身或它的 `-wal`、`-shm` 文件。
         """
         conn, source, file = self._conn, self.path, Path(target)
-        await self._run(lambda: _backup(conn, source, file))
+        abort = threading.Event() if abort is None else abort
+        try:
+            await self._run(lambda: backup_connection(conn, source, file, abort=abort))
+        except asyncio.CancelledError:
+            abort.set()
+            raise
 
     async def close(self) -> None:
         """关闭数据库。关闭前已发出的操作会先执行完；重复调用不报错。"""
@@ -747,12 +789,16 @@ class Database:
 
 
 def _open_connection(
-    path: Path, busy_timeout: float, migrations: Sequence[Migration]
+    path: Path,
+    busy_timeout: float,
+    migrations: Sequence[Migration],
+    before_migration: BeforeMigration | None = None,
+    abort: threading.Event | None = None,
 ) -> tuple[Path, sqlite3.Connection]:
     if str(path) == ":memory:":  # 否则会被当成当前目录下名为 `:memory:` 的文件
         raise StorageError("不支持内存数据库，需要数据库文件的路径")
     try:
-        return _connect(path.absolute(), busy_timeout, migrations)
+        return _connect(path.absolute(), busy_timeout, migrations, before_migration, abort)
     except OSError as exc:
         reason = exc.strerror or type(exc).__name__
         raise StorageError(f"无法打开数据库 {path}：{reason}") from exc
@@ -762,8 +808,13 @@ def _open_connection(
 
 
 def _connect(
-    path: Path, busy_timeout: float, migrations: Sequence[Migration]
+    path: Path,
+    busy_timeout: float,
+    migrations: Sequence[Migration],
+    before_migration: BeforeMigration | None = None,
+    abort: threading.Event | None = None,
 ) -> tuple[Path, sqlite3.Connection]:
+    abort = threading.Event() if abort is None else abort
     path.parent.mkdir(parents=True, exist_ok=True)
     _create_private_file(path)
     path = path.resolve()  # 文件已存在，跟随符号链接；备份时据此认出主库与边车文件
@@ -780,12 +831,45 @@ def _connect(
         conn.execute("PRAGMA synchronous = NORMAL")
         # 删除的内容用零覆盖，不留在空闲页里（用户要求遗忘时要删干净）；WAL 里的旧页由删除后的检查点清掉。
         conn.execute("PRAGMA secure_delete = ON")
+        version = _user_version(conn)
+        if before_migration is not None and 0 < version < len(migrations):
+            _run_before_migration(before_migration, conn, path, version, abort)
+        if abort.is_set():
+            raise BackupAbortedError("打开数据库时被取消，没有升级表结构")
         _migrate(conn, migrations)
         conn.execute("PRAGMA foreign_keys = ON")
     except BaseException:
         conn.close()
         raise
     return path, conn
+
+
+def _run_before_migration(
+    hook: BeforeMigration,
+    conn: sqlite3.Connection,
+    path: Path,
+    version: int,
+    abort: threading.Event,
+) -> None:
+    try:
+        hook(conn, path, version, abort)
+    except BackupAbortedError:
+        raise
+    except Exception as exc:
+        raise StorageError(f"迁移前的备份失败，没有升级表结构：{_failure_reason(exc)}") from exc
+
+
+def _failure_reason(exc: Exception) -> str:
+    """钩子失败的原因：只有异常类型与不含路径的说明（`OSError` 的 `strerror`、SQLite 的错误名）。"""
+    match exc:
+        case OSError(strerror=str() as reason):
+            return reason
+        case sqlite3.Error(sqlite_errorname=str() as name):
+            return name
+        case StorageError():
+            return str(exc)
+        case _:
+            return type(exc).__name__
 
 
 def _create_private_file(path: Path) -> None:
@@ -909,17 +993,40 @@ def _migrate_one(conn: sqlite3.Connection, migrations: Sequence[Migration]) -> b
 _SIDECAR_SUFFIXES = ("-wal", "-shm")
 
 
-def _backup(conn: sqlite3.Connection, source: Path, target: Path) -> None:
+class BackupAbortedError(StorageError):
+    """在线备份被放弃（调用方被取消）；临时文件已删除。"""
+
+
+def backup_connection(
+    conn: sqlite3.Connection,
+    source: Path,
+    target: Path,
+    *,
+    abort: threading.Event | None = None,
+) -> None:
+    """在连接所在的线程里把库在线备份到 `target`（规则见 `Database.backup()`）。`source` 是库的真实路径，用来拒绝
+    把备份写到库本身；`abort` 被设置时在下一步之前放弃，抛 `BackupAbortedError`。
+
+    Raises:
+        ValueError: `target` 是数据库文件本身或它的 `-wal`、`-shm` 文件。
+    """
     _refuse_database_files(source, target)
+    if abort is not None and abort.is_set():
+        raise BackupAbortedError("备份被放弃")
     target.parent.mkdir(parents=True, exist_ok=True)
     # mkstemp 独占创建、权限 0600：不会碰到已有的文件，并发的备份也各用各的临时文件。
-    fd, name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".partial")
+    fd, name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=PARTIAL_SUFFIX)
     os.close(fd)
     partial = Path(name)
     try:
         os.chmod(partial, FILE_MODE)  # 不依赖 umask
         with closing(sqlite3.connect(partial)) as destination:
-            conn.backup(destination)
+
+            def check(status: int, remaining: int, total: int) -> None:
+                if abort is not None and abort.is_set():
+                    raise BackupAbortedError("备份被放弃")
+
+            conn.backup(destination, pages=BACKUP_STEP_PAGES, progress=check)
             # 备份文件不用 WAL：文件头里的 WAL 标记随主库一起复制过来了，改回 DELETE。
             destination.execute("PRAGMA journal_mode = DELETE")
         partial.replace(target)

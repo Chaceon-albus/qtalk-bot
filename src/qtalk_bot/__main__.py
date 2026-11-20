@@ -1,9 +1,15 @@
 """启动入口：`python -m qtalk_bot`。
 
-读配置与密钥、打开数据库、创建对话模型、决策模型、写图片描述的模型与出图的图片模型、构造 `pyqbot.Bot`、
-注册处理函数（经 `batching.Batcher` 交给对话）并运行；
-运行期间在后台定期清理过期的附件。退出时按 `_shut_down()` 的顺序先停收事件、等前台与对话收尾，再停后台的任务，
-最后关闭模型的客户端与数据库。配置或数据库有误、连不上平台时打印原因并以非零状态退出，不打印 traceback。
+读配置与密钥、打开数据库（要升级表结构时先备份到 `<数据目录>/backups/`，见 `maintenance.migration_backup()`）、
+创建对话模型、决策模型、写图片描述的模型与出图的图片模型（成败经 `model_watch.ModelWatch` 统计、告警）、构造
+`pyqbot.Bot`、注册处理函数（经 `batching.Batcher` 交给对话）并运行。
+
+运行期间的后台任务：定期清理过期的附件；写心跳文件供 `python -m qtalk_bot.health` 检查（`health.Heartbeat`，启动时
+先删掉旧的）；定时备份（`maintenance.BackupScheduler`）；查磁盘余量（`maintenance.DiskWatch`）。后两者与模型的告警
+都经 `alerts.Alerts` 发给管理员。
+
+退出时按 `_shut_down()` 的顺序先停收事件、等前台与对话收尾，再停后台的任务，最后关闭模型的客户端与数据库。配置
+或数据库有误（含迁移前的备份失败）、连不上平台时打印原因并以非零状态退出，不打印 traceback。
 """
 
 import asyncio
@@ -11,7 +17,8 @@ import contextlib
 import logging
 import signal
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import pyqbot
@@ -44,9 +51,18 @@ from .config import (
 from .conversation import Conversation
 from .describe import Describer
 from .gate import Gate
+from .health import Heartbeat, clear_heartbeat
 from .llm.providers import ChatModels
+from .maintenance import (
+    BackupScheduler,
+    DiskWatch,
+    backup_dir,
+    migration_backup,
+    remove_stale_partials,
+)
 from .media import Fetcher, MediaStore, run_cleanup
 from .memory import Summarizer
+from .model_watch import ModelWatch
 from .routing import Router, SteerJudge
 from .storage import DATABASE_FILENAME, Database, StorageError
 
@@ -119,8 +135,14 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
     memory = memory_settings(settings)
     image_generation = image_generation_settings(settings)
     private_data_dir(settings.data_dir)
+    backups = backup_dir(settings.data_dir)
+    await asyncio.to_thread(clear_heartbeat, settings.data_dir)
+    await asyncio.to_thread(remove_stale_partials, backups)
+    watch = ModelWatch(settings.alerts.model_failures)
     async with (
-        await Database.open(settings.data_dir / DATABASE_FILENAME) as db,
+        await Database.open(
+            settings.data_dir / DATABASE_FILENAME, before_migration=migration_backup(backups)
+        ) as db,
         ChatModels(
             settings.models,
             secrets,
@@ -129,12 +151,14 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
             settings.describe,
             memory,
             image_generation,
+            observer=watch,
         ) as models,
     ):
         store = MediaStore.under(settings.data_dir)
         bot = _make_bot(secrets, settings)
         refuse_cookies(bot)  # 附件下载与 pyqbot 共用这个客户端，见 `refuse_cookies()`
         alerts = Alerts(AdminAlertSender(bot, secrets.admin_openid))
+        watch.bind(alerts)
         hosts = download_hosts(settings.attachments.extra_download_hosts)
         describer: Describer | None = None
         summarizer: Summarizer | None = None
@@ -143,9 +167,20 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
         batcher: Batcher | None = None
         handlers: Handlers | None = None
         cleanup: asyncio.Task[None] | None = None
+        maintenance: list[Background] = []
         # 从这里起无论怎样结束（取名字时被取消、后面准备失败、正常停止），都经 `_shut_down()` 关闭 Bot 的
         # HTTP 连接并等后台收尾。
         try:
+            # 心跳尽早开始：后面的准备（取名字、补发欢迎语）卡住时健康检查照样看得到进程还活着。
+            maintenance.append(
+                Background("心跳", asyncio.create_task(Heartbeat(db, settings.data_dir).run()))
+            )
+            scheduler = BackupScheduler(db, backups, settings.backup, alerts)
+            maintenance.append(
+                Background("定时备份", asyncio.create_task(scheduler.run()), scheduler.stop)
+            )
+            disk = DiskWatch(settings.data_dir, settings.alerts.disk_free_min_mb, alerts)
+            maintenance.append(Background("磁盘检查", asyncio.create_task(disk.run())))
             gate = Gate(
                 db,
                 admin_openid=secrets.admin_openid,
@@ -222,12 +257,31 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                 handlers,
                 alerts,
                 summarizer,
+                maintenance=maintenance,
             )
             raise
         if await _shut_down(
-            bot, conversation, cleanup, describer, fetcher, batcher, handlers, alerts, summarizer
+            bot,
+            conversation,
+            cleanup,
+            describer,
+            fetcher,
+            batcher,
+            handlers,
+            alerts,
+            summarizer,
+            maintenance=maintenance,
         ):
             raise asyncio.CancelledError  # 关停期间又被取消过：收尾做完了，再把取消传出去
+
+
+@dataclass(frozen=True, slots=True)
+class Background:
+    """一个维护任务（心跳、定时备份、磁盘检查）：`stop` 是可选的同步停止请求，关停时先于取消任务调用。"""
+
+    name: str
+    task: asyncio.Task[None]
+    stop: Callable[[], None] | None = None
 
 
 SHUTDOWN_GRACE_SECONDS = 15.0
@@ -253,10 +307,15 @@ async def _shut_down(
     handlers: Handlers | None = None,
     alerts: Alerts | None = None,
     summarizer: Summarizer | None = None,
+    *,
+    maintenance: Sequence[Background] = (),
 ) -> bool:
-    """按顺序关停，返回期间是否又被取消过。
+    """按顺序关停，返回期间是否又被取消过。`maintenance` 是维护任务：心跳、定时备份、磁盘检查。
 
     顺序：
+    0. 停掉 `maintenance`（同步）：先发各自的停止请求（定时备份借此通知正在复制的备份在下一步之前放弃、删掉临时
+       文件），再取消任务。放在最前面：数据库只有一个线程，正在做的备份会让排在后面的 Gate 事务与流水写入一直等，
+       耗掉第 6 步的时限，已经放行的消息就可能丢掉。等它们退出放在第 8 步。
     1. `Batcher.stop()`（同步）：放弃等待中的附件、防抖的计时与正在进行的插话判断（消息已在流水里，重启后是
        待回复的），取消正在回答的轮次（对话自己在后台收尾记账），之后到达的消息只收下、不再回答。放在
        `Bot.stop()` 之前：否则等处理函数的那几秒里，刚收下的消息还会开新的一轮（发「正在输入」、调用决策），
@@ -279,7 +338,8 @@ async def _shut_down(
        平台重推也会被丢弃）。
     7. 向后台发出停止请求：停掉清理、`Describer.stop()`、`Summarizer.stop()`、`Fetcher.stop()`。这些是同步的、
        无条件执行，前面用完了时间也照样发出，免得后台任务在模型客户端和数据库关闭后还在跑。
-    8. 限时等后台收尾：清理任务、描述与话题摘要的任务和它们受保护的写入、下载与响应的关闭。
+    8. 限时等后台收尾：清理任务、第 0 步停掉的维护任务（放弃的备份已删掉临时文件，已经改名完成的是完整的；线程
+       里的文件操作取消不了，只限时等）、描述与话题摘要的任务和它们受保护的写入、下载与响应的关闭。
     之后由调用方（外层的 `async with`）关模型的客户端与数据库。
 
     每一步的等待都受保护：再次取消（如连按两次 Ctrl+C）不会打断这一段；但所有等待共用
@@ -290,6 +350,10 @@ async def _shut_down(
     # 给 Bot.close() 留出它等处理函数的时间：前面的收尾用超了也不至于来不及断开网关、关掉 HTTP 客户端。
     replies_deadline = deadline - BOT_CLOSE_SECONDS
     interrupted = False
+    for background in maintenance:
+        if background.stop is not None:
+            background.stop()
+        background.task.cancel()
     if batcher is not None:
         batcher.stop()
     stop_deadline = min(now + BOT_STOP_SECONDS, replies_deadline)
@@ -315,6 +379,8 @@ async def _shut_down(
         fetcher.stop()
     if cleanup is not None:
         interrupted |= await _drain(cleanup, deadline, "停掉附件清理")
+    for background in maintenance:
+        interrupted |= await _drain(background.task, deadline, f"停掉{background.name}")
     if describer is not None:
         interrupted |= await _drain(describer.aclose(), deadline, "等待图片描述收尾")
     if summarizer is not None:

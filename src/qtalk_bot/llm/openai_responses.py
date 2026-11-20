@@ -52,10 +52,11 @@ Responses API 不接受音频（文档只在 Chat Completions 里写了音频输
 - `response.content_part.done`：一个内容块的完整正文与标注：已发出的正文是它的开头时补发其余部分（从没有
   增量的块整段补发），并采用它的标注；对不上时都不做。
 - `response.completed`：先按上面的规则读 `response.output` 快照里的消息、补上没计过的搜索，再给出 `Usage`
-  加 `Finished(COMPLETED)`。用量取 `usage.input_tokens`、`usage.output_tokens`，命中缓存的输入取
+  加 `Finished(COMPLETED)`；回答只有 `refusal` 内容块时 `Finished.refused` 为真（`_only_refusal()`）。用量取 `usage.input_tokens`、`usage.output_tokens`，命中缓存的输入取
   `usage.input_tokens_details.cached_tokens`。
 - `response.incomplete`：同上，`Finished` 的原因按 `incomplete_details.reason`。
-- `response.failed`、`error`：有用量（或快照里补上了搜索次数）时先给出 `Usage`，再抛 `ModelError`。
+- `response.failed`、`error`：有用量（或快照里补上了搜索次数）时先给出 `Usage`，再抛 `ModelError`。`response.failed`
+  的错误码按 `_FAILED_CODES` 分类（服务端出错、限流、内容策略拦截），其余是 `FAILED`。
 其余事件（创建、`web_search_call.searching`、`reasoning_summary_part.added` 等）现在忽略。
 每个事件（含忽略的）之前先交出一个 `Heartbeat`，供调用方计算空闲时限：推理时可能很久只有这些被忽略的事件。
 
@@ -71,6 +72,10 @@ Responses API 不接受音频（文档只在 Chat Completions 里写了音频输
 `ModelError` 只用本地的 `ErrorKind` 与数字状态码。读流时 SDK 之外的异常（如 SSE 帧的 JSON 解析不了）
 以及关闭响应流时抛出的异常同样转成 `ModelError`（已有的 `ModelError` 不被盖掉；回答已经完整给出时，关闭
 出错不影响它），取消与调用方的关闭照常传播。
+
+额度用尽：错误体（SDK 3.55.1 的 `APIError.__init__` 从 `body["code"]` 取出，`_make_status_error()` 交给它的是
+响应体里的 `error` 对象）或流里 `error` 事件的 `code` 是 `insufficient_quota` 时，在 `ModelError` 上标出
+`quota_exhausted`（`is_quota_exhausted()`），分类照旧按状态码。只比较这个固定的字符串，不把上游的文字带出去。
 """
 
 import asyncio
@@ -157,8 +162,26 @@ PDF_FILENAME = (
 )
 _LIMITS = INPUT_LIMITS[Provider.OPENAI]
 
+INSUFFICIENT_QUOTA_CODE = "insufficient_quota"
+"""OpenAI 表示额度用尽（余额不足、超出账单上限）的错误码，HTTP 状态通常是 429。"""
+
+
+def is_quota_exhausted(exc: object) -> bool:
+    """SDK 的异常（`openai.APIError` 及其子类）是不是额度用尽。"""
+    return isinstance(exc, openai.APIError) and exc.code == INSUFFICIENT_QUOTA_CODE
+
+
 # 流里 `response.failed` 的错误码中认得的几种；其余归到 FAILED，不把上游的字符串带出去。
-_FAILED_CODES = {"server_error": ErrorKind.SERVER, "rate_limit_exceeded": ErrorKind.RATE_LIMIT}
+_FAILED_CODES = {
+    "server_error": ErrorKind.SERVER,
+    "rate_limit_exceeded": ErrorKind.RATE_LIMIT,
+    # 内容策略类（SDK 3.55.1 的 `ResponseError.code` 取值里属于策略拦截的几种）：是输入的问题，不是服务出错。
+    # `invalid_prompt` 是提示词被判为可能违反使用政策时给的码。
+    "invalid_prompt": ErrorKind.BLOCKED,
+    "bio_policy": ErrorKind.BLOCKED,
+    "misalignment_policy_violation": ErrorKind.BLOCKED,
+    "image_content_policy_violation": ErrorKind.BLOCKED,
+}
 
 # 内置的联网搜索。`user_location` 只写 `type`：不写时服务商假定用户在美国。
 _WEB_SEARCH: ToolParam = {"type": "web_search", "user_location": {"type": "approximate"}}
@@ -409,7 +432,10 @@ class OpenAIChatModel:
                                 if calls:
                                     turn.calls = calls
                                     return
-                                yield Finished(FinishReason.COMPLETED)
+                                yield Finished(
+                                    FinishReason.COMPLETED,
+                                    refused=_only_refusal(event.response.output),
+                                )
                                 return
                             case "response.incomplete":
                                 for found in _tolerant(extras.snapshot, event.response.output):
@@ -438,9 +464,17 @@ class OpenAIChatModel:
                                 error = event.response.error
                                 code = None if error is None else str(error.code)
                                 kind = _FAILED_CODES.get(code or "", ErrorKind.FAILED)
-                                raise ModelError(Provider.OPENAI, kind)
+                                raise ModelError(
+                                    Provider.OPENAI,
+                                    kind,
+                                    quota_exhausted=code == INSUFFICIENT_QUOTA_CODE,
+                                )
                             case "error":
-                                raise ModelError(Provider.OPENAI, ErrorKind.FAILED)
+                                raise ModelError(
+                                    Provider.OPENAI,
+                                    ErrorKind.FAILED,
+                                    quota_exhausted=event.code == INSUFFICIENT_QUOTA_CODE,
+                                )
                             case _:
                                 pass
                     failure = ModelError(Provider.OPENAI, ErrorKind.MALFORMED)
@@ -874,6 +908,24 @@ def _summary_refusal(exc: Exception) -> int | None:
     return None
 
 
+def _only_refusal(output: object) -> bool:
+    """最后一跳的输出里，回答（不是 `commentary` 的消息）只有 `refusal` 内容块、没有非空的正文。字段一律按
+    `getattr` 取：SDK 不校验响应。"""
+    refusal = answer = False
+    for item in items(output):
+        if getattr(item, "type", None) != "message" or getattr(item, "phase", None) == "commentary":
+            continue
+        for part in items(getattr(item, "content", None)):
+            match getattr(part, "type", None):
+                case "refusal":
+                    refusal = True
+                case "output_text" if getattr(part, "text", None):
+                    answer = True
+                case _:
+                    pass
+    return refusal and not answer
+
+
 def _call_id(item: ResponseFunctionWebSearch) -> str:
     call_id: object = getattr(item, "id", None)
     return call_id if isinstance(call_id, str) else ""
@@ -897,13 +949,16 @@ def _queries(action: object) -> tuple[str, ...]:
 
 
 def _error(exc: Exception) -> ModelError:
+    quota = is_quota_exhausted(exc)
     match exc:
         case openai.APIStatusError(status_code=status):
-            return ModelError(Provider.OPENAI, kind_for_status(status), status)
+            return ModelError(
+                Provider.OPENAI, kind_for_status(status), status, quota_exhausted=quota
+            )
         case openai.APIConnectionError():  # 含超时
             return ModelError(Provider.OPENAI, ErrorKind.CONNECTION)
         case openai.APIError():  # 流里的 error 事件等
-            return ModelError(Provider.OPENAI, ErrorKind.FAILED)
+            return ModelError(Provider.OPENAI, ErrorKind.FAILED, quota_exhausted=quota)
         case ValueError():  # 含 JSONDecodeError：响应解析不了
             return ModelError(Provider.OPENAI, ErrorKind.MALFORMED)
         case _:

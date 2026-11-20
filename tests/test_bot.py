@@ -31,7 +31,7 @@ from httpx2.websockets import ASGIWebSocketTransport
 from qtalk_bot import access, texts
 from qtalk_bot import bot as bot_module
 from qtalk_bot.access import User
-from qtalk_bot.alerts import AlertGroup, Alerts, AlertSendError
+from qtalk_bot.alerts import AlertGroup, Alerts, AlertSendError, DeliveryCallback
 from qtalk_bot.batching import Batcher
 from qtalk_bot.bot import (
     ALERT_KEY_PREFIX,
@@ -2445,7 +2445,14 @@ class RecordingAlerts(Alerts):
         self.notified: list[tuple[str, str]] = []
         self.groups: list[AlertGroup | None] = []
 
-    def notify(self, key: str, text: str, *, group: AlertGroup | None = None) -> bool:
+    def notify(
+        self,
+        key: str,
+        text: str,
+        *,
+        group: AlertGroup | None = None,
+        on_delivered: DeliveryCallback | None = None,
+    ) -> bool:
         self.notified.append((key, text))
         self.groups.append(group)
         return True

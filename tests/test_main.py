@@ -33,6 +33,7 @@ from qtalk_bot.config import (
 from qtalk_bot.conversation import Conversation
 from qtalk_bot.describe import Describer
 from qtalk_bot.gate import Gate
+from qtalk_bot.health import Heartbeat
 from qtalk_bot.llm import ChatEvent, ChatRequest, Finished, FinishReason, Provider
 from qtalk_bot.media import Downloader, Fetcher, MediaStore
 from qtalk_bot.memory import Summarizer
@@ -879,3 +880,202 @@ async def test_alerts_are_stopped_even_when_the_whole_budget_is_used_up(
         await asyncio.sleep(0)
     assert in_flight.cancelled()
     assert asyncio.all_tasks() == before
+
+
+# ---- 里程碑 9：心跳、定时备份、磁盘检查、迁移前备份、模型的观察点 ----
+
+
+async def test_maintenance_stops_first_and_is_awaited_with_the_background(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 正在做的备份占着唯一的数据库线程：关停一开始就要让它放弃，不能等到前台入库之后。
+    order: list[str] = []
+
+    class RecordingBot:
+        async def stop(self) -> None:
+            order.append("bot.stop")
+
+        async def close(self) -> None:
+            order.append("bot")
+
+    class RecordingBatcher:
+        def stop(self) -> None:
+            order.append("batcher.stop")
+
+        async def drain(self) -> None: ...
+
+    async def background(name: str) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            order.append(f"{name}退出")
+            raise
+
+    tasks = [
+        entry.Background("心跳", asyncio.create_task(background("心跳"))),
+        entry.Background(
+            "定时备份",
+            asyncio.create_task(background("定时备份")),
+            lambda: order.append("备份放弃"),
+        ),
+    ]
+    await asyncio.sleep(0)
+
+    await entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+        cast(pyqbot.Bot, RecordingBot()),
+        None,
+        None,
+        None,
+        None,
+        cast(Batcher, RecordingBatcher()),
+        maintenance=tasks,
+    )
+
+    assert order[:2] == ["备份放弃", "batcher.stop"]
+    assert order.index("定时备份退出") < order.index("bot")
+    assert all(background.task.cancelled() for background in tasks)
+
+
+async def test_maintenance_tasks_are_cancelled_even_when_the_budget_is_used_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(entry, "SHUTDOWN_GRACE_SECONDS", 0.05)
+    hanging = asyncio.create_task(_forever())
+
+    await entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+        cast(pyqbot.Bot, _SlowBot()),
+        None,
+        None,
+        None,
+        None,
+        maintenance=[entry.Background("磁盘检查", hanging)],
+    )
+    await asyncio.sleep(0)
+
+    assert hanging.cancelled()
+
+
+def test_stale_heartbeat_is_replaced_by_a_fresh_one(
+    config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = config.parent / "data"
+    data.mkdir()
+    heartbeat = data / "heartbeat.json"
+    heartbeat.write_text('{"updated_at": 1}', encoding="utf-8")
+    seen_at_start: list[bool] = []
+    beaten = asyncio.Event()
+    real_beat = Heartbeat.beat
+
+    async def beat(self: Heartbeat) -> bool:
+        written = await real_beat(self)
+        beaten.set()
+        return written
+
+    async def start(self: pyqbot.Bot) -> None:
+        seen_at_start.append(heartbeat.exists() and '"updated_at": 1}' in heartbeat.read_text())
+        async with asyncio.timeout(5):
+            await beaten.wait()
+
+    monkeypatch.setattr(Heartbeat, "beat", beat)
+    monkeypatch.setattr(pyqbot.Bot, "start", start)
+    assert entry.main() == 0
+
+    assert seen_at_start == [False]  # 旧的心跳在启动时就删掉了
+    assert "updated_at" in heartbeat.read_text(encoding="utf-8")
+    assert '"updated_at": 1}' not in heartbeat.read_text(encoding="utf-8")
+
+
+def _make_old_database(path: Path) -> int:
+    from qtalk_bot.storage import MIGRATIONS
+
+    old = len(MIGRATIONS) - 1
+
+    async def create() -> None:
+        async with await Database.open(path, migrations=MIGRATIONS[:old]):
+            pass
+
+    asyncio.run(create())
+    return old
+
+
+def _version(path: Path) -> int:
+    with sqlite3.connect(path) as conn:
+        version: int = conn.execute("PRAGMA user_version").fetchone()[0]
+    conn.close()
+    return version
+
+
+def test_existing_database_is_backed_up_before_migration_on_startup(
+    config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def start(self: pyqbot.Bot) -> None: ...
+
+    monkeypatch.setattr(pyqbot.Bot, "start", start)
+    database = config.parent / "data" / "qtalk.db"
+    old = _make_old_database(database)
+
+    assert entry.main() == 0
+
+    (backup,) = (config.parent / "data" / "backups").iterdir()
+    assert backup.name.startswith(f"qtalk-before-v{old}-")
+    assert _version(backup) == old
+    assert _version(database) == old + 1
+
+
+def test_failed_migration_backup_exits_without_migrating(
+    config: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = config.parent / "data" / "qtalk.db"
+    old = _make_old_database(database)
+    (config.parent / "data" / "backups").write_text("挡住备份目录", encoding="utf-8")
+
+    assert entry.main() == entry.EXIT_RUNTIME_ERROR
+
+    err = capsys.readouterr().err
+    assert "数据库有误：迁移前的备份失败" in err
+    assert "Traceback" not in err
+    assert _version(database) == old
+
+
+def test_models_are_created_with_the_model_watch(
+    config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from qtalk_bot.llm.providers import ChatModels
+    from qtalk_bot.model_watch import ModelWatch, WatchedChatModel
+
+    created: list[ChatModels] = []
+    real = entry.ChatModels
+
+    def spy(*args: object, **kwargs: object) -> ChatModels:
+        models = real(*args, **kwargs)  # pyright: ignore[reportArgumentType]  原样转交
+        created.append(models)
+        assert isinstance(kwargs.get("observer"), ModelWatch)
+        return models
+
+    async def start(self: pyqbot.Bot) -> None: ...
+
+    monkeypatch.setattr(entry, "ChatModels", spy)
+    monkeypatch.setattr(pyqbot.Bot, "start", start)
+    assert entry.main() == 0
+
+    (models,) = created
+    assert isinstance(models["main"], WatchedChatModel)
+
+
+def test_partial_backups_left_by_a_killed_process_are_removed_at_startup(
+    config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def start(self: pyqbot.Bot) -> None: ...
+
+    monkeypatch.setattr(pyqbot.Bot, "start", start)
+    backups = config.parent / "data" / "backups"
+    backups.mkdir(parents=True)
+    stale = backups / ".qtalk-20261120T030000Z.db.k3j9x_2a.partial"
+    stale.write_bytes(b"user data")
+    mine = backups / "我的笔记.partial"
+    mine.write_bytes(b"")
+
+    assert entry.main() == 0
+
+    assert not stale.exists()
+    assert mine.exists()

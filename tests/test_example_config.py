@@ -6,7 +6,9 @@ from qtalk_bot.config import (
     DEFAULT_DATA_DIR,
     DEFAULT_DECISION_MODELS,
     DEFAULT_TIMEZONE,
+    AlertSettings,
     AttachmentSettings,
+    BackupSettings,
     ChatSettings,
     DecisionSettings,
     DescribeSettings,
@@ -62,6 +64,8 @@ def test_example_config_is_valid_and_spells_out_the_defaults() -> None:
     assert example.topics == TopicSettings()
     assert example.attachments == AttachmentSettings()
     assert example.turns == TurnSettings()
+    assert example.backup == BackupSettings()
+    assert example.alerts == AlertSettings()
     # [describe] 的模型没有默认值，其余各项要与默认值一致。
     assert example.describe == DescribeSettings(provider=Provider.OPENAI, model="gpt-6-luna")
     # [memory] 同理；reasoning 默认不传。

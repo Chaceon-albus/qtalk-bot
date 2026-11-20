@@ -2,7 +2,10 @@
 端点与代理），由用到它的模型共用，`ChatModels.aclose()` 时关闭。
 
 对话模型不请求思考摘要（适配器保留了这个能力）：`[[models]].show_process` 只决定展示调用工具前的说明与搜索
-进展，见 `process.py`。"""
+进展，见 `process.py`。
+
+这里也是模型调用成败的集中观察点：给了 `observer` 时，创建的每个模型都包一层（`model_watch.py`），调用方不必在
+各个调用点各自统计。"""
 
 from collections.abc import Iterator, Mapping, Sequence
 from types import TracebackType
@@ -22,6 +25,12 @@ from ..config import (
 )
 from ..imagegen import GeminiImageGenerator, ImageGenerator, OpenAIImageGenerator
 from ..imagegen import create_gemini_client as create_gemini_image_client
+from ..model_watch import (
+    ModelObserver,
+    WatchedChatModel,
+    WatchedDecisionModel,
+    WatchedImageGenerator,
+)
 from . import ChatModel, Provider
 from .decisions import DecisionModel
 from .gemini_decisions import GeminiDecisionModel
@@ -43,6 +52,8 @@ class ChatModels(Mapping[str, ChatModel]):
 
     用 `async with` 或 `aclose()` 关闭底层客户端。调用方要先用 `config.check_provider_secrets()` 确认用到的
     服务商都有密钥。
+
+    给了 `observer` 时，上面每一个模型都是包装过的（`model_watch.Watched*`），成败报给它。
     """
 
     def __init__(
@@ -54,7 +65,9 @@ class ChatModels(Mapping[str, ChatModel]):
         describe: DescribeSettings | None = None,
         memory: MemorySettings | None = None,
         image_generation: ImageGenerationSettings | None = None,
+        observer: ModelObserver | None = None,
     ) -> None:
+        self._observer = observer
         self._providers = ProvidersSettings() if providers is None else providers
         self._secrets = secrets
         self._openai: openai.AsyncOpenAI | None = None
@@ -139,6 +152,10 @@ class ChatModels(Mapping[str, ChatModel]):
         return self._gemini
 
     def _create(self, settings: ModelSettings) -> ChatModel:
+        model = self._create_chat(settings)
+        return model if self._observer is None else WatchedChatModel(model, self._observer)
+
+    def _create_chat(self, settings: ModelSettings) -> ChatModel:
         match settings.provider:
             case Provider.OPENAI:
                 return OpenAIChatModel(
@@ -158,6 +175,10 @@ class ChatModels(Mapping[str, ChatModel]):
                 )
 
     def _create_decider(self, settings: DecisionSettings) -> DecisionModel:
+        decider = self._create_raw_decider(settings)
+        return decider if self._observer is None else WatchedDecisionModel(decider, self._observer)
+
+    def _create_raw_decider(self, settings: DecisionSettings) -> DecisionModel:
         match settings.provider:
             case Provider.OPENAI:
                 return OpenAIDecisionModel(self._openai_client(), model=settings.model)
@@ -165,6 +186,12 @@ class ChatModels(Mapping[str, ChatModel]):
                 return GeminiDecisionModel(self._gemini_client(), model=settings.model)
 
     def _create_image_generator(self, settings: ImageGenerationSettings) -> ImageGenerator:
+        generator = self._create_raw_image_generator(settings)
+        if self._observer is None:
+            return generator
+        return WatchedImageGenerator(generator, self._observer)
+
+    def _create_raw_image_generator(self, settings: ImageGenerationSettings) -> ImageGenerator:
         """出图不自动重试：OpenAI 的出图器内部用对话客户端不重试的副本，Gemini 另建一个只试一次的客户端。"""
         match settings.provider:
             case Provider.OPENAI:

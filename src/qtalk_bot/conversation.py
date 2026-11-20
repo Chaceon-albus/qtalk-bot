@@ -246,6 +246,7 @@ from .media import (
 from .media import GeneratedImage as DrawnImage
 from .memory import ProfileForget, Summarizer
 from .memory_tools import FORGET_TOKEN_SECONDS
+from .model_watch import report_timeout
 from .process import (
     Drawing,
     ProcessEvent,
@@ -598,6 +599,7 @@ class _Deadlines:
         self._started = self._active = timer()
         self._paused = 0
         self.expired: _Expiry | None = None
+        self.during_tools = False  # 到期时正在执行函数（流暂停着），不是在等模型
 
     def touch(self) -> None:
         """流里出现了事件（任何事件，含 `Heartbeat`）。"""
@@ -631,6 +633,7 @@ class _Deadlines:
             if task.cancelling() > cancelling:
                 return  # 已经在被别处取消、正在收尾
             self.expired = expired
+            self.during_tools = self._paused > 0
             task.cancel()
             return
 
@@ -2316,6 +2319,7 @@ class Conversation:
                             model.name,
                             settings.idle_timeout_seconds,
                         )
+                        report_timeout(model)  # 执行函数期间空闲时限暂停，到期一定是在等模型
                     case _Expiry.TOTAL:
                         logger.warning(
                             "模型 %s 超过 %g 秒没有写完（总时限%s），放弃这次调用",
@@ -2325,6 +2329,10 @@ class Conversation:
                             if total < settings.timeout_seconds
                             else "",
                         )
+                        if total >= settings.timeout_seconds and not deadlines.during_tools:
+                            # 按被动回复的截止点截短过的不算：剩下的时间被这一轮前面的步骤用掉了。在执行函数
+                            # （画图、记忆）时到期的也不算：那时没有在等这个模型。
+                            report_timeout(model)
                 run.ending = Ending.TIMEOUT
         finally:
             watcher.cancel()

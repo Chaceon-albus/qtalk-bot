@@ -128,6 +128,15 @@ DEFAULT_IMAGE_DAILY_LIMIT = 10
 MAX_IMAGE_DAILY_LIMIT = 1000
 MAX_IMAGE_TOTAL_DAILY_LIMIT = 100_000
 
+DEFAULT_BACKUP_INTERVAL_HOURS = 24
+MAX_BACKUP_INTERVAL_HOURS = 24 * 365
+DEFAULT_BACKUP_KEEP = 7
+MAX_BACKUP_KEEP = 365
+DEFAULT_ALERT_MODEL_FAILURES = 5
+MAX_ALERT_MODEL_FAILURES = 100
+DEFAULT_ALERT_DISK_FREE_MIN_MB = 1024
+MAX_ALERT_DISK_FREE_MIN_MB = 1024 * 1024  # 1 TiB
+
 type GeminiImageSize = Literal["512", "1K", "2K", "4K"]
 """Gemini 出图的分辨率（Interactions API `response_format.image_size` 的取值）。"""
 type OpenAIImageQuality = Literal["low", "medium", "high", "xhigh", "max", "auto"]
@@ -494,6 +503,33 @@ class ChatSettings:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class BackupSettings:
+    """`[backup]` 表：定时备份（放在 `<数据目录>/backups/`，见 `maintenance.py`）。
+
+    Attributes:
+        interval_hours: 最新一份备份距今超过这么多小时就再做一份。
+        keep: 保留最新的几份定时备份，多的删掉（迁移前的备份另计）。
+    """
+
+    interval_hours: int = DEFAULT_BACKUP_INTERVAL_HOURS
+    keep: int = DEFAULT_BACKUP_KEEP
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AlertSettings:
+    """`[alerts]` 表：给管理员的告警的阈值。
+
+    Attributes:
+        model_failures: 同一个服务商的同一个模型连续失败这么多次（中间没有成功）时告警；鉴权失败与 OpenAI 的
+            额度用尽不等，立即告警。
+        disk_free_min_mb: 数据目录所在文件系统的剩余空间低于这么多 MB 时告警；0 就是不告警。
+    """
+
+    model_failures: int = DEFAULT_ALERT_MODEL_FAILURES
+    disk_free_min_mb: int = DEFAULT_ALERT_DISK_FREE_MIN_MB
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Settings:
     """来自 TOML 配置文件的静态设置。`models` 已经校验过：非空、恰好一个默认、名字不重复、备用引用有效；
     `decisions` 不为空且模型多于一个时，每个模型都有 `description`。"""
@@ -512,6 +548,8 @@ class Settings:
     memory: MemorySettings | None = None  # 只在 `decisions` 不为空时生效
     turns: TurnSettings = TurnSettings()
     image_generation: ImageGenerationSettings | None = None
+    backup: BackupSettings = BackupSettings()
+    alerts: AlertSettings = AlertSettings()
 
     @property
     def default_model(self) -> ModelSettings:
@@ -772,6 +810,10 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
     turns_table = table.table("turns")
     turns = None if turns_table is None else _parse_turns(turns_table)
     image_ok, image_generation = _parse_image_generation(table)
+    backup_table = table.table("backup")
+    backup = None if backup_table is None else _parse_backup(backup_table)
+    alerts_table = table.table("alerts")
+    alerts = None if alerts_table is None else _parse_alerts(alerts_table)
     table.finish()
     if decisions is not None and models is not None and len(models) > MAX_OPTIONS:
         # 每个模型是选模型那道选择题的一个选项，两家接口都最多 255 个。
@@ -797,6 +839,8 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         or not memory_ok
         or turns is None
         or not image_ok
+        or backup is None
+        or alerts is None
     ):
         return None
     return Settings(
@@ -814,7 +858,33 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         memory=memory,
         turns=turns,
         image_generation=image_generation,
+        backup=backup,
+        alerts=alerts,
     )
+
+
+def _parse_backup(table: _Table) -> BackupSettings | None:
+    interval_hours = _positive_int(
+        table, "interval_hours", DEFAULT_BACKUP_INTERVAL_HOURS, MAX_BACKUP_INTERVAL_HOURS
+    )
+    keep = _positive_int(table, "keep", DEFAULT_BACKUP_KEEP, MAX_BACKUP_KEEP)
+    table.finish()
+    if interval_hours is None or keep is None:
+        return None
+    return BackupSettings(interval_hours=interval_hours, keep=keep)
+
+
+def _parse_alerts(table: _Table) -> AlertSettings | None:
+    model_failures = _positive_int(
+        table, "model_failures", DEFAULT_ALERT_MODEL_FAILURES, MAX_ALERT_MODEL_FAILURES
+    )
+    disk_free_min_mb = _bounded_int(
+        table, "disk_free_min_mb", DEFAULT_ALERT_DISK_FREE_MIN_MB, 0, MAX_ALERT_DISK_FREE_MIN_MB
+    )
+    table.finish()
+    if model_failures is None or disk_free_min_mb is None:
+        return None
+    return AlertSettings(model_failures=model_failures, disk_free_min_mb=disk_free_min_mb)
 
 
 def _parse_turns(table: _Table) -> TurnSettings | None:

@@ -72,6 +72,7 @@ from .llm import (
 )
 from .llm.gemini_interactions import API_VERSION as GEMINI_API_VERSION
 from .llm.gemini_interactions import OFFICIAL_BASE_URL as GEMINI_OFFICIAL_BASE_URL
+from .llm.openai_responses import is_quota_exhausted
 from .media import EXTENSIONS, detect_format
 
 MAX_REFERENCES = 4
@@ -389,7 +390,12 @@ def _openai_error(exc: Exception) -> ModelError:
                 Provider.OPENAI, ErrorKind.BLOCKED, status if isinstance(status, int) else None
             )
         case openai.APIStatusError(status_code=status_code):
-            return ModelError(Provider.OPENAI, kind_for_status(status_code), status_code)
+            return ModelError(
+                Provider.OPENAI,
+                kind_for_status(status_code),
+                status_code,
+                quota_exhausted=is_quota_exhausted(exc),
+            )
         case openai.APIConnectionError():  # 含 SDK 自己的超时
             return ModelError(Provider.OPENAI, ErrorKind.CONNECTION)
         case openai.APIError():

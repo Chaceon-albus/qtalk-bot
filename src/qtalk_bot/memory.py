@@ -83,6 +83,7 @@ from .llm import (
     TextPart,
     Usage,
 )
+from .model_watch import report_timeout
 from .routing import LATEST_CHARS
 from .storage import Database
 
@@ -604,6 +605,7 @@ class Summarizer:
         parts: list[str] = []
         usage: Usage | None = None
         completed = False
+        ended = False  # 收到了 Finished（不论原因）
         cancelled: asyncio.CancelledError | None = None
         try:
             async with (
@@ -617,6 +619,7 @@ class Summarizer:
                         case Usage():
                             usage = event
                         case Finished(reason=reason):
+                            ended = True
                             completed = reason is FinishReason.COMPLETED
                         case _:
                             pass
@@ -625,6 +628,8 @@ class Summarizer:
             completed = False
         except TimeoutError:
             logger.warning("给用户 %s %s超时", user.label, what)
+            if not ended:  # 收到结局之后只是关闭流时到期的，不怪模型
+                report_timeout(self._model)
             completed = False
         except asyncio.CancelledError as exc:
             cancelled = exc

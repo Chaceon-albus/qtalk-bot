@@ -17,7 +17,8 @@ SDK 解析响应时不校验，还会做宽松的转换（JSON 布尔值的概�
 题型对不上、概率不是 [0, 1] 内的数字或和不为 1，只把那一道记成 `Malformed`，其它题照常（每一道都坏时仍按
 整次的坏响应抛出，见 `decisions.settle_answers()`）。
 
-出错：与对话适配器一样，只取数字状态码与本地的分类，SDK 的异常文案（可能带响应体）一概不用。
+出错：与对话适配器一样，只取数字状态码与本地的分类，SDK 的异常文案（可能带响应体）一概不用；额度用尽同样标在
+`quota_exhausted` 上（`openai_responses.is_quota_exhausted()`）。
 """
 
 import json
@@ -44,6 +45,7 @@ from .decisions import (
     settle_answers,
     usage_or_none,
 )
+from .openai_responses import is_quota_exhausted
 
 DEFAULT_MODEL = "gpt-6-luna"
 
@@ -174,7 +176,12 @@ def _usage(raw: object) -> Usage | None:
 def _error(exc: Exception) -> DecisionError:
     match exc:
         case openai.APIStatusError(status_code=status):
-            return DecisionError(Provider.OPENAI, kind_for_status(status), status)
+            return DecisionError(
+                Provider.OPENAI,
+                kind_for_status(status),
+                status,
+                quota_exhausted=is_quota_exhausted(exc),
+            )
         case openai.APIConnectionError():  # 含超时
             return DecisionError(Provider.OPENAI, ErrorKind.CONNECTION)
         case ValueError():  # 含 JSONDecodeError：响应解析不了

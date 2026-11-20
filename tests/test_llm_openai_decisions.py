@@ -440,3 +440,28 @@ async def test_media_is_not_supported_and_nothing_is_sent() -> None:
         await model_on(server).decide(voice)
     assert info.value.kind is ErrorKind.UNSUPPORTED
     assert server.requests == []
+
+
+async def test_insufficient_quota_is_marked_and_keeps_the_status_kind() -> None:
+    body = {
+        "error": {
+            "message": SECRET_TEXT,
+            "type": "insufficient_quota",
+            "code": "insufficient_quota",
+        }
+    }
+
+    error = await failure(replying(body, 429))
+
+    assert (error.kind, error.status_code, error.quota_exhausted) == (
+        ErrorKind.RATE_LIMIT,
+        429,
+        True,
+    )
+    assert_clean(error)
+
+
+async def test_other_errors_are_not_quota_exhaustion() -> None:
+    body = {"error": {"message": SECRET_TEXT, "type": "server_error", "code": "server_error"}}
+    error = await failure(replying(body, 503))
+    assert (error.kind, error.quota_exhausted) == (ErrorKind.SERVER, False)
