@@ -21,7 +21,7 @@
 
 除上一节的决定外，下面是按常规做法定的（用户 2026-11-20 授权）。
 
-分两步做。第一步是镜像与 compose、健康检查（只看进程）、备份、模型、备份与磁盘的告警。第二步要等 pyqbot 公开网关的连接状态（2026-11-20 在 pyqbot 仓库里加，推到 GitHub 后在本仓库升级固定的 commit），然后接上网关告警，并把网关状态加进健康检查。按 `AGENTS.md`，不去解析 pyqbot 的日志来绕过。
+分两步做。第一步是镜像与 compose、健康检查（只看进程）、备份、模型、备份与磁盘的告警。第二步接上网关告警，并把网关状态加进健康检查：pyqbot 原来没有公开网关的连接状态，2026-11-20 在 pyqbot 里加了 `Bot.gateway_status`（35093b6），本仓库随之升级了固定的 commit。按 `AGENTS.md`，不去解析 pyqbot 的日志来绕过。
 
 ### 镜像与 compose
 
@@ -120,6 +120,20 @@
   - `alerts.Incident` 管「告警 → 已恢复」：原告警还在发送中就恢复了的，等确认发出后再补；原告警没发出去就不补；被每小时限额挡下的「已恢复」留到下一次恢复检查再试；恢复后又出事，撤回还没发出的「已恢复」。
   - 因关停而放弃的备份只记日志，不告警。
 - **关停**：`_shut_down()` 多了第 0 步，排在 `Batcher.stop()` 之前：同步停掉心跳、定时备份（设置放弃信号）与磁盘检查，再取消任务，免得备份占着唯一的数据库线程、挤掉前台入库的时间；等它们退出仍在第 8 步，受总时限约束。
+
+## 里程碑 9 第二步的实现（2026-11-20）
+
+- **网关告警**（`gateway_watch.py`）：
+  - 每 30 秒读一次 `bot.gateway_status`，DISCONNECTED 处于当前状态的时长达到 `[alerts].gateway_down_minutes`（默认 10，范围 1–1440）时，经 `Incident` 告警，键是 `gateway`。同一次断开只告警一次。
+  - 再看到 CONNECTED 时补「已恢复」，写明断开、连上的时刻（按配置的时区）与断开了多久。时长用 pyqbot 记下的两个状态切换时刻相减，比最后一次看到的 `elapsed` 还短时（系统时钟被往回调过）取后者。
+  - NOT_STARTED 与 STOPPED 不告警。两次检查之间的短暂断连看不到，也不告警。
+  - 检查任务和其它维护任务一样，在关停的第 0 步停下。
+- **健康检查里的网关**：
+  - 心跳文件写成 `{"updated_at": …, "gateway": {"state": …, "elapsed_seconds": …}}`：记阶段与处于这个阶段的秒数（pyqbot 的单调时钟），不记要两边时钟相减的时间点。读状态出错时只是不写网关部分。
+  - 判定：CONNECTED 健康；DISCONNECTED 与 NOT_STARTED 超过 `gateway_down_minutes` 不健康（启动卡在取机器人名字等步骤、迟迟没走到 `bot.start()` 时，最终也会变成不健康）；STOPPED 不健康；旧格式、认不出的阶段或坏数据，网关按未知处理、不判失败。
+  - `health.py` 不导入 pyqbot，阶段的取值用本地常量，有测试核对它们与 `pyqbot.GatewayState` 一致。
+- **已知的边界**（接受）：网关遇到无法恢复的关闭码时 pyqbot 抛错、进程退出、容器反复重启，每次都活不到告警的门槛，所以不会有网关告警，健康检查也可能来不及变成不健康；这时要看 `docker compose ps` 的重启次数与日志。不另做持久化的告警。
+- **OpenAI 的错误码**：`ResponseError.code` 里图片输入有问题的 13 个码归为 `BAD_REQUEST`，内容策略类的 4 个（`image_content_policy_violation`、`bio_policy`、`misalignment_policy_violation`、`invalid_prompt`）归为 `BLOCKED`，都不计入模型的连续失败。面向用户的回复不变：对话遇到任何 `ModelError` 都换备用模型、最后回同一句话，不看分类。有测试核对 SDK 的取值列表里还有哪些码没有映射，SDK 增加新码时会提醒。
 
 ## 给管理员的提醒（`alerts.py`）
 
