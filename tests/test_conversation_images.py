@@ -1159,7 +1159,7 @@ class Recorder:
 async def test_total_timeout_while_a_function_runs_is_not_blamed_on_the_chat_model(
     db: Database, tmp_path: Path
 ) -> None:
-    # 总时限在执行画图函数（等发图）时到期：那时没有在等对话模型，不计它的失败。
+    # 总时限在执行画图函数（等发图）时到期：总时限到期一律不计入对话模型的失败。
     alice = await invited(db, ALICE, "小王")
     clock, recorder = ManualClock(), Recorder()
     model = DrawingModel("main", [draw(), *answer("不该出现")])

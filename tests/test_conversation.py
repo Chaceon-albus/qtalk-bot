@@ -879,8 +879,8 @@ async def test_idle_timeout_is_reported_as_a_failure_of_that_model(db: Database)
     ]
 
 
-async def test_total_timeout_is_reported_unless_cut_by_the_reply_deadline(db: Database) -> None:
-    # 主模型用满了自己的总时限：计一次失败。备用模型的总时限被被动回复的截止点截短：不怪它。
+async def test_total_timeout_is_not_reported(db: Database) -> None:
+    # 总时限到期不计入模型的失败（预算可能被函数或这一轮前面的步骤用掉了）；服务商挂死时空闲时限会先到。
     alice = await invited(db, ALICE, "小王")
     clock, recorder = ManualClock(), Recorder()
     primary = ScriptedModel("main", [], hang=True)
@@ -902,7 +902,7 @@ async def test_total_timeout_is_reported_unless_cut_by_the_reply_deadline(db: Da
     await clock.advance_to(3300)
     await talk
 
-    assert recorder.events == [("failed", primary.model, ErrorKind.CONNECTION)]
+    assert recorder.events == []
 
 
 async def test_no_fallback_when_too_little_time_is_left_before_the_reply_deadline(
