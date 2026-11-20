@@ -16,7 +16,7 @@ uv run --env-file .env python -m qtalk_bot
 
 ## 文档
 
-- [设计](docs/design.md)：方向、已经定下来的决定和待定的事。
+- [设计](docs/design/README.md)：方向、已经定下来的决定和待定的事。
 - [AGENTS.md](AGENTS.md)：开发约束。
 
 ## 开发

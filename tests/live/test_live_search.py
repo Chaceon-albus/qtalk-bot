@@ -4,7 +4,7 @@
 
     uv run --env-file .env pytest -m live -s tests/live/test_live_search.py
 
-模型名默认取 `docs/design.md` 里的候选，可以用环境变量 `QTALK_LIVE_OPENAI_MODEL`、
+模型名默认取 `docs/design/external-facts.md` 里的候选，可以用环境变量 `QTALK_LIVE_OPENAI_MODEL`、
 `QTALK_LIVE_GEMINI_MODEL` 改。缺少某家的密钥时跳过那一家。打印搜索的进展与次数、查询词、引用的条数与链接的
 主机名、整理后「来源」的条数、用量；不打印回答的正文与完整链接。
 """

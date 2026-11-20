@@ -4,7 +4,7 @@
 
     uv run --env-file .env pytest -m live -s tests/live
 
-模型名默认取 `docs/design.md` 里的候选，可以用环境变量 `QTALK_LIVE_OPENAI_MODEL`、
+模型名默认取 `docs/design/external-facts.md` 里的候选，可以用环境变量 `QTALK_LIVE_OPENAI_MODEL`、
 `QTALK_LIVE_GEMINI_MODEL` 改。缺少某家的密钥时跳过那一家。只打印事件的种类、文字的字数与用量。
 """
 
