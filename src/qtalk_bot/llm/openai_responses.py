@@ -19,6 +19,19 @@ Responses API 不接受音频（文档只在 Chat Completions 里写了音频输
 "approximate"}}]`（不写 `user_location` 时服务商默认用户在美国；只写 `type` 就不做这个假定）。模型不支持或
 服务商拒绝时按普通的调用失败处理。
 
+函数调用：请求带 `tools` 时，每个函数声明为 `{"type": "function", "name", "description", "parameters",
+"strict": true}`，与内置搜索放在同一个 `tools` 里。一跳的 `response.completed` 里有 `function_call` 输出项时
+（`output_item.added` → 若干 `function_call_arguments.delta` → `.done` → `output_item.done`；这些事件只交出
+`Heartbeat`，调用取自完整的输出项），交出累计的 `Usage` 但不交出 `Finished`，逐个调用 `tool_runner`（前后各一个
+`Heartbeat`），然后发下一跳：`input` = 上一跳的全部输入 + 上一跳的全部输出项（按原顺序原样，见 `_Turn`）+ 每个
+调用对应的 `function_call_output`（文字是 `input_text`，图片是 data URL 的 `input_image`）。`parallel_tool_calls`
+保持默认；带函数的请求显式带 `include: ["reasoning.encrypted_content"]`。执行过 `MAX_FUNCTION_ROUNDS` 轮后的
+那一跳不再允许调用函数（`tool_choice: "none"`；开着搜索时是只允许 `web_search` 的 `allowed_tools`），模型仍然
+调用时抛 `ModelError(MALFORMED)`。`response.incomplete` 里的函数调用不执行（参数可能被截断），照常以 `Finished`
+结束。带回的输出项只去掉文字里的孤立代理码位，密文与参数不动。交回的图片按整次调用累计的附件体积校验
+（`InlineBudget`），放不下的换成一句说明。各跳共用搜索计数与引用去重，`Usage` 是各跳之和（中途的搜索也给出
+已结束各跳的 token 累计）。
+
 处理的流式事件：
 - `response.output_text.delta`、`response.refusal.delta`：回答（或拒答说明）的文字，转成 `TextDelta`；所在的
   消息项 `phase` 为 `commentary`（调用工具前的说明，`output_item.added` 里给出）时转成 `Commentary`，不算回答，
@@ -61,6 +74,8 @@ Responses API 不接受音频（文档只在 Chat Completions 里写了音频输
 
 import asyncio
 import base64
+import contextlib
+import itertools
 import logging
 import os
 from collections.abc import AsyncGenerator, Callable
@@ -69,6 +84,8 @@ from typing import cast
 import openai
 from openai.types.responses import (
     EasyInputMessageParam,
+    FunctionToolParam,
+    ResponseFunctionCallOutputItemListParam,
     ResponseFunctionWebSearch,
     ResponseInputContentParam,
     ResponseInputFileParam,
@@ -81,10 +98,15 @@ from openai.types.responses import (
     ResponseUsage,
     ToolParam,
 )
+from openai.types.responses.response_create_params import ToolChoice
+from openai.types.responses.response_input_item_param import FunctionCallOutput
 from openai.types.shared_params import Reasoning, ReasoningEffort
 
 from . import (
+    FUNCTION_RESULT_IMAGE_TYPES,
     INPUT_LIMITS,
+    MAX_FUNCTION_ROUNDS,
+    OVERSIZED_IMAGE_NOTE,
     AudioPart,
     ChatEvent,
     ChatRequest,
@@ -94,8 +116,13 @@ from . import (
     FilePart,
     Finished,
     FinishReason,
+    FunctionCall,
+    FunctionCallStarted,
+    FunctionResult,
+    FunctionTool,
     Heartbeat,
     ImagePart,
+    InlineBudget,
     Masked,
     Message,
     Modality,
@@ -109,9 +136,12 @@ from . import (
     TextPart,
     ThoughtSummary,
     Usage,
+    add_tokens,
+    clean_json,
     clean_text,
     items,
     kind_for_status,
+    token_count,
 )
 
 logger = logging.getLogger(__name__)
@@ -215,19 +245,65 @@ class OpenAIChatModel:
         return reasoning or openai.omit
 
     async def stream(self, request: ChatRequest) -> AsyncGenerator[ChatEvent]:
-        messages: list[ResponseInputItemParam] = [_message(m) for m in request.messages]
-        tools: list[ToolParam] | openai.Omit = [_WEB_SEARCH] if self._search else openai.omit
+        runner = request.tool_runner
+        if request.tools and runner is None:
+            raise ModelError(Provider.OPENAI, ErrorKind.UNSUPPORTED)
+        inputs: list[ResponseInputItemParam] = [_message(m) for m in request.messages]
+        tools: list[ToolParam] = [_WEB_SEARCH] if self._search else []
+        tools.extend(_function_tool(tool) for tool in request.tools)
+        extras = _Extras(self._search)
+        tokens = _Tokens()
+        budget = InlineBudget(_LIMITS, request.messages)
+        for rounds in itertools.count():
+            turn = _Turn(final=bool(request.tools) and rounds >= MAX_FUNCTION_ROUNDS)
+            async with contextlib.aclosing(
+                self._hop(request, inputs, tools, turn, extras, tokens)
+            ) as hop:
+                async for event in hop:
+                    yield event
+            if not turn.calls:
+                return  # 这一跳以 Finished 结束
+            assert runner is not None
+            inputs.extend(turn.replay)
+            for call in turn.calls:
+                yield FunctionCallStarted(call.call_id, call.name)
+                yield Heartbeat()
+                result = await runner(call)
+                yield Heartbeat()
+                inputs.append(_function_output(call, result, budget))
+
+    def _final_tool_choice(self) -> ToolChoice:
+        """到了函数轮数上限的那一跳：不再允许调用函数。`none` 会连内置搜索一起禁掉，开着搜索时改为只允许
+        `web_search` 的 `allowed_tools`（`auto`：可以搜索，也可以直接回答）。"""
+        if self._search:
+            return {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "web_search"}]}
+        return "none"
+
+    async def _hop(
+        self,
+        request: ChatRequest,
+        inputs: list[ResponseInputItemParam],
+        tools: list[ToolParam],
+        turn: _Turn,
+        extras: _Extras,
+        tokens: _Tokens,
+    ) -> AsyncGenerator[ChatEvent]:
+        """发一跳请求并读完它的流。以 `Finished` 结束；模型调用了函数时不交出 `Finished`，调用记在 `turn` 里。"""
 
         async def create(summary: bool) -> openai.AsyncStream[ResponseStreamEvent]:
             return await self._client.responses.create(
                 model=self._model,
                 instructions=request.system,
-                input=messages,
+                input=inputs,
                 max_output_tokens=(
                     openai.omit if request.max_output_tokens is None else request.max_output_tokens
                 ),
                 reasoning=self._reasoning_param(summary),
-                tools=tools,
+                tools=tools or openai.omit,
+                tool_choice=self._final_tool_choice() if turn.final else openai.omit,
+                # 文档说无状态模式下推理项默认就带密文、`include` 只为兼容而接受；SDK 的说明仍要求显式
+                # 请求。带了函数才会续发，只在这时带上。
+                include=["reasoning.encrypted_content"] if request.tools else openai.omit,
                 store=False,
                 stream=True,
             )
@@ -256,7 +332,6 @@ class OpenAIChatModel:
                     refused,
                 )
 
-        extras = _Extras(self._search)
         finished = False
         failure: ModelError | None = None
         try:
@@ -298,8 +373,9 @@ class OpenAIChatModel:
                                 _tolerant(extras.item_added, event.item)
                             case "response.web_search_call.completed":
                                 if extras.confirm(event.item_id):
-                                    yield Usage(None, None, extras.count)
+                                    yield tokens.event(extras.count)
                             case "response.output_item.done":
+                                turn.item_done(event.output_index, event.item)
                                 for found in _tolerant(extras.item_done, event.item):
                                     yield found
                             case "response.output_text.annotation.added":
@@ -318,15 +394,26 @@ class OpenAIChatModel:
                             case "response.completed":
                                 for found in _tolerant(extras.snapshot, event.response.output):
                                     yield found
-                                yield _usage(event.response.usage, extras.count)
+                                calls = (
+                                    turn.complete(event.response.output) if request.tools else []
+                                )
+                                tokens.add(event.response.usage)
+                                yield tokens.event(extras.count)
+                                if calls is None or (calls and turn.final):
+                                    # 函数调用的形状不对，或到了轮数上限、要求不再调用时仍然调用。
+                                    raise ModelError(Provider.OPENAI, ErrorKind.MALFORMED)
                                 finished = True
                                 settle()
+                                if calls:
+                                    turn.calls = calls
+                                    return
                                 yield Finished(FinishReason.COMPLETED)
                                 return
                             case "response.incomplete":
                                 for found in _tolerant(extras.snapshot, event.response.output):
                                     yield found
-                                yield _usage(event.response.usage, extras.count)
+                                tokens.add(event.response.usage)
+                                yield tokens.event(extras.count)
                                 details = event.response.incomplete_details
                                 reason = None if details is None else details.reason
                                 finished = True
@@ -342,9 +429,10 @@ class OpenAIChatModel:
                                 # 只为补上漏记的搜索次数：失败了，不再补发正文与引用。
                                 _tolerant(extras.snapshot, event.response.output, text=False)
                                 if event.response.usage is not None:
-                                    yield _usage(event.response.usage, extras.count)
+                                    tokens.add(event.response.usage)
+                                    yield tokens.event(extras.count)
                                 elif extras.count != counted:
-                                    yield Usage(None, None, extras.count)
+                                    yield tokens.event(extras.count)
                                 error = event.response.error
                                 code = None if error is None else str(error.code)
                                 kind = _FAILED_CODES.get(code or "", ErrorKind.FAILED)
@@ -416,10 +504,114 @@ def _data_url(mime_type: str, data: bytes) -> str:
     return f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"
 
 
-def _usage(usage: ResponseUsage | None, searches: int | None = None) -> Usage:
-    if usage is None:
-        return Usage(None, None, searches)
-    return Usage(usage.input_tokens, usage.output_tokens, searches)
+class _Tokens:
+    """一次调用里各跳的 token 用量之和；某项一直没有报告时是 `None`。每一跳的每一项先按 `token_count()` 校验，
+    无效的当作没有报告。"""
+
+    def __init__(self) -> None:
+        self.input_tokens: int | None = None
+        self.output_tokens: int | None = None
+
+    def add(self, usage: ResponseUsage | None) -> None:
+        if usage is None:
+            return
+        self.input_tokens = add_tokens(
+            self.input_tokens, token_count(cast(object, getattr(usage, "input_tokens", None)))
+        )
+        self.output_tokens = add_tokens(
+            self.output_tokens, token_count(cast(object, getattr(usage, "output_tokens", None)))
+        )
+
+    def event(self, searches: int | None) -> Usage:
+        return Usage(self.input_tokens, self.output_tokens, searches)
+
+
+class _Turn:
+    """一跳请求里的函数调用。
+
+    `output_item.done` 的输出项按 `output_index` 记下；跳结束（`response.completed`）时，快照 `response.output`
+    不为空就以它为准，否则用记下的输出项。模型调用了函数时，这一跳的**全部**输出项按原顺序原样（`to_dict()`：
+    只含服务商实际给出的字段）留作下一跳的输入：`store=False` 时服务端不保存上下文，推理项（带
+    `encrypted_content`）、带 `phase` 的消息、`web_search_call` 与 `function_call` 都要带回。
+
+    `final` 为真表示已到轮数上限，这一跳要求模型不再调用函数。
+    """
+
+    def __init__(self, *, final: bool) -> None:
+        self.final = final
+        self.calls: list[FunctionCall] = []
+        self.replay: list[ResponseInputItemParam] = []
+        self._done: dict[int, object] = {}
+
+    def item_done(self, index: object, item: object) -> None:
+        if isinstance(index, int) and not isinstance(index, bool):
+            self._done[index] = item
+
+    def complete(self, snapshot: object) -> list[FunctionCall] | None:
+        """这一跳里的函数调用（没有时是空列表），并备好要带回的输出项；函数调用或输出项的形状不对时返回 `None`。"""
+        source = items(snapshot) or [self._done[index] for index in sorted(self._done)]
+        if not any(getattr(item, "type", None) == "function_call" for item in source):
+            return []
+        calls: list[FunctionCall] = []
+        replay: list[ResponseInputItemParam] = []
+        for item in source:
+            if not isinstance(item, openai.BaseModel):
+                return None
+            # 关掉 Pydantic 的序列化警告：字段类型不对时（如参数给成了对象）它会把原值写进警告，参数可能带出
+            # 用户说的内容；类型由下面显式检查。
+            data = item.to_dict(mode="json", warnings=False)
+            # 原样带回服务商给的输出项：Responses API 接受把输出项直接作为输入，形状由它保证。只去掉文字里的
+            # 孤立代理码位（否则下一跳编码不成 UTF-8），密文与参数不动。
+            replay.append(cast(ResponseInputItemParam, clean_json(data, keep=_REPLAY_KEEP)))
+            if data.get("type") != "function_call":
+                continue
+            call_id, name, arguments = data.get("call_id"), data.get("name"), data.get("arguments")
+            if not (
+                isinstance(call_id, str)
+                and call_id
+                and isinstance(name, str)
+                and isinstance(arguments, str)
+            ):
+                return None
+            calls.append(FunctionCall(call_id, name, arguments))
+        self.replay = replay
+        return calls
+
+
+def _function_tool(tool: FunctionTool) -> FunctionToolParam:
+    return {
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": dict(tool.parameters),
+        "strict": True,
+    }
+
+
+_REPLAY_KEEP = frozenset(("encrypted_content", "arguments"))
+
+
+def _function_output(
+    call: FunctionCall, result: FunctionResult, budget: InlineBudget
+) -> FunctionCallOutput:
+    """函数结果：文字是 `input_text`，图片是 `input_image`（data URL）；没有内容时是空串。OpenAI 的函数结果没有
+    表示出错的字段，`is_error` 只能靠结果里的说明文字。图片连同已有的附件放不进一次请求时换成
+    `OVERSIZED_IMAGE_NOTE`，不发必然超限的请求。"""
+    content: ResponseFunctionCallOutputItemListParam = []
+    for part in result.parts:
+        match part:
+            case TextPart(text=text):
+                content.append({"type": "input_text", "text": text})
+            case ImagePart(data=data, mime_type=mime):
+                if mime not in FUNCTION_RESULT_IMAGE_TYPES:
+                    raise ModelError(Provider.OPENAI, ErrorKind.UNSUPPORTED)
+                if not budget.take(data):
+                    content.append({"type": "input_text", "text": OVERSIZED_IMAGE_NOTE})
+                    continue
+                content.append(
+                    {"type": "input_image", "image_url": _data_url(mime, data), "detail": "auto"}
+                )
+    return {"type": "function_call_output", "call_id": call.call_id, "output": content or ""}
 
 
 class _Extras:

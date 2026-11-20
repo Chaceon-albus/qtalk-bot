@@ -4,11 +4,13 @@
 事件的形状照 SDK 3.55.1 的类型定义（`openai/types/responses/*_event.py`）与官方的流式事件文档。
 """
 
+import asyncio
 import base64
 import dataclasses
 import json
 import logging
 import traceback
+import warnings
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -17,7 +19,10 @@ import openai
 import pytest
 
 from qtalk_bot.llm import (
+    INPUT_LIMITS,
+    MAX_FUNCTION_ROUNDS,
     MAX_TOKENS_PER_CALL,
+    OVERSIZED_IMAGE_NOTE,
     AudioPart,
     ChatEvent,
     ChatRequest,
@@ -27,6 +32,10 @@ from qtalk_bot.llm import (
     FilePart,
     Finished,
     FinishReason,
+    FunctionCall,
+    FunctionCallStarted,
+    FunctionResult,
+    FunctionTool,
     Heartbeat,
     ImagePart,
     Message,
@@ -40,6 +49,8 @@ from qtalk_bot.llm import (
     TextPart,
     ThoughtSummary,
     Usage,
+    inline_size,
+    openai_responses,
 )
 from qtalk_bot.llm.openai_responses import OFFICIAL_BASE_URL, OpenAIChatModel, create_client
 
@@ -1370,3 +1381,505 @@ async def test_rejection_without_a_summary_request_is_not_retried() -> None:
     assert error.status_code == 400
     assert len(server.requests) == 1
     assert "reasoning" not in json.loads(server.requests[0].content)
+
+
+# ---- 函数调用（里程碑 10） ----
+# 事件与输出项的形状照 SDK 的 `response_function_tool_call.py`、`response_function_call_arguments_*_event.py`、
+# `response_input_item_param.py`（`FunctionCallOutput`）与官方的函数调用文档。
+
+DATE_TOOL = FunctionTool(
+    name="get_date",
+    description="查询当前日期",
+    parameters={
+        "type": "object",
+        "properties": {"zone": {"type": ["string", "null"]}},
+        "required": ["zone"],
+        "additionalProperties": False,
+    },
+)
+DATE_TOOL_PARAM: Payload = {
+    "type": "function",
+    "name": "get_date",
+    "description": "查询当前日期",
+    "parameters": {
+        "type": "object",
+        "properties": {"zone": {"type": ["string", "null"]}},
+        "required": ["zone"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+ENCRYPTED = "gAAAAB-encrypted-reasoning"
+
+
+class Runner:
+    """扮演调用方的 `tool_runner`：记下调用，依次返回 `results`（不够时重复最后一个）。"""
+
+    def __init__(self, *results: FunctionResult) -> None:
+        self.results = results or (FunctionResult((TextPart("2026-11-19"),)),)
+        self.calls: list[FunctionCall] = []
+
+    async def __call__(self, call: FunctionCall) -> FunctionResult:
+        self.calls.append(call)
+        return self.results[min(len(self.calls), len(self.results)) - 1]
+
+
+def with_tools(runner: Runner | None) -> ChatRequest:
+    return dataclasses.replace(REQUEST, tools=(DATE_TOOL,), tool_runner=runner)
+
+
+def hopping(*hops: list[Payload]) -> Server:
+    """每次请求依次回一跳的事件。"""
+    replies = iter(hops)
+    return Server(
+        lambda _: httpx2.Response(
+            200, headers={"content-type": "text/event-stream"}, content=sse(next(replies))
+        )
+    )
+
+
+async def drain_request(
+    model: OpenAIChatModel, request: ChatRequest, into: list[ChatEvent]
+) -> None:
+    async for event in model.stream(request):
+        into.append(event)
+
+
+def bodies(server: Server) -> list[Payload]:
+    return [json.loads(request.content) for request in server.requests]
+
+
+def call_item(call_id: str, arguments: str, status: str = "completed") -> Payload:
+    return {
+        "id": f"fc_{call_id}",
+        "type": "function_call",
+        "status": status,
+        "call_id": call_id,
+        "name": "get_date",
+        "arguments": arguments,
+    }
+
+
+def arguments_event(kind: str, seq: int, call_id: str, output_index: int, **fields: Any) -> Payload:
+    return {
+        "type": f"response.function_call_arguments.{kind}",
+        "sequence_number": seq,
+        "item_id": f"fc_{call_id}",
+        "output_index": output_index,
+        **fields,
+    }
+
+
+def completed_with(seq: int, output: list[Payload], tokens: tuple[int, int]) -> Payload:
+    return {
+        "type": "response.completed",
+        "sequence_number": seq,
+        "response": response("completed", output=output, usage=usage(*tokens)),
+    }
+
+
+REASONING_DONE: Payload = {
+    "id": "rs_1",
+    "type": "reasoning",
+    "summary": [],
+    "encrypted_content": ENCRYPTED,
+}
+COMMENTARY_DONE: Payload = {
+    **message_with("msg_c", [output_text("我查一下日期。")]),
+    "phase": "commentary",
+}
+SEARCH_DONE = search_item("ws_1", SEARCH_ACTION)
+CALL_DONE = call_item("call_1", '{"zone":null}')
+CALLING_HOP: list[Payload] = [
+    CREATED,
+    item_event("added", 1, 0, {"id": "rs_1", "type": "reasoning", "summary": []}),
+    item_event("done", 2, 0, REASONING_DONE),
+    message_added(3, "msg_c", 1, "commentary"),
+    {**delta_of(4, "msg_c", "我查一下日期。"), "output_index": 1},
+    item_event("done", 5, 1, COMMENTARY_DONE),
+    item_event("added", 6, 2, search_item("ws_1", {"type": "search"}, "in_progress")),
+    search_event("in_progress", 7, "ws_1", 2),
+    search_event("completed", 8, "ws_1", 2),
+    item_event("done", 9, 2, SEARCH_DONE),
+    item_event("added", 10, 3, call_item("call_1", "", "in_progress")),
+    arguments_event("delta", 11, "call_1", 3, delta='{"zone":'),
+    arguments_event("delta", 12, "call_1", 3, delta="null}"),
+    arguments_event("done", 13, "call_1", 3, arguments='{"zone":null}', name="get_date"),
+    item_event("done", 14, 3, CALL_DONE),
+    completed_with(15, [REASONING_DONE, COMMENTARY_DONE, SEARCH_DONE, CALL_DONE], (50, 20)),
+]
+ANSWER_HOP: list[Payload] = [
+    CREATED,
+    ITEM_ADDED,
+    text_delta(2, "今天是 11 月 19 日。"),
+    completed_with(3, [], (80, 10)),
+]
+ORIGINAL_INPUT = [
+    {"role": "user", "content": [{"type": "input_text", "text": "第一问"}]},
+    {"role": "assistant", "content": "第一答"},
+    {"role": "user", "content": [{"type": "input_text", "text": SECRET_TEXT}]},
+]
+
+
+async def test_function_call_round_trip_with_search_and_summed_usage() -> None:
+    server = hopping(CALLING_HOP, ANSWER_HOP)
+    runner = Runner(FunctionResult((TextPart("2026-11-19"), ImagePart(PNG_BYTES, "image/png"))))
+
+    events = [e async for e in model_on(server, search=True).stream(with_tools(runner))]
+
+    shown = [e for e in events if not isinstance(e, Heartbeat)]
+    assert shown == [
+        Commentary("msg_c#0", "我查一下日期。"),
+        SearchProgress("ws_1", SearchStage.STARTED),
+        Usage(None, None, 1),
+        SearchProgress("ws_1", SearchStage.COMPLETED, ("上海 天气", "今天 日期")),
+        Usage(50, 20, 1),  # 第一跳结束就交出累计值
+        FunctionCallStarted("call_1", "get_date"),
+        TextDelta("今天是 11 月 19 日。"),
+        Usage(130, 30, 1),  # 各跳之和
+        DONE,
+    ]
+    # 执行函数前后各有一个 Heartbeat。
+    started = events.index(FunctionCallStarted("call_1", "get_date"))
+    assert events[started + 1 : started + 3] == [Heartbeat(), Heartbeat()]
+    assert runner.calls == [FunctionCall("call_1", "get_date", '{"zone":null}')]
+
+    first, second = bodies(server)
+    assert first["tools"] == [WEB_SEARCH_TOOL, DATE_TOOL_PARAM]  # 函数与内置搜索同时开着
+    assert "tool_choice" not in first
+    assert "parallel_tool_calls" not in first  # 保持默认
+    assert second["tools"] == first["tools"]
+    assert "tool_choice" not in second
+    assert second["store"] is False
+    # 上一跳的全部输出项按原顺序原样带回（推理项的 encrypted_content、消息的 phase），再接函数结果。
+    assert second["input"] == [
+        *ORIGINAL_INPUT,
+        REASONING_DONE,
+        COMMENTARY_DONE,
+        SEARCH_DONE,
+        CALL_DONE,
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": [
+                {"type": "input_text", "text": "2026-11-19"},
+                {
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{b64(PNG_BYTES)}",
+                    "detail": "auto",
+                },
+            ],
+        },
+    ]
+
+
+async def test_several_calls_in_one_hop_run_in_order() -> None:
+    # 快照里没有输出项时，用 output_item.done 记下的输出项（按 output_index）。
+    first_call, second_call = (
+        call_item("call_a", '{"zone":"A"}'),
+        call_item("call_b", '{"zone":"B"}'),
+    )
+    calling = [
+        CREATED,
+        item_event("done", 1, 1, second_call),
+        item_event("done", 2, 0, first_call),
+        completed_with(3, [], (5, 5)),
+    ]
+    server = hopping(calling, ANSWER_HOP)
+    runner = Runner(FunctionResult((TextPart("甲"),)), FunctionResult((TextPart("乙"),), True))
+
+    events = [
+        e async for e in model_on(server).stream(with_tools(runner)) if not isinstance(e, Heartbeat)
+    ]
+
+    assert [call.call_id for call in runner.calls] == ["call_a", "call_b"]
+    assert [e for e in events if isinstance(e, FunctionCallStarted)] == [
+        FunctionCallStarted("call_a", "get_date"),
+        FunctionCallStarted("call_b", "get_date"),
+    ]
+    assert events[-2:] == [Usage(85, 15), DONE]
+    first, second = bodies(server)
+    assert first["tools"] == [DATE_TOOL_PARAM]
+    assert second["input"][len(ORIGINAL_INPUT) :] == [
+        first_call,
+        second_call,
+        {
+            "type": "function_call_output",
+            "call_id": "call_a",
+            "output": [{"type": "input_text", "text": "甲"}],
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_b",
+            "output": [{"type": "input_text", "text": "乙"}],
+        },
+    ]
+
+
+def calling_until_told_not_to(still_calls: bool, choice: object = "none") -> Server:
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        body = json.loads(request.content)
+        if body.get("tool_choice") == choice and not still_calls:
+            events = ANSWER_HOP
+        else:
+            events = [
+                CREATED,
+                item_event("done", 1, 0, CALL_DONE),
+                completed_with(2, [CALL_DONE], (1, 1)),
+            ]
+        return httpx2.Response(
+            200, headers={"content-type": "text/event-stream"}, content=sse(events)
+        )
+
+    return Server(respond)
+
+
+async def test_after_the_round_limit_the_model_is_told_not_to_call() -> None:
+    server = calling_until_told_not_to(still_calls=False)
+    runner = Runner()
+
+    events = [
+        e async for e in model_on(server).stream(with_tools(runner)) if not isinstance(e, Heartbeat)
+    ]
+
+    assert len(runner.calls) == MAX_FUNCTION_ROUNDS
+    assert [body.get("tool_choice") for body in bodies(server)] == [None] * MAX_FUNCTION_ROUNDS + [
+        "none"
+    ]
+    assert events[-2:] == [Usage(MAX_FUNCTION_ROUNDS + 80, MAX_FUNCTION_ROUNDS + 10), DONE]
+
+
+async def test_calling_again_after_being_told_not_to_is_malformed() -> None:
+    server = calling_until_told_not_to(still_calls=True)
+    runner = Runner()
+    events: list[ChatEvent] = []
+
+    with pytest.raises(ModelError) as info:
+        await drain_request(model_on(server), with_tools(runner), events)
+
+    assert info.value.kind is ErrorKind.MALFORMED
+    assert len(runner.calls) == MAX_FUNCTION_ROUNDS
+    assert len(server.requests) == MAX_FUNCTION_ROUNDS + 1
+    # 最后一跳的用量照样交出。
+    assert [e for e in events if isinstance(e, Usage)][-1] == Usage(
+        MAX_FUNCTION_ROUNDS + 1, MAX_FUNCTION_ROUNDS + 1
+    )
+
+
+async def test_tools_without_a_runner_send_nothing() -> None:
+    server = hopping(ANSWER_HOP)
+
+    with pytest.raises(ModelError) as info:
+        async for _ in model_on(server).stream(with_tools(None)):
+            pass
+
+    assert info.value.kind is ErrorKind.UNSUPPORTED
+    assert server.requests == []
+
+
+class Watched(httpx2.AsyncByteStream):
+    """记下响应流是否已关闭。"""
+
+    def __init__(self, body: bytes, closed: list[bool]) -> None:
+        self.body = body
+        self.closed = closed
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self.body
+
+    async def aclose(self) -> None:
+        self.closed.append(True)
+
+
+class RunnerError(Exception):
+    pass
+
+
+async def test_runner_exception_propagates_unchanged_after_the_stream_is_closed() -> None:
+    closed: list[bool] = []
+    server = Server(
+        lambda _: httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=Watched(sse(CALLING_HOP), closed),
+        )
+    )
+
+    async def explode(call: FunctionCall) -> FunctionResult:
+        assert closed  # 执行函数时上一跳的连接已经释放
+        raise RunnerError(call.call_id)
+
+    request = dataclasses.replace(REQUEST, tools=(DATE_TOOL,), tool_runner=explode)
+    with pytest.raises(RunnerError):
+        async for _ in model_on(server).stream(request):
+            pass
+
+    assert closed
+    assert len(server.requests) == 1
+
+
+async def test_cancelled_runner_propagates_the_cancellation() -> None:
+    closed: list[bool] = []
+    server = Server(
+        lambda _: httpx2.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=Watched(sse(CALLING_HOP), closed),
+        )
+    )
+    running = asyncio.Event()
+
+    async def hang(call: FunctionCall) -> FunctionResult:
+        running.set()
+        await asyncio.Event().wait()
+        raise AssertionError("不会执行到这里")
+
+    async def consume() -> None:
+        request = dataclasses.replace(REQUEST, tools=(DATE_TOOL,), tool_runner=hang)
+        async for _ in model_on(server).stream(request):
+            pass
+
+    task = asyncio.create_task(consume())
+    await running.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert closed
+    assert len(server.requests) == 1
+
+
+async def test_unsupported_image_in_a_function_result_is_not_sent() -> None:
+    server = hopping(CALLING_HOP, ANSWER_HOP)
+    runner = Runner(FunctionResult((ImagePart(b"GIF89a", "image/gif"),)))
+
+    with pytest.raises(ModelError) as info:
+        async for _ in model_on(server).stream(with_tools(runner)):
+            pass
+
+    assert info.value.kind is ErrorKind.UNSUPPORTED
+    assert len(server.requests) == 1
+
+
+async def test_function_calls_are_ignored_when_no_functions_were_declared() -> None:
+    server = hopping(CALLING_HOP)
+
+    events = await collect(model_on(server, search=True))
+
+    assert FunctionCallStarted("call_1", "get_date") not in events
+    assert events[-2:] == [Usage(50, 20, 1), DONE]
+    assert len(server.requests) == 1
+    assert "tool_choice" not in server.body
+
+
+# ---- 函数调用的评审修正 ----
+
+
+async def test_function_requests_ask_for_encrypted_reasoning_and_plain_ones_do_not() -> None:
+    server = hopping(CALLING_HOP, ANSWER_HOP)
+
+    await collect_request(model_on(server, search=True), with_tools(Runner()))
+
+    assert [body["include"] for body in bodies(server)] == [["reasoning.encrypted_content"]] * 2
+    plain = streaming([CREATED, COMPLETED])
+    await collect(model_on(plain, search=True))
+    assert "include" not in plain.body
+
+
+async def collect_request(model: OpenAIChatModel, request: ChatRequest) -> list[ChatEvent]:
+    return [event async for event in model.stream(request) if not isinstance(event, Heartbeat)]
+
+
+ARGUMENT_MARKER = "合成标记-参数原值-7f3a"
+
+
+async def test_arguments_given_as_an_object_are_rejected_without_echoing_them(
+    capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    broken = {**CALL_DONE, "arguments": {"zone": ARGUMENT_MARKER}}
+    hop = [CREATED, item_event("done", 1, 0, broken), completed_with(2, [broken], (3, 3))]
+    runner = Runner()
+
+    with warnings.catch_warnings(record=True) as caught, caplog.at_level(logging.DEBUG):
+        warnings.simplefilter("always")
+        events: list[ChatEvent] = []
+        with pytest.raises(ModelError) as info:
+            await drain_request(model_on(hopping(hop)), with_tools(runner), events)
+
+    assert info.value.kind is ErrorKind.MALFORMED
+    assert runner.calls == []
+    assert caught == []
+    captured = capsys.readouterr()
+    shown = (
+        captured.out,
+        captured.err,
+        caplog.text,
+        str(info.value),
+        "".join(traceback.format_exception(info.value)),
+    )
+    assert all(ARGUMENT_MARKER not in text for text in shown)
+
+
+async def test_lone_surrogates_are_removed_from_replayed_text_only() -> None:
+    commentary = {**message_with("msg_c", [output_text("我\ud800查一下")]), "phase": "commentary"}
+    call = call_item("call_1", '{"zone":"UTC"}')
+    hop = [
+        CREATED,
+        item_event("done", 1, 0, REASONING_DONE),
+        item_event("done", 2, 1, commentary),
+        item_event("done", 3, 2, call),
+        completed_with(4, [REASONING_DONE, commentary, call], (3, 3)),
+    ]
+    server = hopping(hop, ANSWER_HOP)
+
+    events = await collect_request(model_on(server), with_tools(Runner()))
+
+    assert events[-1] == DONE
+    replayed = bodies(server)[1]["input"][len(ORIGINAL_INPUT) : len(ORIGINAL_INPUT) + 3]
+    assert replayed == [
+        REASONING_DONE,  # 密文不动
+        {**message_with("msg_c", [output_text("我查一下")]), "phase": "commentary"},
+        call,  # 参数不动
+    ]
+
+
+async def test_images_that_do_not_fit_the_inline_limit_are_replaced_by_a_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limits = dataclasses.replace(
+        INPUT_LIMITS[Provider.OPENAI], max_inline_bytes=2 * inline_size(len(PNG_BYTES))
+    )
+    monkeypatch.setattr(openai_responses, "_LIMITS", limits)
+    server = hopping(CALLING_HOP, ANSWER_HOP)
+    image = ImagePart(PNG_BYTES, "image/png")
+    runner = Runner(FunctionResult((image, image)), FunctionResult((image,)))
+    # 原来的消息里已经有一张同样大小的图：交回的第一张放得下，第二张放不下。
+    request = dataclasses.replace(
+        with_parts(TextPart("看看"), image), tools=(DATE_TOOL,), tool_runner=runner
+    )
+
+    events = await collect_request(model_on(server), request)
+
+    assert events[-1] == DONE
+    data_url = f"data:image/png;base64,{b64(PNG_BYTES)}"
+    assert bodies(server)[1]["input"][-1] == {
+        "type": "function_call_output",
+        "call_id": "call_1",
+        "output": [
+            {"type": "input_image", "image_url": data_url, "detail": "auto"},
+            {"type": "input_text", "text": OVERSIZED_IMAGE_NOTE},
+        ],
+    }
+
+
+async def test_round_limit_keeps_web_search_allowed() -> None:
+    server = calling_until_told_not_to(still_calls=False, choice=ONLY_SEARCH)
+
+    events = await collect_request(model_on(server, search=True), with_tools(Runner()))
+
+    assert events[-1] == DONE
+    assert [body.get("tool_choice") for body in bodies(server)] == [None] * MAX_FUNCTION_ROUNDS + [
+        ONLY_SEARCH
+    ]
+
+
+ONLY_SEARCH: Payload = {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "web_search"}]}

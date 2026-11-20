@@ -13,6 +13,19 @@
 联网搜索：模型配置了 `search` 时请求带上 `tools=[{"type": "google_search"}]`。模型不支持或服务商拒绝时按普通
 的调用失败处理。
 
+函数调用：请求带 `tools` 时，每个函数声明为 `{"type": "function", "name", "description", "parameters"}`，与
+`google_search` 放在同一个 `tools` 里，每次请求都带上同样的 `tools`。流里的函数调用是 `function_call` 步骤（`id`、
+`name`、参数对象；参数也可能经 `arguments_delta` 以 JSON 文本分段给出），只交出 `Heartbeat`。一次请求结束时
+（状态是 `requires_action`，或 `completed` 而带着函数调用；前者是推断，见下）交出累计的 `Usage` 但不交出
+`Finished`，逐个调用 `tool_runner`（前后各一个 `Heartbeat`），然后再发一次请求：`input` = 上一次的全部输入 +
+上一次请求里模型输出的全部步骤（从流里重建、按原顺序原样，见 `_Turn`）+ 每个调用对应的 `function_result`
+步骤（`result` 是 `text` 与 base64 的 `image`，出错时带 `is_error: true`）。执行过 `MAX_FUNCTION_ROUNDS` 轮后的
+那次请求在 `generation_config` 里带 `tool_choice: "none"`，模型仍然调用时抛 `ModelError(MALFORMED)`。交回的
+图片按整次调用累计的附件体积校验（`InlineBudget`），放不下的换成一句说明。
+
+**推断**：等待函数结果时 interaction 的状态，文档没有写明；SDK 的自动续写把 `requires_action` 当作要调用方
+处理、不再续写的状态，这里据此认定它（没带 `tools`、或带了却没有函数调用时，它仍按失败处理）。
+
 **已知与条款不符**：Gemini 的条款要求用了搜索的回答同时展示它给的「搜索建议」（`google_search_result` 步骤里
 `result[].search_suggestions`，一段 HTML/CSS）。QQ 渲染不了 HTML，用户已决定照常打开搜索，所以这段 HTML 一律
 忽略，不发给用户，也不保存。
@@ -44,8 +57,8 @@
 无论怎样结束（出错、流提前断开、关闭响应流出错），只要此前有哪一跳报告过用量，都先把累加的用量交出来：
 完成的跳是计费的。关闭响应流时的异常也转成 `ModelError`；取消与调用方的关闭照常传播。
 
-用量：输入取 `total_input_tokens`；输出取 `total_output_tokens` 加 `total_thought_tokens`（思考也按输出
-计费，与 OpenAI 的 `output_tokens` 含推理一致）。搜索次数按文档的计费口径（Gemini 3 及更新的模型「按模型
+用量：各次请求（含各自自动续写的各跳）累加。输入取 `total_input_tokens`；输出取 `total_output_tokens` 加
+`total_thought_tokens`（思考也按输出计费，与 OpenAI 的 `output_tokens` 含推理一致）。搜索次数按文档的计费口径（Gemini 3 及更新的模型「按模型
 决定执行的每个查询计费」，数不重复的查询时忽略空查询），数这次调用（含自动续写的各跳）里不重复的非空查询词；
 用量里的 `grounding_tool_count` 文档没有说明含义，没有采用。
 
@@ -61,8 +74,11 @@
 
 import asyncio
 import base64
+import contextlib
+import itertools
+import json
 import logging
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Iterator
 from typing import TypedDict, cast
 
 from google import genai
@@ -70,7 +86,10 @@ from google.genai import interactions, types
 from google.genai.client import DebugConfig
 
 from . import (
+    FUNCTION_RESULT_IMAGE_TYPES,
     INPUT_LIMITS,
+    MAX_FUNCTION_ROUNDS,
+    OVERSIZED_IMAGE_NOTE,
     AudioPart,
     ChatEvent,
     ChatRequest,
@@ -79,8 +98,13 @@ from . import (
     FilePart,
     Finished,
     FinishReason,
+    FunctionCall,
+    FunctionCallStarted,
+    FunctionResult,
+    FunctionTool,
     Heartbeat,
     ImagePart,
+    InlineBudget,
     Masked,
     Message,
     Modality,
@@ -94,6 +118,8 @@ from . import (
     TextPart,
     ThoughtSummary,
     Usage,
+    add_tokens,
+    clean_json,
     clean_text,
     items,
     kind_for_status,
@@ -190,6 +216,9 @@ class GeminiChatModel:
         return f"GeminiChatModel(name={self._name!r}, model={self._model!r})"
 
     async def stream(self, request: ChatRequest) -> AsyncGenerator[ChatEvent]:
+        runner = request.tool_runner
+        if request.tools and runner is None:
+            raise ModelError(Provider.GEMINI, ErrorKind.UNSUPPORTED)
         config: interactions.GenerationConfigParam = {}
         if request.max_output_tokens is not None:  # 不写就不传，由模型自己的上限兜底
             config["max_output_tokens"] = request.max_output_tokens
@@ -198,16 +227,57 @@ class GeminiChatModel:
             config["thinking_level"] = cast(interactions.ThinkingLevel, self._reasoning)
         if self._summaries:
             config["thinking_summaries"] = THINKING_SUMMARIES
-        # SDK 的 `create` 只认传了的关键字参数（没有表示「不传」的公开哨兵值），可选的参数放进 TypedDict 展开：
-        # 什么都不设时整个 `generation_config` 不带，不发空对象。
-        options: _Options = {}
-        if config:
-            options["generation_config"] = config
-        if self._search:
-            options["tools"] = [_GOOGLE_SEARCH]
+        tools: list[interactions.ToolParam] = [_GOOGLE_SEARCH] if self._search else []
+        tools.extend(_function_tool(tool) for tool in request.tools)
+        inputs = [_step(message) for message in request.messages]
+        searches = _Searches(self._search)
+        usage = _UsageTotal(searches)
+        budget = InlineBudget(_LIMITS, request.messages)
+        hops = itertools.count(1)  # 自动续写的第几跳，跨函数调用的各次请求连续编号
+        for rounds in itertools.count():
+            turn = _Turn(final=bool(request.tools) and rounds >= MAX_FUNCTION_ROUNDS)
+            generation = config.copy()
+            if turn.final:
+                # `none` 连 google_search 也一起禁掉。SDK 有 `allowed_tools`，但它的 `tools` 是工具的名字，
+                # 内置搜索没有名字可填，文档也没说怎样只放行它，所以保持 `none`。
+                generation["tool_choice"] = "none"
+            # SDK 的 `create` 只认传了的关键字参数（没有表示「不传」的公开哨兵值），可选的参数放进 TypedDict
+            # 展开：什么都不设时整个 `generation_config` 不带，不发空对象。每次请求都带上同样的 `tools`。
+            options: _Options = {}
+            if generation:
+                options["generation_config"] = generation
+            if tools:
+                options["tools"] = tools
+            async with contextlib.aclosing(
+                self._request(request, inputs, options, turn, searches, usage, hops)
+            ) as exchange:
+                async for event in exchange:
+                    yield event
+            if not turn.calls:
+                return  # 这次请求以 Finished 结束
+            assert runner is not None
+            inputs.extend(turn.replay)
+            for call in turn.calls:
+                yield FunctionCallStarted(call.call_id, call.name)
+                yield Heartbeat()
+                result = await runner(call)
+                yield Heartbeat()
+                inputs.append(_function_result(call, result, budget))
+
+    async def _request(
+        self,
+        request: ChatRequest,
+        inputs: list[interactions.StepParam],
+        options: _Options,
+        turn: _Turn,
+        searches: _Searches,
+        usage: _UsageTotal,
+        hops: Iterator[int],
+    ) -> AsyncGenerator[ChatEvent]:
+        """发一次请求（含 SDK 自动续写的各跳）并读完它的流。以 `Finished` 结束；模型调用了函数时不交出
+        `Finished`，调用记在 `turn` 里。"""
         # `create` 的 `timeout` 参数类型来自 SDK 对 httpx 的可选导入，pyright 看作 Unknown；`model` 的类型是
         # 已知模型名的 Literal 加 SDK 自己的 str 子类，配置里的任意模型名只能 cast 过去。
-        inputs = [_step(message) for message in request.messages]
         model = cast(interactions.Model, self._model)
         try:
             events = await self._client.aio.interactions.create(  # pyright: ignore[reportUnknownMemberType]
@@ -220,8 +290,6 @@ class GeminiChatModel:
             )
         except Exception as exc:  # noqa: BLE001  SDK 的异常类在私有模块里，见模块 docstring
             raise _error(exc) from None
-        searches = _Searches(self._search)
-        usage = _UsageTotal(searches)
         texts = _Texts()
         steps: dict[int, str] = {}
         hop = 0  # 自动续写的第几跳；各跳的步骤 index 可能重新编号
@@ -232,10 +300,12 @@ class GeminiChatModel:
                 try:
                     async for event in events:
                         yield Heartbeat()
+                        if request.tools:
+                            turn.record(hop, event)
                         match event:
                             case interactions.InteractionCreatedEvent():
                                 texts.end_hop()  # 自动续写的新一跳开始
-                                hop += 1
+                                hop = next(hops)
                             case interactions.StepStart(
                                 index=index, step=interactions.ThoughtStep() as step
                             ):
@@ -293,6 +363,25 @@ class GeminiChatModel:
                                 counted = searches.take_counted()  # 快照里补记了查询
                                 if interaction.usage is not None:
                                     usage.add(interaction.usage)
+                                # 等待函数结果时的状态文档没有写明，SDK 的自动续写把 `requires_action` 当作
+                                # 要调用方处理的状态；这里推断是它，也接受 `completed` 里带着函数调用。
+                                calls = (
+                                    turn.complete()
+                                    if request.tools
+                                    and interaction.status in ("requires_action", "completed")
+                                    else []
+                                )
+                                if calls is None or (calls and turn.final):
+                                    # 函数调用的形状不对，或到了轮数上限、要求不再调用时仍然调用。快照里刚
+                                    # 补记的搜索也已计费，先交出累计值。
+                                    if counted or usage.unreported:
+                                        yield usage.event()
+                                    raise ModelError(Provider.GEMINI, ErrorKind.MALFORMED)
+                                if calls:
+                                    yield usage.event()
+                                    finished = True
+                                    turn.calls = calls
+                                    return
                                 match interaction.status:
                                     case "requires_continuation":
                                         # 这一跳已经计费：读下一跳之前就交出累计值，免得中途被打断时丢掉。
@@ -564,18 +653,288 @@ class _UsageTotal:
         """
         self.reported = True
         self.unreported = True
-        self.input_tokens = _add(
+        self.input_tokens = add_tokens(
             self.input_tokens, token_count(_field(usage, "total_input_tokens"))
         )
         output = token_count(_field(usage, "total_output_tokens"))
         thought = token_count(_field(usage, "total_thought_tokens"))
         if output is not None and thought is not None:
             output += thought  # 思考用量无效时只记输出本身
-        self.output_tokens = _add(self.output_tokens, output)
+        self.output_tokens = add_tokens(self.output_tokens, output)
 
     def event(self) -> Usage:
         self.unreported = False
         return Usage(self.input_tokens, self.output_tokens, self._searches.count)
+
+
+class _Turn:
+    """一次请求（含 SDK 自动续写的各跳）里模型输出的步骤与其中的函数调用。
+
+    `store=False` 时服务端不保存上下文，交回函数结果时要把这次请求里模型输出的**全部**步骤按原顺序原样带回
+    （带 `signature` 的 thought 步骤、搜索的调用与结果步骤、`model_output`、`function_call`）。步骤从流里重建：
+    `step.start` 里的步骤按 SDK 的序列化原样记下（按自动续写的第几跳与 `index` 排序），`step.delta` 并进去——
+    文字接到最后一个文本块、标注并进那个文本块、思考摘要接到 `summary`、`thought_signature` 设为 `signature`、
+    `arguments_delta` 的文本拼起来作为参数的 JSON，其余种类的增量按字段合并（列表追加没有的项，对象逐键合并）。
+
+    每一跳结束（`interaction.completed`）时，用它附带的步骤快照补全、校正这一跳重建出的步骤：签名或完整的
+    `function_call` 可能只出现在快照里。文档没有说快照是否也含输入的步骤，所以只取快照里最后一个输入步骤之后的
+    部分，与重建的步骤按顺序配对（种类相同、`id`/`call_id` 不冲突）：配上的以快照的字段为准，快照里多出的插在
+    对应位置，重建里多出的保留——不把两边直接拼接，免得重复带回。输入才有的步骤（`user_input`、
+    `function_result`）不带回。带回前只去掉文字里的孤立代理码位，签名与参数不动。
+
+    `final` 为真表示已到轮数上限，这次请求要求模型不再调用函数。
+    """
+
+    def __init__(self, *, final: bool) -> None:
+        self.final = final
+        self.calls: list[FunctionCall] = []
+        self.replay: list[interactions.StepParam] = []
+        self._steps: dict[tuple[int, int], dict[str, object]] = {}
+        self._arguments: dict[tuple[int, int], str] = {}  # arguments_delta 拼起来的文本
+
+    def record(self, hop: int, event: object) -> None:
+        match event:
+            case interactions.StepStart(index=index, step=step):
+                self._steps[(hop, index)] = _dump(step)
+            case interactions.StepDelta(index=index, delta=delta):
+                key = (hop, index)
+                step = self._steps.get(key)
+                if step is None:
+                    return  # 没有开始事件的步骤：不知道它是什么，无从带回
+                data = _dump(delta)
+                match data.pop("type", None):
+                    case "arguments_delta":
+                        fragment = data.get("arguments")
+                        if isinstance(fragment, str):
+                            self._arguments[key] = self._arguments.get(key, "") + fragment
+                    case "text":
+                        _append_text(step, data.get("text"))
+                    case "text_annotation_delta":
+                        _append_annotations(step, data.get("annotations"))
+                    case "thought_summary":
+                        _append_summary(step, data.get("content"))
+                    case "thought_signature":
+                        signature = data.get("signature")
+                        if isinstance(signature, str):
+                            step["signature"] = signature
+                    case _:
+                        _merge(step, data)
+            case interactions.InteractionCompletedEvent(interaction=interaction):
+                self._end_hop(hop, getattr(interaction, "steps", None))
+            case _:
+                pass
+
+    def _end_hop(self, hop: int, snapshot: object) -> None:
+        keys = sorted(key for key in self._steps if key[0] == hop)
+        steps = [self._steps.pop(key) for key in keys]
+        for key, step in zip(keys, steps, strict=True):
+            fragment = self._arguments.pop(key, None)
+            if fragment is None:
+                continue
+            try:
+                step["arguments"] = json.loads(fragment)
+            except ValueError:
+                # 留下不是对象的值：执行前按坏响应处理，除非快照给出了正确的参数。
+                step["arguments"] = fragment
+        for index, step in enumerate(_reconcile(steps, _snapshot_output(snapshot))):
+            self._steps[(hop, index)] = step
+
+    def complete(self) -> list[FunctionCall] | None:
+        """这次请求里的函数调用（没有时是空列表），并备好要带回的步骤；函数调用的形状不对时返回 `None`。"""
+        steps: list[dict[str, object]] = []
+        calls: list[FunctionCall] = []
+        for key in sorted(self._steps):
+            step = self._steps[key]
+            if step.get("type") in _INPUT_STEPS:
+                continue
+            steps.append(step)
+            if step.get("type") != "function_call":
+                continue
+            arguments = step.setdefault("arguments", {})
+            call_id, name = step.get("id"), step.get("name")
+            if not (
+                isinstance(call_id, str)
+                and call_id
+                and isinstance(name, str)
+                and isinstance(arguments, dict)
+            ):
+                return None
+            calls.append(FunctionCall(call_id, name, json.dumps(arguments, ensure_ascii=False)))
+        if calls:
+            # 原样带回服务商给的步骤：Interactions API 接受把模型的步骤作为输入，形状由它保证。
+            self.replay = [
+                cast(interactions.StepParam, clean_json(step, keep=_REPLAY_KEEP)) for step in steps
+            ]
+        return calls
+
+
+_INPUT_STEPS = frozenset(("user_input", "function_result"))
+_REPLAY_KEEP = frozenset(("signature", "arguments"))
+
+
+def _snapshot_output(snapshot: object) -> list[dict[str, object]]:
+    """完成快照里这一跳模型输出的步骤：最后一个输入步骤之后的部分。"""
+    steps = [_dump(step) for step in items(snapshot)]
+    for index in range(len(steps) - 1, -1, -1):
+        if steps[index].get("type") in _INPUT_STEPS:
+            steps = steps[index + 1 :]
+            break
+    return [step for step in steps if step]
+
+
+def _reconcile(
+    rebuilt: list[dict[str, object]], snapshot: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    """按顺序配对重建的步骤与快照里的步骤：配上的以快照的字段为准，两边多出的都按位置留下。"""
+    merged: list[dict[str, object]] = []
+    position = 0
+    for shot in snapshot:
+        found = next(
+            (j for j in range(position, len(rebuilt)) if _same_step(rebuilt[j], shot)), None
+        )
+        if found is None:
+            merged.append(shot)
+            continue
+        merged.extend(rebuilt[position:found])
+        rebuilt[found].update(shot)
+        merged.append(rebuilt[found])
+        position = found + 1
+    merged.extend(rebuilt[position:])
+    return merged
+
+
+def _same_step(rebuilt: dict[str, object], shot: dict[str, object]) -> bool:
+    return rebuilt.get("type") == shot.get("type") and all(
+        rebuilt[key] == shot[key] for key in ("id", "call_id") if key in rebuilt and key in shot
+    )
+
+
+def _dump(model: object) -> dict[str, object]:
+    """SDK 的对象按它自己的序列化转成 JSON 对象（字段名用接口里的名字，去掉空值）。流式解析不校验，不完整的
+    对象也能序列化；转不成对象时是空的。"""
+    dump: object = getattr(model, "model_dump", None)
+    if not callable(dump):
+        return {}
+    data = dump(mode="json", by_alias=True, exclude_none=True, warnings=False)
+    if not isinstance(data, dict):
+        return {}
+    # SDK 的序列化对必填字段不排除 None（如还没有结果的搜索结果步骤的 `result`）。
+    return {
+        str(key): value
+        for key, value in cast(dict[object, object], data).items()
+        if value is not None
+    }
+
+
+def _append_text(step: dict[str, object], text: object) -> None:
+    if not isinstance(text, str):
+        return
+    content = step.setdefault("content", [])
+    if not isinstance(content, list):
+        return
+    blocks = cast(list[object], content)
+    last = blocks[-1] if blocks else None
+    if isinstance(last, dict) and cast(dict[str, object], last).get("type") == "text":
+        block = cast(dict[str, object], last)
+        previous = block.get("text")
+        block["text"] = (previous if isinstance(previous, str) else "") + text
+    else:
+        blocks.append({"type": "text", "text": text})
+
+
+def _append_annotations(step: dict[str, object], annotations: object) -> None:
+    content = step.get("content")
+    blocks = items(content)
+    last = blocks[-1] if blocks else None
+    if not isinstance(last, dict):
+        return
+    block = cast(dict[str, object], last)
+    existing = block.setdefault("annotations", [])
+    if isinstance(existing, list):
+        cast(list[object], existing).extend(items(annotations))
+
+
+def _append_summary(step: dict[str, object], content: object) -> None:
+    if not isinstance(content, dict):
+        return
+    piece = cast(dict[str, object], content)
+    summary = step.setdefault("summary", [])
+    if not isinstance(summary, list):
+        return
+    parts = cast(list[object], summary)
+    last = parts[-1] if parts else None
+    text = piece.get("text")
+    if (
+        piece.get("type") == "text"
+        and isinstance(text, str)
+        and isinstance(last, dict)
+        and cast(dict[str, object], last).get("type") == "text"
+    ):
+        block = cast(dict[str, object], last)
+        previous = block.get("text")
+        block["text"] = (previous if isinstance(previous, str) else "") + text
+    else:
+        parts.append(dict(piece))
+
+
+def _merge(target: dict[str, object], update: dict[str, object]) -> None:
+    """把一个增量的字段并进步骤：列表追加还没有的项，对象逐键合并，其余覆盖。"""
+    for key, value in update.items():
+        current = target.get(key)
+        if isinstance(value, list) and isinstance(current, list):
+            known = cast(list[object], current)
+            known.extend(item for item in cast(list[object], value) if item not in known)
+        elif isinstance(value, dict) and isinstance(current, dict):
+            _merge(cast(dict[str, object], current), cast(dict[str, object], value))
+        else:
+            target[key] = value
+
+
+def _function_tool(tool: FunctionTool) -> interactions.FunctionParam:
+    return {
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": dict(tool.parameters),
+    }
+
+
+def _function_result(
+    call: FunctionCall, result: FunctionResult, budget: InlineBudget
+) -> interactions.StepParam:
+    """函数结果：文字是 `text`，图片是 base64 的 `image`；没有内容时是空串。图片连同已有的附件放不进一次请求时
+    换成 `OVERSIZED_IMAGE_NOTE`，不发必然超限的请求。"""
+    content: list[interactions.FunctionResultSubcontentParam] = []
+    for part in result.parts:
+        match part:
+            case TextPart(text=text):
+                text_content: interactions.TextContentParam = {"type": "text", "text": text}
+                content.append(text_content)
+            case ImagePart(data=data, mime_type=mime):
+                if mime not in FUNCTION_RESULT_IMAGE_TYPES:
+                    raise ModelError(Provider.GEMINI, ErrorKind.UNSUPPORTED)
+                if not budget.take(data):
+                    note: interactions.TextContentParam = {
+                        "type": "text",
+                        "text": OVERSIZED_IMAGE_NOTE,
+                    }
+                    content.append(note)
+                    continue
+                image: interactions.ImageContentParam = {
+                    "type": "image",
+                    "data": _base64(data),
+                    "mime_type": cast(interactions.ImageContentMimeType, mime),
+                }
+                content.append(image)
+    step: interactions.FunctionResultStepParam = {
+        "type": "function_result",
+        "call_id": call.call_id,
+        "name": call.name,
+        "result": content or "",
+    }
+    if result.is_error:
+        step["is_error"] = True
+    return step
 
 
 def _step(message: Message) -> interactions.StepParam:
@@ -635,12 +994,6 @@ def _base64(data: bytes) -> str:
 def _field(usage: interactions.Usage, name: str) -> object:
     """用量里的一项。SDK 不校验，类型不可信，按 `object` 取出再校验。"""
     return cast(object, getattr(usage, name, None))
-
-
-def _add(total: int | None, value: int | None) -> int | None:
-    if value is None:
-        return total
-    return value if total is None else total + value
 
 
 def _error(exc: Exception) -> ModelError:

@@ -5,6 +5,7 @@
 示例（`event: step.delta` / `data: {...,"event_type":"step.delta"}`，最后是 `data: [DONE]`）。
 """
 
+import asyncio
 import base64
 import dataclasses
 import json
@@ -18,6 +19,9 @@ from google import genai
 from google.genai import types
 
 from qtalk_bot.llm import (
+    INPUT_LIMITS,
+    MAX_FUNCTION_ROUNDS,
+    OVERSIZED_IMAGE_NOTE,
     AudioPart,
     ChatEvent,
     ChatRequest,
@@ -26,6 +30,10 @@ from qtalk_bot.llm import (
     FilePart,
     Finished,
     FinishReason,
+    FunctionCall,
+    FunctionCallStarted,
+    FunctionResult,
+    FunctionTool,
     Heartbeat,
     ImagePart,
     Message,
@@ -39,6 +47,8 @@ from qtalk_bot.llm import (
     TextPart,
     ThoughtSummary,
     Usage,
+    gemini_interactions,
+    inline_size,
 )
 from qtalk_bot.llm.gemini_interactions import (
     API_VERSION,
@@ -1214,3 +1224,573 @@ async def test_thought_summaries_are_not_requested_unless_shown() -> None:
     )
     await collect(model_on(server))
     assert "thinking_summaries" not in server.body()["generation_config"]
+
+
+# ---- 函数调用（里程碑 10） ----
+# 步骤与增量的形状照 SDK 的 `functioncallstep.py`、`argumentsdelta.py`、`thoughtsignaturedelta.py`、
+# `functionresultstep.py` 与官方的函数调用文档；等待函数结果的状态照 SDK 自动续写的测试用 `requires_action`。
+
+DATE_TOOL = FunctionTool(
+    name="get_date",
+    description="查询当前日期",
+    parameters={
+        "type": "object",
+        "properties": {"zone": {"type": ["string", "null"]}},
+        "required": ["zone"],
+        "additionalProperties": False,
+    },
+)
+DATE_TOOL_PARAM: Payload = {
+    "type": "function",
+    "name": "get_date",
+    "description": "查询当前日期",
+    "parameters": {
+        "type": "object",
+        "properties": {"zone": {"type": ["string", "null"]}},
+        "required": ["zone"],
+        "additionalProperties": False,
+    },
+}
+ORIGINAL_INPUT = [
+    {"type": "user_input", "content": [{"type": "text", "text": "第一问"}]},
+    {"type": "model_output", "content": [{"type": "text", "text": "第一答"}]},
+    {"type": "user_input", "content": [{"type": "text", "text": SECRET_TEXT}]},
+]
+
+
+class Runner:
+    """扮演调用方的 `tool_runner`：记下调用，依次返回 `results`（不够时重复最后一个）。"""
+
+    def __init__(self, *results: FunctionResult) -> None:
+        self.results = results or (FunctionResult((TextPart("2026-11-19"),)),)
+        self.calls: list[FunctionCall] = []
+
+    async def __call__(self, call: FunctionCall) -> FunctionResult:
+        self.calls.append(call)
+        return self.results[min(len(self.calls), len(self.results)) - 1]
+
+
+def with_tools(runner: Runner | None) -> ChatRequest:
+    return dataclasses.replace(REQUEST, tools=(DATE_TOOL,), tool_runner=runner)
+
+
+async def drain_request(
+    model: GeminiChatModel, request: ChatRequest, into: list[ChatEvent]
+) -> None:
+    async for event in model.stream(request):
+        into.append(event)
+
+
+def signature(index: int, value: str) -> Payload:
+    return {
+        "event_type": "step.delta",
+        "index": index,
+        "delta": {"type": "thought_signature", "signature": value},
+    }
+
+
+def call_start(index: int, call_id: str, arguments: Payload | None = None) -> Payload:
+    step: Payload = {"type": "function_call", "id": call_id, "name": "get_date"}
+    if arguments is not None:
+        step["arguments"] = arguments
+    return {"event_type": "step.start", "index": index, "step": step}
+
+
+def arguments(index: int, fragment: str) -> Payload:
+    return {
+        "event_type": "step.delta",
+        "index": index,
+        "delta": {"type": "arguments_delta", "arguments": fragment},
+    }
+
+
+def calling(index: int, call_id: str, zone: str) -> list[Payload]:
+    return [call_start(index, call_id, {"zone": zone}), stop(index)]
+
+
+CALLING_HOP: list[Payload] = [
+    created("v1_call"),
+    start(0, "thought"),
+    signature(0, "c2lnLTE="),
+    stop(0),
+    search_call(1, "gs_1"),
+    search_queries(1, "今天 日期"),
+    stop(1),
+    *search_result(2, "gs_1"),
+    start(3, "model_output"),
+    text(3, "我查一下。"),
+    stop(3),
+    call_start(4, "call_1"),
+    arguments(4, '{"zone": '),
+    arguments(4, '"Asia/Shanghai"}'),
+    stop(4),
+    completed("requires_action", SEARCH_USAGE),
+]
+ANSWER_HOP: list[Payload] = [
+    created("v1_answer"),
+    start(0, "model_output"),
+    text(0, "今天是 11 月 19 日。"),
+    stop(0),
+    completed("completed", {"total_input_tokens": 110, "total_output_tokens": 5}),
+]
+REPLAYED_STEPS: list[Payload] = [
+    {"type": "thought", "signature": "c2lnLTE="},
+    {
+        "type": "google_search_call",
+        "id": "gs_1",
+        "signature": "",
+        "arguments": {"queries": ["今天 日期"]},
+    },
+    {
+        "type": "google_search_result",
+        "call_id": "gs_1",
+        "is_error": False,
+        "result": [{"search_suggestions": SUGGESTIONS_HTML}],
+    },
+    {"type": "model_output", "content": [{"type": "text", "text": "我查一下。"}]},
+    {
+        "type": "function_call",
+        "id": "call_1",
+        "name": "get_date",
+        "arguments": {"zone": "Asia/Shanghai"},
+    },
+]
+
+
+async def test_function_call_round_trip_with_search_and_summed_usage() -> None:
+    server = streaming(CALLING_HOP, ANSWER_HOP)
+    runner = Runner(FunctionResult((TextPart("2026-11-19"), ImagePart(PNG_BYTES, "image/png"))))
+
+    events = [e async for e in model_on(server, search=True).stream(with_tools(runner))]
+
+    shown = [e for e in events if not isinstance(e, Heartbeat)]
+    assert shown == [
+        SearchProgress("gs_1", SearchStage.STARTED),
+        SearchProgress("gs_1", SearchStage.UPDATED, ("今天 日期",)),
+        Usage(None, None, 1),
+        SearchProgress("gs_1", SearchStage.COMPLETED, ("今天 日期",)),
+        TextDelta("我查一下。"),
+        Usage(40, 39, 1),  # 第一次请求结束就交出累计值
+        FunctionCallStarted("call_1", "get_date"),
+        TextDelta("今天是 11 月 19 日。"),
+        Usage(150, 44, 1),  # 各次请求之和
+        DONE,
+    ]
+    started = events.index(FunctionCallStarted("call_1", "get_date"))
+    assert events[started + 1 : started + 3] == [Heartbeat(), Heartbeat()]
+    # 参数对象序列化成 JSON 文本交给调用方。
+    assert runner.calls == [FunctionCall("call_1", "get_date", '{"zone": "Asia/Shanghai"}')]
+
+    first, second = server.body(0), server.body(1)
+    assert first["tools"] == [{"type": "google_search"}, DATE_TOOL_PARAM]  # 函数与内置搜索同时开着
+    assert second["tools"] == first["tools"]  # 每次请求都带上同样的 tools
+    assert first["generation_config"] == second["generation_config"] == {"max_output_tokens": 321}
+    assert second["store"] is False
+    # 上一次请求里模型输出的全部步骤按原顺序原样带回（含 thought 与搜索步骤的签名），再接函数结果。
+    assert second["input"] == [
+        *ORIGINAL_INPUT,
+        *REPLAYED_STEPS,
+        {
+            "type": "function_result",
+            "call_id": "call_1",
+            "name": "get_date",
+            "result": [
+                {"type": "text", "text": "2026-11-19"},
+                {"type": "image", "data": b64(PNG_BYTES), "mime_type": "image/png"},
+            ],
+        },
+    ]
+
+
+async def test_steps_of_every_continuation_hop_are_replayed_in_order() -> None:
+    usage = {"total_input_tokens": 10, "total_output_tokens": 100}
+    continued = [
+        created("v1_hop1"),
+        {
+            "event_type": "step.start",
+            "index": 0,
+            "step": {"type": "thought", "signature": "aG9wMQ=="},
+        },
+        stop(0),
+        start(1, "model_output"),
+        text(1, "前"),
+        text(1, "半"),
+        stop(1),
+        completed("requires_continuation", usage, continuation_token="fake-token"),
+    ]
+    calling_hop = [
+        created("v1_hop2"),
+        start(0, "thought"),
+        summary_delta(0, {"type": "text", "text": "**要查日期**"}),
+        signature(0, "aG9wMg=="),
+        stop(0),
+        *calling(1, "call_1", "UTC"),
+        completed("requires_action", usage),
+    ]
+    server = streaming(continued, calling_hop, ANSWER_HOP)
+
+    events = await collect_request(model_on(server), with_tools(Runner()))
+
+    assert events[-2:] == [Usage(130, 205), DONE]
+    assert len(server.requests) == 3
+    assert server.body(1)["continuation_token"] == "fake-token"
+    assert server.body(2)["input"][len(ORIGINAL_INPUT) :] == [
+        {"type": "thought", "signature": "aG9wMQ=="},
+        {"type": "model_output", "content": [{"type": "text", "text": "前半"}]},
+        {
+            "type": "thought",
+            "summary": [{"type": "text", "text": "**要查日期**"}],
+            "signature": "aG9wMg==",
+        },
+        {"type": "function_call", "id": "call_1", "name": "get_date", "arguments": {"zone": "UTC"}},
+        {
+            "type": "function_result",
+            "call_id": "call_1",
+            "name": "get_date",
+            "result": [{"type": "text", "text": "2026-11-19"}],
+        },
+    ]
+
+
+async def collect_request(model: GeminiChatModel, request: ChatRequest) -> list[ChatEvent]:
+    return [event async for event in model.stream(request) if not isinstance(event, Heartbeat)]
+
+
+async def test_several_calls_in_one_hop_run_in_order_and_errors_are_flagged() -> None:
+    hop = [
+        created("v1_call"),
+        *calling(0, "call_a", "A"),
+        *calling(1, "call_b", "B"),
+        completed("requires_action", {"total_input_tokens": 5, "total_output_tokens": 5}),
+    ]
+    server = streaming(hop, ANSWER_HOP)
+    runner = Runner(FunctionResult((TextPart("甲"),)), FunctionResult((TextPart("失败了"),), True))
+
+    events = await collect_request(model_on(server), with_tools(runner))
+
+    assert [call.call_id for call in runner.calls] == ["call_a", "call_b"]
+    assert [e for e in events if isinstance(e, FunctionCallStarted)] == [
+        FunctionCallStarted("call_a", "get_date"),
+        FunctionCallStarted("call_b", "get_date"),
+    ]
+    assert server.body(0)["tools"] == [DATE_TOOL_PARAM]
+    assert server.body(1)["input"][len(ORIGINAL_INPUT) + 2 :] == [
+        {
+            "type": "function_result",
+            "call_id": "call_a",
+            "name": "get_date",
+            "result": [{"type": "text", "text": "甲"}],
+        },
+        {
+            "type": "function_result",
+            "call_id": "call_b",
+            "name": "get_date",
+            "result": [{"type": "text", "text": "失败了"}],
+            "is_error": True,
+        },
+    ]
+
+
+def calling_until_told_not_to(still_calls: bool) -> Server:
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        config = json.loads(request.content).get("generation_config", {})
+        if config.get("tool_choice") == "none" and not still_calls:
+            return stream_response(ANSWER_HOP)
+        usage = {"total_input_tokens": 1, "total_output_tokens": 1}
+        return stream_response(
+            [created(), *calling(0, "call_1", "UTC"), completed("requires_action", usage)]
+        )
+
+    return Server(*([respond] * (MAX_FUNCTION_ROUNDS + 1)))
+
+
+async def test_after_the_round_limit_the_model_is_told_not_to_call() -> None:
+    server = calling_until_told_not_to(still_calls=False)
+    runner = Runner()
+
+    events = await collect_request(model_on(server), with_tools(runner))
+
+    assert len(runner.calls) == MAX_FUNCTION_ROUNDS
+    configs = [server.body(i)["generation_config"] for i in range(len(server.requests))]
+    assert configs == [{"max_output_tokens": 321}] * MAX_FUNCTION_ROUNDS + [
+        {"max_output_tokens": 321, "tool_choice": "none"}
+    ]
+    assert events[-2:] == [Usage(MAX_FUNCTION_ROUNDS + 110, MAX_FUNCTION_ROUNDS + 5), DONE]
+
+
+async def test_calling_again_after_being_told_not_to_is_malformed() -> None:
+    server = calling_until_told_not_to(still_calls=True)
+    runner = Runner()
+    events: list[ChatEvent] = []
+
+    with pytest.raises(ModelError) as info:
+        await drain_request(model_on(server), with_tools(runner), events)
+
+    assert info.value.kind is ErrorKind.MALFORMED
+    assert len(runner.calls) == MAX_FUNCTION_ROUNDS
+    assert len(server.requests) == MAX_FUNCTION_ROUNDS + 1
+    # 最后一次请求的用量照样交出。
+    assert [e for e in events if isinstance(e, Usage)][-1] == Usage(
+        MAX_FUNCTION_ROUNDS + 1, MAX_FUNCTION_ROUNDS + 1
+    )
+
+
+async def test_unparsable_arguments_are_malformed() -> None:
+    hop = [
+        created(),
+        call_start(0, "call_1"),
+        arguments(0, '{"zone": '),
+        stop(0),
+        completed("requires_action"),
+    ]
+    runner = Runner()
+
+    with pytest.raises(ModelError) as info:
+        await drain_request(model_on(streaming(hop)), with_tools(runner), [])
+
+    assert info.value.kind is ErrorKind.MALFORMED
+    assert runner.calls == []
+
+
+async def test_tools_without_a_runner_send_nothing() -> None:
+    server = streaming(ANSWER_HOP)
+
+    with pytest.raises(ModelError) as info:
+        await drain_request(model_on(server), with_tools(None), [])
+
+    assert info.value.kind is ErrorKind.UNSUPPORTED
+    assert server.requests == []
+
+
+class Watched(httpx2.AsyncByteStream):
+    """记下响应流是否已关闭。"""
+
+    def __init__(self, body: bytes, closed: list[bool]) -> None:
+        self.body = body
+        self.closed = closed
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self.body
+
+    async def aclose(self) -> None:
+        self.closed.append(True)
+
+
+def watched(events: list[Payload], closed: list[bool]) -> Server:
+    return Server(
+        lambda _: httpx2.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=Watched(sse(events), closed)
+        )
+    )
+
+
+class RunnerError(Exception):
+    pass
+
+
+async def test_runner_exception_propagates_unchanged_after_the_stream_is_closed() -> None:
+    closed: list[bool] = []
+    server = watched(CALLING_HOP, closed)
+
+    async def explode(call: FunctionCall) -> FunctionResult:
+        assert closed  # 执行函数时上一次请求的连接已经释放
+        raise RunnerError(call.call_id)
+
+    request = dataclasses.replace(REQUEST, tools=(DATE_TOOL,), tool_runner=explode)
+    with pytest.raises(RunnerError):
+        await drain_request(model_on(server), request, [])
+
+    assert closed
+    assert len(server.requests) == 1
+
+
+async def test_cancelled_runner_propagates_the_cancellation() -> None:
+    closed: list[bool] = []
+    server = watched(CALLING_HOP, closed)
+    running = asyncio.Event()
+
+    async def hang(call: FunctionCall) -> FunctionResult:
+        running.set()
+        await asyncio.Event().wait()
+        raise AssertionError("不会执行到这里")
+
+    request = dataclasses.replace(REQUEST, tools=(DATE_TOOL,), tool_runner=hang)
+    task = asyncio.create_task(drain_request(model_on(server), request, []))
+    await running.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert closed
+    assert len(server.requests) == 1
+
+
+async def test_unsupported_image_in_a_function_result_is_not_sent() -> None:
+    server = streaming(CALLING_HOP, ANSWER_HOP)
+    runner = Runner(FunctionResult((ImagePart(b"heic", "image/heic"),)))
+
+    with pytest.raises(ModelError) as info:
+        await drain_request(model_on(server), with_tools(runner), [])
+
+    assert info.value.kind is ErrorKind.UNSUPPORTED
+    assert len(server.requests) == 1
+
+
+async def test_requires_action_without_declared_functions_is_still_a_failure() -> None:
+    # 没有声明函数时与原来一样：函数调用步骤被忽略，requires_action 按失败处理。
+    server = streaming(CALLING_HOP)
+
+    events, error = await failure(model_on(server, search=True))
+
+    assert error.kind is ErrorKind.OTHER
+    assert FunctionCallStarted("call_1", "get_date") not in events
+    assert len(server.requests) == 1
+    assert server.body()["tools"] == [{"type": "google_search"}]
+
+
+# ---- 函数调用的评审修正 ----
+
+
+def requires_action_with(*steps: Payload, usage: Payload | None = SEARCH_USAGE) -> Payload:
+    return completed("requires_action", usage, steps=list(steps))
+
+
+async def test_signature_known_only_from_the_snapshot_is_replayed() -> None:
+    hop = [
+        created("v1_call"),
+        start(0, "thought"),
+        stop(0),
+        *calling(1, "call_1", "UTC"),
+        # 快照连同输入一起给出：只取最后一个输入步骤之后的部分，与重建的步骤配对，不重复带回。
+        requires_action_with(
+            *ORIGINAL_INPUT,
+            {"type": "thought", "signature": "c25hcHNob3Q="},
+            {
+                "type": "function_call",
+                "id": "call_1",
+                "name": "get_date",
+                "arguments": {"zone": "UTC"},
+            },
+        ),
+    ]
+    server = streaming(hop, ANSWER_HOP)
+
+    events = await collect_request(model_on(server), with_tools(Runner()))
+
+    assert events[-1] == DONE
+    assert server.body(1)["input"][len(ORIGINAL_INPUT) : -1] == [
+        {"type": "thought", "signature": "c25hcHNob3Q="},
+        {"type": "function_call", "id": "call_1", "name": "get_date", "arguments": {"zone": "UTC"}},
+    ]
+
+
+async def test_function_call_known_only_from_the_snapshot_is_executed() -> None:
+    hop = [
+        created("v1_call"),
+        start(0, "thought"),
+        signature(0, "c2lnLTE="),
+        stop(0),
+        call_start(1, "call_1"),
+        arguments(1, '{"zone": '),  # 增量里的参数不完整，以快照为准
+        stop(1),
+        requires_action_with(
+            {
+                "type": "function_call",
+                "id": "call_1",
+                "name": "get_date",
+                "arguments": {"zone": "A"},
+            },
+            {
+                "type": "function_call",
+                "id": "call_2",
+                "name": "get_date",
+                "arguments": {"zone": "B"},
+            },
+        ),
+    ]
+    server = streaming(hop, ANSWER_HOP)
+    runner = Runner()
+
+    events = await collect_request(model_on(server), with_tools(runner))
+
+    assert events[-1] == DONE
+    assert runner.calls == [
+        FunctionCall("call_1", "get_date", '{"zone": "A"}'),
+        FunctionCall("call_2", "get_date", '{"zone": "B"}'),
+    ]
+    assert server.body(1)["input"][len(ORIGINAL_INPUT) : len(ORIGINAL_INPUT) + 3] == [
+        {"type": "thought", "signature": "c2lnLTE="},  # 快照里没有的步骤照样保留
+        {"type": "function_call", "id": "call_1", "name": "get_date", "arguments": {"zone": "A"}},
+        {"type": "function_call", "id": "call_2", "name": "get_date", "arguments": {"zone": "B"}},
+    ]
+
+
+async def test_searches_from_the_snapshot_are_reported_before_a_malformed_call() -> None:
+    hop = [
+        created("v1_call"),
+        call_start(0, "call_1"),
+        arguments(0, "不是 JSON"),
+        stop(0),
+        requires_action_with(
+            {"type": "google_search_call", "id": "gs_1", "arguments": {"queries": ["今天 日期"]}},
+            usage=None,
+        ),
+    ]
+    events: list[ChatEvent] = []
+
+    with pytest.raises(ModelError) as info:
+        await drain_request(model_on(streaming(hop), search=True), with_tools(Runner()), events)
+
+    assert info.value.kind is ErrorKind.MALFORMED
+    assert [e for e in events if isinstance(e, Usage)] == [Usage(None, None, 1)]
+
+
+async def test_lone_surrogates_are_removed_from_replayed_text_only() -> None:
+    hop = [
+        created("v1_call"),
+        {"event_type": "step.start", "index": 0, "step": {"type": "thought", "signature": "c2ln"}},
+        stop(0),
+        start(1, "model_output"),
+        text(1, "我\ud800查一下"),
+        stop(1),
+        *calling(2, "call_1", "UTC"),
+        completed("requires_action", SEARCH_USAGE),
+    ]
+    server = streaming(hop, ANSWER_HOP)
+
+    events = await collect_request(model_on(server), with_tools(Runner()))
+
+    assert events[-1] == DONE
+    assert server.body(1)["input"][len(ORIGINAL_INPUT) : -1] == [
+        {"type": "thought", "signature": "c2ln"},
+        {"type": "model_output", "content": [{"type": "text", "text": "我查一下"}]},
+        {"type": "function_call", "id": "call_1", "name": "get_date", "arguments": {"zone": "UTC"}},
+    ]
+
+
+async def test_images_that_do_not_fit_the_inline_limit_are_replaced_by_a_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limits = dataclasses.replace(
+        INPUT_LIMITS[Provider.GEMINI], max_inline_bytes=2 * inline_size(len(PNG_BYTES))
+    )
+    monkeypatch.setattr(gemini_interactions, "_LIMITS", limits)
+    server = streaming(CALLING_HOP, ANSWER_HOP)
+    image = ImagePart(PNG_BYTES, "image/png")
+    runner = Runner(FunctionResult((image, image)))
+    # 原来的消息里已经有一张同样大小的图：交回的第一张放得下，第二张放不下。
+    request = dataclasses.replace(
+        with_parts(TextPart("看看"), image), tools=(DATE_TOOL,), tool_runner=runner
+    )
+
+    events = await collect_request(model_on(server), request)
+
+    assert events[-1] == DONE
+    assert server.body(1)["input"][-1] == {
+        "type": "function_result",
+        "call_id": "call_1",
+        "name": "get_date",
+        "result": [
+            {"type": "image", "data": b64(PNG_BYTES), "mime_type": "image/png"},
+            {"type": "text", "text": OVERSIZED_IMAGE_NOTE},
+        ],
+    }
