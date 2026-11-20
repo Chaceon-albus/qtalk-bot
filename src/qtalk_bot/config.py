@@ -136,6 +136,8 @@ DEFAULT_ALERT_MODEL_FAILURES = 5
 MAX_ALERT_MODEL_FAILURES = 100
 DEFAULT_ALERT_DISK_FREE_MIN_MB = 1024
 MAX_ALERT_DISK_FREE_MIN_MB = 1024 * 1024  # 1 TiB
+DEFAULT_ALERT_GATEWAY_DOWN_MINUTES = 10
+MAX_ALERT_GATEWAY_DOWN_MINUTES = 24 * 60
 
 type GeminiImageSize = Literal["512", "1K", "2K", "4K"]
 """Gemini 出图的分辨率（Interactions API `response_format.image_size` 的取值）。"""
@@ -523,10 +525,12 @@ class AlertSettings:
         model_failures: 同一个服务商的同一个模型连续失败这么多次（中间没有成功）时告警；鉴权失败与 OpenAI 的
             额度用尽不等，立即告警。
         disk_free_min_mb: 数据目录所在文件系统的剩余空间低于这么多 MB 时告警；0 就是不告警。
+        gateway_down_minutes: QQ 网关断开超过这么多分钟时告警；健康检查也用它（断开或启动卡住超过它算不健康）。
     """
 
     model_failures: int = DEFAULT_ALERT_MODEL_FAILURES
     disk_free_min_mb: int = DEFAULT_ALERT_DISK_FREE_MIN_MB
+    gateway_down_minutes: int = DEFAULT_ALERT_GATEWAY_DOWN_MINUTES
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -881,10 +885,20 @@ def _parse_alerts(table: _Table) -> AlertSettings | None:
     disk_free_min_mb = _bounded_int(
         table, "disk_free_min_mb", DEFAULT_ALERT_DISK_FREE_MIN_MB, 0, MAX_ALERT_DISK_FREE_MIN_MB
     )
+    gateway_down_minutes = _positive_int(
+        table,
+        "gateway_down_minutes",
+        DEFAULT_ALERT_GATEWAY_DOWN_MINUTES,
+        MAX_ALERT_GATEWAY_DOWN_MINUTES,
+    )
     table.finish()
-    if model_failures is None or disk_free_min_mb is None:
+    if model_failures is None or disk_free_min_mb is None or gateway_down_minutes is None:
         return None
-    return AlertSettings(model_failures=model_failures, disk_free_min_mb=disk_free_min_mb)
+    return AlertSettings(
+        model_failures=model_failures,
+        disk_free_min_mb=disk_free_min_mb,
+        gateway_down_minutes=gateway_down_minutes,
+    )
 
 
 def _parse_turns(table: _Table) -> TurnSettings | None:

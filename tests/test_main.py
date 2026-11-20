@@ -982,6 +982,8 @@ def test_stale_heartbeat_is_replaced_by_a_fresh_one(
 
     assert seen_at_start == [False]  # 旧的心跳在启动时就删掉了
     assert "updated_at" in heartbeat.read_text(encoding="utf-8")
+    # 替身的 start() 没有真的连网关：心跳里记的是还没开始连。
+    assert '"state": "not_started"' in heartbeat.read_text(encoding="utf-8")
     assert '"updated_at": 1}' not in heartbeat.read_text(encoding="utf-8")
 
 
@@ -1079,3 +1081,27 @@ def test_partial_backups_left_by_a_killed_process_are_removed_at_startup(
 
     assert not stale.exists()
     assert mine.exists()
+
+
+def test_gateway_watch_is_started_and_stopped_with_the_other_maintenance(
+    config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from qtalk_bot.gateway_watch import GatewayWatch
+
+    checked: list[pyqbot.GatewayState] = []
+    real_check = GatewayWatch.check
+
+    def check(self: GatewayWatch) -> None:
+        real_check(self)
+        checked.append(self._status().state)  # pyright: ignore[reportPrivateUsage]
+
+    async def start(self: pyqbot.Bot) -> None:
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(GatewayWatch, "check", check)
+    monkeypatch.setattr(pyqbot.Bot, "start", start)
+    assert entry.main() == 0
+
+    assert checked  # 启动后检查过
+    assert pyqbot.GatewayState.STOPPED not in checked  # 关停时先于 Bot.stop() 停掉，看不到 STOPPED

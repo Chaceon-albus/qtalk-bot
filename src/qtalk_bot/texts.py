@@ -578,6 +578,32 @@ BACKUP_CLEANUP_RECOVERED = "【已恢复】旧的数据库备份又能正常清�
 BACKUP_LOW_DISK = "磁盘剩余空间不足"
 
 
+def format_duration(seconds: float) -> str:
+    """时长的口语写法：不到 1 分钟写「不到 1 分钟」，不到 1 小时写「N 分钟」，再长写「H 小时 M 分钟」。"""
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "不到 1 分钟"
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    hours, rest = divmod(minutes, 60)
+    return f"{hours} 小时" if rest == 0 else f"{hours} 小时 {rest} 分钟"
+
+
+def gateway_down(since: str, elapsed_seconds: float) -> str:
+    """`since` 是断开的起始时刻（已按配置的时区写好）。告警经 QQ 的 HTTP 接口发，网关断开时它多半仍然可用。"""
+    return (
+        f"【告警】QQ 网关从 {since} 起断开，已经 {format_duration(elapsed_seconds)}，机器人收不到新消息。"
+        "程序会自己重连；一直连不上时请看日志与网络、代理。"
+    )
+
+
+def gateway_recovered(since: str, until: str, down_seconds: float) -> str:
+    return (
+        f"【已恢复】QQ 网关在 {until} 重新连上了，从 {since} 起断开了约 "
+        f"{format_duration(down_seconds)}。"
+    )
+
+
 def disk_low(free_mb: int, threshold_mb: int) -> str:
     return (
         f"【告警】数据目录所在的磁盘只剩 {free_mb} MB，低于告警阈值 {threshold_mb} MB。"

@@ -16,6 +16,7 @@ from qtalk_bot.health import (
     FUTURE_TOLERANCE_SECONDS,
     HEARTBEAT_INTERVAL_SECONDS,
     STALE_AFTER_SECONDS,
+    GatewayReading,
     Heartbeat,
     check,
     clear_heartbeat,
@@ -205,3 +206,97 @@ def test_command_with_a_broken_config_is_unhealthy(
     environ = {"QTALK_CONFIG": str(tmp_path / "missing.toml")}
     assert health.main(environ, clock=lambda: NOW) == EXIT_UNHEALTHY
     assert "配置文件不存在" in capsys.readouterr().err
+
+
+# ---- 网关（里程碑 9 第二步）----
+
+LIMIT = 600.0
+
+
+def write_heartbeat(path: Path, gateway: object | None, *, at: float = NOW - 10) -> None:
+    data: dict[str, object] = {"updated_at": at}
+    if gateway is not None:
+        data["gateway"] = gateway
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_state_names_match_pyqbot() -> None:
+    import pyqbot
+
+    assert {state.value for state in pyqbot.GatewayState} == {
+        health.GATEWAY_NOT_STARTED,
+        health.GATEWAY_DISCONNECTED,
+        health.GATEWAY_CONNECTED,
+        health.GATEWAY_STOPPED,
+    }
+
+
+async def test_heartbeat_records_the_gateway_state(db: Database, tmp_path: Path) -> None:
+    reading = GatewayReading("disconnected", 42.5)
+    beat = Heartbeat(db, tmp_path, clock=Clock(), gateway=lambda: reading)
+
+    assert await beat.beat()
+
+    data = json.loads(heartbeat_path(tmp_path).read_text(encoding="utf-8"))
+    assert data == {
+        "updated_at": NOW,
+        "gateway": {"state": "disconnected", "elapsed_seconds": 42.5},
+    }
+
+
+async def test_heartbeat_is_written_even_if_the_gateway_cannot_be_read(
+    db: Database, tmp_path: Path
+) -> None:
+    def broken() -> GatewayReading:
+        raise RuntimeError("读不到")
+
+    assert await Heartbeat(db, tmp_path, clock=Clock(), gateway=broken).beat()
+    data = json.loads(heartbeat_path(tmp_path).read_text(encoding="utf-8"))
+    assert data == {"updated_at": NOW}
+
+
+@pytest.mark.parametrize(
+    ("gateway", "healthy"),
+    [
+        ({"state": "connected", "elapsed_seconds": 9999.0}, True),
+        ({"state": "disconnected", "elapsed_seconds": LIMIT}, True),
+        ({"state": "disconnected", "elapsed_seconds": LIMIT + 1}, False),
+        ({"state": "not_started", "elapsed_seconds": LIMIT}, True),
+        ({"state": "not_started", "elapsed_seconds": LIMIT + 1}, False),  # 启动卡住
+        ({"state": "stopped", "elapsed_seconds": 1.0}, False),
+        (None, True),  # 旧格式：网关未知，不判失败
+        ({"state": "later_state", "elapsed_seconds": 1.0}, True),
+        ({"state": "disconnected", "elapsed_seconds": "很久"}, True),
+        ("坏的", True),
+    ],
+)
+def test_gateway_part_of_the_check(tmp_path: Path, gateway: object | None, healthy: bool) -> None:
+    path = heartbeat_path(tmp_path)
+    write_heartbeat(path, gateway)
+
+    assert check(path, NOW, gateway_limit=LIMIT)[0] is healthy
+
+
+def test_stale_heartbeat_is_unhealthy_whatever_the_gateway_says(tmp_path: Path) -> None:
+    path = heartbeat_path(tmp_path)
+    write_heartbeat(path, {"state": "connected", "elapsed_seconds": 1.0}, at=NOW - 91)
+    assert not check(path, NOW, gateway_limit=LIMIT)[0]
+
+
+def test_command_uses_the_configured_gateway_limit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    environ = write_config(tmp_path)
+    config = Path(environ["QTALK_CONFIG"])
+    config.write_text(
+        config.read_text(encoding="utf-8") + "[alerts]\ngateway_down_minutes = 2\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "state").mkdir()
+    path = heartbeat_path(tmp_path / "state")
+
+    write_heartbeat(path, {"state": "disconnected", "elapsed_seconds": 119.0})
+    assert health.main(environ, clock=lambda: NOW) == EXIT_HEALTHY
+    write_heartbeat(path, {"state": "disconnected", "elapsed_seconds": 121.0})
+    assert health.main(environ, clock=lambda: NOW) == EXIT_UNHEALTHY
+    assert "网关已经断开 121 秒" in capsys.readouterr().err

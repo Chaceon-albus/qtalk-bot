@@ -5,8 +5,9 @@
 `pyqbot.Bot`、注册处理函数（经 `batching.Batcher` 交给对话）并运行。
 
 运行期间的后台任务：定期清理过期的附件；写心跳文件供 `python -m qtalk_bot.health` 检查（`health.Heartbeat`，启动时
-先删掉旧的）；定时备份（`maintenance.BackupScheduler`）；查磁盘余量（`maintenance.DiskWatch`）。后两者与模型的告警
-都经 `alerts.Alerts` 发给管理员。
+先删掉旧的，心跳里带着 QQ 网关的状态）；定时备份（`maintenance.BackupScheduler`）；查磁盘余量
+（`maintenance.DiskWatch`）；看网关断没断（`gateway_watch.GatewayWatch`）。后三者与模型的告警都经 `alerts.Alerts` 发给
+管理员。
 
 退出时按 `_shut_down()` 的顺序先停收事件、等前台与对话收尾，再停后台的任务，最后关闭模型的客户端与数据库。配置
 或数据库有误（含迁移前的备份失败）、连不上平台时打印原因并以非零状态退出，不打印 traceback。
@@ -51,7 +52,8 @@ from .config import (
 from .conversation import Conversation
 from .describe import Describer
 from .gate import Gate
-from .health import Heartbeat, clear_heartbeat
+from .gateway_watch import GatewayWatch
+from .health import GatewayReading, Heartbeat, clear_heartbeat
 from .llm.providers import ChatModels
 from .maintenance import (
     BackupScheduler,
@@ -114,6 +116,16 @@ def private_data_dir(path: Path) -> None:
         logger.warning("数据目录 %s 的权限没能收紧：%s", path, exc.strerror or type(exc).__name__)
 
 
+def gateway_reading(bot: pyqbot.Bot) -> Callable[[], GatewayReading]:
+    """把 `Bot.gateway_status` 转成心跳里记的网关状态（阶段的取值与处于这个阶段的秒数）。"""
+
+    def read() -> GatewayReading:
+        status = bot.gateway_status
+        return GatewayReading(status.state.value, status.elapsed.total_seconds())
+
+    return read
+
+
 def _make_bot(secrets: Secrets, settings: Settings) -> pyqbot.Bot:
     """按 `[qq]` 构造 `pyqbot.Bot`：没配的项不传，用 pyqbot 的默认值。代理也作用于网关与附件下载
     （`bot.http_client`）；地址里的账号密码由 pyqbot 保证不进它的 `repr`、日志与异常。"""
@@ -173,7 +185,12 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
         try:
             # 心跳尽早开始：后面的准备（取名字、补发欢迎语）卡住时健康检查照样看得到进程还活着。
             maintenance.append(
-                Background("心跳", asyncio.create_task(Heartbeat(db, settings.data_dir).run()))
+                Background(
+                    "心跳",
+                    asyncio.create_task(
+                        Heartbeat(db, settings.data_dir, gateway=gateway_reading(bot)).run()
+                    ),
+                )
             )
             scheduler = BackupScheduler(db, backups, settings.backup, alerts)
             maintenance.append(
@@ -181,6 +198,13 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
             )
             disk = DiskWatch(settings.data_dir, settings.alerts.disk_free_min_mb, alerts)
             maintenance.append(Background("磁盘检查", asyncio.create_task(disk.run())))
+            gateway = GatewayWatch(
+                lambda: bot.gateway_status,
+                settings.alerts.gateway_down_minutes,
+                settings.timezone,
+                alerts,
+            )
+            maintenance.append(Background("网关检查", asyncio.create_task(gateway.run())))
             gate = Gate(
                 db,
                 admin_openid=secrets.admin_openid,
@@ -277,7 +301,7 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
 
 @dataclass(frozen=True, slots=True)
 class Background:
-    """一个维护任务（心跳、定时备份、磁盘检查）：`stop` 是可选的同步停止请求，关停时先于取消任务调用。"""
+    """一个维护任务（心跳、定时备份、磁盘检查、网关检查）：`stop` 是可选的同步停止请求，关停时先于取消任务调用。"""
 
     name: str
     task: asyncio.Task[None]
@@ -310,12 +334,13 @@ async def _shut_down(
     *,
     maintenance: Sequence[Background] = (),
 ) -> bool:
-    """按顺序关停，返回期间是否又被取消过。`maintenance` 是维护任务：心跳、定时备份、磁盘检查。
+    """按顺序关停，返回期间是否又被取消过。`maintenance` 是维护任务：心跳、定时备份、磁盘检查、网关检查。
 
     顺序：
     0. 停掉 `maintenance`（同步）：先发各自的停止请求（定时备份借此通知正在复制的备份在下一步之前放弃、删掉临时
        文件），再取消任务。放在最前面：数据库只有一个线程，正在做的备份会让排在后面的 Gate 事务与流水写入一直等，
-       耗掉第 6 步的时限，已经放行的消息就可能丢掉。等它们退出放在第 8 步。
+       耗掉第 6 步的时限，已经放行的消息就可能丢掉。心跳与网关检查也在这里停：之后 `Bot.stop()` 把网关切到
+       `STOPPED`，不该再写进心跳或拿来告警。等它们退出放在第 8 步。
     1. `Batcher.stop()`（同步）：放弃等待中的附件、防抖的计时与正在进行的插话判断（消息已在流水里，重启后是
        待回复的），取消正在回答的轮次（对话自己在后台收尾记账），之后到达的消息只收下、不再回答。放在
        `Bot.stop()` 之前：否则等处理函数的那几秒里，刚收下的消息还会开新的一轮（发「正在输入」、调用决策），

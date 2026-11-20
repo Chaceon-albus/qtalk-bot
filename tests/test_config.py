@@ -1598,17 +1598,21 @@ def test_image_generation_provider_needs_its_key() -> None:
 def test_backup_and_alerts_default_when_omitted(tmp_path: Path) -> None:
     settings = load_settings(write_config(tmp_path, ""))
     assert settings.backup == BackupSettings(interval_hours=24, keep=7)
-    assert settings.alerts == AlertSettings(model_failures=5, disk_free_min_mb=1024)
+    assert settings.alerts == AlertSettings(
+        model_failures=5, disk_free_min_mb=1024, gateway_down_minutes=10
+    )
 
 
 def test_backup_and_alerts_values_are_read(tmp_path: Path) -> None:
     text = (
         "[backup]\ninterval_hours = 6\nkeep = 30\n"
-        "[alerts]\nmodel_failures = 2\ndisk_free_min_mb = 0\n"
+        "[alerts]\nmodel_failures = 2\ndisk_free_min_mb = 0\ngateway_down_minutes = 3\n"
     )
     settings = load_settings(write_config(tmp_path, text))
     assert settings.backup == BackupSettings(interval_hours=6, keep=30)
-    assert settings.alerts == AlertSettings(model_failures=2, disk_free_min_mb=0)
+    assert settings.alerts == AlertSettings(
+        model_failures=2, disk_free_min_mb=0, gateway_down_minutes=3
+    )
 
 
 def test_backup_and_alerts_may_set_only_some_keys(tmp_path: Path) -> None:
@@ -1630,7 +1634,9 @@ def test_backup_and_alerts_may_set_only_some_keys(tmp_path: Path) -> None:
         ("[alerts]\nmodel_failures = 101\n", "alerts.model_failures：不能大于 100"),
         ("[alerts]\ndisk_free_min_mb = -1\n", "alerts.disk_free_min_mb：不能小于 0"),
         ("[alerts]\ndisk_free_min_mb = 1048577\n", "alerts.disk_free_min_mb：不能大于 1048576"),
-        ("[alerts]\ngateway_down_minutes = 10\n", "alerts.gateway_down_minutes：未知的键"),
+        ("[alerts]\ngateway_down_minutes = 0\n", "alerts.gateway_down_minutes：应为正整数"),
+        ("[alerts]\ngateway_down_minutes = 1441\n", "alerts.gateway_down_minutes：不能大于 1440"),
+        ("[alerts]\ngateway_minutes = 10\n", "alerts.gateway_minutes：未知的键"),
         ("backup = 1\n", "backup：应为表，实际是整数"),
         ("alerts = 'x'\n", "alerts：应为表，实际是字符串"),
     ],
