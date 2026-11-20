@@ -404,6 +404,12 @@ CREATE INDEX usage_images_by_time ON usage (created_at) WHERE purpose = 'image';
 -- 为 done（不再调用描述模型）。是不是生成的只看所属消息的 role，不另设一列。表结构不变。
 """
 
+_V12_CACHED_INPUT = """
+-- cached_input_tokens：input_tokens 里命中服务商缓存的部分（OpenAI 的 input_tokens_details.cached_tokens，
+-- Gemini 的 total_cached_tokens），两家对它大幅打折。服务商没有报告的调用与升级前的行为空。
+ALTER TABLE usage ADD COLUMN cached_input_tokens INTEGER CHECK (cached_input_tokens >= 0);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     _V1_ACCESS,
     _V2_CHAT,
@@ -416,6 +422,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     _V9_TOPICS,
     _V10_MEMORY_USAGE,
     _V11_IMAGES,
+    _V12_CACHED_INPUT,
 )
 """本程序的迁移列表。业务表由各里程碑在末尾追加，已发布的不能修改。"""
 

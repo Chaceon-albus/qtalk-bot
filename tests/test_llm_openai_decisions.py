@@ -48,14 +48,17 @@ def request(*questions: ChoiceQuestion | YesNoQuestion) -> DecisionRequest:
     return DecisionRequest(input=f'{{"latest": "{SECRET_TEXT}"}}', questions=questions)
 
 
-def usage(input_tokens: int) -> Payload:
-    return {
+def usage(input_tokens: int, cached: object = None) -> Payload:
+    """`cached` 为 `None` 时没有 `input_tokens_details`，这时 `Usage` 里的缓存数为空。"""
+    body: Payload = {
         "input_tokens": input_tokens,
-        "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
         "output_tokens": 0,
         "output_tokens_details": {"reasoning_tokens": 0},
         "total_tokens": input_tokens,
     }
+    if cached is not None:
+        body["input_tokens_details"] = {"cached_tokens": cached, "cache_write_tokens": 0}
+    return body
 
 
 def choice(name: str, **chances: float) -> Payload:
@@ -226,6 +229,19 @@ async def test_custom_model_name_is_sent() -> None:
     assert server.body["model"] == "gpt-6-luna-next"
     assert (model.provider, model.model) == (Provider.OPENAI, "gpt-6-luna-next")
     assert FAKE_KEY not in repr(model)
+
+
+@pytest.mark.parametrize(
+    ("cached", "expected"),
+    [(40, 40), (0, 0), (57, 57), (58, None), (2**63, None), ("40", None)],
+    ids=["reported", "zero", "all_of_the_input", "more_than_the_input", "too_big", "not_a_number"],
+)
+async def test_cached_input_tokens_come_from_the_input_details(
+    cached: object, expected: int | None
+) -> None:
+    server = replying(decision(predicate("damaged", 0.5), used=usage(57, cached)))
+    result = await model_on(server).decide(request(DAMAGED))
+    assert result.usage == Usage(57, 0, cached_input_tokens=expected)
 
 
 async def test_missing_usage_is_none_not_invented() -> None:

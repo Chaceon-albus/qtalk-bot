@@ -576,6 +576,83 @@ def test_proxy_credentials_are_not_shown_in_the_sdk_options() -> None:
     client.close()
 
 
+async def test_cached_input_tokens_are_taken_and_summed_across_hops() -> None:
+    first_hop = [
+        created("v1_hop1"),
+        start(0, "model_output"),
+        text(0, "前半"),
+        stop(0),
+        completed(
+            "requires_continuation",
+            {"total_input_tokens": 10, "total_output_tokens": 100, "total_cached_tokens": 6},
+            continuation_token="fake-token",
+        ),
+    ]
+    second_hop = [
+        created("v1_hop2"),
+        start(0, "model_output"),
+        text(0, "后半"),
+        stop(0),
+        completed(
+            "completed",
+            {"total_input_tokens": 110, "total_output_tokens": 5, "total_cached_tokens": 96},
+        ),
+    ]
+
+    events = await collect(model_on(streaming(first_hop, second_hop)))
+
+    assert [e for e in events if isinstance(e, Usage)] == [
+        Usage(10, 100, cached_input_tokens=6),
+        Usage(120, 105, cached_input_tokens=102),
+    ]
+
+
+@pytest.mark.parametrize(
+    "hop_usage",
+    [
+        {"total_input_tokens": 10, "total_output_tokens": 100, "total_cached_tokens": 11},
+        {"total_output_tokens": 100, "total_cached_tokens": 6},  # 只报告了缓存、没报告输入
+    ],
+    ids=["more_than_the_input", "without_input"],
+)
+async def test_cached_tokens_not_covered_by_their_own_hops_input_are_dropped(
+    hop_usage: dict[str, object],
+) -> None:
+    first_hop = [
+        created("v1_hop1"),
+        start(0, "model_output"),
+        text(0, "前半"),
+        stop(0),
+        completed("requires_continuation", hop_usage, continuation_token="fake-token"),
+    ]
+    second_hop = [
+        created("v1_hop2"),
+        start(0, "model_output"),
+        text(0, "后半"),
+        stop(0),
+        completed(
+            "completed",
+            {"total_input_tokens": 110, "total_output_tokens": 5, "total_cached_tokens": 96},
+        ),
+    ]
+
+    events = await collect(model_on(streaming(first_hop, second_hop)))
+
+    usage = [e for e in events if isinstance(e, Usage)][-1]
+    assert usage.cached_input_tokens == 96
+
+
+async def test_absurd_cached_token_count_is_dropped() -> None:
+    usage = {"total_input_tokens": 5, "total_output_tokens": 9, "total_cached_tokens": 2**63}
+    server = streaming(
+        [created(), start(0, "model_output"), text(0, "好"), stop(0), completed("completed", usage)]
+    )
+
+    events = await collect(model_on(server))
+
+    assert events == [TextDelta("好"), Usage(5, 9), DONE]
+
+
 @pytest.mark.parametrize(
     ("usage", "expected"),
     [

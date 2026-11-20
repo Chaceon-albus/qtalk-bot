@@ -2,7 +2,7 @@
 
 import pytest
 
-from qtalk_bot.llm import MAX_TOKENS_PER_CALL, Usage
+from qtalk_bot.llm import MAX_TOKENS_PER_CALL, Usage, cached_count
 from qtalk_bot.llm.decisions import (
     PROBABILITY_SUM_TOLERANCE,
     ChoiceAnswer,
@@ -56,5 +56,17 @@ def test_tolerance_is_read_when_checking(monkeypatch: pytest.MonkeyPatch) -> Non
     ids=["cap", "above_cap", "int64_max", "negative", "boolean", "string", "zero"],
 )
 def test_usage_drops_untrustworthy_counts(given: object, expected: int | None) -> None:
-    usage = Usage(given, given)  # pyright: ignore[reportArgumentType]  故意传入不合法的类型
-    assert usage == Usage(expected, expected)
+    usage = Usage(given, given, cached_input_tokens=given)  # pyright: ignore[reportArgumentType]  故意传入不合法的类型
+    assert usage == Usage(expected, expected, cached_input_tokens=expected)
+
+
+@pytest.mark.parametrize(
+    ("input_tokens", "cached", "expected"),
+    [(100, 100, 100), (100, 120, None), (None, 5, None), (100, None, None)],
+    ids=["all_of_the_input", "more_than_the_input", "without_input", "not_reported"],
+)
+def test_cached_count_must_be_part_of_the_reported_input(
+    input_tokens: int | None, cached: int | None, expected: int | None
+) -> None:
+    assert cached_count(cached, input_tokens) == expected
+    assert Usage(input_tokens, 1, cached_input_tokens=cached).cached_input_tokens == expected

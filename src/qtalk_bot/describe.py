@@ -311,5 +311,6 @@ def _add_usage(
         input_tokens=None if usage is None else usage.input_tokens,
         output_tokens=None if usage is None else usage.output_tokens,
         now=now,
+        cached_input_tokens=None if usage is None else usage.cached_input_tokens,
         purpose=UsagePurpose.DESCRIBE,
     )

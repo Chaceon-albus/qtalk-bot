@@ -1536,6 +1536,7 @@ class Conversation:
         provider_model: str,
         input_tokens: int | None,
         output_tokens: int | None,
+        cached_input_tokens: int | None,
     ) -> None:
         journal.add_image_usage(
             conn,
@@ -1546,6 +1547,7 @@ class Conversation:
             now=int(self._clock()),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cached_input_tokens=cached_input_tokens,
         )
 
     def _waiting_counts(
@@ -2150,6 +2152,7 @@ def _record_usage(
             input_tokens=None if usage is None else usage.input_tokens,
             output_tokens=None if usage is None else usage.output_tokens,
             searches=None if usage is None else usage.searches,
+            cached_input_tokens=None if usage is None else usage.cached_input_tokens,
             now=now,
         )
 
@@ -2190,6 +2193,7 @@ def _record_decisions(
         provider_model=record.provider_model,
         input_tokens=None if usage is None else usage.input_tokens,
         output_tokens=None if usage is None else usage.output_tokens,
+        cached_input_tokens=None if usage is None else usage.cached_input_tokens,
         now=now,
         purpose=UsagePurpose.DECISION,
     )
@@ -2395,7 +2399,7 @@ class _DrawDeps:
     allowed: Callable[[sqlite3.Connection, User], bool]
     check: Callable[[sqlite3.Connection, User, Sequence[int], Collection[int]], _DrawCheck]
     record_usage: Callable[
-        [sqlite3.Connection, User, int, Provider, str, int | None, int | None], None
+        [sqlite3.Connection, User, int, Provider, str, int | None, int | None, int | None], None
     ]
 
 
@@ -2508,6 +2512,7 @@ class _Drawer:
                 generator.model,
                 image.input_tokens,
                 image.output_tokens,
+                image.cached_input_tokens,
             )
         )
         writing.add_done_callback(_retrieve_any)

@@ -177,6 +177,22 @@ async def test_openai_edit_without_quality_does_not_send_it() -> None:
     assert b'name="quality"' not in server.requests[0].content
 
 
+async def test_openai_cached_input_tokens_are_taken_when_reported() -> None:
+    # SDK 的类型里没有这个字段（文档的 GPT Image 用量也没写），响应里有才有；没有时是空，见上面的用例。
+    details = {"image_tokens": 0, "text_tokens": 12, "cached_tokens": 8}
+    server = Server(images_response(usage={**USAGE, "input_tokens_details": details}))
+    image = await openai_on(server).generate(PROMPT, Aspect.SQUARE)
+    assert image == GeneratedImage(JPEG_BYTES, JPEG, 12, 824, 8)
+
+
+@pytest.mark.parametrize("cached", [-3, 13], ids=["negative", "more_than_the_input"])
+async def test_openai_absurd_cached_token_count_is_dropped(cached: int) -> None:
+    details = {"image_tokens": 0, "text_tokens": 12, "cached_tokens": cached}
+    server = Server(images_response(usage={**USAGE, "input_tokens_details": details}))
+    image = await openai_on(server).generate(PROMPT, Aspect.SQUARE)
+    assert image.cached_input_tokens is None
+
+
 async def test_openai_mime_type_comes_from_the_bytes_and_usage_may_be_missing() -> None:
     server = Server(images_response(PNG_BYTES))
     image = await openai_on(server).generate(PROMPT, Aspect.SQUARE)
@@ -368,6 +384,18 @@ async def test_gemini_mime_type_comes_from_the_bytes_and_usage_may_be_missing() 
     server = Server(interaction(image_content(PNG_BYTES)))
     image = await gemini_on(server).generate(PROMPT, Aspect.SQUARE)
     assert image == GeneratedImage(PNG_BYTES, PNG, None, None)
+
+
+async def test_gemini_cached_input_tokens_are_taken_when_reported() -> None:
+    server = Server(interaction(image_content(), usage={**GEMINI_USAGE, "total_cached_tokens": 16}))
+    image = await gemini_on(server).generate(PROMPT, Aspect.SQUARE)
+    assert image == GeneratedImage(JPEG_BYTES, JPEG, 20, 1828, 16)
+
+
+async def test_gemini_cached_tokens_beyond_the_input_are_dropped() -> None:
+    server = Server(interaction(image_content(), usage={**GEMINI_USAGE, "total_cached_tokens": 21}))
+    image = await gemini_on(server).generate(PROMPT, Aspect.SQUARE)
+    assert (image.input_tokens, image.cached_input_tokens) == (20, None)
 
 
 async def test_gemini_invalid_thought_tokens_count_only_the_output() -> None:

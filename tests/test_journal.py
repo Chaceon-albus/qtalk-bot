@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from qtalk_bot import access, journal
-from qtalk_bot.journal import Ending, HistoryEntry, ReplyDelivery
+from qtalk_bot.journal import Ending, HistoryEntry, ReplyDelivery, UsageTotals
 from qtalk_bot.llm import Provider, Role
 from qtalk_bot.media import (
     JPEG,
@@ -129,7 +129,7 @@ async def test_reply_rows_must_be_complete(db: Database) -> None:
         await db.transaction(bad)
 
 
-async def test_usage_summary_splits_today_and_total_and_counts_missing_usage(
+async def test_usage_summary_splits_the_period_and_total_and_counts_missing_usage(
     db: Database,
 ) -> None:
     alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
@@ -159,11 +159,15 @@ async def test_usage_summary_splits_today_and_total_and_counts_missing_usage(
     await db.transaction(fill)
     alice_usage, bob_usage = await db.transaction(journal.usage_summary, 1000)
 
-    assert (alice_usage.name, alice_usage.today_calls, alice_usage.total_calls) == ("小王", 2, 3)
-    assert (alice_usage.today_input, alice_usage.today_output) == (20, 7)
-    assert (alice_usage.total_input, alice_usage.total_output) == (30, 12)
-    assert (alice_usage.today_unreported, alice_usage.total_unreported) == (1, 1)
-    assert (bob_usage.today_input, bob_usage.today_output, bob_usage.total_unreported) == (3, 0, 1)
+    chat = journal.UsagePurpose.CHAT
+    assert alice_usage.name == "小王"
+    assert alice_usage.period == {
+        chat: UsageTotals(calls=2, input_tokens=20, output_tokens=7, unreported=1)
+    }
+    assert alice_usage.total == {
+        chat: UsageTotals(calls=3, input_tokens=30, output_tokens=12, unreported=1)
+    }
+    assert bob_usage.period[chat] == UsageTotals(calls=1, input_tokens=3, unreported=1)
 
 
 async def test_usage_rows_store_null_rather_than_zero(db: Database) -> None:
@@ -334,7 +338,7 @@ async def test_decision_rows_need_either_probabilities_or_an_error(db: Database)
         await db.transaction(bad)
 
 
-async def test_usage_summary_counts_decisions_in_the_totals_and_separately(db: Database) -> None:
+async def test_usage_summary_keeps_decisions_apart_from_chat(db: Database) -> None:
     alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
 
     def fill(conn: sqlite3.Connection) -> None:
@@ -363,11 +367,13 @@ async def test_usage_summary_counts_decisions_in_the_totals_and_separately(db: D
     await db.transaction(fill)
     (summary,) = await db.transaction(journal.usage_summary, 1000)
 
-    assert (summary.today_calls, summary.today_input, summary.today_output) == (3, 230, 50)
-    assert (summary.total_calls, summary.total_input, summary.total_output) == (4, 270, 50)
-    assert (summary.today_unreported, summary.total_unreported) == (1, 1)
-    assert (summary.today_decision_calls, summary.today_decision_input) == (2, 30)
-    assert (summary.total_decision_calls, summary.total_decision_input) == (3, 70)
+    decision, chat = journal.UsagePurpose.DECISION, journal.UsagePurpose.CHAT
+    assert summary.period == {
+        decision: UsageTotals(calls=2, input_tokens=30, unreported=1),
+        chat: UsageTotals(calls=1, input_tokens=200, output_tokens=50),
+    }
+    assert summary.total[decision] == UsageTotals(calls=3, input_tokens=70, unreported=1)
+    assert summary.total[chat] == UsageTotals(calls=1, input_tokens=200, output_tokens=50)
 
 
 async def test_version_2_database_gets_the_decisions_table_and_chat_purpose(
@@ -418,10 +424,11 @@ async def test_usage_summary_survives_rows_that_bypassed_the_usage_checks(db: Da
     await db.transaction(fill)
     alice_usage, bob_usage = await db.transaction(journal.usage_summary, 0)
 
-    assert alice_usage.total_input == 2**63 - 1
-    assert alice_usage.today_input == 2**63 - 1
-    assert (alice_usage.total_output, alice_usage.total_calls) == (2, 2)
-    assert (bob_usage.total_input, bob_usage.total_output) == (7, 1)
+    chat = journal.UsagePurpose.CHAT
+    assert alice_usage.total[chat].input_tokens == 2**63 - 1
+    assert alice_usage.period[chat].input_tokens == 2**63 - 1
+    assert (alice_usage.total[chat].output_tokens, alice_usage.total[chat].calls) == (2, 2)
+    assert (bob_usage.total[chat].input_tokens, bob_usage.total[chat].output_tokens) == (7, 1)
 
 
 # ---- 里程碑 5a：附件、引用索引、一轮多条用户消息 ----
@@ -569,7 +576,10 @@ async def test_version_3_database_keeps_its_usage_and_accepts_describe(tmp_path:
                 (user.id,),
             )
         (summary,) = await db.transaction(journal.usage_summary, 0)
-        assert (summary.total_calls, summary.total_decision_calls) == (2, 1)
+        assert {purpose: totals.calls for purpose, totals in summary.total.items()} == {
+            journal.UsagePurpose.DECISION: 1,
+            journal.UsagePurpose.DESCRIBE: 1,
+        }
 
 
 async def test_unanswered_messages_do_not_use_up_history_turns(db: Database) -> None:
@@ -988,7 +998,7 @@ async def test_version_4_stickers_are_recognized_again_by_version_6(tmp_path: Pa
 # ---- 里程碑 7a：联网搜索的次数 ----
 
 
-async def test_usage_summary_counts_searches_today_and_in_total(db: Database) -> None:
+async def test_usage_summary_counts_searches_in_the_period_and_in_total(db: Database) -> None:
     alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
     bob = await new_user(db, "FAKE-OPENID-BOB", "小李")
 
@@ -1017,8 +1027,9 @@ async def test_usage_summary_counts_searches_today_and_in_total(db: Database) ->
     await db.transaction(fill)
     alice_usage, bob_usage = await db.transaction(journal.usage_summary, 1000)
 
-    assert (alice_usage.today_searches, alice_usage.total_searches) == (2, 5)
-    assert (bob_usage.today_searches, bob_usage.total_searches) == (0, 0)
+    chat = journal.UsagePurpose.CHAT
+    assert (alice_usage.period[chat].searches, alice_usage.total[chat].searches) == (2, 5)
+    assert (bob_usage.period[chat].searches, bob_usage.total[chat].searches) == (0, 0)
     rows = await db.fetch_all("SELECT searches FROM usage ORDER BY id")
     assert [row["searches"] for row in rows] == [3, 2, 0, None, None]  # 0 与空分开记
 
@@ -1048,7 +1059,9 @@ async def test_version_6_database_gets_an_empty_searches_column(tmp_path: Path) 
         assert row is not None
         assert tuple(row) == (5, 6, None)
         (summary,) = await db.transaction(journal.usage_summary, 0)
-        assert (summary.total_calls, summary.total_searches) == (1, 0)
+        assert summary.total == {
+            journal.UsagePurpose.CHAT: UsageTotals(calls=1, input_tokens=5, output_tokens=6)
+        }
 
 
 async def test_message_time_is_read_only_for_this_users_own_messages(db: Database) -> None:
@@ -1406,15 +1419,193 @@ async def test_usage_summary_counts_images_apart_from_model_calls(db: Database) 
     await db.transaction(fill)
     (summary,) = await db.transaction(journal.usage_summary, 1000)
 
-    assert (summary.today_calls, summary.today_input, summary.today_output) == (1, 100, 20)
-    assert (summary.total_calls, summary.total_unreported) == (1, 0)  # 出图不算进调用与缺数据
-    assert (summary.today_images, summary.today_image_input, summary.today_image_output) == (
-        2,
-        20,
-        1120,
+    chat, image = journal.UsagePurpose.CHAT, journal.UsagePurpose.IMAGE
+    assert summary.period == {
+        chat: UsageTotals(calls=1, input_tokens=100, output_tokens=20),
+        image: UsageTotals(calls=2, input_tokens=20, output_tokens=1120, unreported=1),
+    }
+    assert summary.total[image] == UsageTotals(
+        calls=3, input_tokens=30, output_tokens=2120, unreported=1
     )
-    assert (summary.total_images, summary.total_image_input, summary.total_image_output) == (
-        3,
-        30,
-        2120,
+
+
+# ---- 缓存命中的输入 token（迁移 V12）与按用户、按用途的用量汇总 ----
+
+
+async def test_version_11_usage_rows_survive_with_an_empty_cached_column(tmp_path: Path) -> None:
+    path = tmp_path / DATABASE_FILENAME
+    async with await Database.open(path, migrations=MIGRATIONS[:11]) as old:
+        user = await old.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+        await old.execute(
+            "INSERT INTO usage (user_id, model, provider, provider_model, input_tokens,"
+            " output_tokens, created_at, purpose, searches)"
+            " VALUES (?, 'main', 'openai', 'gpt-fake', 5, 6, 7, 'chat', 2)",
+            (user.id,),
+        )
+
+    async with await Database.open(path) as db:
+        row = await db.fetch_one(
+            "SELECT model, input_tokens, output_tokens, created_at, purpose, searches,"
+            " cached_input_tokens FROM usage"
+        )
+        assert row is not None
+        assert tuple(row) == ("main", 5, 6, 7, "chat", 2, None)
+        with pytest.raises(sqlite3.IntegrityError):
+            await db.execute(
+                "INSERT INTO usage (user_id, model, provider, provider_model, created_at,"
+                " cached_input_tokens) VALUES (?, 'main', 'openai', 'gpt-fake', 0, -1)",
+                (user.id,),
+            )
+        (summary,) = await db.transaction(journal.usage_summary, 0)
+        assert summary.total == {
+            journal.UsagePurpose.CHAT: UsageTotals(
+                calls=1, input_tokens=5, output_tokens=6, searches=2
+            )
+        }
+
+
+async def test_cached_input_tokens_are_written_and_summed(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> None:
+        for cached, now in [(30, 100), (40, 1000), (None, 1000)]:
+            journal.add_usage(
+                conn,
+                user_id=alice,
+                message_id=None,
+                model="main",
+                provider=Provider.OPENAI,
+                provider_model="gpt-fake",
+                input_tokens=50,
+                output_tokens=5,
+                now=now,
+                cached_input_tokens=cached,
+            )
+        journal.add_image_usage(
+            conn,
+            user_id=alice,
+            message_id=None,
+            provider=Provider.OPENAI,
+            provider_model="img",
+            now=1000,
+            input_tokens=12,
+            output_tokens=800,
+            cached_input_tokens=8,
+        )
+
+    await db.transaction(fill)
+    rows = await db.fetch_all("SELECT purpose, cached_input_tokens FROM usage ORDER BY id")
+    assert [tuple(row) for row in rows] == [
+        ("chat", 30),
+        ("chat", 40),
+        ("chat", None),
+        ("image", 8),
+    ]
+    (summary,) = await db.transaction(journal.usage_summary, 1000)
+    chat, image = journal.UsagePurpose.CHAT, journal.UsagePurpose.IMAGE
+    assert summary.period[chat] == UsageTotals(
+        calls=2, input_tokens=100, cached_input_tokens=40, output_tokens=10
     )
+    assert summary.total[chat].cached_input_tokens == 70
+    assert summary.total[image] == UsageTotals(
+        calls=1, input_tokens=12, cached_input_tokens=8, output_tokens=800
+    )
+
+
+async def test_usage_summary_for_one_user_reads_only_that_users_rows(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+    bob = await new_user(db, "FAKE-OPENID-BOB", "小李")
+    carol = await new_user(db, "FAKE-OPENID-CAROL", "小张")
+
+    def fill(conn: sqlite3.Connection) -> None:
+        for user_id, tokens in [(alice, 10), (bob, 20), (bob, 30)]:
+            journal.add_usage(
+                conn,
+                user_id=user_id,
+                message_id=None,
+                model="main",
+                provider=Provider.OPENAI,
+                provider_model="gpt-fake",
+                input_tokens=tokens,
+                output_tokens=1,
+                now=1000,
+            )
+
+    await db.transaction(fill)
+
+    (summary,) = await db.transaction(journal.usage_summary, 0, bob)
+    assert (summary.user_id, summary.name) == (bob, "小李")
+    assert summary.total[journal.UsagePurpose.CHAT].input_tokens == 50
+    assert await db.transaction(journal.usage_summary, 0, carol) == []
+    everyone = await db.transaction(journal.usage_summary, 0)
+    assert [s.user_id for s in everyone] == [alice, bob]
+
+
+async def test_usage_summary_leaves_out_purposes_without_rows_in_the_period(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> None:
+        journal.add_usage(
+            conn,
+            user_id=alice,
+            message_id=None,
+            model="main",
+            provider=Provider.OPENAI,
+            provider_model="gpt-fake",
+            input_tokens=1,
+            output_tokens=1,
+            now=10,
+        )
+
+    await db.transaction(fill)
+    (summary,) = await db.transaction(journal.usage_summary, 1000)
+    assert summary.period == {}
+    assert summary.total[journal.UsagePurpose.CHAT].calls == 1
+
+
+def test_usage_totals_add_up_field_by_field() -> None:
+    first = UsageTotals(calls=1, input_tokens=2, cached_input_tokens=3, output_tokens=4)
+    second = UsageTotals(calls=10, input_tokens=20, searches=5, unreported=6)
+    assert first + second == UsageTotals(
+        calls=11, input_tokens=22, cached_input_tokens=3, output_tokens=4, searches=5, unreported=6
+    )
+
+
+async def test_usage_summary_counts_cached_tokens_only_where_input_was_reported(
+    db: Database,
+) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> None:
+        for tokens_in, cached in [(None, 900), (1000, 100)]:
+            journal.add_usage(
+                conn,
+                user_id=alice,
+                message_id=None,
+                model="main",
+                provider=Provider.GEMINI,
+                provider_model="gemini-fake",
+                input_tokens=tokens_in,
+                output_tokens=1,
+                now=1000,
+                cached_input_tokens=cached,
+            )
+
+    await db.transaction(fill)
+    (summary,) = await db.transaction(journal.usage_summary, 0)
+    chat = journal.UsagePurpose.CHAT
+    expected = UsageTotals(
+        calls=2, input_tokens=1000, cached_input_tokens=100, output_tokens=2, unreported=1
+    )
+    assert summary.period[chat] == expected
+    assert summary.total[chat] == expected
+
+
+async def test_usage_summary_of_one_user_searches_the_user_index(db: Database) -> None:
+    sql = journal._USAGE_SUMMARY_ONE_USER  # pyright: ignore[reportPrivateUsage]
+    plan = await db.fetch_all(f"EXPLAIN QUERY PLAN {sql}", {"since": 0, "user_id": 1})
+    details = [row["detail"] for row in plan]
+    assert any(
+        detail.startswith("SEARCH u USING") and "usage_by_user (user_id=?" in detail
+        for detail in details
+    ), details

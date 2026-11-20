@@ -52,7 +52,8 @@ Responses API 不接受音频（文档只在 Chat Completions 里写了音频输
 - `response.content_part.done`：一个内容块的完整正文与标注：已发出的正文是它的开头时补发其余部分（从没有
   增量的块整段补发），并采用它的标注；对不上时都不做。
 - `response.completed`：先按上面的规则读 `response.output` 快照里的消息、补上没计过的搜索，再给出 `Usage`
-  加 `Finished(COMPLETED)`。
+  加 `Finished(COMPLETED)`。用量取 `usage.input_tokens`、`usage.output_tokens`，命中缓存的输入取
+  `usage.input_tokens_details.cached_tokens`。
 - `response.incomplete`：同上，`Finished` 的原因按 `incomplete_details.reason`。
 - `response.failed`、`error`：有用量（或快照里补上了搜索次数）时先给出 `Usage`，再抛 `ModelError`。
 其余事件（创建、`web_search_call.searching`、`reasoning_summary_part.added` 等）现在忽略。
@@ -137,6 +138,7 @@ from . import (
     ThoughtSummary,
     Usage,
     add_tokens,
+    cached_count,
     clean_json,
     clean_text,
     items,
@@ -511,19 +513,24 @@ class _Tokens:
     def __init__(self) -> None:
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None
+        self.cached_input_tokens: int | None = None
 
     def add(self, usage: ResponseUsage | None) -> None:
         if usage is None:
             return
-        self.input_tokens = add_tokens(
-            self.input_tokens, token_count(cast(object, getattr(usage, "input_tokens", None)))
-        )
+        input_tokens = token_count(cast(object, getattr(usage, "input_tokens", None)))
+        details: object = cast(object, getattr(usage, "input_tokens_details", None))
+        self.input_tokens = add_tokens(self.input_tokens, input_tokens)
         self.output_tokens = add_tokens(
             self.output_tokens, token_count(cast(object, getattr(usage, "output_tokens", None)))
         )
+        self.cached_input_tokens = add_tokens(
+            self.cached_input_tokens,
+            cached_count(getattr(details, "cached_tokens", None), input_tokens),
+        )
 
     def event(self, searches: int | None) -> Usage:
-        return Usage(self.input_tokens, self.output_tokens, searches)
+        return Usage(self.input_tokens, self.output_tokens, searches, self.cached_input_tokens)
 
 
 class _Turn:

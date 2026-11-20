@@ -195,8 +195,175 @@ async def test_admin_help_is_markdown_with_plain_fallback(h: Harness) -> None:
         assert f"`/{command}" in reply.text
 
 
-async def test_admin_usage_lists_today_and_total_per_user(h: Harness) -> None:
+MONTH_START = START - (14 * 24 + 16) * HOUR  # 上海时间 2027-01-01 0 点
+LAST_MONTH = MONTH_START - HOUR
+
+
+def add_usage_row(
+    conn: sqlite3.Connection,
+    user_id: int,
+    purpose: journal.UsagePurpose,
+    tokens: tuple[int | None, int | None, int | None],
+    now: int,
+    searches: int | None = None,
+) -> None:
+    """记一行用量；`tokens` 是（输入，其中缓存，输出）。"""
+    tokens_in, cached, tokens_out = tokens
+    if purpose is journal.UsagePurpose.IMAGE:
+        journal.add_image_usage(
+            conn,
+            user_id=user_id,
+            message_id=None,
+            provider=Provider.GEMINI,
+            provider_model="img-fake",
+            now=now,
+            input_tokens=tokens_in,
+            output_tokens=tokens_out,
+            cached_input_tokens=cached,
+        )
+        return
+    journal.add_usage(
+        conn,
+        user_id=user_id,
+        message_id=None,
+        model=purpose.value,
+        provider=Provider.OPENAI,
+        provider_model="gpt-fake",
+        input_tokens=tokens_in,
+        output_tokens=tokens_out,
+        now=now,
+        purpose=purpose,
+        searches=searches,
+        cached_input_tokens=cached,
+    )
+
+
+async def usage_fixture(h: Harness) -> tuple[User, User]:
+    """管理员与小王的一组用量，返回（管理员，小王）。"""
+    code = await h.invite("小王")
+    await h.friend_add(ALICE, code)
+    alice = await h.user(ALICE)
+    admin = await h.user(ADMIN)
+    assert alice is not None
+    assert admin is not None
+    purpose = journal.UsagePurpose
+
+    def record(conn: sqlite3.Connection) -> None:
+        add_usage_row(conn, admin.id, purpose.CHAT, (5, None, 1), START)
+        add_usage_row(conn, alice.id, purpose.CHAT, (12000, 9140, 950), START, searches=2)
+        add_usage_row(conn, alice.id, purpose.CHAT, (None, None, None), START)  # 没有用量数据
+        add_usage_row(conn, alice.id, purpose.DECISION, (1250, None, 0), START)
+        add_usage_row(conn, alice.id, purpose.DESCRIBE, (70, None, 9), START)
+        add_usage_row(conn, alice.id, purpose.IMAGE, (7, None, 1120), START)
+        # 上个月的：话题摘要只在累计里出现；缓存为空的对话像升级前的旧行。
+        add_usage_row(conn, alice.id, purpose.MEMORY, (3000, 1000, 200), LAST_MONTH)
+        add_usage_row(conn, alice.id, purpose.CHAT, (1_240_000, None, 5000), LAST_MONTH, 1)
+
+    await h.db.transaction(record)
+    return admin, alice
+
+
+async def test_admin_usage_lists_this_month_and_total_per_user_and_the_sum(h: Harness) -> None:
     assert await h.admin("/usage") == texts.NO_USAGE
+    admin, alice = await usage_fixture(h)
+
+    reply = await h.admin_reply("/usage")
+
+    assert reply.markdown
+    month = "输入 13.3k token（其中缓存 9.14k），输出 2.08k token，联网搜索 2 次，出图 1 张"
+    total = "输入 1.26M token（其中缓存 10.1k），输出 7.28k token，联网搜索 3 次，出图 1 张"
+    assert reply.text == (
+        "**用量**（本月从 1 月 1 日 0 点算起）\n\n"
+        f"- `#{admin.id}` 管理员\n"
+        "  - 本月：输入 5 token，输出 1 token\n"
+        "  - 累计：输入 5 token，输出 1 token\n"
+        f"- `#{alice.id}` 小王\n"
+        f"  - 本月：{month}\n"
+        f"  - 累计：{total}\n"
+        "- **合计**\n"
+        f"  - 本月：{month}\n"  # 管理员的 5 与 1 进位后看不出
+        f"  - 累计：{total}\n\n"
+        "发送 `/usage 编号` 查看一个用户按用途分开的明细。"
+    )
+    plain = (
+        "用量（本月从 1 月 1 日 0 点算起）\n\n"
+        f"#{admin.id} 管理员\n"
+        "本月：输入 5 token，输出 1 token\n"
+        "累计：输入 5 token，输出 1 token\n\n"
+        f"#{alice.id} 小王\n"
+        f"本月：{month}\n"
+        f"累计：{total}\n\n"
+        "合计\n"
+        f"本月：{month}\n"
+        f"累计：{total}\n\n"
+        "发送 /usage 编号 查看一个用户按用途分开的明细。"
+    )
+    assert reply.fallbacks == (plain,)
+
+
+async def test_admin_usage_of_one_user_is_split_by_purpose(h: Harness) -> None:
+    _, alice = await usage_fixture(h)
+
+    reply = await h.admin_reply(f"/usage #{alice.id}")
+
+    month_lines = [
+        "对话：2 次（1 次没有用量数据），输入 12k token（其中缓存 9.14k），输出 950 token，联网搜索 2 次",
+        "决策：1 次，输入 1.25k token",
+        "附件描述与摘要：1 次，输入 70 token，输出 9 token",
+        "出图：1 张，输入 7 token，输出 1.12k token",
+    ]
+    total_lines = [
+        (
+            "对话：3 次（1 次没有用量数据），输入 1.25M token（其中缓存 9.14k），输出 5.95k token，"
+            "联网搜索 3 次"
+        ),
+        "决策：1 次，输入 1.25k token",
+        "附件描述与摘要：1 次，输入 70 token，输出 9 token",
+        "话题摘要：1 次，输入 3k token（其中缓存 1k），输出 200 token",
+        "出图：1 张，输入 7 token，输出 1.12k token",
+    ]
+    assert reply.markdown
+    assert reply.text == (
+        f"**用量明细**：`#{alice.id}` 小王\n\n"
+        "- 本月（1 月 1 日 0 点起）\n"
+        + "".join(f"  - {line}\n" for line in month_lines)
+        + "- 累计\n"
+        + "\n".join(f"  - {line}" for line in total_lines)
+    )
+    assert reply.fallbacks == (
+        f"用量明细：#{alice.id} 小王\n\n"
+        "本月（1 月 1 日 0 点起）\n" + "\n".join(month_lines) + "\n\n"
+        "累计\n" + "\n".join(total_lines),
+    )
+    # 编号也可以不带 #。
+    assert (await h.admin_reply(f"/usage {alice.id}")).text == reply.text
+
+
+async def test_admin_usage_of_one_user_reads_only_that_user(h: Harness) -> None:
+    admin, _ = await usage_fixture(h)
+
+    reply = await h.admin_reply(f"/usage {admin.id}")
+
+    assert reply.text == (
+        f"**用量明细**：`#{admin.id}` 管理员\n\n"
+        "- 本月（1 月 1 日 0 点起）\n"
+        "  - 对话：1 次，输入 5 token，输出 1 token\n"
+        "- 累计\n"
+        "  - 对话：1 次，输入 5 token，输出 1 token"
+    )
+
+
+async def test_admin_usage_of_an_unknown_or_unused_user(h: Harness) -> None:
+    assert await h.admin("/usage 999") == texts.user_not_found(999)
+    assert await h.admin("/usage 小王") == texts.id_required("usage", "users")
+    code = await h.invite("小王")
+    await h.friend_add(ALICE, code)
+    alice = await h.user(ALICE)
+    assert alice is not None
+    assert await h.admin(f"/usage #{alice.id}") == texts.user_has_no_usage(alice.id, "小王")
+
+
+async def test_admin_usage_counts_this_month_from_the_first_at_local_midnight(h: Harness) -> None:
     code = await h.invite("小王")
     await h.friend_add(ALICE, code)
     alice = await h.user(ALICE)
@@ -205,199 +372,112 @@ async def test_admin_usage_lists_today_and_total_per_user(h: Harness) -> None:
     assert admin is not None
 
     def record(conn: sqlite3.Connection) -> None:
-        # 上海时间今天 0 点是 START - 16 小时。
-        rows = [
-            (alice.id, 100, 20, START - HOUR),
-            (alice.id, None, None, START - 15 * HOUR),
-            (alice.id, 1000, 200, START - 17 * HOUR),  # 昨天
-            (admin.id, 5, 1, START),
-        ]
-        for user_id, tokens_in, tokens_out, now in rows:
-            journal.add_usage(
-                conn,
-                user_id=user_id,
-                message_id=None,
-                model="main",
-                provider=Provider.OPENAI,
-                provider_model="gpt-fake",
-                input_tokens=tokens_in,
-                output_tokens=tokens_out,
-                now=now,
-            )
+        chat = journal.UsagePurpose.CHAT
+        add_usage_row(conn, admin.id, chat, (5, None, 1), MONTH_START - 1)  # 上个月的最后一秒
+        add_usage_row(conn, alice.id, chat, (None, None, None), MONTH_START)  # 本月的第一秒
 
     await h.db.transaction(record)
 
-    reply = await h.admin_reply("/usage")
-    assert reply == Reply.rich(
-        texts.usage_message(
-            [
-                texts.UsageRow(
-                    user_id=admin.id, name=texts.ADMIN_NAME, today=(1, 5, 1, 0), total=(1, 5, 1, 0)
-                ),
-                texts.UsageRow(
-                    user_id=alice.id, name="小王", today=(2, 100, 20, 1), total=(3, 1100, 220, 1)
-                ),
-            ]
-        )
+    overview = await h.admin("/usage")
+    assert (
+        f"- `#{admin.id}` 管理员\n  - 本月：无\n  - 累计：输入 5 token，输出 1 token\n"
+    ) in overview
+    assert (
+        f"- `#{alice.id}` 小王\n  - 本月：1 次调用，都没有用量数据\n"
+        "  - 累计：1 次调用，都没有用量数据\n"
+    ) in overview
+    assert "- **合计**\n  - 本月：1 次调用，都没有用量数据\n" in overview
+    detail = await h.admin_reply(f"/usage {admin.id}")
+    assert "- 本月（1 月 1 日 0 点起）：无\n- 累计\n" in detail.text
+    assert detail.fallbacks[0].endswith(
+        "本月（1 月 1 日 0 点起）：无\n\n累计\n对话：1 次，输入 5 token，输出 1 token"
     )
-    assert reply.markdown
-    assert reply.text == (
-        "**用量**（今天从本地时间 0 点算起）\n\n"
-        f"- `#{admin.id}` 管理员\n"
-        "  - 今天：1 次，输入 5 / 输出 1 token\n"
-        "  - 累计：1 次，输入 5 / 输出 1 token\n"
-        f"- `#{alice.id}` 小王\n"
-        "  - 今天：2 次，输入 100 / 输出 20 token（其中 1 次没有用量数据）\n"
-        "  - 累计：3 次，输入 1100 / 输出 220 token（其中 1 次没有用量数据）"
+    assert (
+        (await h.admin_reply(f"/usage {alice.id}"))
+        .fallbacks[0]
+        .endswith("对话：1 次（1 次没有用量数据）")
     )
-    assert reply.fallbacks == (
-        texts.usage_list(
-            [
-                texts.usage_line(
-                    user_id=admin.id, name="管理员", today=(1, 5, 1, 0), total=(1, 5, 1, 0)
-                ),
-                texts.usage_line(
-                    user_id=alice.id, name="小王", today=(2, 100, 20, 1), total=(3, 1100, 220, 1)
-                ),
-            ]
-        ),
-    )
-    assert "/usage" in texts.HELP
 
 
-async def test_admin_usage_shows_searches_only_when_there_are_some(h: Harness) -> None:
-    assert await h.admin("/usage") == texts.NO_USAGE
+async def test_admin_usage_tells_reported_zeros_from_missing_data(h: Harness) -> None:
+    code = await h.invite("小王")
+    await h.friend_add(ALICE, code)
+    alice = await h.user(ALICE)
     admin = await h.user(ADMIN)
+    assert alice is not None
     assert admin is not None
 
     def record(conn: sqlite3.Connection) -> None:
-        for searches, now in [(3, START - 17 * HOUR), (2, START), (0, START), (None, START)]:
-            journal.add_usage(
-                conn,
-                user_id=admin.id,
-                message_id=None,
-                model="main",
-                provider=Provider.OPENAI,
-                provider_model="gpt-fake",
-                input_tokens=10,
-                output_tokens=1,
-                now=now,
-                searches=searches,
-            )
+        chat = journal.UsagePurpose.CHAT
+        add_usage_row(conn, admin.id, chat, (0, None, 0), START)  # 明确报告了 0
+        add_usage_row(conn, alice.id, chat, (0, None, 0), START)
+        add_usage_row(conn, alice.id, chat, (None, None, None), START)
 
     await h.db.transaction(record)
 
-    reply = await h.admin_reply("/usage")
-    assert reply.text == (
-        "**用量**（今天从本地时间 0 点算起）\n\n"
-        f"- `#{admin.id}` 管理员\n"
-        "  - 今天：3 次，输入 30 / 输出 3 token，联网搜索 2 次\n"
-        "  - 累计：4 次，输入 40 / 输出 4 token，联网搜索 5 次"
-    )
-    expected = (
-        f"#{admin.id} 管理员：今天 3 次，输入 30 / 输出 3 token，联网搜索 2 次；"
-        "累计 4 次，输入 40 / 输出 4 token，联网搜索 5 次"
-    )
-    assert reply.fallbacks == (texts.usage_list([expected]),)
-
-
-async def test_admin_usage_shows_images_as_a_count(h: Harness) -> None:
-    assert await h.admin("/usage") == texts.NO_USAGE
-    admin = await h.user(ADMIN)
-    assert admin is not None
-
-    def record(conn: sqlite3.Connection) -> None:
-        journal.add_usage(
-            conn,
-            user_id=admin.id,
-            message_id=None,
-            model="main",
-            provider=Provider.OPENAI,
-            provider_model="gpt-fake",
-            input_tokens=10,
-            output_tokens=1,
-            now=START,
-        )
-        for now, output_tokens in [(START - 17 * HOUR, None), (START, 1120), (START, 1120)]:
-            journal.add_image_usage(
-                conn,
-                user_id=admin.id,
-                message_id=None,
-                provider=Provider.GEMINI,
-                provider_model="img-fake",
-                now=now,
-                output_tokens=output_tokens,
-            )
-
-    await h.db.transaction(record)
-
-    reply = await h.admin_reply("/usage")
-    assert reply.text == (
-        "**用量**（今天从本地时间 0 点算起）\n\n"
-        f"- `#{admin.id}` 管理员\n"
-        "  - 今天：1 次，输入 10 / 输出 1 token，出图 2 张（输入 0 / 输出 2240 token）\n"
-        "  - 累计：1 次，输入 10 / 输出 1 token，出图 3 张（输入 0 / 输出 2240 token）"
-    )
-
-
-def test_usage_line_shows_images_without_tokens_as_just_a_count() -> None:
-    line = texts.usage_line(
-        user_id=1,
-        name="小王",
-        today=(1, 2, 3, 0),
-        total=(4, 5, 6, 0),
-        today_images=(0, 0, 0),
-        total_images=(2, 0, 0),
-    )
+    overview = await h.admin("/usage")
+    assert f"- `#{admin.id}` 管理员\n  - 本月：1 次调用，报告的 token 都是 0\n" in overview
     assert (
-        line
-        == "#1 小王：今天 1 次，输入 2 / 输出 3 token；累计 4 次，输入 5 / 输出 6 token，出图 2 张"
-    )
+        f"- `#{alice.id}` 小王\n  - 本月：2 次调用，报告的 token 都是 0（1 次没有用量数据）\n"
+    ) in overview
 
 
-def test_usage_line_hides_zero_searches() -> None:
-    line = texts.usage_line(
-        user_id=1, name="小王", today=(1, 2, 3, 0), total=(4, 5, 6, 0), total_searches=7
-    )
-    assert (
-        line
-        == "#1 小王：今天 1 次，输入 2 / 输出 3 token；累计 4 次，输入 5 / 输出 6 token，联网搜索 7 次"
-    )
-
-
-async def test_admin_usage_counts_decision_calls(h: Harness) -> None:
+async def test_admin_usage_ignores_cached_tokens_of_rows_without_input(h: Harness) -> None:
+    # Gemini 的输入与缓存数都是可选字段：只报告了缓存的行，缓存数不能算进别的行的输入里。
     assert await h.admin("/usage") == texts.NO_USAGE  # 管理员发过消息后才有自己的一行
     admin = await h.user(ADMIN)
     assert admin is not None
 
     def record(conn: sqlite3.Connection) -> None:
-        for purpose, model, tokens_in, tokens_out in [
-            (journal.UsagePurpose.DECISION, journal.DECISION_USAGE_MODEL, 30, 0),
-            (journal.UsagePurpose.CHAT, "main", 100, 20),
-        ]:
-            journal.add_usage(
-                conn,
-                user_id=admin.id,
-                message_id=None,
-                model=model,
-                provider=Provider.OPENAI,
-                provider_model="gpt-fake",
-                input_tokens=tokens_in,
-                output_tokens=tokens_out,
-                now=START,
-                purpose=purpose,
-            )
+        chat = journal.UsagePurpose.CHAT
+        add_usage_row(conn, admin.id, chat, (None, 900, 10), START)
+        add_usage_row(conn, admin.id, chat, (1000, 100, 20), START)
 
     await h.db.transaction(record)
 
-    expected = (
-        f"#{admin.id} {texts.ADMIN_NAME}：今天 2 次，输入 130 / 输出 20 token，含决策 1 次、输入 30 token；"
-        "累计 2 次，输入 130 / 输出 20 token，含决策 1 次、输入 30 token"
-    )
-    assert (await h.admin_reply("/usage")).fallbacks == (texts.usage_list([expected]),)
-    assert "  - 今天：2 次，输入 130 / 输出 20 token，含决策 1 次、输入 30 token" in (
-        await h.admin("/usage")
-    )
+    overview = await h.admin("/usage")
+    assert "  - 本月：输入 1k token（其中缓存 100），输出 30 token\n" in overview
+
+
+@pytest.mark.parametrize(
+    ("count", "shown"),
+    [
+        (0, "0"),
+        (950, "950"),
+        (999, "999"),
+        (1000, "1k"),
+        (1004, "1k"),
+        (1005, "1.01k"),
+        (1500, "1.5k"),
+        (9140, "9.14k"),
+        (9995, "10k"),  # 进位后整数部分成了两位，改成一位小数
+        (12_300, "12.3k"),
+        (12_350, "12.4k"),
+        (123_456, "123.5k"),
+        (999_949, "999.9k"),
+        (999_950, "1M"),  # 进位到 1000k 时改用 M
+        (1_250_000, "1.25M"),
+        (45_600_000, "45.6M"),
+        (2**63 - 1, "9223372036854.8M"),
+    ],
+)
+def test_format_tokens(count: int, shown: str) -> None:
+    assert texts.format_tokens(count) == shown
+
+
+def test_month_start_in_shanghai() -> None:
+    assert commands.month_start(START, SHANGHAI) == MONTH_START
+    assert commands.month_start(MONTH_START, SHANGHAI) == MONTH_START
+    assert commands.month_start(MONTH_START - 1, SHANGHAI) == MONTH_START - 31 * 24 * HOUR
+
+
+def test_month_start_when_midnight_of_the_first_is_skipped() -> None:
+    # 亚松森 2023-10-01 0 点夏令时开始，直接跳到 1 点（UTC 03:00）：本月从跳变后的第一刻算起。
+    asuncion = ZoneInfo("America/Asuncion")
+    first_moment = 1696132800
+    assert datetime.fromtimestamp(first_moment, asuncion).hour == 1
+    assert commands.month_start(first_moment + 5 * 24 * HOUR, asuncion) == first_moment
+    assert commands.month_start(first_moment - 1, asuncion) < first_moment - 29 * 24 * HOUR
 
 
 def test_day_start_takes_the_first_of_two_midnights() -> None:

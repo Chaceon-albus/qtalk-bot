@@ -306,16 +306,24 @@ class Usage:
     报告：两家 SDK 都不校验响应，原样留下的超大整数在 SQLite 绑定时会抛 `OverflowError`，让整轮记账一起回滚。
     要把几项相加的地方（如 Gemini 的思考用量、各跳的累计）先用 `token_count()` 逐项校验再加，这里只能拦住
     最后交进来的值。
+
+    `cached_input_tokens` 是 `input_tokens` 里命中服务商缓存的部分（两家对它大幅打折），服务商没有报告时是
+    `None`。各跳累加的方式与 `input_tokens` 相同，但每一跳的缓存数先经 `cached_count()` 按这一跳的输入校验
+    （只看合计会被别的跳掩盖）；构造时再兜一次底：输入没有报告或缓存数超过输入时也换成 `None`。
     """
 
     input_tokens: int | None
     output_tokens: int | None
     searches: int | None = None
+    cached_input_tokens: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "input_tokens", token_count(self.input_tokens))
         object.__setattr__(self, "output_tokens", token_count(self.output_tokens))
         object.__setattr__(self, "searches", search_count(self.searches))
+        object.__setattr__(
+            self, "cached_input_tokens", cached_count(self.cached_input_tokens, self.input_tokens)
+        )
 
 
 MAX_TOKENS_PER_CALL = 10**9
@@ -332,6 +340,15 @@ def token_count(value: object) -> int | None:
     ):
         return None
     return value
+
+
+def cached_count(value: object, input_tokens: int | None) -> int | None:
+    """一次请求（一跳）报告的命中缓存的输入 token 数。先按 `token_count()` 校验；`input_tokens`（同一跳的输入，已经
+    校验过）没有报告、或缓存数超过它时也当作没有报告，返回 `None`：缓存数必须是这一跳已报告输入的一部分。"""
+    cached = token_count(value)
+    if cached is None or input_tokens is None or cached > input_tokens:
+        return None
+    return cached
 
 
 def add_tokens(total: int | None, value: int | None) -> int | None:

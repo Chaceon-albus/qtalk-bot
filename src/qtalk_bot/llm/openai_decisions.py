@@ -7,7 +7,8 @@
 
 响应（SDK 3.55.1 的 `types/decision.py`）：`answers` 是数组，按题目的顺序，每项带回题目的 `name`；类型有
 `choice`（`probabilities` 是 `{value, probability}` 的数组）、`predicate`（`probability`）、`score` 与
-`refusal`（这道题拒答，其余题照常）。`usage` 有 `input_tokens`、`output_tokens`。
+`refusal`（这道题拒答，其余题照常）。`usage` 有 `input_tokens`、`output_tokens`，命中缓存的输入在
+`input_tokens_details.cached_tokens`。
 
 SDK 解析响应时不校验，还会做宽松的转换（JSON 布尔值的概率变成 1.0 / 0.0，缺了 `type` 的答案被构造成别的
 题型），所以这里经公开的原始响应接口（`with_raw_response`）拿到响应体，按原始的 JSON 逐项检查：按 `name`
@@ -162,7 +163,12 @@ def _usage(raw: object) -> Usage | None:
     usage = json_object(raw)
     if usage is None:
         return None
-    return usage_or_none(usage.get("input_tokens"), usage.get("output_tokens"))
+    details = json_object(usage.get("input_tokens_details"))
+    return usage_or_none(
+        usage.get("input_tokens"),
+        usage.get("output_tokens"),
+        None if details is None else details.get("cached_tokens"),
+    )
 
 
 def _error(exc: Exception) -> DecisionError:

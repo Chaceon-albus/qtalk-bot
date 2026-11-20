@@ -173,7 +173,7 @@ async def test_summary_is_written_from_the_topics_turns(db: Database) -> None:
     topic_id = await turn(db, alice, "快排怎么写", "先选一个基准")
     await turn(db, alice, "分区呢", "小的放左边", topic_id)
     other = await turn(db, alice, "无关的话题", "好")
-    model = ScriptedModel("memory", written())
+    model = ScriptedModel("memory", written(usage=Usage(80, 20, cached_input_tokens=64)))
     worker = summarizer(db, model)
 
     worker.schedule(alice, topic_id)
@@ -204,6 +204,9 @@ async def test_summary_is_written_from_the_topics_turns(db: Database) -> None:
     last_user = await db.fetch_one("SELECT max(id) FROM messages WHERE content = '分区呢'")
     assert last_user is not None
     assert await memory_usage(db) == [(last_user[0], MEMORY_USAGE_MODEL, "memory-model", 80, 20)]
+    cached = await db.fetch_one("SELECT cached_input_tokens FROM usage WHERE purpose = 'memory'")
+    assert cached is not None
+    assert cached[0] == 64
 
 
 async def test_next_update_has_the_old_summary_and_only_the_newer_turns(db: Database) -> None:
@@ -530,7 +533,8 @@ async def test_version_9_usage_rows_survive_and_memory_is_accepted(tmp_path: Pat
             )
         )
         (summary,) = await db.transaction(journal.usage_summary, 0)
-        assert (summary.total_calls, summary.total_searches) == (2, 2)
+        assert sum(totals.calls for totals in summary.total.values()) == 2
+        assert sum(totals.searches for totals in summary.total.values()) == 2
 
 
 async def test_output_limit_is_passed_only_when_configured(db: Database) -> None:

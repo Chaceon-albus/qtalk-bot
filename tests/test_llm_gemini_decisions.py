@@ -221,8 +221,29 @@ async def test_custom_model_name_and_repr() -> None:
         (None, None),
         ({"total_input_tokens": 12}, Usage(12, None)),
         ({"total_input_tokens": 12, "total_output_tokens": 0}, Usage(12, 0)),
+        (
+            {"total_input_tokens": 12, "total_output_tokens": 0, "total_cached_tokens": 8},
+            Usage(12, 0, cached_input_tokens=8),
+        ),
+        (
+            {"total_input_tokens": 12, "total_output_tokens": 0, "total_cached_tokens": 2**63},
+            Usage(12, 0),
+        ),
+        (
+            {"total_input_tokens": 12, "total_output_tokens": 0, "total_cached_tokens": 13},
+            Usage(12, 0),
+        ),
+        ({"total_output_tokens": 0, "total_cached_tokens": 8}, Usage(None, 0)),
     ],
-    ids=["missing", "input_only", "both"],
+    ids=[
+        "missing",
+        "input_only",
+        "both",
+        "cached",
+        "absurd_cached",
+        "cached_beyond_input",
+        "cached_without_input",
+    ],
 )
 async def test_usage_is_taken_as_reported(used: Payload | None, expected: Usage | None) -> None:
     result = await model_on(replying(decision(used, damaged=noul(0.5)))).decide(request(DAMAGED))

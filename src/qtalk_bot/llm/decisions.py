@@ -35,6 +35,7 @@ from . import (
     ModelError,
     Provider,
     Usage,
+    cached_count,
     token_count,
 )
 
@@ -280,9 +281,17 @@ def choice_answer(
     return ChoiceAnswer({option.value: seen[option.value] for option in question.options})
 
 
-def usage_or_none(input_tokens: object, output_tokens: object) -> Usage | None:
-    """服务商报告的 token 数，规则见 `Usage`（不合理的计数记空）；两项都没有时返回 `None`。"""
-    usage = Usage(token_count(input_tokens), token_count(output_tokens))
+def usage_or_none(
+    input_tokens: object, output_tokens: object, cached_input_tokens: object = None
+) -> Usage | None:
+    """服务商报告的 token 数，规则见 `Usage`（不合理的计数记空，缓存数按 `cached_count()`）；一项都没有时返回
+    `None`。"""
+    checked_input = token_count(input_tokens)
+    usage = Usage(
+        checked_input,
+        token_count(output_tokens),
+        cached_input_tokens=cached_count(cached_input_tokens, checked_input),
+    )
     return None if usage == Usage(None, None) else usage
 
 

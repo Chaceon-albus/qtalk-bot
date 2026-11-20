@@ -21,7 +21,8 @@
 OpenAI：Images API（`gpt-image-2.6-flare` 只支持 `/v1/images/generations` 与 `/v1/images/edits`，不支持
 Responses）。没有参考图时 `images.generate`，有参考图时 `images.edit`，参考图作为多张 `image` 传入。总是
 `n=1`、`output_format="jpeg"`；配置了 `openai_quality` 才传 `quality`。结果取 `data[0].b64_json`，用量取响应的
-`usage.input_tokens` / `usage.output_tokens`。SDK 不严格校验响应，HTTP 200 的 HTML、`null` 或数组可能原样返回，
+`usage.input_tokens` / `usage.output_tokens`，命中缓存的输入取 `usage.input_tokens_details.cached_tokens`（SDK 的类型里
+没有这个字段，响应里有才有）。SDK 不严格校验响应，HTTP 200 的 HTML、`null` 或数组可能原样返回，
 顶层不是 `ImagesResponse` 时算 `MALFORMED`。文档写明内容审核拒绝时错误的 `code` 是 `moderation_blocked`
 （`type` 是 `image_generation_user_error`；HTTP 状态文档没写，示例接住的是 BadRequest），只认 `code`：
 `type` 也可能用于别的用户错误。
@@ -38,7 +39,7 @@ base64）加一段提示词。SDK 默认自动续写，合并各跳时保留前�
 `error.details[].reason` 里有安全拦截的字样（safety、blocked、prohibited）就算 `BLOCKED`；文案只作兜底，限于
 `interaction.errors[].message` 与 HTTP 400 的错误文案（别的状态，如 404 的文案可能列出名字里带 safety 的模型，
 会误报）。其余没有图片的情况算 `FAILED`。用量的口径同对话适配器
-（`llm/gemini_interactions.py`）：输入取 `total_input_tokens`，输出取 `total_output_tokens` 加
+（`llm/gemini_interactions.py`）：输入取 `total_input_tokens`，其中命中缓存的取 `total_cached_tokens`，输出取 `total_output_tokens` 加
 `total_thought_tokens`（思考也按输出计费）。
 """
 
@@ -63,6 +64,7 @@ from .llm import (
     Masked,
     ModelError,
     Provider,
+    cached_count,
     inline_size,
     items,
     kind_for_status,
@@ -112,6 +114,8 @@ class GeneratedImage:
     mime_type: str
     input_tokens: int | None = None
     output_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    """`input_tokens` 里命中服务商缓存的部分，没有报告时是 `None`。"""
 
 
 class ImageGenerator(Protocol):
@@ -209,11 +213,15 @@ class OpenAIImageGenerator:
         first = next(iter(items(cast(object, response.data))), None)
         encoded: object = getattr(first, "b64_json", None)
         usage: object = cast(object, response.usage)
+        # SDK 的类型里 `input_tokens_details` 只有图片与文字的 token 数；响应里若有 `cached_tokens` 也照收。
+        details: object = getattr(usage, "input_tokens_details", None)
+        input_tokens = token_count(getattr(usage, "input_tokens", None))
         return _result(
             Provider.OPENAI,
             encoded,
-            token_count(getattr(usage, "input_tokens", None)),
+            input_tokens,
             token_count(getattr(usage, "output_tokens", None)),
+            cached_count(getattr(details, "cached_tokens", None), input_tokens),
         )
 
 
@@ -291,11 +299,18 @@ class GeminiImageGenerator:
         thought_tokens = token_count(getattr(usage, "total_thought_tokens", None))
         if output_tokens is not None and thought_tokens is not None:
             output_tokens += thought_tokens  # 思考用量无效时只记输出本身
+        cached_tokens = cached_count(getattr(usage, "total_cached_tokens", None), input_tokens)
         image: object = cast(object, interaction.output_image)
         if image is None:
             raise ModelError(Provider.GEMINI, _gemini_failure(interaction))
         # 有图片却不是内联的 base64（如只给了 uri）也算响应不对：请求里没要 uri。
-        return _result(Provider.GEMINI, getattr(image, "data", None), input_tokens, output_tokens)
+        return _result(
+            Provider.GEMINI,
+            getattr(image, "data", None),
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+        )
 
 
 def create_gemini_client(
@@ -347,7 +362,11 @@ def _check_references(provider: Provider, references: Sequence[ImagePart]) -> No
 
 
 def _result(
-    provider: Provider, encoded: object, input_tokens: int | None, output_tokens: int | None
+    provider: Provider,
+    encoded: object,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    cached_input_tokens: int | None,
 ) -> GeneratedImage:
     """把 base64 的图片解出来、按文件头判断类型。"""
     if not isinstance(encoded, str) or not encoded:
@@ -359,7 +378,7 @@ def _result(
     mime_type = detect_format(data)
     if mime_type is None or not mime_type.startswith("image/"):
         raise ModelError(provider, ErrorKind.MALFORMED)
-    return GeneratedImage(data, mime_type, input_tokens, output_tokens)
+    return GeneratedImage(data, mime_type, input_tokens, output_tokens, cached_input_tokens)
 
 
 def _openai_error(exc: Exception) -> ModelError:

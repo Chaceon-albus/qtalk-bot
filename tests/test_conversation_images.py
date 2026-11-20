@@ -207,7 +207,13 @@ class FakeGenerator:
         index = len(self.calls) - 1
         if index < len(self.errors) and (error := self.errors[index]) is not None:
             raise error
-        return ImageResult(picture(len(self.calls)), JPEG, input_tokens=7, output_tokens=1120)
+        return ImageResult(
+            picture(len(self.calls)),
+            JPEG,
+            input_tokens=7,
+            output_tokens=1120,
+            cached_input_tokens=5,
+        )
 
 
 def picture(n: int) -> bytes:
@@ -453,6 +459,9 @@ async def test_a_full_drawing_turn(db: Database, tmp_path: Path) -> None:
     question = await db.fetch_one("SELECT id FROM messages WHERE role = 'user'")
     assert question is not None
     assert await image_usage(db) == [(alice.id, question["id"], "gemini", "fake-image", 7, 1120)]
+    cached = await db.fetch_one("SELECT cached_input_tokens FROM usage WHERE purpose = 'image'")
+    assert cached is not None
+    assert cached[0] == 5
     assert ("main", 12, 34) in await usage(db)
     # 图挂在助手的回复上，文件存在这个用户的目录里。
     (drawn,) = await drawn_rows(db)

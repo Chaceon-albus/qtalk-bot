@@ -15,7 +15,7 @@
 
 响应（google-genai 3.6.1 的 `google.genai.decisions`）：`answers` 是以题目名为键的对象，选择题的
 `probabilities` 是 `{取值: 概率}`，是非题的 `noul` 是成立的概率；`usage` 有 `total_input_tokens`、
-`total_output_tokens`（文档说恒为 0）。
+`total_output_tokens`（文档说恒为 0），命中缓存的输入在 `total_cached_tokens`（与 Interactions 共用同一个用量类型）。
 
 SDK 解析时不校验（`validate=False`），还会做宽松的转换：缺了 `type` 的答案被补成选择题，JSON 布尔值的概率
 变成 1.0 / 0.0。所以这里经公开的原始响应接口（`with_raw_response`，返回的响应对象有 `json()`）拿到响应体，
@@ -184,7 +184,11 @@ def _usage(raw: object) -> Usage | None:
     usage = json_object(raw)
     if usage is None:
         return None
-    return usage_or_none(usage.get("total_input_tokens"), usage.get("total_output_tokens"))
+    return usage_or_none(
+        usage.get("total_input_tokens"),
+        usage.get("total_output_tokens"),
+        usage.get("total_cached_tokens"),
+    )
 
 
 def _error(exc: Exception) -> DecisionError:

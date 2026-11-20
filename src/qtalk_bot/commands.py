@@ -92,7 +92,7 @@ def execute(
             changed = access.set_paused(conn, False, now)
             return texts.SERVICE_RESUMED if changed else texts.SERVICE_NOT_PAUSED
         case "usage":
-            return _usage(conn, context, now)
+            return _usage(conn, command.argument, context, now)
         case "help":
             return texts.HELP_MESSAGE
         case _:
@@ -190,30 +190,39 @@ def day_start(now: int, timezone: ZoneInfo) -> int:
     跳变后的第一个时刻，也就是这一天真正的开始。出图的每日限额也按它定「当天」。
     """
     local = datetime.fromtimestamp(now, timezone)
-    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0, fold=0)
-    return int(midnight.timestamp())
+    return _midnight(local)
 
 
-def _usage(conn: sqlite3.Connection, context: CommandContext, now: int) -> str | Rich:
-    summaries = journal.usage_summary(conn, day_start(now, context.timezone))
+def month_start(now: int, timezone: ZoneInfo) -> int:
+    """`now` 所在的本地月份 1 日第一次到达 0 点的时刻，夏令时的处理同 `day_start()`。`/usage` 的「本月」从这里算起。"""
+    local = datetime.fromtimestamp(now, timezone)
+    return _midnight(local.replace(day=1))
+
+
+def _midnight(local: datetime) -> int:
+    return int(local.replace(hour=0, minute=0, second=0, microsecond=0, fold=0).timestamp())
+
+
+def _usage(
+    conn: sqlite3.Connection, argument: str, context: CommandContext, now: int
+) -> str | Rich:
+    since = month_start(now, context.timezone)
+    month = datetime.fromtimestamp(now, context.timezone).month
+    if not argument:
+        summaries = journal.usage_summary(conn, since)
+        if not summaries:
+            return texts.NO_USAGE
+        return texts.usage_overview(summaries, month)
+    user_id = _parse_id(argument)
+    if user_id is None:
+        return texts.id_required("usage", "users")
+    user = access.get_user(conn, user_id)
+    if user is None:
+        return texts.user_not_found(user_id)
+    summaries = journal.usage_summary(conn, since, user.id)
     if not summaries:
-        return texts.NO_USAGE
-    rows = [
-        texts.UsageRow(
-            user_id=s.user_id,
-            name=s.name,
-            today=(s.today_calls, s.today_input, s.today_output, s.today_unreported),
-            total=(s.total_calls, s.total_input, s.total_output, s.total_unreported),
-            today_decisions=(s.today_decision_calls, s.today_decision_input),
-            total_decisions=(s.total_decision_calls, s.total_decision_input),
-            today_searches=s.today_searches,
-            total_searches=s.total_searches,
-            today_images=(s.today_images, s.today_image_input, s.today_image_output),
-            total_images=(s.total_images, s.total_image_input, s.total_image_output),
-        )
-        for s in summaries
-    ]
-    return texts.usage_message(rows)
+        return texts.user_has_no_usage(user.id, user.name)
+    return texts.usage_detail(summaries[0], month)
 
 
 def _parse_id(argument: str) -> int | None:

@@ -8,8 +8,10 @@ Markdown 里的动态内容（备注、名字）一律先经 `escape_markdown()`
 """
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+
+from .journal import UsagePurpose, UsageSummary, UsageTotals
 
 ADMIN_NAME = "管理员"
 """管理员在用户表里的名字。"""
@@ -157,7 +159,8 @@ HELP = """管理命令：
 /enable <编号>：启用用户
 /pause：暂停服务
 /resume：恢复服务
-/usage：查看各用户今天和累计的用量
+/usage：查看各用户本月和累计的用量概要
+/usage <编号>：查看一个用户按用途分开的用量明细
 /help：显示这份说明"""
 
 _HELP_ITEMS = (
@@ -169,7 +172,8 @@ _HELP_ITEMS = (
     ("/enable <编号>", "启用用户"),
     ("/pause", "暂停服务"),
     ("/resume", "恢复服务"),
-    ("/usage", "查看各用户今天和累计的用量"),
+    ("/usage", "查看各用户本月和累计的用量概要"),
+    ("/usage <编号>", "查看一个用户按用途分开的用量明细"),
     ("/help", "显示这份说明"),
 )
 
@@ -342,97 +346,159 @@ SERVICE_NOT_PAUSED = "服务没有暂停。"
 NO_USAGE = "还没有用量记录。"
 
 
-def _usage_part(
-    calls: int,
-    input_tokens: int,
-    output_tokens: int,
-    unreported: int,
-    decisions: tuple[int, int],
-    searches: int = 0,
-    images: tuple[int, int, int] = (0, 0, 0),
-) -> str:
-    part = f"{calls} 次，输入 {input_tokens} / 输出 {output_tokens} token"
-    if unreported:
-        part += f"（其中 {unreported} 次没有用量数据）"
-    decision_calls, decision_input = decisions
-    if decision_calls:
-        part += f"，含决策 {decision_calls} 次、输入 {decision_input} token"
-    if searches:
-        part += f"，联网搜索 {searches} 次"
-    image_count, image_input, image_output = images
-    if image_count:
-        part += f"，出图 {image_count} 张"
-        if image_input or image_output:
-            part += f"（输入 {image_input} / 输出 {image_output} token）"
-    return part
+def user_has_no_usage(user_id: int, name: str) -> str:
+    return f"用户 #{user_id}（{name}）还没有用量记录。"
 
 
-def usage_line(
-    *,
-    user_id: int,
-    name: str,
-    today: tuple[int, int, int, int],
-    total: tuple[int, int, int, int],
-    today_decisions: tuple[int, int] = (0, 0),
-    total_decisions: tuple[int, int] = (0, 0),
-    today_searches: int = 0,
-    total_searches: int = 0,
-    today_images: tuple[int, int, int] = (0, 0, 0),
-    total_images: tuple[int, int, int] = (0, 0, 0),
-) -> str:
-    """`today`、`total` 都是（调用次数，输入 token，输出 token，没有用量数据的次数），包括决策调用、不包括出图；
-    `*_decisions` 是其中决策调用的（次数，输入 token）；`*_searches` 是服务商内置搜索的执行次数，为 0 时不显示；
-    `*_images` 是出图的（张数，输入 token，输出 token），张数为 0 时不显示，token 都为 0 时只显示张数。"""
-    today_part = _usage_part(*today, today_decisions, today_searches, today_images)
-    total_part = _usage_part(*total, total_decisions, total_searches, total_images)
-    return f"#{user_id} {name}：今天 {today_part}；累计 {total_part}"
+def _round_div(numerator: int, denominator: int) -> int:
+    """四舍五入的整数除法（都是非负数），不经过浮点数。"""
+    return (numerator * 2 + denominator) // (denominator * 2)
 
 
-def usage_list(lines: list[str]) -> str:
-    return "用量（今天从本地时间 0 点算起）：\n" + "\n".join(lines)
+def format_tokens(count: int) -> str:
+    """把 token 数写短：小于 1000 原样写；之后按 k（千）、M（百万），整数部分一位时保留两位小数，两位及以上时
+    保留一位，四舍五入，去掉末尾的 0（950、9.14k、12.3k、1.5k、12k、1.25M、45.6M）。进位后整数部分多出一位时
+    按多出的位数重新取小数位，到了 1000k 改用 M；M 之上不再换单位。"""
+    if count < 1000:
+        return str(count)
+    for unit, suffix in ((1000, "k"), (1_000_000, "M")):
+        digits = 2
+        scaled = _round_div(count * 100, unit)
+        if scaled >= 1000:  # 整数部分两位及以上
+            digits = 1
+            scaled = _round_div(count * 10, unit)
+        whole, fraction = divmod(scaled, 10**digits)
+        if suffix == "k" and whole >= 1000:
+            continue
+        fraction_text = f"{fraction:0{digits}d}".rstrip("0")
+        return f"{whole}.{fraction_text}{suffix}" if fraction_text else f"{whole}{suffix}"
+    raise AssertionError("不会到这里：M 是最后一个单位")
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class UsageRow:
-    """`today`、`total` 与 `usage_line()` 相同。"""
-
-    user_id: int
-    name: str
-    today: tuple[int, int, int, int]
-    total: tuple[int, int, int, int]
-    today_decisions: tuple[int, int] = (0, 0)
-    total_decisions: tuple[int, int] = (0, 0)
-    today_searches: int = 0
-    total_searches: int = 0
-    today_images: tuple[int, int, int] = (0, 0, 0)
-    total_images: tuple[int, int, int] = (0, 0, 0)
+_USAGE_PURPOSES: tuple[tuple[UsagePurpose, str, str], ...] = (
+    (UsagePurpose.CHAT, "对话", "次"),
+    (UsagePurpose.DECISION, "决策", "次"),
+    (UsagePurpose.DESCRIBE, "附件描述与摘要", "次"),  # 图片的描述与 PDF 的摘要
+    (UsagePurpose.MEMORY, "话题摘要", "次"),
+    (UsagePurpose.IMAGE, "出图", "张"),
+)
+"""`/usage` 明细里各用途的名字与计数单位，按显示的顺序。"""
 
 
-def usage_message(rows: Sequence[UsageRow]) -> Rich:
-    blocks = [
-        f"- `#{r.user_id}` {escape_markdown(r.name)}\n"
-        f"  - 今天：{_usage_part(*r.today, r.today_decisions, r.today_searches, r.today_images)}\n"
-        f"  - 累计：{_usage_part(*r.total, r.total_decisions, r.total_searches, r.total_images)}"
-        for r in rows
-    ]
-    markdown = "**用量**（今天从本地时间 0 点算起）\n\n" + "\n".join(blocks)
-    plain = usage_list(
-        [
-            usage_line(
-                user_id=r.user_id,
-                name=r.name,
-                today=r.today,
-                total=r.total,
-                today_decisions=r.today_decisions,
-                total_decisions=r.total_decisions,
-                today_searches=r.today_searches,
-                total_searches=r.total_searches,
-                today_images=r.today_images,
-                total_images=r.total_images,
-            )
-            for r in rows
-        ]
+def _token_parts(totals: UsageTotals) -> list[str]:
+    parts: list[str] = []
+    if totals.input_tokens:
+        part = f"输入 {format_tokens(totals.input_tokens)} token"
+        if totals.cached_input_tokens:
+            part += f"（其中缓存 {format_tokens(totals.cached_input_tokens)}）"
+        parts.append(part)
+    if totals.output_tokens:
+        parts.append(f"输出 {format_tokens(totals.output_tokens)} token")
+    return parts
+
+
+def _usage_brief(by_purpose: Mapping[UsagePurpose, UsageTotals]) -> str:
+    """一段时间里所有用途合起来的概要：token（含出图的）、联网搜索次数、出图张数，为 0 的项不写。"""
+    combined = sum(by_purpose.values(), UsageTotals())
+    parts = _token_parts(combined)
+    if combined.searches:
+        parts.append(f"联网搜索 {combined.searches} 次")
+    images = by_purpose.get(UsagePurpose.IMAGE, UsageTotals()).calls
+    if images:
+        parts.append(f"出图 {images} 张")
+    if parts:
+        return "，".join(parts)
+    if not combined.calls:
+        return "无"
+    if combined.unreported == combined.calls:
+        return f"{combined.calls} 次调用，都没有用量数据"
+    # 有调用报告了用量、报告的数却都是 0：明确报告的 0 不算没有数据。
+    brief = f"{combined.calls} 次调用，报告的 token 都是 0"
+    if combined.unreported:
+        brief += f"（{combined.unreported} 次没有用量数据）"
+    return brief
+
+
+def _purpose_lines(by_purpose: Mapping[UsagePurpose, UsageTotals]) -> list[str]:
+    """一段时间里每种用途一行，没有调用的用途不写。"""
+    lines: list[str] = []
+    for purpose, label, unit in _USAGE_PURPOSES:
+        totals = by_purpose.get(purpose)
+        if totals is None or not totals.calls:
+            continue
+        count = f"{totals.calls} {unit}"
+        if totals.unreported:
+            count += f"（{totals.unreported} {unit}没有用量数据）"
+        parts = [f"{label}：{count}", *_token_parts(totals)]
+        if totals.searches:
+            parts.append(f"联网搜索 {totals.searches} 次")
+        lines.append("，".join(parts))
+    return lines
+
+
+def _month_since(month: int) -> str:
+    return f"{month} 月 1 日 0 点"
+
+
+def usage_overview(summaries: Sequence[UsageSummary], month: int) -> Rich:
+    """不带编号的 `/usage`：每个用户一项，写本月（`month` 月 1 日 0 点起）与累计的概要，最后一项是所有人的合计。
+
+    Markdown 用两级列表，第二级每行以「本月：」「累计：」开头，列表的嵌套被压平时也看得懂。纯文本每个用户一段。
+    """
+    period_all: dict[UsagePurpose, UsageTotals] = {}
+    total_all: dict[UsagePurpose, UsageTotals] = {}
+    for summary in summaries:
+        for source, target in ((summary.period, period_all), (summary.total, total_all)):
+            for purpose, totals in source.items():
+                target[purpose] = target.get(purpose, UsageTotals()) + totals
+    since = _month_since(month)
+    markdown_blocks: list[str] = []
+    plain_blocks: list[str] = []
+    for summary in summaries:
+        period, total = _usage_brief(summary.period), _usage_brief(summary.total)
+        markdown_blocks.append(
+            f"- `#{summary.user_id}` {escape_markdown(summary.name)}\n"
+            f"  - 本月：{period}\n"
+            f"  - 累计：{total}"
+        )
+        plain_blocks.append(f"#{summary.user_id} {summary.name}\n本月：{period}\n累计：{total}")
+    period, total = _usage_brief(period_all), _usage_brief(total_all)
+    markdown_blocks.append(f"- **合计**\n  - 本月：{period}\n  - 累计：{total}")
+    plain_blocks.append(f"合计\n本月：{period}\n累计：{total}")
+    markdown = (
+        f"**用量**（本月从 {since}算起）\n\n"
+        + "\n".join(markdown_blocks)
+        + "\n\n发送 `/usage 编号` 查看一个用户按用途分开的明细。"
     )
+    plain = (
+        f"用量（本月从 {since}算起）\n\n"
+        + "\n\n".join(plain_blocks)
+        + "\n\n发送 /usage 编号 查看一个用户按用途分开的明细。"
+    )
+    return Rich(markdown, plain)
+
+
+def usage_detail(summary: UsageSummary, month: int) -> Rich:
+    """`/usage 编号`：这个用户本月（`month` 月 1 日 0 点起）与累计的用量，每段按用途分行。
+
+    Markdown 用两级列表，第二级每行以用途开头，列表的嵌套被压平时也看得懂。纯文本每段一个小标题。
+    """
+    sections = ((f"本月（{_month_since(month)}起）", summary.period), ("累计", summary.total))
+    markdown_blocks: list[str] = []
+    plain_blocks: list[str] = []
+    for title, by_purpose in sections:
+        lines = _purpose_lines(by_purpose)
+        if not lines:
+            markdown_blocks.append(f"- {title}：无")
+            plain_blocks.append(f"{title}：无")
+            continue
+        markdown_blocks.append(f"- {title}\n" + "\n".join(f"  - {line}" for line in lines))
+        plain_blocks.append(f"{title}\n" + "\n".join(lines))
+    markdown = (
+        f"**用量明细**：`#{summary.user_id}` {escape_markdown(summary.name)}\n\n"
+        + "\n".join(markdown_blocks)
+    )
+    plain = f"用量明细：#{summary.user_id} {summary.name}\n\n" + "\n\n".join(plain_blocks)
     return Rich(markdown, plain)
 
 

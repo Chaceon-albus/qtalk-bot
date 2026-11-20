@@ -57,7 +57,8 @@
 无论怎样结束（出错、流提前断开、关闭响应流出错），只要此前有哪一跳报告过用量，都先把累加的用量交出来：
 完成的跳是计费的。关闭响应流时的异常也转成 `ModelError`；取消与调用方的关闭照常传播。
 
-用量：各次请求（含各自自动续写的各跳）累加。输入取 `total_input_tokens`；输出取 `total_output_tokens` 加
+用量：各次请求（含各自自动续写的各跳）累加。输入取 `total_input_tokens`，其中命中缓存的部分取
+`total_cached_tokens`；输出取 `total_output_tokens` 加
 `total_thought_tokens`（思考也按输出计费，与 OpenAI 的 `output_tokens` 含推理一致）。搜索次数按文档的计费口径（Gemini 3 及更新的模型「按模型
 决定执行的每个查询计费」，数不重复的查询时忽略空查询），数这次调用（含自动续写的各跳）里不重复的非空查询词；
 用量里的 `grounding_tool_count` 文档没有说明含义，没有采用。
@@ -119,6 +120,7 @@ from . import (
     ThoughtSummary,
     Usage,
     add_tokens,
+    cached_count,
     clean_json,
     clean_text,
     items,
@@ -642,6 +644,7 @@ class _UsageTotal:
         self._searches = searches
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None
+        self.cached_input_tokens: int | None = None
         self.reported = False  # 有哪一跳报告过用量
         self.unreported = False  # 有累加进来、还没作为事件交出去的用量
 
@@ -653,18 +656,26 @@ class _UsageTotal:
         """
         self.reported = True
         self.unreported = True
-        self.input_tokens = add_tokens(
-            self.input_tokens, token_count(_field(usage, "total_input_tokens"))
-        )
+        input_tokens = token_count(_field(usage, "total_input_tokens"))
+        self.input_tokens = add_tokens(self.input_tokens, input_tokens)
         output = token_count(_field(usage, "total_output_tokens"))
         thought = token_count(_field(usage, "total_thought_tokens"))
         if output is not None and thought is not None:
             output += thought  # 思考用量无效时只记输出本身
         self.output_tokens = add_tokens(self.output_tokens, output)
+        self.cached_input_tokens = add_tokens(
+            self.cached_input_tokens,
+            cached_count(_field(usage, "total_cached_tokens"), input_tokens),
+        )
 
     def event(self) -> Usage:
         self.unreported = False
-        return Usage(self.input_tokens, self.output_tokens, self._searches.count)
+        return Usage(
+            self.input_tokens,
+            self.output_tokens,
+            self._searches.count,
+            self.cached_input_tokens,
+        )
 
 
 class _Turn:

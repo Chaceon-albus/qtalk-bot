@@ -124,37 +124,41 @@ class HistoryEntry:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class UsageSummary:
-    """一个用户的用量汇总。token 数只累加服务商返回了的；`*_unreported` 是没有返回用量的调用次数。
+class UsageTotals:
+    """一段时间里某种用途的调用合计。
 
-    `*_calls`、`*_input`、`*_output`、`*_unreported` 包括决策调用，不包括出图；`*_decision_calls`、
-    `*_decision_input` 是其中决策调用的部分（决策没有输出 token）。`*_searches` 是服务商内置搜索的执行次数（只
-    累加报告了的）。`*_images` 是出图的张数（用途为 image 的行数），`*_image_input`、`*_image_output` 是这些
-    出图报告了的 token 数。
+    `calls` 是用量表的行数（出图是张数）；token 数与搜索次数只累加服务商报告了的，`cached_input_tokens` 是
+    `input_tokens` 里命中缓存的部分（升级前的行与没有报告的为空，不计）；`unreported` 是输入或输出 token 没有报告
+    的行数。
     """
+
+    calls: int = 0
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+    searches: int = 0
+    unreported: int = 0
+
+    def __add__(self, other: UsageTotals) -> UsageTotals:
+        return UsageTotals(
+            calls=self.calls + other.calls,
+            input_tokens=self.input_tokens + other.input_tokens,
+            cached_input_tokens=self.cached_input_tokens + other.cached_input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            searches=self.searches + other.searches,
+            unreported=self.unreported + other.unreported,
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class UsageSummary:
+    """一个用户的用量：`period` 是 `usage_summary()` 的 `since` 之后（本月），`total` 是累计，都按用途分开；
+    没有记录的用途不在里面。"""
 
     user_id: int
     name: str
-    today_calls: int
-    today_input: int
-    today_output: int
-    today_unreported: int
-    total_calls: int
-    total_input: int
-    total_output: int
-    total_unreported: int
-    today_decision_calls: int = 0
-    today_decision_input: int = 0
-    total_decision_calls: int = 0
-    total_decision_input: int = 0
-    today_searches: int = 0
-    total_searches: int = 0
-    today_images: int = 0
-    today_image_input: int = 0
-    today_image_output: int = 0
-    total_images: int = 0
-    total_image_input: int = 0
-    total_image_output: int = 0
+    period: Mapping[UsagePurpose, UsageTotals]
+    total: Mapping[UsagePurpose, UsageTotals]
 
 
 def add_user_message(
@@ -828,14 +832,16 @@ def add_usage(
     now: int,
     purpose: UsagePurpose = UsagePurpose.CHAT,
     searches: int | None = None,
+    cached_input_tokens: int | None = None,
 ) -> None:
     """记一次模型调用：`model` 是内部名字（决策调用是 `DECISION_USAGE_MODEL`），`provider` 与
     `provider_model` 是实际调用的服务商与模型名。`searches` 是这次调用执行了的服务商内置搜索次数：带了搜索
-    工具的调用是整数（没搜就是 0），没带的（以及没有报告用量的）是 `None`。"""
+    工具的调用是整数（没搜就是 0），没带的（以及没有报告用量的）是 `None`。`cached_input_tokens` 是
+    `input_tokens` 里命中缓存的部分，服务商没有报告时是 `None`。"""
     conn.execute(
         "INSERT INTO usage (user_id, message_id, model, provider, provider_model,"
-        " input_tokens, output_tokens, created_at, purpose, searches)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " input_tokens, output_tokens, created_at, purpose, searches, cached_input_tokens)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             user_id,
             message_id,
@@ -847,6 +853,7 @@ def add_usage(
             now,
             purpose.value,
             searches,
+            cached_input_tokens,
         ),
     )
 
@@ -861,6 +868,7 @@ def add_image_usage(
     now: int,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
+    cached_input_tokens: int | None = None,
 ) -> None:
     """记一次出图（含改图）：一张图一行，`model` 列是 `IMAGE_USAGE_MODEL`，`provider` 与 `provider_model` 是实际的
     图片服务商与模型名。`message_id` 是触发这一轮的用户消息。限额按这种行的行数算（`image_count()`）。"""
@@ -875,6 +883,7 @@ def add_image_usage(
         output_tokens=output_tokens,
         now=now,
         purpose=UsagePurpose.IMAGE,
+        cached_input_tokens=cached_input_tokens,
     )
 
 
@@ -934,80 +943,83 @@ def add_decision(
     )
 
 
-def usage_summary(conn: sqlite3.Connection, since: int) -> list[UsageSummary]:
-    """按用户汇总用量：`since` 之后（「今天」）与累计。没有用量记录的用户不列出。出图另算张数，不计进调用次数
-    与 token（见 `UsageSummary`）。
+_USAGE_SUMMARY_COLUMNS = """
+  u.user_id, users.name, u.purpose,
+  SUM(u.created_at >= :since) AS period_calls,
+  CAST(total(CASE WHEN u.created_at >= :since THEN u.input_tokens END) AS INTEGER)
+    AS period_input,
+  CAST(total(CASE WHEN u.created_at >= :since AND u.input_tokens IS NOT NULL
+    THEN u.cached_input_tokens END) AS INTEGER) AS period_cached,
+  CAST(total(CASE WHEN u.created_at >= :since THEN u.output_tokens END) AS INTEGER)
+    AS period_output,
+  CAST(total(CASE WHEN u.created_at >= :since THEN u.searches END) AS INTEGER)
+    AS period_searches,
+  SUM(u.created_at >= :since AND (u.input_tokens IS NULL OR u.output_tokens IS NULL))
+    AS period_unreported,
+  count(*) AS total_calls,
+  CAST(total(u.input_tokens) AS INTEGER) AS total_input,
+  CAST(total(CASE WHEN u.input_tokens IS NOT NULL THEN u.cached_input_tokens END) AS INTEGER)
+    AS total_cached,
+  CAST(total(u.output_tokens) AS INTEGER) AS total_output,
+  CAST(total(u.searches) AS INTEGER) AS total_searches,
+  SUM(u.input_tokens IS NULL OR u.output_tokens IS NULL) AS total_unreported
+"""
+
+_USAGE_SUMMARY_ALL = f"""
+SELECT {_USAGE_SUMMARY_COLUMNS}
+FROM usage AS u JOIN users ON users.id = u.user_id
+GROUP BY u.user_id, u.purpose ORDER BY u.user_id
+"""  # noqa: S608  只拼接上面的常量列名，值都是绑定参数
+
+_USAGE_SUMMARY_ONE_USER = f"""
+SELECT {_USAGE_SUMMARY_COLUMNS}
+FROM usage AS u JOIN users ON users.id = u.user_id
+WHERE u.user_id = :user_id
+GROUP BY u.user_id, u.purpose ORDER BY u.user_id
+"""  # noqa: S608  同上；单个用户的条件写死，查询走 usage_by_user 索引
+
+
+def usage_summary(
+    conn: sqlite3.Connection, since: int, user_id: int | None = None
+) -> list[UsageSummary]:
+    """按用户、按用途汇总用量：`since`（含）之后与累计，按用户编号排序。`user_id` 不为 `None` 时只汇总这一个
+    用户。没有用量记录的用户不列出。
+
+    缓存数只累加 `input_tokens` 不为空的行：只报告了缓存、没报告输入的行，缓存数不能算进别的行的输入里，这样
+    汇总的缓存数总是已报告输入的一部分。
 
     token 数用 `total()` 累加再转回整数，不用 `SUM()`：`SUM()` 的结果超出 64 位整数时抛 `integer overflow`，
     一行异常的大数（如绕过 `Usage` 校验写进来的）就会让整个 `/usage` 失败；`total()` 按浮点数累加，不会溢出，
-    转回整数时超出范围的部分封顶。2**53 以内的总数是精确的。
+    转回整数时超出范围的部分封顶。2**53 以内的总数是精确的。各用途之间的相加在 Python 里做，不会溢出。
     """
-    rows = conn.execute(
-        """
-        SELECT
-          u.user_id, users.name,
-          SUM(u.created_at >= :since AND u.purpose != 'image') AS today_calls,
-          CAST(total(CASE WHEN u.created_at >= :since AND u.purpose != 'image'
-            THEN u.input_tokens END) AS INTEGER) AS today_input,
-          CAST(total(CASE WHEN u.created_at >= :since AND u.purpose != 'image'
-            THEN u.output_tokens END) AS INTEGER) AS today_output,
-          SUM(u.created_at >= :since AND u.purpose != 'image'
-            AND (u.input_tokens IS NULL OR u.output_tokens IS NULL)) AS today_unreported,
-          SUM(u.purpose != 'image') AS total_calls,
-          CAST(total(CASE WHEN u.purpose != 'image' THEN u.input_tokens END) AS INTEGER)
-            AS total_input,
-          CAST(total(CASE WHEN u.purpose != 'image' THEN u.output_tokens END) AS INTEGER)
-            AS total_output,
-          SUM(u.purpose != 'image' AND (u.input_tokens IS NULL OR u.output_tokens IS NULL))
-            AS total_unreported,
-          SUM(u.created_at >= :since AND u.purpose = 'decision') AS today_decision_calls,
-          CAST(total(CASE WHEN u.created_at >= :since AND u.purpose = 'decision'
-            THEN u.input_tokens END) AS INTEGER) AS today_decision_input,
-          SUM(u.purpose = 'decision') AS total_decision_calls,
-          CAST(total(CASE WHEN u.purpose = 'decision' THEN u.input_tokens END) AS INTEGER)
-            AS total_decision_input,
-          CAST(total(CASE WHEN u.created_at >= :since THEN u.searches END) AS INTEGER)
-            AS today_searches,
-          CAST(total(u.searches) AS INTEGER) AS total_searches,
-          SUM(u.created_at >= :since AND u.purpose = 'image') AS today_images,
-          CAST(total(CASE WHEN u.created_at >= :since AND u.purpose = 'image'
-            THEN u.input_tokens END) AS INTEGER) AS today_image_input,
-          CAST(total(CASE WHEN u.created_at >= :since AND u.purpose = 'image'
-            THEN u.output_tokens END) AS INTEGER) AS today_image_output,
-          SUM(u.purpose = 'image') AS total_images,
-          CAST(total(CASE WHEN u.purpose = 'image' THEN u.input_tokens END) AS INTEGER)
-            AS total_image_input,
-          CAST(total(CASE WHEN u.purpose = 'image' THEN u.output_tokens END) AS INTEGER)
-            AS total_image_output
-        FROM usage AS u JOIN users ON users.id = u.user_id
-        GROUP BY u.user_id ORDER BY u.user_id
-        """,
-        {"since": since},
-    ).fetchall()
+    if user_id is None:
+        rows = conn.execute(_USAGE_SUMMARY_ALL, {"since": since}).fetchall()
+    else:
+        rows = conn.execute(
+            _USAGE_SUMMARY_ONE_USER, {"since": since, "user_id": user_id}
+        ).fetchall()
+    names: dict[int, str] = {}
+    period: defaultdict[int, dict[UsagePurpose, UsageTotals]] = defaultdict(dict)
+    total: defaultdict[int, dict[UsagePurpose, UsageTotals]] = defaultdict(dict)
+    for row in rows:
+        owner: int = row["user_id"]
+        purpose = UsagePurpose(row["purpose"])
+        names[owner] = row["name"]
+        if row["period_calls"]:
+            period[owner][purpose] = _totals(row, "period")
+        total[owner][purpose] = _totals(row, "total")
     return [
-        UsageSummary(
-            user_id=row["user_id"],
-            name=row["name"],
-            today_calls=row["today_calls"],
-            today_input=row["today_input"],
-            today_output=row["today_output"],
-            today_unreported=row["today_unreported"],
-            total_calls=row["total_calls"],
-            total_input=row["total_input"],
-            total_output=row["total_output"],
-            total_unreported=row["total_unreported"],
-            today_decision_calls=row["today_decision_calls"],
-            today_decision_input=row["today_decision_input"],
-            total_decision_calls=row["total_decision_calls"],
-            total_decision_input=row["total_decision_input"],
-            today_searches=row["today_searches"],
-            total_searches=row["total_searches"],
-            today_images=row["today_images"],
-            today_image_input=row["today_image_input"],
-            today_image_output=row["today_image_output"],
-            total_images=row["total_images"],
-            total_image_input=row["total_image_input"],
-            total_image_output=row["total_image_output"],
-        )
-        for row in rows
+        UsageSummary(user_id=owner, name=name, period=period[owner], total=total[owner])
+        for owner, name in names.items()
     ]
+
+
+def _totals(row: sqlite3.Row, prefix: str) -> UsageTotals:
+    return UsageTotals(
+        calls=row[f"{prefix}_calls"],
+        input_tokens=row[f"{prefix}_input"],
+        cached_input_tokens=row[f"{prefix}_cached"],
+        output_tokens=row[f"{prefix}_output"],
+        searches=row[f"{prefix}_searches"],
+        unreported=row[f"{prefix}_unreported"],
+    )

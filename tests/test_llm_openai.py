@@ -90,14 +90,17 @@ def response(status: str, **extra: Any) -> Payload:
     return body
 
 
-def usage(input_tokens: int, output_tokens: int) -> Payload:
-    return {
+def usage(input_tokens: int, output_tokens: int, cached: object = None) -> Payload:
+    """`cached` 为 `None` 时没有 `input_tokens_details`（像不报告缓存的兼容端点），这时 `Usage` 里的缓存数为空。"""
+    body: Payload = {
         "input_tokens": input_tokens,
-        "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
         "output_tokens": output_tokens,
         "output_tokens_details": {"reasoning_tokens": 4},
         "total_tokens": input_tokens + output_tokens,
     }
+    if cached is not None:
+        body["input_tokens_details"] = {"cached_tokens": cached, "cache_write_tokens": 0}
+    return body
 
 
 def text_delta(seq: int, delta: str) -> Payload:
@@ -601,6 +604,25 @@ async def test_absurd_token_counts_are_reported_as_missing(
         model_on(streaming([CREATED, ITEM_ADDED, text_delta(3, "好"), completed]))
     )
     assert events[-2] == expected
+
+
+@pytest.mark.parametrize(
+    ("cached", "expected"),
+    [(30, 30), (0, 0), (40, 40), (41, None), (2**63, None), (-1, None)],
+    ids=["reported", "zero", "all_of_the_input", "more_than_the_input", "too_big", "negative"],
+)
+async def test_cached_input_tokens_come_from_the_input_details(
+    cached: object, expected: int | None
+) -> None:
+    completed = {
+        "type": "response.completed",
+        "sequence_number": 4,
+        "response": response("completed", usage=usage(40, 5, cached)),
+    }
+    events = await collect(
+        model_on(streaming([CREATED, ITEM_ADDED, text_delta(3, "好"), completed]))
+    )
+    assert events[-2] == Usage(40, 5, cached_input_tokens=expected)
 
 
 # ---- 附件（里程碑 5a） ----
@@ -1470,7 +1492,9 @@ def arguments_event(kind: str, seq: int, call_id: str, output_index: int, **fiel
     }
 
 
-def completed_with(seq: int, output: list[Payload], tokens: tuple[int, int]) -> Payload:
+def completed_with(
+    seq: int, output: list[Payload], tokens: tuple[int, int] | tuple[int, int, int]
+) -> Payload:
     return {
         "type": "response.completed",
         "sequence_number": seq,
@@ -1571,6 +1595,56 @@ async def test_function_call_round_trip_with_search_and_summed_usage() -> None:
             ],
         },
     ]
+
+
+async def test_cached_input_tokens_are_summed_over_hops() -> None:
+    calling = [
+        CREATED,
+        item_event("done", 1, 0, call_item("call_a", '{"zone":"A"}')),
+        completed_with(2, [], (50, 5, 32)),
+    ]
+    answer = [CREATED, ITEM_ADDED, text_delta(2, "答"), completed_with(3, [], (80, 10, 48))]
+    runner = Runner(FunctionResult((TextPart("甲"),)))
+
+    events = [e async for e in model_on(hopping(calling, answer)).stream(with_tools(runner))]
+
+    usages = [e for e in events if isinstance(e, Usage)]
+    assert usages == [
+        Usage(50, 5, cached_input_tokens=32),
+        Usage(130, 15, cached_input_tokens=80),
+    ]
+
+
+async def test_cached_tokens_beyond_their_own_hops_input_are_dropped() -> None:
+    # 第一跳的缓存数（60）超过它自己的输入（50）：只看合计（108 ≤ 130）会被第二跳掩盖。
+    calling = [
+        CREATED,
+        item_event("done", 1, 0, call_item("call_a", '{"zone":"A"}')),
+        completed_with(2, [], (50, 5, 60)),
+    ]
+    answer = [CREATED, ITEM_ADDED, text_delta(2, "答"), completed_with(3, [], (80, 10, 48))]
+    runner = Runner(FunctionResult((TextPart("甲"),)))
+
+    events = [e async for e in model_on(hopping(calling, answer)).stream(with_tools(runner))]
+
+    usages = [e for e in events if isinstance(e, Usage)]
+    assert usages == [Usage(50, 5), Usage(130, 15, cached_input_tokens=48)]
+
+
+async def test_cached_input_tokens_stay_partial_when_one_hop_does_not_report_them() -> None:
+    # 某一跳没有报告缓存数时不影响已有的累计，与 input_tokens 的累加方式一样。
+    calling = [
+        CREATED,
+        item_event("done", 1, 0, call_item("call_a", '{"zone":"A"}')),
+        completed_with(2, [], (50, 5)),
+    ]
+    answer = [CREATED, ITEM_ADDED, text_delta(2, "答"), completed_with(3, [], (80, 10, 48))]
+    runner = Runner(FunctionResult((TextPart("甲"),)))
+
+    events = [e async for e in model_on(hopping(calling, answer)).stream(with_tools(runner))]
+
+    usages = [e for e in events if isinstance(e, Usage)]
+    assert usages == [Usage(50, 5), Usage(130, 15, cached_input_tokens=48)]
 
 
 async def test_several_calls_in_one_hop_run_in_order() -> None:

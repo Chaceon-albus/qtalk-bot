@@ -1514,6 +1514,28 @@ async def usage_by_purpose(db: Database) -> list[tuple[str, str, int | None, int
     return [(r["purpose"], r["model"], r["input_tokens"], r["output_tokens"]) for r in result]
 
 
+async def cached_by_purpose(db: Database) -> list[tuple[str, int | None]]:
+    """用量行的（用途，命中缓存的输入 token）。"""
+    result = await db.fetch_all("SELECT purpose, cached_input_tokens FROM usage ORDER BY id")
+    return [(r["purpose"], r["cached_input_tokens"]) for r in result]
+
+
+async def test_cached_input_tokens_of_the_decision_and_the_answer_are_recorded(
+    db: Database,
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    solve = ScriptedModel("solve", answer("好", usage=Usage(20, 5, cached_input_tokens=12)))
+    decided = DecisionResult(
+        answers={QUESTION: ChoiceAnswer({"solve": 0.9, "support": 0.1})},
+        usage=Usage(40, 0, cached_input_tokens=32),
+    )
+    support = ScriptedModel("support", [])
+
+    await say(deciding(db, FakeDecider(decided), solve, support), alice, "在吗")
+
+    assert await cached_by_purpose(db) == [("decision", 32), ("chat", 12)]
+
+
 async def test_decision_picks_the_model_and_is_recorded_with_its_usage(db: Database) -> None:
     alice = await invited(db, ALICE, "小王")
     solve = ScriptedModel("solve", answer("不该出现"))
@@ -2298,7 +2320,9 @@ async def test_description_is_written_in_the_background_and_used_in_later_histor
     db: Database, tmp_path: Path
 ) -> None:
     alice = await invited(db, ALICE, "小王")
-    describing = ScriptedModel("describe", answer("一只橘猫\n趴在窗台上", usage=Usage(70, 9)))
+    describing = ScriptedModel(
+        "describe", answer("一只橘猫\n趴在窗台上", usage=Usage(70, 9, cached_input_tokens=50))
+    )
     describer = describer_of(db, tmp_path, describing)
     model = ScriptedModel("main", answer("好"))
     chat = media_chat(
@@ -2322,6 +2346,7 @@ async def test_description_is_written_in_the_background_and_used_in_later_histor
         Role.USER, "看我家猫\n[图片：一只橘猫 趴在窗台上]"
     )
     assert ("describe", "describe", 70, 9) in await usage_by_purpose(db)
+    assert ("describe", 50) in await cached_by_purpose(db)
 
 
 async def test_failed_description_does_not_affect_the_reply(db: Database, tmp_path: Path) -> None:
