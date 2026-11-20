@@ -100,6 +100,7 @@ from qtalk_bot.media import (
     IncomingAttachment,
     MediaStore,
 )
+from qtalk_bot.process import ANSWER_RESERVE, MAX_PASSIVE_REPLIES
 from qtalk_bot.routing import Router
 from qtalk_bot.storage import DATABASE_FILENAME, Database
 
@@ -226,6 +227,8 @@ class Platform:
     单聊消息的响应带引用索引 `REFIDX_sent-<序号>`；`stream_ref_at` 不为空时，从第这么多个分片（从 0 数）起，
     分片的响应带 `REFIDX_stream`（平台在哪一片给出还没有实测）；`stream_ref_by_seq` 为真时改带
     `REFIDX_stream-<msg_seq>`，每条流式消息各不相同。
+
+    `hold` 里有第几个事件（从 0 数）时，推送它之前先等对应的 `asyncio.Event`，用来控制事件之间的先后。
     """
 
     def __init__(
@@ -238,8 +241,10 @@ class Platform:
         files: dict[str, bytes] | None = None,
         stream_ref_at: int | None = None,
         stream_ref_by_seq: bool = False,
+        hold: dict[int, asyncio.Event] | None = None,
     ) -> None:
         self.events = events
+        self.hold = hold or {}
         self.stream_ref_at = stream_ref_at
         self.stream_ref_by_seq = stream_ref_by_seq
         self.respond = respond
@@ -321,8 +326,10 @@ class Platform:
             "shard": [0, 1],
         }
         await push({"op": 0, "s": 1, "t": "READY", "d": ready})
-        for seq, event in enumerate(self.events, start=2):
-            await push({**event, "s": seq})
+        for index, event in enumerate(self.events):
+            if (held := self.hold.get(index)) is not None:
+                await held.wait()
+            await push({**event, "s": index + 2})
         while (message := await receive())["type"] != "websocket.disconnect":
             if json.loads(message["text"])["op"] == 1:
                 await push({"op": 11})
@@ -902,6 +909,10 @@ class Tracked:
         self.platform = platform
         self.batcher = batcher
         self.handled = 0
+
+    def answering(self, openid: str) -> object:
+        """转给 `QQChat.answering()`：接线层照常能问到正在回答的一轮。"""
+        return self.inner.answering(openid) if isinstance(self.inner, QQChat) else None
 
     async def handle(self, user: User, message: pyqbot.C2CMessage) -> None:
         try:
@@ -2503,3 +2514,140 @@ async def test_bursts_of_download_host_alerts_leave_room_for_other_alerts() -> N
 
     assert len(sent) == 4
     assert sent[-1] == "机器人掉线了"
+
+
+# ---- 回答进行中 Gate 的回复：回在正在回答的那条消息上 ----
+
+
+class PausingModel(FakeModel):
+    """先给出第一段增量，等平台收到它（回答已经开始显示），再等 `pause()` 返回，然后给出其余的。"""
+
+    def __init__(self, platform: Platform, pause: Callable[[], Awaitable[None]]) -> None:
+        super().__init__(ANSWER)
+        self.platform = platform
+        self.pause = pause
+
+    async def stream(self, request: ChatRequest) -> AsyncGenerator[ChatEvent]:
+        self.requests.append(request)
+        yield self.events[0]
+        await until_platform(self.platform, lambda: bool(self.platform.streamed))
+        await self.pause()
+        for event in self.events[1:]:
+            yield event
+
+
+async def until_platform(platform: Platform, condition: Callable[[], bool]) -> None:
+    while not condition():
+        platform.changed.clear()
+        await platform.changed.wait()
+
+
+def help_sent(platform: Platform) -> bool:
+    return any(text_of(body) == texts.HELP_MESSAGE.markdown for body in platform.sent)
+
+
+async def test_admin_command_while_answering_is_replied_on_the_answered_message(
+    db: Database,
+) -> None:
+    release = asyncio.Event()
+    platform = Platform(
+        [
+            admin_says("你好"),
+            c2c(ADMIN, "/help", "ROBOT1.0_fake-2"),
+            c2c(STRANGER, "你好", "ROBOT1.0_fake-3"),
+        ],
+        hold={1: release, 2: release},
+    )
+    budgets: list[int] = []
+    qq: QQChat | None = None
+
+    async def pause() -> None:
+        release.set()  # 回答已经开始显示：这时管理员发来 /help，陌生人发来一句话
+        await until_platform(platform, lambda: help_sent(platform))
+        assert qq is not None
+        answering = qq.answering(ADMIN)
+        assert answering is not None
+        budgets.append(answering.budget.replies)
+
+    chat = real_chat(db, PausingModel(platform, pause), platform)
+    assert isinstance(chat.inner, QQChat)
+    qq = chat.inner
+
+    await run_until_handled(platform, db, chat, events=3, sent=2, until=lambda: chat.handled == 1)
+
+    # 回给新消息会让平台提前结束正在写的流式消息（40034019）：回在正在回答的那条消息上，计进它的次数。
+    (help_reply,) = [body for body in platform.sent if text_of(body) == texts.HELP_MESSAGE.markdown]
+    assert help_reply["msg_id"] == "ROBOT1.0_fake-1"
+    assert help_reply["msg_seq"] == 3  # 「正在输入」1，回答的流式消息 2
+    assert is_markdown(help_reply)
+    assert budgets == [2]  # 回答一条，/help 一条
+    chunks = platform.streamed
+    assert "".join(chunk["content_raw"] for chunk in chunks) == "你好，我是助手。"
+    assert {chunk["msg_id"] for chunk in chunks} == {"ROBOT1.0_fake-1"}
+    # 别的用户不受影响：未授权的陌生人没有正在进行的一轮，拒绝照旧回给他自己的消息。
+    (refusal,) = [
+        body for body in platform.sent if body["path"] == f"/v2/users/{STRANGER}/messages"
+    ]
+    assert (refusal["content"], refusal["msg_id"], refusal["msg_seq"]) == (
+        texts.REFUSAL,
+        "ROBOT1.0_fake-3",
+        1,
+    )
+    assert qq.answering(ADMIN) is None
+
+
+async def test_admin_command_after_the_answer_is_replied_on_its_own_message(
+    db: Database,
+) -> None:
+    release = asyncio.Event()
+    platform = Platform(
+        [admin_says("你好"), c2c(ADMIN, "/help", "ROBOT1.0_fake-2")], hold={1: release}
+    )
+    chat = real_chat(db, FakeModel(ANSWER), platform)
+
+    async def release_after_the_answer() -> None:
+        await until_platform(platform, lambda: chat.handled == 1)
+        release.set()
+
+    releasing = asyncio.create_task(release_after_the_answer())
+    await run_until_handled(platform, db, chat, events=2, sent=1, until=lambda: help_sent(platform))
+    await releasing
+
+    (help_reply,) = [body for body in platform.sent if text_of(body) == texts.HELP_MESSAGE.markdown]
+    assert (help_reply["msg_id"], help_reply["msg_seq"]) == ("ROBOT1.0_fake-2", 1)
+
+
+async def test_admin_command_goes_to_its_own_message_when_the_answer_needs_the_replies(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    release = asyncio.Event()
+    platform = Platform(
+        [admin_says("你好"), c2c(ADMIN, "/help", "ROBOT1.0_fake-2")], hold={1: release}
+    )
+    budgets: list[int] = []
+    qq: QQChat | None = None
+
+    async def pause() -> None:
+        assert qq is not None
+        answering = qq.answering(ADMIN)
+        assert answering is not None
+        answering.budget.replies = MAX_PASSIVE_REPLIES - ANSWER_RESERVE  # 再发一条就不够兜底了
+        release.set()
+        await until_platform(platform, lambda: help_sent(platform))
+        budgets.append(answering.budget.replies)
+
+    chat = real_chat(db, PausingModel(platform, pause), platform)
+    assert isinstance(chat.inner, QQChat)
+    qq = chat.inner
+
+    await run_until_handled(platform, db, chat, events=2, sent=1, until=lambda: chat.handled == 1)
+
+    # 管理员命令的回复不能丢：退回回给新消息（可能截断正在显示的回答），记一条日志。
+    (help_reply,) = [body for body in platform.sent if text_of(body) == texts.HELP_MESSAGE.markdown]
+    assert (help_reply["msg_id"], help_reply["msg_seq"]) == ("ROBOT1.0_fake-2", 1)
+    assert budgets == [MAX_PASSIVE_REPLIES - ANSWER_RESERVE]
+    assert "可能截断正在显示的回答" in caplog.text
+    ours = [r.getMessage() for r in caplog.records if r.name.startswith("qtalk_bot")]
+    assert ours
+    assert all(ADMIN not in line for line in ours)  # 日志不记 openid

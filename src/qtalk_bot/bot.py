@@ -24,7 +24,7 @@ import re
 from collections.abc import AsyncGenerator, Awaitable, Sequence
 from dataclasses import dataclass
 from http.cookiejar import DefaultCookiePolicy
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 from urllib.parse import urljoin, urlsplit
 
 import pyqbot
@@ -108,6 +108,9 @@ class QQChat:
 
     收下消息（复查授权、下载附件、写进流水）就返回，回答在 `Batcher` 自己的任务里进行，回复挂在这一轮的
     最后一条上（被动回复用它的消息 ID）。
+
+    `answering()` 告诉接线层这个用户有没有正在回答的一轮、它挂在哪条消息上：这时管理员命令等 Gate 的回复要回在
+    那条消息上，回给新消息会让平台提前结束正在写的流式消息（pyqbot errata，40034019）。
     """
 
     def __init__(self, batcher: Batcher) -> None:
@@ -115,6 +118,20 @@ class QQChat:
 
     async def handle(self, user: User, message: pyqbot.C2CMessage) -> None:
         await self._batcher.submit(user, chat_input(message), _QQReplyChannel(message))
+
+    def answering(self, openid: str) -> _QQReplyChannel | None:
+        """这个用户正在回答的一轮的回复挂在哪条消息上（它的通道）；没有在回答时为 `None`。结果只在当下有效，
+        要在真正发送的那一刻再问。"""
+        channel = self._batcher.replying_to_openid(openid)
+        return channel if isinstance(channel, _QQReplyChannel) else None
+
+
+@runtime_checkable
+class _Answering(Protocol):
+    """能告诉接线层某个用户有没有正在回答的一轮的对话处理器（`QQChat` 符合它）。`ChatHandler` 不要求这一项：
+    注入的其它处理器没有时，Gate 的回复照旧回给新消息。"""
+
+    def answering(self, openid: str) -> _QQReplyChannel | None: ...
 
 
 MAX_ATTACHMENTS = 16  # 一条消息（含被引用的图片）最多处理这么多个附件，多的不理会
@@ -475,6 +492,11 @@ class _QQReplyChannel:
         self._stream: pyqbot.StreamMessage | None = None
         self.budget = ReplyBudget()
 
+    @property
+    def message(self) -> pyqbot.C2CMessage:
+        """被回复的那条消息。接线层在回答进行中把 Gate 的回复也回在它上面（见 `Handlers`）。"""
+        return self._message
+
     def open_process(self) -> _QQProcessStream:
         return _QQProcessStream(self._message)
 
@@ -575,6 +597,7 @@ class Handlers:
         # 不带备注的邀请转发错人。只锁回复链的发送，对话处理器不在锁里。
         self._reply_locks = _KeyedLock()
         self._active: set[asyncio.Future[None]] = set()
+        self._answering = chat if isinstance(chat, _Answering) else None
 
     async def drain(self) -> None:
         """关停时调用（在 `Bot.close()` 之后、关数据库之前）：等所有还在进行的处理结束，包括被取消之后仍在等
@@ -601,6 +624,12 @@ class Handlers:
             await self._on_friend_add(event)
 
     async def _on_c2c_message(self, message: pyqbot.C2CMessage) -> None:
+        """一条单聊消息：交给 Gate，放行的交给对话处理器，Gate 的回复（管理员命令的回复、给未授权用户的拒绝等）
+        经 `_deliver()` 发出。
+
+        Gate 的回复经 `_RoutedReply` 发：这个用户有一轮回答正在进行时，回在那一轮回复挂的那条消息上，计进它的
+        被动回复次数，否则回给这条消息。未授权的用户不会有正在进行的一轮，照旧回给这条消息。
+        """
         incoming = IncomingMessage(
             openid=message.user_openid, message_id=message.id, content=message.content
         )
@@ -625,7 +654,8 @@ class Handlers:
             raise
         match outcome:
             case Reply() as reply:
-                await self._deliver(message.user_openid, message.reply, reply)
+                send = _RoutedReply(message, self._answering)
+                await self._deliver(message.user_openid, send, reply)
             case Chat(user=user):
                 _log_shape(user, message, self._hosts)
                 try:
@@ -906,6 +936,39 @@ class _Send(Protocol):
     def __call__(
         self, content: str | None = None, *, markdown: str | None = None
     ) -> Awaitable[object]: ...
+
+
+class _RoutedReply:
+    """Gate 的回复的发送函数，符合 `_Send`。
+
+    每发一次（含被拒之后改发的备用文案）都在那一刻问对话处理器：这个用户有一轮回答正在进行时，回在那一轮回复挂
+    的那条消息上（`C2CMessage.reply`，与回给新消息是同一个接口），计进它的被动回复次数。流式消息还没结束时，
+    回复这个用户的另一条消息会让平台提前结束它（pyqbot errata，40034019），对同一条消息插一条普通回复则不受影响。
+    发完要给那条消息留不足 `ANSWER_RESERVE` 次（兜底的说明要用）时改回给新消息，记一条日志：可能截断正在显示的
+    回答，但管理员命令的回复不能丢。没有在回答时回给新消息。
+    """
+
+    def __init__(self, message: pyqbot.C2CMessage, answering: _Answering | None) -> None:
+        self._message = message
+        self._answering = answering
+
+    def __call__(
+        self, content: str | None = None, *, markdown: str | None = None
+    ) -> Awaitable[object]:
+        target = None
+        if self._answering is not None:
+            found: object = self._answering.answering(self._message.user_openid)
+            # 运行时协议不检查签名与返回类型：注入的处理器碰巧有个别的 `answering()` 时照旧回给新消息（评审修正）。
+            target = found if isinstance(found, _QQReplyChannel) else None
+        if target is not None and target.message is not self._message:
+            if target.budget.affords(1):
+                # 发出（或尝试发出）时就计数，与 `conversation` 的做法相同。
+                target.budget.replies += 1
+                return target.message.reply(content, markdown=markdown)
+            logger.info(
+                "回答进行中，那条消息的被动回复次数要留给回答，这条回复改回给新消息，可能截断正在显示的回答"
+            )
+        return self._message.reply(content, markdown=markdown)
 
 
 async def _send(send: _Send, reply: Reply) -> Delivery:

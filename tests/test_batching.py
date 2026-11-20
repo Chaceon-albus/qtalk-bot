@@ -25,10 +25,11 @@ from qtalk_bot.config import AttachmentTimeoutAction, TurnSettings
 from qtalk_bot.conversation import ChatInput, Received, ReplyChannel, ReplyStream, TurnControl
 from qtalk_bot.journal import ROWS_PER_TURN
 from qtalk_bot.media import AttachmentKind, IncomingAttachment
-from qtalk_bot.process import ReplyBudget
+from qtalk_bot.process import ANSWER_RESERVE, MAX_PASSIVE_REPLIES, ReplyBudget
 from qtalk_bot.routing import Steer
 
 HANG_GUARD = 5
+UNSUPPORTED = "暂不支持"
 STICKER_TEXT = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
 DEFAULT = TurnSettings()
 T, A = InputKind.TEXT, InputKind.ATTACHMENT
@@ -168,16 +169,19 @@ async def settle() -> None:
 
 
 class Channel:
-    """回复通道的替身：只用来认出回复挂在哪条消息上。"""
+    """回复通道的替身：用来认出回复挂在哪条消息上；`sent` 是经它发出的普通消息。"""
 
     def __init__(self, name: str) -> None:
         self.name = name
         self.budget = ReplyBudget()
+        self.sent: list[str] = []
 
     async def typing(self, seconds: int) -> None: ...
     async def stream(self, text: str) -> None: ...
     async def finish_stream(self) -> None: ...
-    async def send(self, text: str) -> None: ...
+
+    async def send(self, text: str) -> None:
+        self.sent.append(text)
 
     def open_process(self) -> ReplyStream:
         raise AssertionError("这里的替身不发过程消息")
@@ -204,7 +208,7 @@ type Verdict = Steer | Exception
 @dataclass
 class FakeResponder:
     """收消息：按顺序编号；`refused` 里的用户、`refused_messages` 里的消息不写进流水；`gates` 里的消息收到一半
-    要等。回答：记下来，`answer_gate` 不为空时要等它；`controls` 是各次回答拿到的 `TurnControl`。判断插话：依次
+    要等；只有不支持的内容时像 `Conversation` 那样（先计数、再发）经通道回 `UNSUPPORTED`，被拒的用户不回。回答：记下来，`answer_gate` 不为空时要等它；`controls` 是各次回答拿到的 `TurnControl`。判断插话：依次
     给出 `verdicts`（用完了就是补充），`judge_gate` 不为空时要等它。询问附件：记下来。
 
     停下已在显示的回答（`TurnControl.cut()`）：`cuttable` 为真时停得下，这一轮不再等 `answer_gate`，先等
@@ -252,11 +256,11 @@ class FakeResponder:
     ) -> Received | None:
         if (gate := self.gates.get(message.message_id)) is not None:
             await gate.wait()
-        if (
-            user.id in self.refused
-            or message.message_id in self.refused_messages
-            or classify(message) is None
-        ):
+        if user.id in self.refused or message.message_id in self.refused_messages:
+            return None
+        if classify(message) is None:
+            channel.budget.replies += 1
+            await channel.send(UNSUPPORTED)
             return None
         self.received.append((user.id, message.message_id))
         return Received(next(self._ids), message.sticker)
@@ -1551,3 +1555,144 @@ async def test_stop_gathers_the_acknowledgement_in_flight(
     assert not workers(chat)
     assert asyncio.all_tasks() == before
     assert "出错" not in caplog.text  # 被取消不算出错，也没有留下未取回的异常
+
+
+# -- 回答进行中给新消息的其它回复：回在正在回答的那条消息上 --
+
+
+def video() -> ChatInput:
+    return ChatInput(
+        message_id=f"qq-{next(_ids)}",
+        text=None,
+        attachments=(IncomingAttachment(kind=AttachmentKind.VIDEO),),
+    )
+
+
+async def answering_on(chat: Batcher, responder: FakeResponder, channel: Channel) -> None:
+    """经 `channel` 开始一轮并让它卡住（`answer_gate`）。"""
+    responder.answer_gate = asyncio.Event()
+    async with asyncio.timeout(HANG_GUARD):
+        await chat.submit(ALICE, text("问一"), channel)
+    await settle()
+    assert responder.answering == 1
+
+
+async def test_unsupported_content_while_answering_goes_to_the_answered_message(
+    clock: ManualClock,
+) -> None:
+    responder = FakeResponder(clock)
+    chat = batcher_of(responder)
+    first, second = Channel("问一"), Channel("视频")
+    await answering_on(chat, responder, first)
+    assert chat.replying_to(ALICE.id) is first
+    assert chat.replying_to_openid(ALICE.openid) is first
+    assert chat.replying_to(BOB.id) is None
+
+    async with asyncio.timeout(HANG_GUARD):
+        await chat.submit(ALICE, video(), second)
+
+    # 回给新消息会让平台提前结束正在写的流式消息（40034019）：回在正在回答的那条消息上，计进它的次数。
+    assert first.sent == [UNSUPPORTED]
+    assert first.budget.replies == 1
+    assert second.sent == []
+    assert second.budget.replies == 0
+    assert responder.answer_gate is not None
+    responder.answer_gate.set()
+    await finish(chat)
+    assert chat.replying_to(ALICE.id) is None
+    assert turns(responder) == [([1], "问一")]  # 不支持的内容不开轮
+
+
+async def test_unsupported_content_while_idle_goes_to_the_new_message(clock: ManualClock) -> None:
+    responder = FakeResponder(clock)
+    chat = batcher_of(responder)
+    channel = Channel("视频")
+
+    async with asyncio.timeout(HANG_GUARD):
+        await chat.submit(ALICE, video(), channel)
+
+    assert channel.sent == [UNSUPPORTED]
+    assert channel.budget.replies == 1
+    assert responder.started == []
+
+
+async def test_unsupported_content_follows_whether_a_turn_is_answering_when_sent(
+    clock: ManualClock,
+) -> None:
+    responder = FakeResponder(clock)
+    chat = batcher_of(responder)
+    first, ended, began = Channel("问一"), Channel("视频一"), Channel("视频二")
+    late, early = video(), video()
+    responder.gates[late.message_id] = asyncio.Event()
+    responder.gates[early.message_id] = asyncio.Event()
+
+    # 收的时候一轮正在回答，真正发之前它结束了：回给新消息。
+    await answering_on(chat, responder, first)
+    receiving = asyncio.create_task(chat.submit(ALICE, late, ended))
+    await settle()
+    assert responder.answer_gate is not None
+    responder.answer_gate.set()
+    await finish(chat)
+    responder.gates[late.message_id].set()
+    async with asyncio.timeout(HANG_GUARD):
+        await receiving
+    assert ended.sent == [UNSUPPORTED]
+    assert first.sent == []
+
+    # 收的时候没有在回答，真正发之前开始了一轮：回在那一轮的消息上。
+    second = Channel("问二")
+    receiving = asyncio.create_task(chat.submit(ALICE, early, began))
+    await settle()
+    await answering_on(chat, responder, second)
+    responder.gates[early.message_id].set()
+    async with asyncio.timeout(HANG_GUARD):
+        await receiving
+    assert began.sent == []
+    assert second.sent == [UNSUPPORTED]
+    assert second.budget.replies == 1
+    responder.answer_gate.set()
+    await finish(chat)
+
+
+async def test_unsupported_content_goes_to_the_new_message_when_the_answer_needs_the_replies(
+    clock: ManualClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    responder = FakeResponder(clock)
+    chat = batcher_of(responder)
+    first, second = Channel("问一"), Channel("视频")
+    await answering_on(chat, responder, first)
+    first.budget.replies = MAX_PASSIVE_REPLIES - ANSWER_RESERVE  # 再发一条就不够给回答兜底了
+
+    async with asyncio.timeout(HANG_GUARD):
+        await chat.submit(ALICE, video(), second)
+
+    assert first.sent == []
+    assert first.budget.replies == MAX_PASSIVE_REPLIES - ANSWER_RESERVE
+    assert second.sent == [UNSUPPORTED]
+    assert second.budget.replies == 1
+    assert "可能截断正在显示的回答" in caplog.text
+    assert responder.answer_gate is not None
+    responder.answer_gate.set()
+    await finish(chat)
+
+
+async def test_one_users_answer_does_not_take_another_users_replies(clock: ManualClock) -> None:
+    # 不变量：一个用户的回复不会回到另一个用户的消息上；被拒的用户（未获授权）什么都收不到。
+    responder = FakeResponder(clock, refused={3})
+    chat = batcher_of(responder)
+    first, bobs, strangers = Channel("问一"), Channel("小李的视频"), Channel("陌生人的视频")
+    await answering_on(chat, responder, first)
+
+    async with asyncio.timeout(HANG_GUARD):
+        await chat.submit(BOB, video(), bobs)
+        await chat.submit(user(3, "陌生人"), video(), strangers)
+
+    assert first.sent == []
+    assert bobs.sent == [UNSUPPORTED]
+    assert strangers.sent == []
+    assert responder.answer_gate is not None
+    responder.answer_gate.set()
+    await finish(chat)
+    assert responder.started[0].user == ALICE.id
+    assert len(responder.started) == 1

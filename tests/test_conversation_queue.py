@@ -33,6 +33,7 @@ from qtalk_bot import access, texts
 from qtalk_bot.access import UserStatus
 from qtalk_bot.conversation import SendUncertainError
 from qtalk_bot.llm import TextDelta
+from qtalk_bot.media import AttachmentKind, IncomingAttachment
 from qtalk_bot.process import ANSWER_RESERVE, MAX_PASSIVE_REPLIES
 from qtalk_bot.storage import DATABASE_FILENAME, Database
 
@@ -174,4 +175,51 @@ async def test_acknowledge_rechecks_access_stays_out_of_the_journal_and_only_log
     assert failing.sent == []
     assert "网络错误" in caplog.text
     assert [row.role for row in await rows(db)] == ["user"]
+    assert model.requests == []
+
+
+VIDEO = IncomingAttachment(kind=AttachmentKind.VIDEO)
+
+
+async def test_unsupported_content_while_showing_goes_to_the_answered_message(
+    db: Database,
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    model = ScriptedModel("main", [TextDelta("二分查找"), gate, TextDelta("讲完了"), *answer()])
+    chat = steering(db, model, FakeDecider(steer_result(0.2)))
+    batcher = batcher_of(chat, ManualClock())
+    first, second = FakeChannel(), FakeChannel()
+
+    await submit(batcher, alice, message("讲讲二分查找"), first)
+    async with asyncio.timeout(HANG_GUARD):
+        await first.delivered.wait()  # 回答已经开始显示，模型还在写
+    await submit(batcher, alice, message(None, VIDEO), second)
+
+    # 回给新消息会让平台提前结束正在写的流式消息（40034019）：回在正在回答的那条消息上。
+    assert first.log[-1] == ("send", texts.UNSUPPORTED)
+    assert "finish" not in first.kinds
+    assert second.log == []
+    gate.set()
+    await finish(batcher)
+
+    assert first.streamed == "二分查找讲完了"
+    assert first.sent == [texts.UNSUPPORTED]
+    assert first.budget.replies == 2  # 回答一条，「暂不支持」一条
+    assert second.log == []
+    assert second.budget.replies == 0
+    assert len(model.requests) == 1  # 不支持的内容不开轮、不调用模型
+
+
+async def test_unsupported_content_while_idle_goes_to_its_own_message(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("不该出现"))
+    batcher = batcher_of(steering(db, model, None), ManualClock())
+    channel = FakeChannel()
+
+    await submit(batcher, alice, message(None, VIDEO), channel)
+    await finish(batcher)
+
+    assert channel.log == [("send", texts.UNSUPPORTED)]
+    assert channel.budget.replies == 1
     assert model.requests == []

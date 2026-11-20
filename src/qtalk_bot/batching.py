@@ -55,6 +55,13 @@
 
 同一个用户的这些事在一个任务里依次处理，不同用户的互不影响。
 
+**回答进行中给这个用户的其它回复**：流式消息还没结束时，机器人回复这个用户的另一条消息会让平台提前结束它
+（pyqbot errata，40034019），正在显示的回答就断了；对同一条消息插一条普通回复则不受影响。所以这个用户有一轮正在
+回答时（`replying_to()` 不为 `None`），给新消息的回复都改回在那一轮回复挂的那条消息上，计进它的被动回复次数：
+排到下一轮时的那句收到（见上），`Responder.receive()` 回的「暂不支持」（`submit()` 交给它的通道是一层路由，在
+真正发送的那一刻才看有没有正在回答的一轮），以及接线层发的管理员命令等固定回复（`bot.py` 按 openid 问
+`replying_to_openid()`）。发完要给那条消息留不足 `process.ANSWER_RESERVE` 次时改回给新消息，记一条日志。
+
 **关停**：`stop()` 取消所有用户的任务：等待中的附件、防抖的计时、正在进行的插话判断、还没发完的那句收到直接
 放弃（消息已在流水里，重启后是待回复的消息），正在回答的轮次被取消（对话自己收尾记账）。判断与回答同时被取消，
 再各自收尾；`drain()` 等这些任务都结束，不留下没人管的任务。
@@ -69,9 +76,10 @@ from typing import Protocol
 
 from .access import User
 from .config import AttachmentTimeoutAction, TurnSettings
-from .conversation import ChatInput, Received, ReplyChannel, TurnControl
+from .conversation import ChatInput, Received, ReplyChannel, ReplyStream, TurnControl
 from .journal import ROWS_PER_TURN
 from .media import SUPPORTED_KINDS, AttachmentKind
+from .process import ReplyBudget
 from .routing import Steer
 
 logger = logging.getLogger(__name__)
@@ -228,7 +236,8 @@ class _UserState:
     acknowledging: asyncio.Task[None] | None = None  # 最近一次回收到的后台任务，下一轮开始前等它
     # 回过收到的消息（流水里的编号）。一轮装不下、留到再下一轮的消息不再重复回；开轮时只留还在队列里的。
     acknowledged_ids: set[int] = field(default_factory=set[int])
-    # 正在回答的这一轮的回复挂在哪条消息上（它的通道）；没有在回答时为 None。那句收到也回在它上面，见 `_acknowledge()`。
+    # 正在回答的这一轮的回复挂在哪条消息上（它的通道）；没有在回答时为 None。那句收到、「暂不支持」与管理员命令的
+    # 回复也回在它上面，见 `_acknowledge()`、`_RoutedChannel` 与 `replying_to()`。
     replying: ReplyChannel | None = None
 
     def poke(self) -> None:
@@ -257,12 +266,31 @@ class Batcher:
         self._acknowledgements: set[asyncio.Task[None]] = set()  # 后台回收到的任务
         self._closed = False
 
+    def replying_to(self, user_id: int) -> ReplyChannel | None:
+        """这个用户正在回答的一轮的回复挂在哪条消息上（它的通道）；没有在回答时为 `None`。
+
+        这时给这个用户的其它回复要回在这条消息上，不能回给新消息（见模块说明）。只是查询，结果在下一次让出事件循环
+        之后就可能变了：要在真正发送的那一刻再问。"""
+        state = self._users.get(user_id)
+        return None if state is None else state.replying
+
+    def replying_to_openid(self, openid: str) -> ReplyChannel | None:
+        """同 `replying_to()`，按 openid 查：接线层发 Gate 的回复时只有 openid。"""
+        for state in self._users.values():
+            if state.user.openid == openid:
+                return state.replying
+        return None
+
     async def submit(self, user: User, message: ChatInput, channel: ReplyChannel) -> None:
         """收下一条已授权用户的消息（`Responder.receive()`），按上面的规则安排。收完就返回，回答在后台的任务里
-        进行；`channel` 是回复这条消息的通道，它是一轮的最后一条时回复经它发出。"""
+        进行；`channel` 是回复这条消息的通道，它是一轮的最后一条时回复经它发出。
+
+        交给 `receive()` 的是包了一层路由的通道（`_RoutedChannel`）：它回「暂不支持」的那一刻这个用户有一轮正在
+        回答，就回在那一轮回复挂的那条消息上。这条消息自己那一轮的回复仍经 `channel`。"""
         kind = classify(message)
+        routed = _RoutedChannel(lambda: self._route(user, channel))
         if kind is None or kind is InputKind.STICKER or self._closed:
-            await self._responder.receive(user, message, channel)
+            await self._responder.receive(user, message, routed)
             return
         state = self._users.get(user.id)
         if state is None:
@@ -274,7 +302,7 @@ class Batcher:
         self._ensure_worker(state)
         received: Received | None = None
         try:
-            received = await self._responder.receive(user, message, channel)
+            received = await self._responder.receive(user, message, routed)
         finally:
             arrival.settle(received)
             if received is None and arrival in state.arrivals:
@@ -302,6 +330,20 @@ class Batcher:
         self.stop()
         while pending := self._workers | self._acknowledgements:
             await asyncio.wait(pending)
+
+    def _route(self, user: User, own: ReplyChannel) -> ReplyChannel:
+        """现在给这个用户发一句回复，该经哪个通道：有一轮正在回答、发完仍给那条消息留着 `ANSWER_RESERVE` 次被动
+        回复时是那一轮的通道，否则是新消息自己的 `own`。"""
+        replying = self.replying_to(user.id)
+        if replying is None or replying is own:
+            return own
+        if replying.budget.affords(1):
+            return replying
+        logger.info(
+            "用户 %s 有一轮回答在进行，那条消息的被动回复次数要留给回答，这句改回给新消息，可能截断正在显示的回答",
+            user.label,
+        )
+        return own
 
     def _now(self) -> float:
         return asyncio.get_running_loop().time() if self._clock is None else self._clock()
@@ -637,6 +679,48 @@ class Batcher:
                 await asyncio.wait((task, wake, judging), return_when=asyncio.FIRST_COMPLETED)
         finally:
             state.wake = None
+
+
+class _RoutedChannel:
+    """`submit()` 交给 `Responder.receive()` 的通道，符合 `ReplyChannel`。`receive()` 只用它回「暂不支持」，一条
+    消息至多一句。
+
+    回给谁在第一次用到 `budget` 或 `send()` 时才决定（`Batcher._route()`），也就是真正要发的那一刻：`receive()`
+    先下载、复查授权，提前判断的话，回答可能已经开始或结束。决定之后固定下来：`conversation` 先给 `budget` 计数
+    再 `send()`，计数要落在实际发出的那条消息上；只看有没有正在回答的一轮不会在两步之间变（中间不让出事件循环），
+    但计数之后「还留不留得出余量」可能变，所以不能每次重新判断。
+
+    流式相关的方法 `receive()` 用不到，调用时报错：它们的计数与发送若落在不同的消息上，被动回复次数就记错了。
+    """
+
+    def __init__(self, route: Callable[[], ReplyChannel]) -> None:
+        """`route` 在要发的那一刻决定经哪个通道。"""
+        self._route = route
+        self._chosen: ReplyChannel | None = None
+
+    def _target(self) -> ReplyChannel:
+        if self._chosen is None:
+            self._chosen = self._route()
+        return self._chosen
+
+    @property
+    def budget(self) -> ReplyBudget:
+        return self._target().budget
+
+    async def send(self, text: str) -> str | None:
+        return await self._target().send(text)
+
+    def open_process(self) -> ReplyStream:
+        raise AssertionError("收消息时不发过程消息")
+
+    async def typing(self, seconds: int) -> None:
+        raise AssertionError("收消息时不发「正在输入」")
+
+    async def stream(self, text: str) -> str | None:
+        raise AssertionError("收消息时不发流式消息")
+
+    async def finish_stream(self) -> str | None:
+        raise AssertionError("收消息时不发流式消息")
 
 
 def _room(control: TurnControl) -> int:
