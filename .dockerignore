@@ -1,0 +1,11 @@
+# 构建上下文只放构建要用的文件：其余一律排除，镜像里不会带上密钥（.env）、配置（config.toml）、
+# 用户数据（data/）、.git、.venv、测试与文档。
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!src
+
+# src 里的字节码缓存也不要。
+src/**/__pycache__
+src/**/*.py[cod]

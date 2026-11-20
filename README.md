@@ -16,6 +16,7 @@ uv run --env-file .env python -m qtalk_bot
 
 ## 文档
 
+- [部署说明](docs/deploy.md)：在 Debian 上用 docker compose 运行、看健康状态、升级与从备份恢复。
 - [设计](docs/design/README.md)：方向、已经定下来的决定和待定的事。
 - [AGENTS.md](AGENTS.md)：开发约束。
 

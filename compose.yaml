@@ -1,0 +1,38 @@
+# qtalk-bot 的 docker compose 配置。用法见 docs/deploy.md：
+#
+#   install -m 600 .env.example .env                 # 填上密钥
+#   install -m 600 config.example.toml config.toml   # 按需修改；data_dir 保持 "data"
+#   sudo chgrp 1000 config.toml && chmod 640 config.toml   # 只让容器账户的组读（代理地址里可能有口令）
+#   docker compose up -d --build
+#
+# 机器人只往外连（QQ 开放平台、大模型服务），不开端口。
+
+services:
+  bot:
+    build:
+      context: .
+      args:
+        # 运行机器人的账户；宿主机上 ./data 要属于它。宿主机上的账户不是 1000 时改这两项。
+        UID: "1000"
+        GID: "1000"
+    image: qtalk-bot:local
+    restart: unless-stopped
+    init: true
+    # 程序自己的关停总时限是 15 秒，docker 默认 10 秒就强杀，不够。
+    stop_grace_period: 30s
+    # 密钥从同目录的 .env 逐项注入，不在这里写值；与 .env.example 一一对应。
+    environment:
+      APP_ID: ${APP_ID:?请在 .env 里填写 APP_ID}
+      APP_SECRET: ${APP_SECRET:?请在 .env 里填写 APP_SECRET}
+      ADMIN_OPENID: ${ADMIN_OPENID:?请在 .env 里填写 ADMIN_OPENID}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    volumes:
+      # 镜像里的 QTALK_CONFIG 指向 /app/config.toml；data_dir = "data" 按配置文件所在目录解析成 /app/data。
+      - ./config.toml:/app/config.toml:ro
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
