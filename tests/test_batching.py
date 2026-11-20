@@ -1185,7 +1185,7 @@ def acks(responder: FakeResponder) -> list[tuple[list[int], str]]:
 
 
 @pytest.mark.parametrize("shown", [False, True])
-async def test_new_question_is_acknowledged_at_once_on_its_own_channel(
+async def test_new_question_is_acknowledged_at_once_on_the_answered_message(
     clock: ManualClock, shown: bool, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.INFO)
@@ -1196,7 +1196,7 @@ async def test_new_question_is_acknowledged_at_once_on_its_own_channel(
         assert responder.controls[0].claim()
 
     await submit(chat, ALICE, text("明天天气怎么样"), "新问题")
-    assert acks(responder) == [([2], "新问题")]
+    assert acks(responder) == [([2], "问一")]
     assert responder.acks_done == 1
     assert len(responder.started) == 1  # 当前这一轮还在回答，没有等它答完
     assert responder.answer_gate is not None
@@ -1227,7 +1227,7 @@ async def test_message_left_for_the_next_turn_while_showing_is_acknowledged(
     await submit(chat, ALICE, text("二"), "二")
 
     assert responder.cut == []
-    assert acks(responder) == [([2], "二")]
+    assert acks(responder) == [([2], "问一")]
 
 
 async def test_supplement_that_restarts_the_turn_is_not_acknowledged(clock: ManualClock) -> None:
@@ -1275,7 +1275,7 @@ async def test_judgment_still_pending_is_not_acknowledged_yet(clock: ManualClock
     responder.judge_gate.set()
     await settle()
 
-    assert acks(responder) == [([2], "二")]
+    assert acks(responder) == [([2], "问一")]
 
 
 async def test_only_the_first_queued_message_of_a_turn_is_acknowledged(
@@ -1289,7 +1289,7 @@ async def test_only_the_first_queued_message_of_a_turn_is_acknowledged(
     await submit(chat, ALICE, text("三"), "三")
     await submit(chat, ALICE, text("四"), "四")
 
-    assert acks(responder) == [([2], "二")]
+    assert acks(responder) == [([2], "问一")]
 
 
 async def test_acknowledgement_goes_to_the_earliest_queued_message(clock: ManualClock) -> None:
@@ -1303,7 +1303,7 @@ async def test_acknowledgement_goes_to_the_earliest_queued_message(clock: Manual
         await chat.submit(ALICE, text("三"), Channel("三"))
     await settle()
 
-    assert acks(responder) == [([2], "二")]
+    assert acks(responder) == [([2], "问一")]
 
 
 async def test_message_left_over_from_a_full_turn_is_not_acknowledged_again(
@@ -1316,7 +1316,7 @@ async def test_message_left_over_from_a_full_turn_is_not_acknowledged_again(
     for index in range(batching.MAX_BATCH):
         await submit(chat, ALICE, picture(), f"图{index}")
     await submit(chat, ALICE, text("这些是什么"), "问题")
-    assert acks(responder) == [([batching.MAX_BATCH + 2], "问题")]
+    assert acks(responder) == [([batching.MAX_BATCH + 2], "问一")]
 
     old = responder.answer_gate
     assert old is not None
@@ -1324,12 +1324,13 @@ async def test_message_left_over_from_a_full_turn_is_not_acknowledged_again(
     old.set()
     await settle()
     assert len(turns(responder)) == 2  # 下一轮只带走 32 张图，那句文字还留在队列里
-    assert acks(responder) == [([batching.MAX_BATCH + 2], "问题")]
+    assert acks(responder) == [([batching.MAX_BATCH + 2], "问一")]
 
     await submit(chat, ALICE, text("再问一句"), "再问")  # 这一轮真正新排队的仍可以回
+    last = f"图{batching.MAX_BATCH - 1}"  # 这一轮的回复挂在最后一张图上，收到也回在它上面
     assert acks(responder) == [
-        ([batching.MAX_BATCH + 2], "问题"),
-        ([batching.MAX_BATCH + 3], "再问"),
+        ([batching.MAX_BATCH + 2], "问一"),
+        ([batching.MAX_BATCH + 3], last),
     ]
 
 
@@ -1341,7 +1342,7 @@ async def test_message_during_the_acknowledgement_wait_joins_the_next_turn(
     chat = batcher_of(responder, TurnSettings(max_restarts=0))
     await answering(chat, responder)
     await submit(chat, ALICE, text("二"), "二")
-    assert acks(responder) == [([2], "二")]
+    assert acks(responder) == [([2], "问一")]
     assert responder.answer_gate is not None
     responder.answer_gate.set()
     await settle()
@@ -1353,7 +1354,7 @@ async def test_message_during_the_acknowledgement_wait_joins_the_next_turn(
     await settle()
 
     assert turns(responder) == [([1], "问一"), ([2, 3], "三")]
-    assert acks(responder) == [([2], "二")]
+    assert acks(responder) == [([2], "问一")]
 
 
 async def test_acknowledgement_counts_across_restarts_and_each_turn_has_its_own(
@@ -1367,7 +1368,7 @@ async def test_acknowledgement_counts_across_restarts_and_each_turn_has_its_own(
     assert responder.acknowledged == []
     await submit(chat, ALICE, text("二"), "二")
     await submit(chat, ALICE, text("三"), "三")
-    assert acks(responder) == [([3], "二")]
+    assert acks(responder) == [([3], "补一")]
 
     old = responder.answer_gate
     assert old is not None
@@ -1378,7 +1379,7 @@ async def test_acknowledgement_counts_across_restarts_and_each_turn_has_its_own(
     await submit(chat, ALICE, text("五"), "五")  # 补充，重来
     await submit(chat, ALICE, text("六"), "六")
 
-    assert acks(responder) == [([3], "二"), ([6], "六")]
+    assert acks(responder) == [([3], "补一"), ([6], "五")]  # 都回在当时正在回答的那条消息上
 
 
 @pytest.mark.parametrize("why", ["restart_limit", "zero_restarts", "no_room"])
@@ -1403,7 +1404,10 @@ async def test_messages_that_are_no_longer_judged_are_acknowledged(
     await submit(chat, ALICE, text("又一句"), "又一句")
 
     assert len(responder.judged) == judged  # 不再判断
-    assert [channel for _, channel in acks(responder)] == ["又一句"]
+    # 回在正在回答的那条消息上：重来过的这一轮挂在「补一」上。
+    assert [channel for _, channel in acks(responder)] == [
+        "补一" if why == "restart_limit" else "问一"
+    ]
     assert responder.answer_gate is not None
     responder.answer_gate.set()
     await settle()
@@ -1440,7 +1444,7 @@ async def test_lone_picture_during_a_turn_is_not_acknowledged(clock: ManualClock
     assert responder.acknowledged == []
     await submit(chat, ALICE, text("看这张"), "看这张")
 
-    assert acks(responder) == [([3], "看这张")]
+    assert acks(responder) == [([3], "问一")]
 
 
 async def test_refused_message_during_a_turn_is_not_acknowledged(clock: ManualClock) -> None:

@@ -54,7 +54,7 @@ async def test_new_question_while_showing_is_acknowledged_before_its_own_turn(
     chat = steering(db, model, decider)
     batcher = batcher_of(chat, ManualClock())
     acknowledged = asyncio.Event()
-    first, second = FakeChannel(), FakeChannel(send_action=set_event(acknowledged))
+    first, second = FakeChannel(send_action=set_event(acknowledged)), FakeChannel()
 
     await submit(batcher, alice, message("讲讲二分查找"), first)
     async with asyncio.timeout(HANG_GUARD):
@@ -62,19 +62,23 @@ async def test_new_question_while_showing_is_acknowledged_before_its_own_turn(
     await submit(batcher, alice, message("明天天气怎么样"), second)
     async with asyncio.timeout(HANG_GUARD):
         await acknowledged.wait()  # 回收到要先在数据库线程里复查授权
-    # 立刻回，不等当前的回答写完。
-    assert second.log == [("send", texts.QUEUED)]
+    # 立刻回，不等当前的回答写完；回在正在回答的那条消息上（回复用户的另一条消息会让平台提前结束正在写的
+    # 流式消息），新消息那边什么也没发。
+    assert first.log[-1] == ("send", texts.QUEUED)
     assert "finish" not in first.kinds
+    assert second.log == []
     model.script = answer("晴")
     gate.set()
     await finish(batcher)
 
-    assert first.streamed == "二分查找讲完了"  # 当前的回答照常写完
-    # 新消息自己那一轮正常回答，「正在输入」与回答都在那句收到之后。
-    assert second.kinds == ["send", "typing", "stream", "finish"]
-    assert second.sent == [texts.QUEUED]
+    assert first.streamed == "二分查找讲完了"  # 当前的回答照常写完，流式消息没有被打断
+    assert first.sent == [texts.QUEUED]
+    assert first.budget.replies == 2  # 回答一条，收到一条
+    # 新消息自己那一轮正常回答。
+    assert second.kinds == ["typing", "stream", "finish"]
+    assert second.sent == []
     assert second.streamed == "晴"
-    assert second.budget.replies == 2
+    assert second.budget.replies == 1
     # 不进流水，也不进之后的上下文；只调用过一次插话判断。
     assert texts.QUEUED not in [row.content for row in await rows(db)]
     assert all(
@@ -99,18 +103,20 @@ async def test_no_acknowledgement_when_the_replies_are_needed_for_the_answer(
     chat = steering(db, model, FakeDecider(steer_result(0.2)))
     batcher = batcher_of(chat, ManualClock())
     first, second = FakeChannel(), FakeChannel()
-    second.budget.replies = MAX_PASSIVE_REPLIES - ANSWER_RESERVE  # 再发一条就不够给回答留余量
 
     await submit(batcher, alice, message("一"), first)
     async with asyncio.timeout(HANG_GUARD):
         await first.delivered.wait()
+    # 收到回在正在回答的那条消息上：它再发一条就不够给回答（被拒时的说明）留余量了。
+    first.budget.replies = MAX_PASSIVE_REPLIES - ANSWER_RESERVE
     await submit(batcher, alice, message("二"), second)
     model.script = answer("答二")
     gate.set()
     await finish(batcher)
 
-    assert second.sent == []
-    assert second.streamed == "答二"  # 留下的次数照样够回答用
+    assert first.sent == []
+    assert first.streamed == "答完"
+    assert second.streamed == "答二"
     assert "被动回复次数要留给回答，不回收到" in caplog.text
 
 

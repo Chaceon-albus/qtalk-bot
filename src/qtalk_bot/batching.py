@@ -39,11 +39,14 @@
   不再判断；已达到重来上限时同样不再判断。判断期间又来的消息不另判，跟着这次的结论走（重来就一起带上）。
 - 单独的图片或文件不触发判断；重来时一并带上，否则留到下一轮按上面「空闲时」的规则等文字。
 - **排到下一轮时回一句收到**（`Responder.acknowledge()`，`texts.QUEUED`）：文字或语音真的排到了下一轮（判为
-  新问题；显示中判断失败、没有配置或停不下；装不下；已经不再判断时到达的，含 `max_restarts` 为 0），就在后台经
-  这条消息自己的通道立刻回一句，不调用模型、不进流水。每轮只回一次（重来之后接着算）：这一轮里第一条排队的
+  新问题；显示中判断失败、没有配置或停不下；装不下；已经不再判断时到达的，含 `max_restarts` 为 0），就在后台
+  立刻回一句，不调用模型、不进流水。这句回在正在回答的那条消息上（这一轮回复挂的那条），而不是新消息上：流式
+  消息还没结束时，机器人回复这个用户的另一条消息会让平台提前结束它（pyqbot errata，40034019），正在显示的回答
+  就断了；对同一条消息插一条普通回复则不受影响。它计进那条消息的被动回复次数。每轮只回一次（重来之后接着算）：这一轮里第一条排队的
   回，之后的不回。带上它重来的、停下了正在显示的回答的不回（过程消息或回答末尾已有说明；停下之后再来的也不回，
   它们紧接着就开轮）；判断还没有结论时不回；判断期间这一轮先结束了的不回（新消息立刻自己开轮）。单独的图片或文件不触发。
-  下一轮开始之前先等这句发完（最多 `GRACE_SECONDS`），免得它排在那一轮的「正在输入」、过程与回答之后。
+  下一轮开始之前先等这句发完（最多 `GRACE_SECONDS`）：它是对上一条消息的回复，晚于下一轮的流式消息到达会把
+  那条提前结束，也会排在那一轮的「正在输入」、过程与回答之后。
 
 只显示了过程消息（`process.py`）不算回答已开始显示，照常可以重来；重来时把上一次的 `TurnControl` 交给新的
 （`previous`），被重来的过程消息由最后答完的那一次处理，上次实际发出「正在输入」的时刻（`TurnControl.typed_at`）
@@ -220,6 +223,8 @@ class _UserState:
     acknowledging: asyncio.Task[None] | None = None  # 最近一次回收到的后台任务，下一轮开始前等它
     # 回过收到的消息（流水里的编号）。一轮装不下、留到再下一轮的消息不再重复回；开轮时只留还在队列里的。
     acknowledged_ids: set[int] = field(default_factory=set[int])
+    # 正在回答的这一轮的回复挂在哪条消息上（它的通道）；没有在回答时为 None。那句收到也回在它上面，见 `_acknowledge()`。
+    replying: ReplyChannel | None = None
 
     def poke(self) -> None:
         if self.wake is not None and not self.wake.done():
@@ -408,10 +413,12 @@ class Batcher:
             # 也接着用。
             control = TurnControl(notify=state.poke, previous=control)
             ids = [item.message_id for item, _ in recorded]
+            state.replying = recorded[-1][1]
             task = asyncio.create_task(self._responder.respond(user, ids, recorded[-1][1], control))
             try:
                 extra = await self._watch(state, task, control, restarts)
             finally:
+                state.replying = None
                 if not task.done():
                     task.cancel()  # 这个任务被取消了（关停）：回答一轮的一方自己收尾记账
                     await asyncio.wait((task,))
@@ -541,7 +548,8 @@ class Batcher:
 
     def _acknowledge(self, state: _UserState, arrival: _Arrival) -> None:
         """`arrival`（收完、写进了流水的文字或语音）连同它之前的消息排到了下一轮：这一轮还没回过收到时，在后台的
-        任务里回一句（`Responder.acknowledge()`），不挡住看着这一轮的循环。回给其中最早一条还没回过的文字或语音
+        任务里回一句（`Responder.acknowledge()`，回在正在回答的那条消息上），不挡住看着这一轮的循环。针对其中最早
+        一条还没回过的文字或语音
         （评审修正：插话判断看最新一条，回执按到达的顺序）；都回过了（上一轮装不下留下来的）就不回，也不占这一轮
         的名额。"""
         if state.acknowledged or self._closed:
@@ -566,10 +574,15 @@ class Batcher:
         assert received is not None
         if received.message_id in state.acknowledged_ids:
             return
+        replying = state.replying
+        if replying is None:
+            return  # 没有在回答（防御：只在看着一轮的循环里调用）
         state.acknowledged = True
         state.acknowledged_ids.add(received.message_id)
+        # 回在正在回答的那条消息上，而不是新消息上：流式消息还没结束时，机器人回复这个用户的另一条消息会让平台
+        # 提前结束它（pyqbot errata，40034019），正在显示的回答就断了；对同一条消息插一条普通回复则不受影响。
         task = asyncio.create_task(
-            self._send_acknowledgement(state.user, received.message_id, target.channel)
+            self._send_acknowledgement(state.user, received.message_id, replying)
         )
         state.acknowledging = task
         self._acknowledgements.add(task)

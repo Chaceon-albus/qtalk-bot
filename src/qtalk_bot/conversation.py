@@ -820,9 +820,11 @@ class Conversation:
     async def acknowledge(self, user: User, message_id: int, channel: ReplyChannel) -> None:
         """一轮回答进行中来的新消息排到了下一轮：回一句收到（`texts.QUEUED`），不调用模型。
 
-        `message_id` 是那条新消息，`channel` 回复它。先在事务里复查授权，已不能使用对话就不发；发完要给这条消息
-        自己那一轮的回答留不足 `process.ANSWER_RESERVE` 次被动回复时也不发。和 `ask()` 一样不写进流水、不进之后
-        的上下文；发送失败只记日志。由 `drain()` 等待。
+        `message_id` 是那条新消息（只用于日志）；`channel` 是正在回答的那一轮回复挂的那条消息的通道，收到回在它上面：
+        流式消息还没结束时回复这个用户的另一条消息会让平台提前结束它（pyqbot errata，40034019），对同一条消息插一条
+        普通回复则不受影响。先在事务里复查授权，已不能使用对话就不发；发完要给那条消息留不足
+        `process.ANSWER_RESERVE` 次被动回复时也不发。和 `ask()` 一样不写进流水、不进之后的上下文；发送失败只记日志。
+        由 `drain()` 等待。
         """
         async with self._tracking():
             if not await self._db.transaction(self._allowed, user):
