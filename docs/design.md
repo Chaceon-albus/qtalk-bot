@@ -609,7 +609,7 @@ image_generation = true           # 可选，默认关：这个模型能用画�
 试调用（2026-11-19，提示词固定、不含用户数据，`store=False`）：
 
 - Gemini `gemini-nano-banana-2.1`（Interactions API，`response_format` 为 `{"type": "image", "image_size": "1K", "aspect_ratio": "1:1"}`）：约 16 秒出一张 1K 的 JPEG；图片输出 1120 token，另有 708 个思考 token 也计费，按价格页约 0.04 美元；同时回一段文字介绍。
-- OpenAI（`gpt-6.2-sol` 加内置 `image_generation` 工具）：起初 `gpt-image-2.6-flare`、`gpt-image-2.6-sunburst`、`gpt-image-2.5-flare` 都返回 403 `model_not_found`（项目没有这个模型的访问权限）。用户在项目里打开 2.6 的 flare 与 sunburst 后，flare 约 4 分钟后生效：低质量 1024×1024 连主模型共约 10 秒，图片输出 824 token（比旧模型低质量的 272 多），按每百万 $30 约 0.025 美元。sunburst 当时还没生效。
+- OpenAI（`gpt-6.2-sol` 加内置 `image_generation` 工具）：起初 `gpt-image-2.6-flare`、`gpt-image-2.6-sunburst`、`gpt-image-2.5-flare` 都返回 403 `model_not_found`（项目没有这个模型的访问权限）。用户在项目里打开 2.6 的 flare 与 sunburst 后，flare 约 4 分钟后生效：低质量 1024×1024 连主模型共约 10 秒，图片输出 824 token（比旧模型低质量的 272 多），按每百万 $30 约 0.025 美元。sunburst 随后也生效：同样的请求约 13.5 秒，图片输出同样是 824 token、价格相同（各只试了一次，快慢只作参考）。
 
 步骤：
 
