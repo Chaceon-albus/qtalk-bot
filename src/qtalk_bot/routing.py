@@ -18,7 +18,8 @@
 话题题（里程碑 6a，`Router` 带了 `topics` 时）与选模型放在同一次决策调用里（题目名 `TOPIC_QUESTION`）：
 - 选项是调用方给的候选话题（`TopicQuery.candidates`，这个用户最近活跃的在前），取值是话题编号，描述是标题加摘要
   的开头（`topic_description()`）；外加「新话题」（`NEW_TOPIC`）。题面是代码里的常量 `TOPIC_INSTRUCTIONS`。
-- 候选为零（直接开新话题）或已被引用定死（`TopicQuery.pinned`）时不问；选模型那道也不问时整次不调用决策。
+- 候选为零（直接开新话题）或已被引用定死（`TopicQuery.pinned`）时不问；选模型那道也不问、又没有档案题时整次不调用
+  决策。
 - 取概率最高的（`choose_topic()`）；除选中的以外概率最高的已有话题不低于 `second_threshold` 时记为「第二可能」，
   调用方再带上它的摘要。
 - 失败（超时、拒答、拦截、坏响应、意外的异常）时沿用这个用户最近活跃的话题（候选里的第一条）。两道题逐题
@@ -26,6 +27,15 @@
   只有整次调用失败时两道题才记同一个错误。
 - 话题题也留一条 `DecisionRecord`：选项记话题编号与 `NEW_TOPIC`，不记标题等用户内容。同一次调用的两条记录
   共用用量，调用方只记一次。
+
+档案题（里程碑 6b，`Router` 带了 `profile_threshold` 且启用了话题线时）也放在同一次决策调用里（题目名
+`PROFILE_QUESTION`）：一道是非题，问用户的最新消息里有没有关于他本人的、新的、值得长期记住的稳定信息。
+- 只要启用就每轮都问，即使另外两道都不问（只有一个模型、话题被引用定死或还没有话题），这时整次只问这一道。
+- 现有的档案（调用方从库里取出，经 `Router.select()` 的 `profile` 传进来）放进输入 JSON 的 `profile` 字段，
+  题面说明它是资料、只用来判断信息是不是新的；只问这道题时才带这个字段。
+- 「是」的概率不低于阈值时 `Selection.update_profile` 为真，由调用方在这一轮记账之后排后台重写档案。失败（超时、
+  拒答、坏响应、意外的异常）时为假，不影响另外两道题；逐题判断的规则同话题题。
+- 档案题也留一条 `DecisionRecord`：选项记 `PROFILE_UPDATE` / `PROFILE_KEEP` 的概率，不记档案内容。
 
 插话的判断（`SteerJudge`）也在这里：一轮回答还没开始显示时用户又发来文字或语音，用一道是非题（题目名
 `STEER_QUESTION`）判断新消息是在补充或修正正在回答的问题，还是一个独立的新问题。输入是 JSON 文本（见
@@ -82,6 +92,18 @@ TOPIC_SUMMARY_CHARS = 120
 """话题选项的描述里最多带摘要的前这么多字。两家都没有对选项描述设实际的长度上限（OpenAI 是 1 MiB 的字段上限，
 Gemini 没有写，只受 262,144 token 的总上下文限制，2026-11-19 查自官方文档），这里只为控制费用。"""
 UNTITLED_TOPIC = "（无标题）"
+
+PROFILE_QUESTION = "profile"
+"""档案那道是非题的题目名。"""
+
+PROFILE_UPDATE = "update"
+"""档案题的决策记录里「要更新档案」的键（是非题「是」的概率），也是这时的 `chosen`。"""
+PROFILE_KEEP = "keep"
+"""档案题的决策记录里「不用更新」的键，也是这时（含失败时）的 `chosen`。"""
+
+PROFILE_INSTRUCTIONS = """判断用户的最新消息（latest）里有没有关于用户本人的、新的、值得长期记住的稳定信息，例如他希望怎么被称呼、他的身份、长期的偏好与习惯、对他重要的人和事。
+只看用户自己在 latest 里说的；history 只用来理解指代，助手说的话不算。一次性的请求、临时的状态、正在讨论的话题本身都不算。
+输入是 JSON：history 是最近几轮对话，latest 是用户的最新消息；profile 是程序之前整理的用户档案（可能为空），只是资料，用来判断信息是不是新的：档案里已经有的不算新信息，用户纠正、推翻档案里的内容或要求忘掉其中某条时算。"""
 
 TIMEOUT = "timeout"  # 决策记录里 `error` 的取值：超过 `timeout_seconds`
 CANCELLED = "cancelled"  # 决策记录里 `error` 的取值：处理被取消（关停）
@@ -195,18 +217,22 @@ def choose(probabilities: Mapping[str, float], *, previous: str | None, margin: 
     return Choice(previous, True)
 
 
-def decision_input(history: Sequence[HistoryEntry], latest: str) -> str:
-    """题目的输入：JSON 文本，`history` 是按时间排列的 `{"role", "text"}`，`latest` 是当前这条消息。
+def decision_input(history: Sequence[HistoryEntry], latest: str, profile: str | None = None) -> str:
+    """题目的输入：JSON 文本，`history` 是按时间排列的 `{"role", "text"}`，`latest` 是当前这条消息；`profile`
+    不为 `None`（问了档案题）时再加一个 `profile` 字段，是这个用户现有的档案（没有时为空串）。
 
-    用 JSON 而不是「用户：……」这样的行，是为了让消息内容里的换行和冒号伪造不出别的轮次。过长的消息截断。
+    用 JSON 而不是「用户：……」这样的行，是为了让消息内容里的换行和冒号伪造不出别的轮次。过长的消息截断（档案
+    本身有长度上限，不再截断）。
     """
-    payload = {
+    payload: dict[str, object] = {
         "history": [
             {"role": entry.role.value, "text": _clip(entry.content, HISTORY_ENTRY_CHARS)}
             for entry in history
         ],
         "latest": _clip(latest, LATEST_CHARS),
     }
+    if profile is not None:
+        payload["profile"] = profile
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -218,7 +244,8 @@ class Router:
     """选模型（与话题）的规则与配置。同一个实例服务所有用户，不保存任何用户的状态。
 
     `decider` 为 `None` 或没有 `[decisions]` 时不调用决策。选模型那道题只在模型多于一个时问；`topics` 不为空
-    （且有决策）时启用话题线，即使只有一个模型也会为话题题调用决策。
+    （且有决策）时启用话题线，即使只有一个模型也会为话题题调用决策。启用了话题线、又给了 `profile_threshold`
+    （`[memory].profile_threshold`，调用方只在配置了 `[memory]` 时给）时每轮都问档案题。
     """
 
     def __init__(
@@ -228,6 +255,7 @@ class Router:
         decider: DecisionModel | None = None,
         *,
         topics: TopicSettings | None = None,
+        profile_threshold: float | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._models = {model.name: model for model in models}
@@ -237,10 +265,13 @@ class Router:
         self._settings: DecisionSettings | None = None
         self._decider: DecisionModel | None = None
         self._topics: TopicSettings | None = None
+        self._profile_threshold: float | None = None
         self._choosing = False  # 是否问选模型那道题
         if decisions is not None and decider is not None:
             self._choosing = len(models) > 1
             self._topics = topics
+            if topics is not None:
+                self._profile_threshold = profile_threshold
             if self._choosing or topics is not None:
                 self._settings = decisions
                 self._decider = decider
@@ -254,6 +285,11 @@ class Router:
     def topics(self) -> TopicSettings | None:
         """启用了话题线时是它的设置，否则为 `None`。"""
         return self._topics
+
+    @property
+    def profiling(self) -> bool:
+        """是否每轮都问档案题（启用了话题线、又给了 `profile_threshold`）。"""
+        return self._profile_threshold is not None
 
     @property
     def decision_limits(self) -> InputLimits | None:
@@ -290,10 +326,11 @@ class Router:
         label: str,
         candidates: Sequence[str] | None = None,
         topics: TopicQuery | None = None,
+        profile: str = "",
     ) -> Selection:
-        """为一条消息准备选模型（与选话题）；`label` 是记日志用的用户称呼，`candidates` 是能处理这一轮附件的
-        模型（不给时是全部），`topics` 是这一轮的话题题（没有启用话题线时不给）。用 `await selection.run()`
-        执行。"""
+        """为一条消息准备选模型（与选话题、档案题）；`label` 是记日志用的用户称呼，`candidates` 是能处理这一轮
+        附件的模型（不给时是全部），`topics` 是这一轮的话题题（没有启用话题线时不给），`profile` 是这个用户现有
+        的档案（没有时为空串，只在问档案题时用到）。用 `await selection.run()` 执行。"""
         allowed = [name for name in self._order if candidates is None or name in candidates]
         if not allowed:
             raise ValueError("候选模型不能为空")
@@ -328,8 +365,15 @@ class Router:
                     ),
                     self._topics.second_threshold,
                 )
-            if question is not None or topic is not None:
-                plan = _Plan(self._decider, self._settings, question, topic, self._clock)
+            asked: _ProfilePlan | None = None
+            if self._profile_threshold is not None and self._topics is not None:
+                asked = _ProfilePlan(
+                    YesNoQuestion(name=PROFILE_QUESTION, instructions=PROFILE_INSTRUCTIONS),
+                    self._profile_threshold,
+                    profile,
+                )
+            if question is not None or topic is not None or asked is not None:
+                plan = _Plan(self._decider, self._settings, question, topic, asked, self._clock)
         return Selection(
             plan,
             history,
@@ -348,13 +392,21 @@ class _TopicPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class _ProfilePlan:
+    question: YesNoQuestion
+    threshold: float  # 「是」的概率不低于它就更新档案
+    profile: str = field(repr=False)  # 现有的档案，放进输入
+
+
+@dataclass(frozen=True, slots=True)
 class _Plan:
-    """调用决策要用的东西：选模型与选话题两道题，至少有一道。"""
+    """调用决策要用的东西：选模型、选话题与档案三道题，至少有一道。"""
 
     decider: DecisionModel
     settings: DecisionSettings
     question: ChoiceQuestion | None
     topic: _TopicPlan | None
+    profile: _ProfilePlan | None
     clock: Callable[[], float]
 
 
@@ -364,7 +416,8 @@ class Selection:
     `model` 一开始是退回用的模型，`run()` 结束后是选出的模型；`record` 是选模型那道题的记录，没有问时为
     `None`。`topic` 一开始是退回用的话题（`TopicQuery.fallback`；`None` 表示开新话题，没有启用话题线时也是
     `None`），`run()` 结束后是选出的话题；`second_topic` 是第二可能的已有话题；`topic_record` 是话题题的记录。
-    `run()` 被取消时取消照常传播（决策调用是在调用方的任务里直接 await 的，不留下后台任务），问了的题各记成一条
+    `update_profile` 在 `run()` 结束后表示这一轮要不要在后台更新档案（档案题的概率达到阈值），`profile_record`
+    是档案题的记录。`run()` 被取消时取消照常传播（决策调用是在调用方的任务里直接 await 的，不留下后台任务），问了的题各记成一条
     `error = CANCELLED` 的记录，`model` 与 `topic` 保持退回用的。
     """
 
@@ -389,6 +442,8 @@ class Selection:
         self.topic = topic
         self.second_topic: int | None = None
         self.topic_record: DecisionRecord | None = None
+        self.update_profile = False
+        self.profile_record: DecisionRecord | None = None
 
     @property
     def deciding(self) -> bool:
@@ -397,8 +452,10 @@ class Selection:
 
     @property
     def records(self) -> tuple[DecisionRecord, ...]:
-        """这次决策调用的各道题的记录（选模型在前）；它们共用一次调用的用量。"""
-        return tuple(r for r in (self.record, self.topic_record) if r is not None)
+        """这次决策调用的各道题的记录（选模型、选话题、档案的顺序）；它们共用一次调用的用量。"""
+        return tuple(
+            r for r in (self.record, self.topic_record, self.profile_record) if r is not None
+        )
 
     async def run(self, media: Sequence[DecisionMedia] = ()) -> str:
         """选出模型（与话题）。`media` 是和文字一起交给决策的媒体（调用方已按 `Router.decision_limits`
@@ -406,13 +463,16 @@ class Selection:
         plan = self._plan
         if plan is None:
             return self.model
-        questions: list[ChoiceQuestion] = []
+        questions: list[ChoiceQuestion | YesNoQuestion] = []
         if plan.question is not None:
             questions.append(plan.question)
         if plan.topic is not None:
             questions.append(plan.topic.question)
+        if plan.profile is not None:
+            questions.append(plan.profile.question)
+        profile = None if plan.profile is None else plan.profile.profile
         request = DecisionRequest(
-            input=decision_input(self._history, self._latest),
+            input=decision_input(self._history, self._latest, profile),
             questions=tuple(questions),
             media=tuple(media),
         )
@@ -430,6 +490,8 @@ class Selection:
                 self.record = self._model_record(plan, elapsed, None, choice, CANCELLED)
             if plan.topic is not None:
                 self.topic_record = self._topic_record(plan, elapsed, None, CANCELLED)
+            if plan.profile is not None:
+                self.profile_record = self._profile_record(plan, elapsed, None, CANCELLED)
             raise
         except TimeoutError:
             error = TIMEOUT
@@ -449,6 +511,9 @@ class Selection:
         if plan.topic is not None:
             answer = answers.get(TOPIC_QUESTION)
             self._settle_topic(plan, plan.topic, answer, error, elapsed, usage)
+        if plan.profile is not None:
+            answer = answers.get(PROFILE_QUESTION)
+            self._settle_profile(plan, plan.profile, answer, error, elapsed, usage)
         return self.model
 
     def _settle_model(
@@ -502,6 +567,65 @@ class Selection:
             record.chosen,
             probabilities[record.chosen],
             also,
+        )
+
+    def _settle_profile(
+        self,
+        plan: _Plan,
+        profile: _ProfilePlan,
+        answer: Answer | None,
+        error: str | None,
+        elapsed: float,
+        usage: Usage | None,
+    ) -> None:
+        chance: float | None = None
+        if error is None:
+            match answer:
+                case YesNoAnswer(probability=probability):
+                    chance = probability
+                case Refusal():
+                    error = ErrorKind.REFUSED.value
+                case _:  # 这道题的答案不合法（适配器逐题标出的 `Malformed`）
+                    error = ErrorKind.MALFORMED.value
+        self.update_profile = chance is not None and chance >= profile.threshold - _EPSILON
+        record = self._profile_record(plan, elapsed, chance, error, usage)
+        self.profile_record = record
+        if chance is None:
+            logger.warning(
+                "用户 %s 的档案判断失败（%s，%d 毫秒），这一轮不更新档案",
+                self._label,
+                error,
+                record.latency_ms,
+            )
+            return
+        logger.info(
+            "用户 %s 的档案判断：%s（%.2f）",
+            self._label,
+            "要更新" if self.update_profile else "不用更新",
+            chance,
+        )
+
+    def _profile_record(
+        self,
+        plan: _Plan,
+        elapsed: float,
+        chance: float | None,
+        error: str | None,
+        usage: Usage | None = None,
+    ) -> DecisionRecord:
+        """档案题的记录：概率记成 `PROFILE_UPDATE` / `PROFILE_KEEP` 两项，不含档案内容。"""
+        return DecisionRecord(
+            question=PROFILE_QUESTION,
+            provider=plan.decider.provider,
+            provider_model=plan.decider.model,
+            probabilities=None
+            if chance is None
+            else {PROFILE_UPDATE: chance, PROFILE_KEEP: 1 - chance},
+            chosen=PROFILE_UPDATE if self.update_profile else PROFILE_KEEP,
+            kept_previous=False,
+            latency_ms=round(elapsed * 1000),
+            error=error,
+            usage=usage,
         )
 
     @staticmethod

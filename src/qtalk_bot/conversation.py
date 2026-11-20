@@ -86,7 +86,8 @@
   用户自己的流水里（他的消息与回复他的消息）找被引用消息的话题（`topics.quoted_topic()`）；找到就定下它，话题题
   不问。回复的引用索引在回答送达后存进回复行（`ReplyChannel` 的发送方法返回它，经 `_Outbox.ref_idx` 与
   `_Outcome.ref_idx`）。
-- 选话题与选模型在同一次决策调用里（`routing.Router.select()` 的 `topics`）；两道都不问时不调用决策。
+- 选话题与选模型在同一次决策调用里（`routing.Router.select()` 的 `topics`）；启用了档案题时它也在其中（见下文
+  「用户档案」）；一道都不问时不调用决策。
 - 决策之后在事务里复查授权，按选中的话题组装上下文（`_topic_context()`）：不分话题的最近 `[topics].recent_turns`
   轮、选中话题最近 `[chat].history_turns` 轮（`journal.topic_history()`），合并去重（`context.merge_history()`）；
   选中话题与第二可能的话题的摘要、别的话题的标题（目录）放进系统提示词（`prompt.Memory`）。没有话题的旧消息只经
@@ -96,6 +97,13 @@
   不写；因插话停下已在显示的回答的那一轮照写。
 - 话题题的决策记录与选模型的写在一起，同一次调用只记一次用量。
 - 写了归属、正常结束的一轮，交给 `memory.Summarizer` 在后台更新这个话题的标题与摘要（配置了 `[memory]` 时）。
+
+**用户档案**（里程碑 6b，`Router.profiling`，即启用了话题线又配置了 `[memory]` 时）：
+- 开轮的事务里取出这个用户现有的档案，经 `Router.select()` 放进决策的输入，决策每轮多问一道档案题（见 `routing.py`）。
+- 选完话题后组装上下文的同一个事务里再取一次档案，放进系统提示词（`prompt.Memory.profile`）；只要分话题、有档案
+  就放，不看这一轮问没问档案题。
+- 档案题的概率达到阈值（`Selection.update_profile`）、这一轮写了话题归属、没有被取消时，记账之后交给
+  `memory.Summarizer.schedule_profile()` 在后台重写档案，输入是这一轮的用户消息与回复。
 
 **画图**（里程碑 10）：构造时给了出图器与 `[image_generation]`、这次调用的模型打开了 `image_generation`（且能存附件）
 时，组装请求时列出「可以引用的图片」（`RequestBuilder.build(referable_images=True)`），请求带上画图函数
@@ -149,7 +157,7 @@ from math import inf
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
-from . import access, citations, drawing, faces, journal, texts, topics
+from . import access, citations, drawing, faces, journal, profiles, texts, topics
 from .access import User
 from .citations import Source
 from .commands import day_start
@@ -607,6 +615,7 @@ class _Begun:
     received_at: float | None = (
         None  # 回复所挂的那条消息记进流水的时刻（`Conversation` 的墙上时钟）
     )
+    profile: str = field(default="", repr=False)  # 问档案题时这个用户现有的档案，放进决策的输入
 
     @property
     def last_message_id(self) -> int:
@@ -1071,6 +1080,7 @@ class Conversation:
             label=user.label,
             candidates=plan.candidates,
             topics=begun.topics,
+            profile=begun.profile,
         )
         builder = RequestBuilder(
             None if self._fetcher is None else self._fetcher.store,
@@ -1139,7 +1149,7 @@ class Conversation:
             entry.message_id for entry in begun.current if entry.message_id is not None
         ]
         processes = [*control.earlier, turn.process]
-        topic_id = await asyncio.shield(
+        attributed = await asyncio.shield(
             self._record(
                 turn,
                 begun.last_message_id,
@@ -1153,8 +1163,10 @@ class Conversation:
             raise cancelled
         if outcome.delivery is not ReplyDelivery.WITHHELD:  # 结局 skipped 的也是 withheld
             self._schedule_descriptions(user, begun)
-        if topic_id is not None and self._summarizer is not None:
-            self._summarizer.schedule(user, topic_id)
+        if attributed is not None and self._summarizer is not None:
+            self._summarizer.schedule(user, attributed.topic_id)
+            if turn.selection.update_profile:
+                self._summarizer.schedule_profile(user, turn_messages, attributed.reply_id)
 
     async def _acquire(self, user: User, message: ChatInput) -> list[Acquired]:
         if self._fetcher is None:
@@ -1201,11 +1213,11 @@ class Conversation:
         turn_messages: Sequence[int],
         process: str | None = None,
         title_text: str | None = None,
-    ) -> int | None:
+    ) -> _Attributed | None:
         """记账。`turn_messages` 是这一轮的全部用户消息（含并进来的），它们的附件按这一轮重记 `given`。
 
         `title_text` 不为空（分话题）时，这一轮结束了就把它的消息与回复归到选中的话题（新话题以它为临时标题），
-        返回实际归到的话题编号；没有写归属时返回 `None`。
+        返回实际归到的话题编号与回复编号；没有写归属时返回 `None`。
         """
         # 没有调用过对话模型时（选完模型后发现已不能使用对话，或正在决策时被取消）没有调用结果：结局记成
         # 没有调用或被取消，不记对话的用量。
@@ -1236,7 +1248,7 @@ class Conversation:
         topic: _TopicWrite | None = None
         if title_text is not None and journal.ends_turn(outcome.content, outcome.delivery):
             topic = _TopicWrite(turn.selection.topic, title_text)
-        topic_id = await self._db.transaction(
+        attributed = await self._db.transaction(
             self._finish,
             turn.user,
             message_id,
@@ -1267,7 +1279,7 @@ class Conversation:
             commentaries,
             turn.process.chunks,
         )
-        return topic_id
+        return attributed
 
     async def _record_preempted(self, turn: _Turn, message_id: int) -> None:
         await self._db.transaction(
@@ -1370,6 +1382,10 @@ class Conversation:
                 ),
                 pinned=pinned,
             )
+        profile = ""
+        if self._router.profiling:
+            found = profiles.get_profile(conn, user.id)  # 只取这个用户的
+            profile = "" if found is None else found.content
         received_at = journal.message_time(conn, user.id, message_ids[-1])
         return _Begun(
             tuple(message_ids),
@@ -1380,6 +1396,7 @@ class Conversation:
             previous,
             query,
             None if received_at is None else float(received_at),
+            profile,
         )
 
     def _topic_context(
@@ -1390,8 +1407,8 @@ class Conversation:
         topic_id: int | None,
         second_id: int | None,
     ) -> tuple[list[HistoryEntry], Memory] | None:
-        """分话题时选完话题后的上下文：历史（不分话题的最近几轮加选中话题的最近几轮，合并去重）与记忆（摘要、
-        目录）。一律只取这个用户的；复查授权不通过时返回 `None`。"""
+        """分话题时选完话题后的上下文：历史（不分话题的最近几轮加选中话题的最近几轮，合并去重）与记忆（档案、
+        摘要、目录）。一律只取这个用户的；复查授权不通过时返回 `None`。"""
         settings = self._router.topics
         if settings is None or not access.chat_allowed(conn, user.id, self._admin_openid):
             return None
@@ -1410,7 +1427,9 @@ class Conversation:
             for t in topics.recent_topics(conn, user.id, settings.directory + 1)
             if topic is None or t.id != topic.id
         ][: settings.directory]
+        profile = profiles.get_profile(conn, user.id)
         memory = Memory(
+            profile="" if profile is None else profile.content,
             summary=(topic.summary or "") if topic is not None else "",
             related_title="" if related is None else related.display_title,
             related_summary=(related.summary or "") if related is not None else "",
@@ -1425,8 +1444,8 @@ class Conversation:
         message_id: int,
         decisions: Sequence[DecisionRecord],
         reply: _Reply,
-    ) -> int | None:
-        """写入一轮的记账；写了话题归属时返回话题编号。"""
+    ) -> _Attributed | None:
+        """写入一轮的记账；写了话题归属时返回话题编号与回复编号。"""
         now = int(self._clock())
         _record_decisions(conn, user.id, message_id, decisions, now)
         reply_id = journal.add_reply(
@@ -1449,7 +1468,7 @@ class Conversation:
         _record_usage(conn, user.id, message_id, reply.attempts, now)
         if reply.topic is None:
             return None
-        return topics.attribute(
+        topic_id = topics.attribute(
             conn,
             user.id,
             reply.topic.topic_id,
@@ -1458,6 +1477,7 @@ class Conversation:
             reply_id=reply_id,
             now=now,
         )
+        return _Attributed(topic_id, reply_id)
 
     def _finish_preempted(
         self,
@@ -2118,6 +2138,14 @@ class _Reply:
     process: str | None = field(default=None, repr=False)  # 处理过程的全文，只存档
     topic: _TopicWrite | None = None  # 分话题、这一轮结束了时要写的话题归属
     images: tuple[DrawnImage, ...] = field(default=(), repr=False)  # 这一轮发出去的图，挂到回复上
+
+
+@dataclass(frozen=True, slots=True)
+class _Attributed:
+    """一轮结束、写了话题归属：归到的话题与这一轮的回复。"""
+
+    topic_id: int
+    reply_id: int
 
 
 @dataclass(frozen=True, slots=True)

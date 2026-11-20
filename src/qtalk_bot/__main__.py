@@ -178,12 +178,16 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                     db,
                     admin_openid=secrets.admin_openid,
                     models=models,
-                    # 话题线只在配置了 [decisions] 时启用：Router 没有决策时不理会 topics。
+                    # 话题线只在配置了 [decisions] 时启用：Router 没有决策时不理会 topics。档案题只在
+                    # 有后台重写档案的 Summarizer（生效的 [memory]）时问。
                     router=Router(
                         settings.models,
                         settings.decisions,
                         models.decider,
                         topics=settings.topics,
+                        profile_threshold=None
+                        if memory is None or summarizer is None
+                        else memory.profile_threshold,
                     ),
                     settings=settings.chat,
                     timezone=settings.timezone,

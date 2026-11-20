@@ -410,6 +410,17 @@ _V12_CACHED_INPUT = """
 ALTER TABLE usage ADD COLUMN cached_input_tokens INTEGER CHECK (cached_input_tokens >= 0);
 """
 
+_V13_PROFILES = """
+-- 用户档案：每个用户一行，几百字的稳定事实（称呼、偏好、重要的人和事），由后台的模型按对话重写（里程碑 6b）。
+-- 属于派生数据，以后可以从流水重算。content 是整理过的纯文本（见 profiles.clean_profile()），长度上限由程序
+-- 检查，不写进 CHECK（上限以后可能调整）；档案为空时不留行。updated_at 是最近一次写入的时刻。
+CREATE TABLE profiles (
+    user_id INTEGER PRIMARY KEY REFERENCES users (id),
+    content TEXT NOT NULL CHECK (content != ''),
+    updated_at INTEGER NOT NULL
+) STRICT;
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     _V1_ACCESS,
     _V2_CHAT,
@@ -423,6 +434,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     _V10_MEMORY_USAGE,
     _V11_IMAGES,
     _V12_CACHED_INPUT,
+    _V13_PROFILES,
 )
 """本程序的迁移列表。业务表由各里程碑在末尾追加，已发布的不能修改。"""
 

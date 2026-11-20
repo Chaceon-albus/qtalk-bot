@@ -724,6 +724,20 @@ def topic_turns_after(
     return _entries(conn, user_id, [(row, 0) for row in rows]), int(through)
 
 
+def reply_entry(conn: sqlite3.Connection, user_id: int, reply_id: int) -> HistoryEntry | None:
+    """这个用户的一条助手回复（带上那一轮里模型画的图）；不是他的、不是回复，或正文为空又没有画图时返回
+    `None`。"""
+    row = conn.execute(
+        "SELECT id, role, content, faces_only, reply_to FROM messages"
+        " WHERE id = ? AND user_id = ? AND role = 'assistant'",
+        (reply_id, user_id),
+    ).fetchone()
+    if row is None:
+        return None
+    entries = _entries(conn, user_id, [(row, 0)])
+    return entries[0] if entries else None
+
+
 def pending_messages(conn: sqlite3.Connection, user_id: int, before: int) -> list[HistoryEntry]:
     """这个用户在消息 `before` 之前、最近一个轮次边界（`_last_boundary()`）之后还没有回复的用户消息（与它们的
     附件），按时间排列。

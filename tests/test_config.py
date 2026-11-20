@@ -9,6 +9,7 @@ from qtalk_bot.config import (
     DEFAULT_FILE_INSTRUCTIONS,
     DEFAULT_MEMORY_INSTRUCTIONS,
     DEFAULT_PERSONA,
+    DEFAULT_PROFILE_INSTRUCTIONS,
     MAX_ATTACHMENT_WAIT_SECONDS,
     AttachmentSettings,
     AttachmentTimeoutAction,
@@ -1349,10 +1350,40 @@ def test_memory_is_optional_and_read(tmp_path: Path) -> None:
             "memory.reasoning：应为小写字母开头的标识符（小写字母、数字、`_`），如 high",
         ),
         ('provider = "openai"\nmodel = "m"\nlimit = 3', "memory.limit：未知的键"),
+        (
+            'provider = "openai"\nmodel = "m"\nprofile_threshold = 0',
+            "memory.profile_threshold：应大于 0、不大于 1",
+        ),
+        (
+            'provider = "openai"\nmodel = "m"\nprofile_threshold = 1.5',
+            "memory.profile_threshold：应大于 0、不大于 1",
+        ),
+        (
+            'provider = "openai"\nmodel = "m"\nprofile_threshold = "高"',
+            "memory.profile_threshold：应为数字，实际是字符串",
+        ),
+        (
+            'provider = "openai"\nmodel = "m"\nprofile_instructions = " "',
+            "memory.profile_instructions：不能为空",
+        ),
     ],
 )
 def test_invalid_memory(tmp_path: Path, text: str, problem: str) -> None:
     assert config_error(write_config(tmp_path, f"[memory]\n{text}\n")).problems == (problem,)
+
+
+def test_profile_settings_default_and_read(tmp_path: Path) -> None:
+    text = '[memory]\nprovider = "openai"\nmodel = "m"\n'
+    memory = load_settings(write_config(tmp_path, text)).memory
+    assert memory is not None
+    assert (memory.profile_threshold, memory.profile_instructions) == (
+        0.5,
+        DEFAULT_PROFILE_INSTRUCTIONS,
+    )
+    text += 'profile_threshold = 1\nprofile_instructions = "重写档案。"\n'
+    memory = load_settings(write_config(tmp_path, text, "b.toml")).memory
+    assert memory is not None
+    assert (memory.profile_threshold, memory.profile_instructions) == (1.0, "重写档案。")
 
 
 @pytest.mark.parametrize(
