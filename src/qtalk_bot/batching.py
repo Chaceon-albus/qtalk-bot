@@ -76,7 +76,14 @@ from typing import Protocol
 
 from .access import User
 from .config import AttachmentTimeoutAction, TurnSettings
-from .conversation import ChatInput, Received, ReplyChannel, ReplyStream, TurnControl
+from .conversation import (
+    ChatInput,
+    ChoiceButton,
+    Received,
+    ReplyChannel,
+    ReplyStream,
+    TurnControl,
+)
 from .journal import ROWS_PER_TURN
 from .media import SUPPORTED_KINDS, AttachmentKind
 from .process import ReplyBudget
@@ -191,7 +198,13 @@ class Responder(Protocol):
         control: TurnControl | None = None,
     ) -> None: ...
 
-    async def judge(self, user: User, answering: Sequence[int], latest: Sequence[int]) -> Steer: ...
+    async def judge(
+        self,
+        user: User,
+        answering: Sequence[int],
+        latest: Sequence[int],
+        displaying: bool = False,
+    ) -> Steer: ...
 
     async def ask(self, user: User, messages: Sequence[int], channel: ReplyChannel) -> None: ...
 
@@ -564,7 +577,7 @@ class Batcher:
                             if (item := a.recorded) is not None
                         ]
                         judging = asyncio.create_task(
-                            self._responder.judge(user, control.included, latest)
+                            self._responder.judge(user, control.included, latest, control.displayed)
                         )
                 await self._woken(state, task, judging)
         finally:
@@ -715,6 +728,10 @@ class _RoutedChannel:
     ) -> str | None:
         # 收消息时不发图；为了符合协议照样转发，计数与发送落在同一个通道上（同 `send()`）。
         return await self._target().send_image(data, mime_type, replying)
+
+    async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
+        # 收消息时不发按钮；为了符合协议照样转发（同 `send_image()`）。
+        await self._target().send_buttons(markdown, buttons)
 
     def open_process(self) -> ReplyStream:
         raise AssertionError("收消息时不发过程消息")

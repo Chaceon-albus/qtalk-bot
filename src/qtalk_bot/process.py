@@ -123,6 +123,11 @@ class ReplyBudget:
         """再发一条过程消息之后，是否还给回答留着 `ANSWER_RESERVE` 次。"""
         return self.affords(1)
 
+    def affords_last(self) -> bool:
+        """还能再发一条被动回复（不再给之后留余量）：一轮的回答都发完了，最后附上的一条（如忘掉话题的确认按钮）用。"""
+        replies = self.replies + 1
+        return replies <= MAX_PASSIVE_REPLIES and replies + self.typings <= MAX_PASSIVE_SENDS
+
     def affords_continuation(self) -> bool:
         """回答已经开始显示，再开一条流式消息接着写（主动分条）之后，是否还给兜底留着 2 次：新的一条被拒时先改发
         纯文本，纯文本也被拒再发固定说明，两次都计数（评审修正）。"""

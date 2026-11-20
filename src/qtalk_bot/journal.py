@@ -191,6 +191,42 @@ def add_user_message(
     return message_id
 
 
+def latest_message_id(conn: sqlite3.Connection, user_id: int) -> int | None:
+    """这个用户在流水里最新的一条用户消息的编号；还没有时返回 `None`。"""
+    row = conn.execute(
+        "SELECT max(id) AS latest FROM messages WHERE user_id = ? AND role = 'user'", (user_id,)
+    ).fetchone()
+    return None if row is None or row["latest"] is None else int(row["latest"])
+
+
+def owned_message(conn: sqlite3.Connection, user_id: int, message_id: int | None) -> int | None:
+    """`message_id` 还在、又属于这个用户时原样返回，否则返回 `None`。后台调用（摘要、档案、附件描述）记用量时用：
+    调用期间来源消息可能被用户要求删掉了（遗忘话题），挂不上就以空引用记下，免得外键失败、整笔用量丢失。"""
+    if message_id is None:
+        return None
+    row = conn.execute(
+        "SELECT 1 FROM messages WHERE id = ? AND user_id = ?", (message_id, user_id)
+    ).fetchone()
+    return None if row is None else message_id
+
+
+def owned_messages(conn: sqlite3.Connection, user_id: int, message_ids: Iterable[int]) -> set[int]:
+    """`message_ids` 里还在、又属于这个用户的那些。"""
+    ids = sorted(set(message_ids))
+    found: set[int] = set()
+    for start in range(0, len(ids), 500):
+        chunk = ids[start : start + 500]
+        marks = ", ".join("?" * len(chunk))
+        found.update(
+            int(row["id"])
+            for row in conn.execute(
+                f"SELECT id FROM messages WHERE user_id = ? AND id IN ({marks})",  # noqa: S608  只拼 ? 占位符
+                (user_id, *chunk),
+            )
+        )
+    return found
+
+
 def add_attachment(
     conn: sqlite3.Connection,
     *,
@@ -446,8 +482,8 @@ def expire_attachments(conn: sqlite3.Connection, cutoff: int) -> list[tuple[int,
         (cutoff,),
     ).fetchall()
     conn.executemany(
-        "UPDATE attachments SET status = 'expired', path = NULL WHERE id = ?",
-        [(row["id"],) for row in rows],
+        "UPDATE attachments SET status = 'expired', path = NULL WHERE id = ? AND user_id = ?",
+        [(row["id"], row["user_id"]) for row in rows],
     )
     return [(row["user_id"], row["path"]) for row in rows]
 

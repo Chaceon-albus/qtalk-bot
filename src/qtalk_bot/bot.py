@@ -1,6 +1,6 @@
 """接线层：把 pyqbot 的事件转成普通数据交给 `Gate`，再按结果回复或交给对话处理器。
 
-只注册单聊消息与加好友两个处理函数，群聊明确不做。这里尽量薄，判断都在 `gate.py` 与 `conversation.py`。
+只注册单聊消息、加好友与按钮互动（忘掉话题的确认按钮）的处理函数，群聊明确不做。这里尽量薄，判断都在 `gate.py` 与 `conversation.py`。
 
 日志不记 openid 与消息正文。pyqbot 的异常文案里可能带 openid（请求路径），所以这里只记异常类型、
 `err_code` 与 `trace_id`。
@@ -34,7 +34,15 @@ from .access import User
 from .alerts import AlertGroup, Alerts, AlertSendError
 from .batching import Batcher
 from .chat import ChatHandler
-from .conversation import ChatInput, SendError, SendRejectedError, SendUncertainError
+from .conversation import (
+    FORGET_PREFIX,
+    KEEP_PREFIX,
+    ChatInput,
+    ChoiceButton,
+    SendError,
+    SendRejectedError,
+    SendUncertainError,
+)
 from .gate import Chat, Delivery, FriendAdded, Gate, IncomingMessage, Reply, ShareLinkError
 from .media import (
     GIF,
@@ -66,16 +74,30 @@ PLATFORM_HOSTS = (
 _HOST = re.compile(r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
 
 
-def register(
-    bot: pyqbot.Bot, gate: Gate, chat: ChatHandler, *, hosts: Sequence[str] = PLATFORM_HOSTS
-) -> Handlers:
-    """在 `bot` 上注册单聊消息与加好友的处理函数。关停时要在关数据库之前等返回值的 `drain()`。
+type ButtonHandler = Callable[[str, str, Callable[[str], Awaitable[None]]], Awaitable[None]]
+"""处理回调按钮：参数是点按钮的人的 openid、按钮数据与回复用户的函数（处理方在合适的时候调用它，见
+`conversation.Conversation.press_button()`）。"""
 
-    `hosts` 是下载白名单（`download_hosts()` 合并后的），形态日志按它决定记不记主机名。
+
+def register(
+    bot: pyqbot.Bot,
+    gate: Gate,
+    chat: ChatHandler,
+    *,
+    hosts: Sequence[str] = PLATFORM_HOSTS,
+    buttons: ButtonHandler | None = None,
+) -> Handlers:
+    """在 `bot` 上注册单聊消息、加好友与（给了 `buttons` 时）互动的处理函数。关停时要在关数据库之前等返回值的
+    `drain()`。
+
+    `hosts` 是下载白名单（`download_hosts()` 合并后的），形态日志按它决定记不记主机名。`buttons` 处理忘掉话题的
+    确认按钮（`conversation.Conversation.press_button()`）；`Bot` 默认先替我们回应互动（`auto_ack`），这里只管回复。
     """
-    handlers = Handlers(gate, chat, hosts=hosts)
+    handlers = Handlers(gate, chat, hosts=hosts, buttons=buttons)
     bot.on_c2c_message(handlers.on_c2c_message)
     bot.on_friend_add(handlers.on_friend_add)
+    if buttons is not None:
+        bot.on_interaction(handlers.on_interaction)
     return handlers
 
 
@@ -549,6 +571,16 @@ class _QQReplyChannel:
         sent = await _guarded(self._message.reply(media=photo))
         return None if sent.ext_info is None else _ref_value(sent.ext_info.ref_idx)
 
+    async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
+        """Markdown 加一行回调按钮（键盘只能随 Markdown 发，pyqbot guide 第 3 节；单聊实测可发，errata「键盘」）。"""
+        keyboard = pyqbot.Keyboard.from_rows(
+            [
+                pyqbot.Button.callback(b.label, b.data, visited_label=b.visited_label)
+                for b in buttons
+            ]
+        )
+        await _guarded(self._message.reply(markdown=markdown, keyboard=keyboard))
+
 
 class _QQProcessStream:
     """过程消息：另一条被动回复的流式消息（`coalesce=False`），符合 `conversation.ReplyStream`。用纯文本发
@@ -608,7 +640,7 @@ class _KeyedLock:
 
 
 class Handlers:
-    """前台的处理函数（单聊消息、加好友）。
+    """前台的处理函数（单聊消息、加好友、按钮的互动）。
 
     每次处理从 Gate 的决定开始，到对话处理器把放行的消息写进流水（或回复链收尾）为止，都由这里跟踪，关停时
     `drain()` 在关数据库之前等它们。pyqbot 关闭时只等处理函数 5 秒：数据库的队列堵着时，受保护的 Gate 事务
@@ -617,11 +649,17 @@ class Handlers:
     """
 
     def __init__(
-        self, gate: Gate, chat: ChatHandler, *, hosts: Sequence[str] = PLATFORM_HOSTS
+        self,
+        gate: Gate,
+        chat: ChatHandler,
+        *,
+        hosts: Sequence[str] = PLATFORM_HOSTS,
+        buttons: ButtonHandler | None = None,
     ) -> None:
         self._gate = gate
         self._chat = chat
         self._hosts = tuple(hosts)
+        self._buttons = buttons
         # 同一个人的回复链成组发出：管理员连发两条 /invite 时，两组「状态 + 邀请」不会交叉，免得把
         # 不带备注的邀请转发错人。只锁回复链的发送，对话处理器不在锁里。
         self._reply_locks = _KeyedLock()
@@ -651,6 +689,26 @@ class Handlers:
     async def on_friend_add(self, event: pyqbot.FriendAdd) -> None:
         async with self._tracking():
             await self._on_friend_add(event)
+
+    async def on_interaction(self, interaction: pyqbot.Interaction) -> None:
+        """点了回调按钮：只处理忘掉话题的确认按钮（`FORGET_PREFIX`、`KEEP_PREFIX` 开头），交给 `buttons`，连同一个经
+        `interaction.reply()` 回复用户的函数（发送失败只记日志）。互动已由 `Bot` 先回应（`auto_ack`）；回复由处理方在
+        这个用户的锁里发，不插进正在写的流式回答。别的互动（资料卡的开关等）不理会。"""
+        async with self._tracking():
+            data = interaction.button_data or ""
+            openid = interaction.user_openid
+            if self._buttons is None or openid is None:
+                return
+            if not data.startswith((FORGET_PREFIX, KEEP_PREFIX)):
+                return
+
+            async def reply(text: str) -> None:
+                try:
+                    await interaction.reply(text)
+                except pyqbot.QQBotError as exc:
+                    logger.warning("回复按钮的互动失败：%s", _describe(exc))
+
+            await self._buttons(openid, data, reply)
 
     async def _on_c2c_message(self, message: pyqbot.C2CMessage) -> None:
         """一条单聊消息：交给 Gate，放行的交给对话处理器，Gate 的回复（管理员命令的回复、给未授权用户的拒绝等）

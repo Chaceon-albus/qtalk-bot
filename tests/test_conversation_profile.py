@@ -38,7 +38,7 @@ from qtalk_bot.journal import DECISION_USAGE_MODEL, MEMORY_USAGE_MODEL
 from qtalk_bot.llm import ChatEvent, ChatRequest, Provider, TextDelta, Usage
 from qtalk_bot.llm.decisions import DecisionRequest, DecisionResult, YesNoAnswer
 from qtalk_bot.memory import Summarizer
-from qtalk_bot.prompt import PROFILE_NOTICE
+from qtalk_bot.prompt import PROFILE_NOTICE, profile_block
 from qtalk_bot.routing import PROFILE_KEEP, PROFILE_QUESTION, PROFILE_UPDATE, Router
 from qtalk_bot.storage import DATABASE_FILENAME, Database
 
@@ -173,7 +173,7 @@ async def test_profile_question_rides_along_and_the_rewrite_feeds_later_turns(
     assert decision_input(second)["profile"] == NEW
     system = model.requests[-1].system
     assert PROFILE_NOTICE in system
-    assert f"用户档案：\n{NEW}" in system
+    assert f"用户档案：\n{profile_block(NEW)}" in system
     await settle(chat)
 
     # 决策记录：每轮一行档案题；用量每次决策调用一行，后台的摘要与档案各记 memory。
@@ -239,7 +239,7 @@ async def test_without_memory_there_is_no_profile_question_but_a_stored_profile_
 
     assert all(PROFILE_QUESTION not in [q.name for q in r.questions] for r in decider.requests)
     assert all("profile" not in decision_input(r) for r in decider.requests)
-    assert all(f"用户档案：\n{NEW}" in r.system for r in model.requests)
+    assert all(f"用户档案：\n{profile_block(NEW)}" in r.system for r in model.requests)
 
 
 async def test_one_users_profile_never_reaches_another_user(db: Database) -> None:
@@ -262,7 +262,7 @@ async def test_one_users_profile_never_reaches_another_user(db: Database) -> Non
         assert "小王" not in request.input
     for request in model.requests:
         assert "小王" not in request.system
-    assert "用户档案：\n- 称呼：小李" in model.requests[-1].system
+    assert f"用户档案：\n{profile_block('- 称呼：小李')}" in model.requests[-1].system
     for request in writer.rewrites.requests:
         assert "小王" not in text_of(request.messages[0].parts[0])
     assert await profile_of(db, alice) == secret

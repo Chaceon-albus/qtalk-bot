@@ -22,7 +22,14 @@ from qtalk_bot.batching import (
     next_step,
 )
 from qtalk_bot.config import AttachmentTimeoutAction, TurnSettings
-from qtalk_bot.conversation import ChatInput, Received, ReplyChannel, ReplyStream, TurnControl
+from qtalk_bot.conversation import (
+    ChatInput,
+    ChoiceButton,
+    Received,
+    ReplyChannel,
+    ReplyStream,
+    TurnControl,
+)
 from qtalk_bot.journal import ROWS_PER_TURN
 from qtalk_bot.media import AttachmentKind, IncomingAttachment
 from qtalk_bot.process import ANSWER_RESERVE, MAX_PASSIVE_REPLIES, ReplyBudget
@@ -187,6 +194,9 @@ class Channel:
         replying()
         self.sent.append(f"[图片 {mime_type}]")
 
+    async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
+        self.sent.append(f"[按钮] {markdown}")
+
     def open_process(self) -> ReplyStream:
         raise AssertionError("这里的替身不发过程消息")
 
@@ -234,6 +244,7 @@ class FakeResponder:
     answered: list[Answered] = field(default_factory=list[Answered])
     controls: list[TurnControl] = field(default_factory=list[TurnControl])
     judged: list[Judged] = field(default_factory=list[Judged])
+    displaying: list[bool] = field(default_factory=list[bool])  # 每次判断时回答是否已经在显示
     judges_cancelled: int = 0
     judge_cleanup: asyncio.Event | None = (
         None  # 不为空时判断被取消后要等它（模拟收尾时写数据库排着队）
@@ -310,8 +321,15 @@ class FakeResponder:
         finally:
             self.answering -= 1
 
-    async def judge(self, user: User, answering: Sequence[int], latest: Sequence[int]) -> Steer:
+    async def judge(
+        self,
+        user: User,
+        answering: Sequence[int],
+        latest: Sequence[int],
+        displaying: bool = False,
+    ) -> Steer:
         self.judged.append(Judged(user.id, list(answering), list(latest)))
+        self.displaying.append(displaying)
         try:
             if self.judge_gate is not None:
                 await self.judge_gate.wait()
@@ -1700,3 +1718,19 @@ async def test_one_users_answer_does_not_take_another_users_replies(clock: Manua
     await finish(chat)
     assert responder.started[0].user == ALICE.id
     assert len(responder.started) == 1
+
+
+@pytest.mark.parametrize("shown", [False, True])
+async def test_judge_is_told_whether_the_answer_is_showing(clock: ManualClock, shown: bool) -> None:
+    responder = FakeResponder(clock, verdicts=[Steer.NEW], cuttable=True)
+    chat = batcher_of(responder)
+    await answering(chat, responder)
+    if shown:
+        assert responder.controls[0].claim()
+
+    await submit(chat, ALICE, text("嗯"), "嗯")
+
+    assert responder.displaying == [shown]
+    assert responder.answer_gate is not None
+    responder.answer_gate.set()
+    await settle()

@@ -509,9 +509,10 @@ async def test_context_merges_recent_turns_with_the_topics_turns_in_order(db: Da
     # 选中话题甲的最近 2 轮（甲1、甲2），加上不分话题的最近 1 轮（乙2），按时间排列；乙1 不带。
     request = model.requests[-1]
     assert texts_of(request) == ["甲1", "答", "甲2", "答", "乙2", "答", "甲3"]
-    # 目录里只有别的话题（乙），不含当前话题（甲）。
-    assert "- 乙1" in request.system
-    assert "- 甲1" not in request.system
+    # 目录里只有别的话题（乙），带编号，不含当前话题（甲）；当前话题的编号单独给出。
+    assert f"- #{b} 乙1" in request.system
+    assert "甲1" not in request.system.split("这个用户最近还聊过这些话题")[1]
+    assert f"当前话题的编号是 #{a}。" in request.system
 
     # 不分话题的最近几轮与话题里的几轮重叠时按消息去重。
     decider.then(topic_answer(new=0.0, **{f"t{a}": 1.0, f"t{b}": 0.0}))
@@ -544,14 +545,15 @@ async def test_summaries_of_the_topic_and_a_likely_second_topic_go_into_the_syst
     options = topic_question(decider).options
     assert [o.description for o in options[:2]] == ["乙的标题：乙的摘要", "甲的标题：甲的摘要"]
     system = model.requests[-1].system
-    assert "当前话题此前的摘要：\n甲的摘要" in system
-    assert "可能相关的另一个话题「乙的标题」的摘要：\n乙的摘要" in system
+    assert '当前话题此前的摘要：\n{"summary": "甲的摘要"}' in system
+    assert "可能相关的另一个话题 #" in system
+    assert '「乙的标题」的摘要：\n{"summary": "乙的摘要"}' in system
 
     decider.then(topic_answer(new=0.1, **{f"t{a}": 0.8, f"t{b}": 0.1}))
     await say(chat, alice, "还有呢")
     system = model.requests[-1].system
     assert "乙的摘要" not in system  # 第二可能的低于阈值，不带它的摘要
-    assert "- 乙的标题" in system  # 目录里照样有它的标题
+    assert "- #2 乙的标题" in system  # 目录里照样有它的标题
 
 
 async def test_messages_before_topics_appear_only_as_recent_turns(db: Database) -> None:
@@ -735,7 +737,7 @@ async def test_ended_turn_schedules_the_summary_which_later_turns_use(db: Databa
     await say(chat, alice, "回到快排")
     system = model.requests[-1].system
     assert MEMORY_NOTICE in system  # 摘要写成资料而不是指令
-    assert "当前话题此前的摘要：\n用户在学快排的分区。" in system
+    assert '当前话题此前的摘要：\n{"summary": "用户在学快排的分区。"}' in system
     await summarizer.aclose()
 
 

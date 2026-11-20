@@ -5,8 +5,10 @@
 
 - 档案是派生数据（流水仍只追加），由后台的模型按对话重写（`memory.Summarizer`），之后查看记忆、遗忘档案里的
   某条信息的工具也经这里的 `get_profile()`、`set_profile()`、`delete_profile()` 读写。
-- 存进库里的总是整理过的文本（`clean_profile()`），不超过 `PROFILE_LIMIT` 字；整理后为空的档案不留行，所以
+- 存进库里的总是整理过的文本（`clean_profile()`），不超过 `PROFILE_LIMIT` 字；整理后为空的档案算作没有，
   `get_profile()` 取到的内容一定不为空。
+- 每次修改（写入、替换、删除）都把版本号加一（`profile_version()`），删掉档案时保留行、内容置空，版本号接着用：
+  后台重写写回之前比较版本号，识别得出「改过又改回」（如重写期间写入某条又按用户要求删掉）。
 - 档案来自用户的对话，进系统提示词时写成资料而不是指令（见 `prompt.memory_section()`）。日志与异常文案不记它的
   内容。
 """
@@ -24,10 +26,12 @@ class ProfileTooLongError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class Profile:
-    """一个用户的档案：`content` 是整理过的文本（不为空），`updated_at` 是最近一次写入的时刻。"""
+    """一个用户的档案：`content` 是整理过的文本（不为空），`updated_at` 是最近一次写入的时刻，`version` 是
+    这次写入后的版本号（见 `profile_version()`）。"""
 
     content: str = field(repr=False)
     updated_at: int
+    version: int = 1
 
 
 def clean_profile(text: str) -> str:
@@ -43,35 +47,49 @@ def clean_profile(text: str) -> str:
 
 
 def get_profile(conn: sqlite3.Connection, user_id: int) -> Profile | None:
-    """这个用户的档案；还没有时返回 `None`。"""
+    """这个用户的档案；还没有（或已经删掉）时返回 `None`。"""
     row = conn.execute(
-        "SELECT content, updated_at FROM profiles WHERE user_id = ?", (user_id,)
+        "SELECT content, updated_at, version FROM profiles WHERE user_id = ? AND content != ''",
+        (user_id,),
     ).fetchone()
-    return None if row is None else Profile(row["content"], int(row["updated_at"]))
+    if row is None:
+        return None
+    return Profile(row["content"], int(row["updated_at"]), int(row["version"]))
+
+
+def profile_version(conn: sqlite3.Connection, user_id: int) -> int:
+    """这个用户的档案的版本号：每次修改（含删除）加一，从来没有过档案时是 0。"""
+    row = conn.execute("SELECT version FROM profiles WHERE user_id = ?", (user_id,)).fetchone()
+    return 0 if row is None else int(row["version"])
 
 
 def set_profile(conn: sqlite3.Connection, user_id: int, content: str, *, now: int) -> str:
     """写入或替换这个用户的档案，返回实际存下的文本（`clean_profile()` 整理过的）。
 
-    整理后为空时删掉这个用户的档案（不留行），返回空串。整理后超过 `PROFILE_LIMIT` 字时抛
+    整理后为空时删掉这个用户的档案（同 `delete_profile()`），返回空串。整理后超过 `PROFILE_LIMIT` 字时抛
     `ProfileTooLongError`，什么都不改。
     """
     cleaned = clean_profile(content)
     if len(cleaned) > PROFILE_LIMIT:
         raise ProfileTooLongError(f"档案有 {len(cleaned)} 字，超过上限 {PROFILE_LIMIT} 字")
     if not cleaned:
-        delete_profile(conn, user_id)
+        delete_profile(conn, user_id, now=now)
         return ""
     conn.execute(
-        "INSERT INTO profiles (user_id, content, updated_at) VALUES (?, ?, ?)"
+        "INSERT INTO profiles (user_id, content, version, updated_at) VALUES (?, ?, 1, ?)"
         " ON CONFLICT (user_id) DO UPDATE SET content = excluded.content,"
-        " updated_at = excluded.updated_at",
+        " version = profiles.version + 1, updated_at = excluded.updated_at",
         (user_id, cleaned, now),
     )
     return cleaned
 
 
-def delete_profile(conn: sqlite3.Connection, user_id: int) -> bool:
-    """删掉这个用户的档案；原来有档案时返回 `True`。"""
-    cursor = conn.execute("DELETE FROM profiles WHERE user_id = ?", (user_id,))
+def delete_profile(conn: sqlite3.Connection, user_id: int, *, now: int | None = None) -> bool:
+    """删掉这个用户的档案（保留行、内容置空、版本号加一）；原来有档案时返回 `True`，没有时什么都不改。
+    `now` 是删除的时刻，不给时沿用上次修改的时刻。"""
+    cursor = conn.execute(
+        "UPDATE profiles SET content = '', version = version + 1,"
+        " updated_at = coalesce(?, updated_at) WHERE user_id = ? AND content != ''",
+        (now, user_id),
+    )
     return cursor.rowcount > 0

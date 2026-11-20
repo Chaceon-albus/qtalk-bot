@@ -201,7 +201,13 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                 )
                 batcher = Batcher(conversation, settings.turns)
                 chat = QQChat(batcher)
-            handlers = register(bot, gate, chat, hosts=hosts)
+            handlers = register(
+                bot,
+                gate,
+                chat,
+                hosts=hosts,
+                buttons=None if conversation is None else conversation.press_button,
+            )
             cleanup = asyncio.create_task(run_cleanup(db, store, settings.attachments))
             logger.info("机器人启动")
             await bot.start()

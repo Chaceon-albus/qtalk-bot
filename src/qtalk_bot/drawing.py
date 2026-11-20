@@ -24,10 +24,12 @@ MAX_PROMPT_CHARS = 4000
 GENERATE_IMAGE = FunctionTool(
     name=FUNCTION_NAME,
     description=(
-        "画一张图，或按用户的要求修改、参照已有的图片重新画一张。用户想要一张图、或想改一张图时调用；"
-        "不要用文字假装画了图或描述一张并不存在的图。要修改或参照的图片只能用系统提示里「可以引用的图片」"
-        "列出的编号；新画一张时 reference_image_ids 为空数组。画好的图由程序直接发给用户，结果里也会附上"
-        "这张图；之后的回答简短说明即可，不用复述画面细节。"
+        "画一张图，或按用户的要求修改、参照已有的图片重新画一张。用户想要一张图片（插画、照片风格的图、海报、头像、"
+        "表情等）或想改一张图时调用；不要用文字假装画了图，也不要描述一张并不存在的图。用户要的是表格、公式、代码、"
+        "字符画，或只是让你看图、讲解图片时不要调用。每次调用画一张，要几张就调用几次，一轮最多 "
+        f"{MAX_IMAGES_PER_TURN} 张；用户每天能画的张数有限，不要画用户没有要的图。要修改或参照的图片只能用系统提示里"
+        "「可以引用的图片」列出的编号；新画一张时 reference_image_ids 为空数组。画好的图由程序直接发给用户，结果里也会"
+        "附上这张图；之后的回答简短说明即可，不用复述画面细节。没画成时结果会说明原因，如实告诉用户。"
     ),
     parameters={
         "type": "object",
@@ -35,7 +37,9 @@ GENERATE_IMAGE = FunctionTool(
             "prompt": {
                 "type": "string",
                 "description": (
-                    "画面描述：画什么、风格、构图、文字等，写得具体。改图时写明要怎么改、哪些保持不变。"
+                    "画面描述，写给图片模型看：画什么、风格、构图，写得具体；图里要出现的文字原样写在引号里。改图时也"
+                    "先用一两句写出改完之后的整个画面，再写明改哪里、哪些保持不变。开头的两三句要能概括整张图：它们"
+                    "会作为这张图的文字记录留在之后的对话里。"
                 ),
             },
             "aspect": {
@@ -118,7 +122,7 @@ def unknown_function(name: str) -> FunctionResult:
 
 def turn_full() -> FunctionResult:
     return failure(
-        f"这一轮已经画了 {MAX_IMAGES_PER_TURN} 张图，不能再画了。请直接回答用户，可以请对方之后再提。"
+        f"这一轮已经画了 {MAX_IMAGES_PER_TURN} 张图，不能再画了。请直接回答用户，还想要的话请对方再发一条消息。"
     )
 
 
@@ -128,7 +132,7 @@ def _numbers(ids: Sequence[int]) -> str:
 
 def bad_references(ids: Sequence[int]) -> FunctionResult:
     return failure(
-        f"编号 {_numbers(ids)} 不是「可以引用的图片」里列出的，或者那张图已经找不到了，没有画图。只能用系统提示"
+        f"编号 {_numbers(ids)} 不是「可以引用的图片」里列出的，或者那张图已经过期删除，没有画图。只能用系统提示"
         "里列出的编号；用户要改的图不在其中时，请对方重新发送那张图。"
     )
 
@@ -150,7 +154,9 @@ def total_limit() -> FunctionResult:
 
 
 def no_room() -> FunctionResult:
-    return failure("这条消息能回复的次数快用完了，不能再发图片，这次没有画。请直接用文字回答用户。")
+    return failure(
+        "受平台限制，这一轮不能再发图片了，这次没有画。请直接用文字回答，并告诉用户想要图的话再发一条消息说一声。"
+    )
 
 
 def blocked() -> FunctionResult:

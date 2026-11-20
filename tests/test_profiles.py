@@ -34,29 +34,47 @@ async def test_set_get_replace_and_delete(db: Database) -> None:
     )
     assert stored == "- 称呼：小王"
     assert await db.transaction(profiles.get_profile, alice.id) == Profile("- 称呼：小王", START)
+    assert await db.transaction(profiles.profile_version, alice.id) == 1
 
     await db.transaction(
         lambda conn: profiles.set_profile(conn, alice.id, "- 称呼：老王", now=START + 5)
     )
     assert await db.transaction(profiles.get_profile, alice.id) == Profile(
-        "- 称呼：老王", START + 5
+        "- 称呼：老王", START + 5, version=2
     )
 
     assert await db.transaction(profiles.delete_profile, alice.id)
     assert not await db.transaction(profiles.delete_profile, alice.id)
     assert await db.transaction(profiles.get_profile, alice.id) is None
+    # 删除也推进版本号，再删一次（本来就没有）不推进。
+    assert await db.transaction(profiles.profile_version, alice.id) == 3
 
 
-async def test_blank_profile_removes_the_row(db: Database) -> None:
+async def test_blank_profile_empties_the_row_and_keeps_the_version(db: Database) -> None:
     alice = await invited(db, ALICE, "小王")
     await db.transaction(lambda conn: profiles.set_profile(conn, alice.id, "- 喜欢猫", now=START))
 
     stored = await db.transaction(
-        lambda conn: profiles.set_profile(conn, alice.id, "  \n", now=START)
+        lambda conn: profiles.set_profile(conn, alice.id, "  \n", now=START + 1)
     )
 
     assert stored == ""
-    assert await db.fetch_all("SELECT * FROM profiles") == []
+    assert await db.transaction(profiles.get_profile, alice.id) is None
+    rows = await db.fetch_all("SELECT content, version, updated_at FROM profiles")
+    assert [tuple(row) for row in rows] == [("", 2, START + 1)]
+
+
+async def test_version_tells_a_change_and_change_back_apart(db: Database) -> None:
+    # 没有档案 → 写入一条 → 按要求删掉：内容又是空，版本号却变了，迟到的重写据此认出来。
+    alice = await invited(db, ALICE, "小王")
+    assert await db.transaction(profiles.profile_version, alice.id) == 0
+    await db.transaction(lambda conn: profiles.set_profile(conn, alice.id, "- 喜欢猫", now=START))
+    await db.transaction(profiles.delete_profile, alice.id)
+    assert await db.transaction(profiles.get_profile, alice.id) is None
+    assert await db.transaction(profiles.profile_version, alice.id) == 2
+    await db.transaction(lambda conn: profiles.set_profile(conn, alice.id, "- 喜欢狗", now=START))
+    found = await db.transaction(profiles.get_profile, alice.id)
+    assert found == Profile("- 喜欢狗", START, version=3)
 
 
 async def test_too_long_profile_is_refused_and_changes_nothing(db: Database) -> None:
@@ -117,6 +135,6 @@ async def test_version_12_database_gains_an_empty_profiles_table(tmp_path: Path)
         await db.transaction(lambda conn: profiles.set_profile(conn, user.id, "- 喜欢猫", now=1))
         found = await db.transaction(profiles.get_profile, user.id)
         assert found == Profile("- 喜欢猫", 1)
-        # STRICT 与 CHECK：空串写不进去（程序本来就不写空档案）。
+        # STRICT 与 CHECK：版本号从 1 起。
         with pytest.raises(sqlite3.IntegrityError):
-            await db.execute("UPDATE profiles SET content = '' WHERE user_id = ?", (user.id,))
+            await db.execute("UPDATE profiles SET version = 0 WHERE user_id = ?", (user.id,))

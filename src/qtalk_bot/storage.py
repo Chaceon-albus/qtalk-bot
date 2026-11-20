@@ -421,6 +421,118 @@ CREATE TABLE profiles (
 ) STRICT;
 """
 
+_V14_AUTOINCREMENT = """
+-- 消息、附件、话题的编号不再复用（里程碑 6b 的遗忘）：普通的 INTEGER PRIMARY KEY 在删掉编号最大的行之后会把那个
+-- 编号再发出去，被忘掉的话题的编号可能落到新话题上，后台给已删附件写的描述也可能写到复用了编号的另一个附件上。
+-- 改成 AUTOINCREMENT（编号只增不减，记在 sqlite_sequence 里）。同第 10 版按 SQLite 的做法重建表：迁移期间外键是
+-- 关着的；新建、按原编号复制、删旧、改名，再建回全部索引。列的顺序与原表相同（含之后各版加的列）。别的表对它们的
+-- 引用按表名解析，改名之后照常指向新表。
+CREATE TABLE messages_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users (id),
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    qq_message_id TEXT,
+    reply_to INTEGER REFERENCES messages (id) ON DELETE CASCADE,
+    model TEXT,
+    finish TEXT,
+    delivery TEXT,
+    created_at INTEGER NOT NULL,
+    msg_idx TEXT,
+    faces_only INTEGER NOT NULL DEFAULT 0 CHECK (faces_only IN (0, 1)),
+    process TEXT,
+    ref_msg_idx TEXT,
+    CHECK (
+        (role = 'user' AND reply_to IS NULL AND model IS NULL AND finish IS NULL
+            AND delivery IS NULL)
+        OR (role = 'assistant' AND reply_to IS NOT NULL AND finish IS NOT NULL
+            AND delivery IS NOT NULL AND qq_message_id IS NULL)
+    )
+) STRICT;
+INSERT INTO messages_new (id, user_id, role, content, qq_message_id, reply_to, model, finish,
+    delivery, created_at, msg_idx, faces_only, process, ref_msg_idx)
+SELECT id, user_id, role, content, qq_message_id, reply_to, model, finish, delivery, created_at,
+    msg_idx, faces_only, process, ref_msg_idx FROM messages;
+DROP TABLE messages;
+ALTER TABLE messages_new RENAME TO messages;
+CREATE INDEX messages_by_user ON messages (user_id, id);
+CREATE INDEX messages_replies ON messages (user_id, reply_to) WHERE role = 'assistant';
+CREATE INDEX messages_by_msg_idx ON messages (user_id, msg_idx) WHERE msg_idx IS NOT NULL;
+
+CREATE TABLE attachments_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users (id),
+    message_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    quoted INTEGER NOT NULL CHECK (quoted IN (0, 1)),
+    kind TEXT NOT NULL
+        CHECK (kind IN ('image', 'voice', 'file', 'video', 'card', 'chat_history', 'other')),
+    status TEXT NOT NULL
+        CHECK (status IN ('stored', 'failed', 'too_large', 'unsupported', 'skipped', 'expired')),
+    mime_type TEXT,
+    size INTEGER CHECK (size >= 0),
+    path TEXT,
+    filename TEXT,
+    text TEXT NOT NULL,
+    describe_status TEXT CHECK (describe_status IN ('pending', 'done', 'failed')),
+    created_at INTEGER NOT NULL,
+    description TEXT,
+    given INTEGER NOT NULL DEFAULT 0 CHECK (given IN (0, 1)),
+    CHECK ((status = 'stored') = (path IS NOT NULL)),
+    UNIQUE (message_id, position)
+) STRICT;
+INSERT INTO attachments_new (id, user_id, message_id, position, quoted, kind, status, mime_type,
+    size, path, filename, text, describe_status, created_at, description, given)
+SELECT id, user_id, message_id, position, quoted, kind, status, mime_type, size, path, filename,
+    text, describe_status, created_at, description, given FROM attachments;
+DROP TABLE attachments;
+ALTER TABLE attachments_new RENAME TO attachments;
+CREATE INDEX attachments_by_user ON attachments (user_id, message_id);
+CREATE INDEX attachments_by_time ON attachments (created_at) WHERE path IS NOT NULL;
+
+CREATE TABLE topics_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users (id),
+    provisional_title TEXT NOT NULL,
+    title TEXT,
+    summary TEXT,
+    summarized_through INTEGER REFERENCES messages (id) ON DELETE SET NULL,
+    created_at INTEGER NOT NULL,
+    active_at INTEGER NOT NULL,
+    last_message_id INTEGER NOT NULL
+) STRICT;
+INSERT INTO topics_new (id, user_id, provisional_title, title, summary, summarized_through,
+    created_at, active_at, last_message_id)
+SELECT id, user_id, provisional_title, title, summary, summarized_through, created_at, active_at,
+    last_message_id FROM topics;
+DROP TABLE topics;
+ALTER TABLE topics_new RENAME TO topics;
+CREATE INDEX topics_by_activity ON topics (user_id, last_message_id);
+"""
+
+_V15_PROFILE_VERSIONS = """
+-- 用户档案加版本号（里程碑 6b 的遗忘）：每次修改（含删除）加一，后台重写写回前比较它，识别「改过又改回」。删掉
+-- 档案时保留行、内容置空、版本号接着用，所以放宽第 13 版的 content != '' 约束。CHECK 约束改不了，同第 10 版重建表；
+-- 已有的档案版本号从 1 起。
+CREATE TABLE profiles_new (
+    user_id INTEGER PRIMARY KEY REFERENCES users (id),
+    content TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK (version >= 1),
+    updated_at INTEGER NOT NULL
+) STRICT;
+INSERT INTO profiles_new (user_id, content, version, updated_at)
+SELECT user_id, content, 1, updated_at FROM profiles;
+DROP TABLE profiles;
+ALTER TABLE profiles_new RENAME TO profiles;
+
+-- 删除消息与话题时，SQLite 要按外键查引用它们的子表行（ON DELETE CASCADE / SET NULL）。这些列原来没有以它们
+-- 开头的索引，忘掉一个话题时每删一条消息都要扫一遍用量表、决策表、话题表与流水本身。
+CREATE INDEX messages_by_reply_to ON messages (reply_to);
+CREATE INDEX usage_by_message ON usage (message_id);
+CREATE INDEX decisions_by_message ON decisions (message_id);
+CREATE INDEX topics_by_summarized_through ON topics (summarized_through);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     _V1_ACCESS,
     _V2_CHAT,
@@ -435,6 +547,8 @@ MIGRATIONS: tuple[Migration, ...] = (
     _V11_IMAGES,
     _V12_CACHED_INPUT,
     _V13_PROFILES,
+    _V14_AUTOINCREMENT,
+    _V15_PROFILE_VERSIONS,
 )
 """本程序的迁移列表。业务表由各里程碑在末尾追加，已发布的不能修改。"""
 
@@ -580,6 +694,19 @@ class Database:
 
         return await self._run(lambda: _in_transaction(conn, body))
 
+    async def checkpoint(self) -> bool:
+        """做一次 `PRAGMA wal_checkpoint(TRUNCATE)`：把 WAL 里的页写回主库并清空 WAL 文件，免得删掉的内容还留在
+        WAL 里。有别的读者挡住、没能做完时返回 `False`（不抛错，下次检查点会接着做）。"""
+        conn = self._conn
+
+        def run() -> bool:
+            with closing(conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")) as cursor:
+                row = cursor.fetchone()
+            _ensure_no_transaction(conn)
+            return row is None or int(row[0]) == 0
+
+        return await self._run(run)
+
     async def backup(self, target: str | os.PathLike[str]) -> None:
         """把数据库在线备份到 `target`，已存在的文件会被替换。上级目录不存在时会创建。
 
@@ -651,6 +778,8 @@ def _connect(
             raise StorageError(f"无法启用 WAL 模式（当前为 {mode}）：{path}")
         # WAL 下不会损坏数据库，断电时可能丢最后几个事务。
         conn.execute("PRAGMA synchronous = NORMAL")
+        # 删除的内容用零覆盖，不留在空闲页里（用户要求遗忘时要删干净）；WAL 里的旧页由删除后的检查点清掉。
+        conn.execute("PRAGMA secure_delete = ON")
         _migrate(conn, migrations)
         conn.execute("PRAGMA foreign_keys = ON")
     except BaseException:

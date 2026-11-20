@@ -7,7 +7,7 @@ import logging
 import secrets
 import sqlite3
 import threading
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -34,6 +34,7 @@ from qtalk_bot.config import (
 from qtalk_bot.conversation import (
     TYPING_PULSE_SECONDS,
     ChatInput,
+    ChoiceButton,
     Conversation,
     SendError,
     SendRejectedError,
@@ -242,6 +243,8 @@ class FakeChannel:
         )
         self.images: list[bytes] = []  # 发出的图片
         self.image_failure: SendError | None = None
+        self.buttons: list[tuple[ChoiceButton, ...]] = []  # 发出的按钮消息里的按钮
+        self.buttons_failure: SendError | None = None
         self.image_ref: str | None = None
 
     def open_process(self) -> FakeProcess:
@@ -322,6 +325,14 @@ class FakeChannel:
         self.log.append(("image", mime_type))
         self.images.append(data)
         return self.image_ref
+
+    async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
+        """发 Markdown 加按钮：记成（`buttons`，Markdown），按钮记进 `buttons`。`buttons_failure` 不为空时抛出它。"""
+        await asyncio.sleep(0)
+        if self.buttons_failure is not None:
+            raise self.buttons_failure
+        self.log.append(("buttons", markdown))
+        self.buttons.append(tuple(buttons))
 
 
 class FakeProcess:
@@ -4024,7 +4035,9 @@ async def test_supplement_cancels_the_hidden_answer_and_restarts_with_the_new_me
     await finish(batcher)
 
     (judged,) = decider.requests
-    assert judged.input == '{"answering": ["写个排序"], "latest": ["用 Python"]}'
+    assert (
+        judged.input == '{"answering": ["写个排序"], "latest": ["用 Python"], "displaying": false}'
+    )
     assert [question.name for question in judged.questions] == [STEER_QUESTION]
     assert user_texts(model.requests[1]) == ["写个排序\n用 Python"]
     assert first.kinds == ["typing"]  # 被取消的那次什么都没发
@@ -4134,7 +4147,9 @@ async def test_supplement_while_showing_stops_the_answer_and_answers_the_message
     await finish(batcher)
 
     (judged,) = decider.requests
-    assert judged.input == '{"answering": ["讲讲快排"], "latest": ["用 Python"]}'
+    assert (
+        judged.input == '{"answering": ["讲讲快排"], "latest": ["用 Python"], "displaying": true}'
+    )
     # 停下的回答：已送达的部分后接说明，结束分片照常发出。
     assert first.log == [
         ("typing", ""),
@@ -4506,7 +4521,7 @@ async def test_judgment_reads_only_this_users_messages_and_rechecks_access(db: D
         assert await chat.judge(alice, [mine.message_id], [more.message_id]) is routing.Steer.NEW
 
     (request,) = decider.requests
-    assert request.input == '{"answering": ["小王的问题"], "latest": ["补充"]}'
+    assert request.input == '{"answering": ["小王的问题"], "latest": ["补充"], "displaying": false}'
 
 
 async def test_ask_about_waiting_attachments_counts_them_and_rechecks_access(
@@ -4687,7 +4702,11 @@ async def test_judgment_input_has_every_message_the_turn_carries(db: Database) -
     await finish(batcher)
 
     (request,) = decider.requests
-    assert json.loads(request.input) == {"answering": ["遗留的问题", "新问题"], "latest": ["补充"]}
+    assert json.loads(request.input) == {
+        "answering": ["遗留的问题", "新问题"],
+        "latest": ["补充"],
+        "displaying": False,
+    }
     assert user_texts(model.requests[1]) == ["遗留的问题\n新问题\n补充"]
 
 

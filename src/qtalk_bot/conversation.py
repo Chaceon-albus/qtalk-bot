@@ -125,12 +125,30 @@
 描述是画面描述）；存了盘却没发出的不记，由孤儿清理删掉。发出过图之后不再换备用模型；模型只发了图、没写文字时
 不发失败说明，送达状态记 `images`；文字回答没送达但有图确认送达时也记 `images`（这一轮照样结束）。
 
+**查看记忆与遗忘**（里程碑 6b，启用了话题线时）：所有对话模型的请求都带上 `memory_tools.VIEW_MEMORY` 与
+`memory_tools.FORGET_TOPIC`，配置了 `[memory]`（有 `Summarizer`）时再带上 `memory_tools.FORGET_PROFILE_ITEM`；能画图
+时与画图函数在同一个请求里，`tool_runner` 是按函数名分派的 `_Tools`（画图给 `_Drawer`，记忆给 `_Recall`）。一个函数
+都没有时请求与之前完全一样。系统提示词里当前话题、相关话题与目录都标上编号（`prompt.Memory`），方便模型引用。
+- 交回任何一个函数的结果之前（成功与失败都一样）复查授权，不通过就照画图的做法停下这次调用（`_RevokedError`），
+  不再发下一跳；`forget_profile_item` 调用 `[memory]` 的模型之前也复查（`Summarizer.forget_profile_item()`）。
+- `forget_topic` 本身不删任何东西：话题属于这个用户、被动回复还留得出余量时，只把（话题、标题）记在这一轮的状态里
+  （`_Turn.forget`）。这一轮正常记账之后（插话重来、取消、出错时不发）对这一轮回复挂的那条消息发一条 Markdown 加
+  「确认删除」「取消」按钮的消息（`_offer_forget()`，不进流水），按钮数据带一个只在内存里的令牌（用户、openid、话题、
+  这一轮的用户消息、单调时钟的到期时刻，`FORGET_TOKEN_SECONDS`）。模型单独调用永远删不了：只有用户点了按钮才删。
+- 用户点按钮时由接线层交给 `press_button()`：令牌过期或不存在时请用户重新说一次；点的人的 openid 与令牌不符时只记
+  日志、不处理；令牌只能用一次。点「确认删除」时在这个用户的锁里（与他的轮次串行）删除：一个事务里删掉这个话题、
+  令牌记下的那一轮的用户消息（连同回复）与因此变空的话题，被删了一部分的话题清掉摘要、重取临时标题
+  （`topics.erase_topics()`）；之后删附件文件、做一次 WAL 检查点；被删的话题有摘要、用户有档案时把摘要排进后台，
+  尽量从档案里去掉只来自那段聊天的信息（`Summarizer.schedule_profile_forget()`），被删了一部分的话题排一次摘要重写。
+  删除不看授权（用户自己的数据）；档案清理的后台任务调用模型前照旧复查授权。
+
 **判断插话**（`judge()`）：在事务里复查授权、取出正在回答的消息与新消息的文字版（只有这个用户自己的），交给
 `routing.SteerJudge`；决策记录与用量挂在新消息里最后一条上，被取消时也照记。
 """
 
 import asyncio
 import logging
+import secrets
 import sqlite3
 import time
 from collections.abc import (
@@ -157,7 +175,7 @@ from math import inf
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
-from . import access, citations, drawing, faces, journal, profiles, texts, topics
+from . import access, citations, drawing, faces, journal, memory_tools, profiles, texts, topics
 from .access import User
 from .citations import Source
 from .commands import day_start
@@ -196,6 +214,7 @@ from .llm import (
     FinishReason,
     FunctionCall,
     FunctionResult,
+    FunctionTool,
     ImagePart,
     Modality,
     ModelError,
@@ -205,6 +224,7 @@ from .llm import (
     TextDelta,
     TextPart,
     ThoughtSummary,
+    ToolRunner,
     Usage,
     inline_size,
 )
@@ -224,7 +244,8 @@ from .media import (
     skipped,
 )
 from .media import GeneratedImage as DrawnImage
-from .memory import Summarizer
+from .memory import ProfileForget, Summarizer
+from .memory_tools import FORGET_TOKEN_SECONDS
 from .process import (
     Drawing,
     ProcessEvent,
@@ -273,6 +294,13 @@ REPLY_DEADLINE_SECONDS = 55 * 60
 # 每次模型调用至少给这么久：离截止点不到这么久时不再换备用模型（高推理加搜索，一分钟内很难写出有用的回答），
 # 第一次调用的总时限也不短于它（宁可略微越过留出的余量，也给用户一次机会）。
 MIN_CALL_SECONDS = 60.0
+
+CHECKPOINT_RETRY_DELAYS = (0.5, 1.0, 2.0)
+"""删掉话题后 WAL 检查点被别的读者挡住时，各次重试之前等的秒数；都失败就记警告，留给之后的检查点。"""
+FORGET_PREFIX = "forget:"
+"""「确认删除」按钮数据的前缀，后面是令牌。"""
+KEEP_PREFIX = "keep:"
+"""「取消」按钮数据的前缀，后面是令牌。"""
 
 
 class SendError(Exception):
@@ -407,6 +435,20 @@ class ReplyChannel(Protocol):
         接受了这条回复，调用方按送达说不准处理。"""
         ...
 
+    async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
+        """发一条 Markdown 加一行回调按钮的消息，算一次被动回复。它不是回答，引用索引不存，不返回。"""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class ChoiceButton:
+    """回调按钮：`label` 是按钮上的字，`data` 是点击后带回的数据（`Conversation.press_button()` 认它），
+    `visited_label` 是点过之后的字。"""
+
+    label: str
+    data: str
+    visited_label: str
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ChatInput:
@@ -465,7 +507,7 @@ class _Attempt:
     text: str = field(repr=False)  # 模型生成的全部文字（未经 MarkdownGuard 处理）
     given: frozenset[int] = frozenset()  # 这次请求里实际以原件交给模型的、本轮的附件
     sources: tuple[Source, ...] = ()  # 回答引用的来源，整理过（见 `citations.collect()`）
-    revoked: bool = False  # 执行画图函数前复查授权不通过，这次调用就此停下（见 `_RevokedError`）
+    revoked: bool = False  # 执行函数时复查授权不通过，这次调用就此停下（见 `_RevokedError`）
 
     @property
     def has_answer(self) -> bool:
@@ -680,6 +722,12 @@ class _Turn:
         self.images_delivered = 0  # 确认发给了用户的图
         self.images_uncertain = 0  # 说不准是否送达的图
         self.image_ref: str | None = None  # 第一张确认送达的图的引用索引
+        # `forget_topic` 要忘掉的话题（编号与标题）：这一轮记账之后发确认按钮（`Conversation._offer_forget()`）。
+        self.forget: tuple[int, str] | None = None
+        self.profile_forgotten = False  # 这一轮调用过 `forget_profile_item`：不再排整份档案的重写
+        self.ended = False  # 记账时这一轮记下了轮次边界（`journal.ends_turn()`）
+        # 这一轮带上的全部用户消息：用户点了「确认删除」时随话题一并删掉。
+        self.messages: tuple[int, ...] = ()
         self.control.on_cut(self.cut)
 
     @property
@@ -834,6 +882,8 @@ class Conversation:
         self._locks = _UserLocks()
         self._media_slots = asyncio.Semaphore(MULTIMODAL_REQUESTS)
         self._in_flight: set[asyncio.Future[None]] = set()
+        # 忘掉话题的确认按钮里的令牌 → 那次请求（只在内存里，重启就失效）。
+        self._forget_tokens: dict[str, _ForgetToken] = {}
         inputs = {modality for model in router.models for modality in model.inputs}
         wanted = {
             kind
@@ -897,7 +947,13 @@ class Conversation:
                 user, messages, channel, TurnControl() if control is None else control
             )
 
-    async def judge(self, user: User, answering: Sequence[int], latest: Sequence[int]) -> Steer:
+    async def judge(
+        self,
+        user: User,
+        answering: Sequence[int],
+        latest: Sequence[int],
+        displaying: bool = False,
+    ) -> Steer:
         """判断插话：`latest`（新到的消息的编号）是在补充或修正 `answering`（正在回答的这一轮的消息），还是一个
         独立的新问题。
 
@@ -913,7 +969,7 @@ class Conversation:
             before, after = found
             if not after:
                 return Steer.NEW
-            call = self._steer.prepare(before, after, label=user.label)
+            call = self._steer.prepare(before, after, label=user.label, displaying=displaying)
             try:
                 return await call.run()
             finally:
@@ -987,6 +1043,115 @@ class Conversation:
             answered = [item.message_id for item in received if not item.sticker]
             if answered:
                 await self._respond(user, answered, channel, TurnControl())
+
+    async def press_button(
+        self, openid: str, data: str, reply: Callable[[str], Awaitable[None]]
+    ) -> None:
+        """用户点了忘掉话题的确认按钮（接线层只把 `FORGET_PREFIX`、`KEEP_PREFIX` 开头的交过来）。要回复用户时调用
+        `reply`（接线层的被动回复，自己处理发送失败）。
+
+        整次点击（含回复）都在这个用户的锁里，与他的轮次串行：正在写的流式回答结束之后才处理、才回复，免得互动的
+        回复插进去让平台提前结束它。按 openid 找不到用户时不处理。
+
+        - 令牌不存在或已过期（`FORGET_TOKEN_SECONDS`，或机器人重启过、已经点过）：请用户重新说一次。
+        - 点的人与令牌记下的用户不符：只记日志，不回复、不处理（令牌照旧有效）。
+        - 令牌只能用一次：点过任一按钮就作废。点「取消」什么都不删。
+        - 点「确认删除」：删掉这个话题，连同令牌记下的那一轮的用户消息（与回复），以及因此变空的话题
+          （`_erase_topics()`）。话题已经不在时照样删掉那一轮的消息。不看授权：这是用户自己的数据；档案清理的后台
+          任务调用模型前照旧复查授权。
+        由 `drain()` 等待。
+        """
+        async with self._tracking():
+            if data.startswith(FORGET_PREFIX):
+                confirmed, token = True, data.removeprefix(FORGET_PREFIX)
+            elif data.startswith(KEEP_PREFIX):
+                confirmed, token = False, data.removeprefix(KEEP_PREFIX)
+            else:
+                return
+            user = await self._db.transaction(access.get_user_by_openid, openid)
+            if user is None:
+                logger.info("不认识的人点了忘掉话题的按钮，不处理")
+                return
+            async with self._locks.hold(user.id):
+                self._prune_tokens()
+                found = self._forget_tokens.get(token)
+                if found is None:
+                    logger.info("用户 %s 点的忘掉话题的按钮已经失效", user.label)
+                    await reply(texts.forget_expired(FORGET_TOKEN_SECONDS // 60))
+                    return
+                if found.user_id != user.id or not secrets.compare_digest(found.openid, openid):
+                    logger.warning(
+                        "用户 %s 点了不是发给他的忘掉话题的按钮（用户编号 %d），不处理",
+                        user.label,
+                        found.user_id,
+                    )
+                    return
+                del self._forget_tokens[token]  # 只能用一次
+                if not confirmed:
+                    logger.info("用户 %s 取消了忘掉话题 %d", user.label, found.topic_id)
+                    await reply(texts.FORGET_CANCELLED)
+                    return
+                existed = await self._erase_topics(
+                    user, (found.topic_id,), {found.topic_id: found.messages}
+                )
+                await reply(
+                    texts.forget_done(found.topic_id) if existed else texts.FORGET_TOPIC_GONE
+                )
+
+    def _prune_tokens(self) -> None:
+        now = self._timer()
+        for token, entry in list(self._forget_tokens.items()):
+            if entry.expires_at <= now:
+                del self._forget_tokens[token]
+
+    async def _offer_forget(self, turn: _Turn, forget: tuple[int, str]) -> None:
+        """这一轮记账之后，对这一轮回复挂的那条消息发一条带「确认删除」「取消」按钮的消息（不进流水）。
+
+        先复查授权：停用了就不发（已经发出的有效按钮照设计仍可删本人的数据）。被插话重来、余量不够时不发；平台拒发而
+        余量还够发一条纯文字时，补一句「按钮没能发出来」（`texts.FORGET_BUTTONS_FAILED`），免得用户以为该有按钮。
+        发送结果说不准时只记日志（按钮可能已经到了）。"""
+        topic_id, title = forget
+        user = turn.user
+        if turn.control.preempted:
+            return
+        if not await self._db.transaction(self._allowed, user):
+            logger.info("用户 %s 已不能使用对话，不发忘掉话题的确认按钮", user.label)
+            return
+        if not turn.channel.budget.affords_last():
+            logger.info("用户 %s 这条消息的被动回复次数用完了，没发忘掉话题的确认按钮", user.label)
+            return
+        self._prune_tokens()
+        token = secrets.token_urlsafe(16)
+        self._forget_tokens[token] = _ForgetToken(
+            user_id=user.id,
+            openid=user.openid,
+            topic_id=topic_id,
+            title=title,
+            messages=turn.messages,
+            expires_at=self._timer() + FORGET_TOKEN_SECONDS,
+        )
+        buttons = (
+            ChoiceButton(
+                texts.FORGET_CONFIRM_LABEL, FORGET_PREFIX + token, texts.FORGET_CONFIRMED_LABEL
+            ),
+            ChoiceButton(texts.FORGET_KEEP_LABEL, KEEP_PREFIX + token, texts.FORGET_KEPT_LABEL),
+        )
+        minutes = FORGET_TOKEN_SECONDS // 60
+        try:
+            await turn.channel.send_buttons(texts.forget_prompt(topic_id, title, minutes), buttons)
+        except SendRejectedError as exc:
+            logger.warning("忘掉话题的确认按钮没能发给用户 %s：%s", user.label, exc)
+            del self._forget_tokens[token]
+            if turn.channel.budget.affords_last():
+                try:
+                    await turn.channel.send(texts.FORGET_BUTTONS_FAILED)
+                except SendError as again:
+                    logger.warning("按钮没能发出的说明也没能发给用户 %s：%s", user.label, again)
+            return
+        except SendError as exc:
+            logger.warning("给用户 %s 发忘掉话题的确认按钮时不确定是否送达：%s", user.label, exc)
+            return
+        logger.info("给用户 %s 发了忘掉话题 %d 的确认按钮", user.label, topic_id)
 
     async def drain(self) -> None:
         """关停时调用：等所有在途的轮次结束（含被取消后的收尾与记账）。"""
@@ -1094,6 +1259,7 @@ class Conversation:
             models=models,
             announce=announce,
             max_size_mb=max_size_mb,
+            drawing_possible=any(self._draws(model.image_generation) for model in models),
         )
 
         def open_process() -> ProcessStream | None:
@@ -1120,24 +1286,41 @@ class Conversation:
             if begun.received_at is None
             else begun.received_at + REPLY_DEADLINE_SECONDS,
         )
+        turn.messages = tuple(e.message_id for e in begun.current if e.message_id is not None)
         cancelled: asyncio.CancelledError | None = None
+        failure: Exception | None = None
         try:
             outcome = await self._generate(turn, builder, begun)
             await turn.stop_pulses(GRACE_SECONDS)
         except asyncio.CancelledError as exc:
             if control.preempted:
                 # 插话重来：回答什么都没交给 QQ，不写回复行，消息留给重新开始的那一轮；决策与用量照记。过程
-                # 消息写上收尾的一行后结束，全文留给重来的那一轮存档。
+                # 消息写上收尾的一行后结束，全文留给重来的那一轮存档。忘掉话题的确认按钮不发。
                 await self._wind_down(turn, quiet=True, note=texts.PROCESS_RESTART)
                 control.earlier.append(turn.process)
                 await asyncio.shield(self._record_preempted(turn, begun.last_message_id))
                 raise
             cancelled = exc
             outcome = await self._wind_down(turn)
+        except Exception as exc:  # noqa: BLE001  记账之后原样抛出
+            # 意外的异常（如复查授权时数据库出错）：像取消那样有时限地收尾（停下模型、等在途的分片、结束已打开的
+            # 消息），尽量按已确认送达的部分记账，最后抛出。收尾本身出错也照样记账。
+            failure = exc
+            if turn.run is not None:
+                turn.attempts.append(turn.run.attempt(Ending.ERROR))
+                turn.run = None
+            try:
+                outcome = await self._wind_down(turn, quiet=True)
+            except Exception as again:  # noqa: BLE001  收尾出错也不能跳过记账；只记类型
+                logger.warning(
+                    "用户 %s 的一轮出错后收尾又出错：%s", user.label, type(again).__name__
+                )
+                turn.abandon()
+                outcome = turn.outbox.outcome(ReplyDelivery.CANCELLED)
         except BaseException:
             turn.abandon()
             raise
-        if cancelled is None:
+        if cancelled is None and failure is None:
             try:
                 await self._close_process(turn)
             except asyncio.CancelledError as exc:  # 回答已经有了结局，照它记账
@@ -1161,12 +1344,21 @@ class Conversation:
         )
         if cancelled is not None:
             raise cancelled
-        if outcome.delivery is not ReplyDelivery.WITHHELD:  # 结局 skipped 的也是 withheld
+        if failure is not None:
+            raise failure
+        if turn.forget is not None and turn.ended:
+            # 模型调用了 forget_topic：记账之后发一条带确认按钮的消息，用户点了「确认删除」才删（`press_button()`）。
+            # 只在这一轮记下了轮次边界时发：没有结束的一轮（什么都没送达）会被并进下一轮，确认后删不干净。
+            await self._offer_forget(turn, turn.forget)
+        if outcome.delivery is not ReplyDelivery.WITHHELD:  # skipped 的也是 withheld
             self._schedule_descriptions(user, begun)
         if attributed is not None and self._summarizer is not None:
             self._summarizer.schedule(user, attributed.topic_id)
-            if turn.selection.update_profile:
-                self._summarizer.schedule_profile(user, turn_messages, attributed.reply_id)
+            # 这一轮调用过 forget_profile_item 时不排整份重写：重写会绕过按行删除。
+            if turn.selection.update_profile and not turn.profile_forgotten:
+                self._summarizer.schedule_profile(
+                    user, turn_messages, attributed.reply_id, fresh=begun.message_ids
+                )
 
     async def _acquire(self, user: User, message: ChatInput) -> list[Acquired]:
         if self._fetcher is None:
@@ -1240,6 +1432,7 @@ class Conversation:
             outcome = _Outcome("", ReplyDelivery.NOTICED)
         # 实际以原件交给模型的附件：这一轮结束了（用户实际收到了东西，`journal.ends_turn()`）时，以最后一次
         # 调用（换了备用模型时是备用模型，被取消时是被打断的那次）的请求为准；没有结束这一轮的都不算。
+        turn.ended = journal.ends_turn(outcome.content, outcome.delivery)
         given = (
             turn.attempts[-1].given
             if turn.attempts and journal.ends_turn(outcome.content, outcome.delivery)
@@ -1381,6 +1574,9 @@ class Conversation:
                     for topic in candidates
                 ),
                 pinned=pinned,
+                attributed=topics.topics_of(
+                    conn, user.id, (e.message_id for e in decisions if e.message_id is not None)
+                ),
             )
         profile = ""
         if self._router.profiling:
@@ -1423,14 +1619,17 @@ class Conversation:
         if second_id is not None and second_id != topic_id:
             related = topics.get_topic(conn, user.id, second_id)
         others = [
-            t.display_title
+            (t.id, t.display_title)
             for t in topics.recent_topics(conn, user.id, settings.directory + 1)
             if topic is None or t.id != topic.id
         ][: settings.directory]
         profile = profiles.get_profile(conn, user.id)
         memory = Memory(
             profile="" if profile is None else profile.content,
+            profile_tool=self._summarizer is not None,
+            topic_id=None if topic is None else topic.id,
             summary=(topic.summary or "") if topic is not None else "",
+            related_id=None if related is None else related.id,
             related_title="" if related is None else related.display_title,
             related_summary=(related.summary or "") if related is not None else "",
             directory=tuple(others),
@@ -1744,19 +1943,30 @@ class Conversation:
                     return True
                 request, given, referable = built.request, built.given, built.referable
                 built = None
+                functions: list[FunctionTool] = []
+                runners: dict[str, ToolRunner] = {}
                 if draws:
+                    functions.append(drawing.GENERATE_IMAGE)
+                    runners[drawing.FUNCTION_NAME] = _Drawer(
+                        self._draw_deps(),
+                        turn,
+                        reply_to=reply_to,
+                        referable=referable,
+                        show=settings.show_process,
+                        # 这次调用已经占着名额时，读参考图与出图不再另占（免得几轮互相等着死锁）。
+                        slots=None if holds_slot else self._media_slots,
+                    )
+                if self._router.topics is not None:
+                    recall = _Recall(self._recall_deps(), turn, reply_to=reply_to)
+                    for function in recall.functions:
+                        functions.append(function)
+                        runners[function.name] = recall
+                if functions:
+                    # 没有任何函数时请求与之前完全一样（不带 tools 与 tool_runner）。
                     request = replace(
                         request,
-                        tools=(*request.tools, drawing.GENERATE_IMAGE),
-                        tool_runner=_Drawer(
-                            self._draw_deps(),
-                            turn,
-                            reply_to=reply_to,
-                            referable=referable,
-                            show=settings.show_process,
-                            # 这次调用已经占着名额时，读参考图与出图不再另占（免得几轮互相等着死锁）。
-                            slots=None if holds_slot else self._media_slots,
-                        ),
+                        tools=(*request.tools, *functions),
+                        tool_runner=_Tools(runners),
                     )
                 # 进展：真正开始调用这个模型。它与之后的备用模型里有会发过程消息的，就给过程消息留余量。
                 turn.process_ahead = any(
@@ -1833,6 +2043,91 @@ class Conversation:
             check=self._draw_check,
             record_usage=self._record_image_usage,
         )
+
+    def _recall_deps(self) -> _RecallDeps:
+        return _RecallDeps(
+            db=self._db,
+            allowed=self._allowed,
+            timezone=self._timezone,
+            summarizer=self._summarizer,
+        )
+
+    async def _erase_topics(
+        self,
+        user: User,
+        topic_ids: Sequence[int],
+        extras: Mapping[int, Sequence[int]] | None = None,
+    ) -> bool:
+        """彻底删掉这个用户的这些话题：在一个事务里先核对全部目标、收集要删的消息（含 `extras` 里提出要求的那一轮）
+        与附件，再统一删除（`topics.erase_topics()`）；提交之后在后台删附件的本地文件、做 WAL 检查点。删掉的话题有摘要、用户又有档案时，
+        把摘要排进后台，尽量从档案里去掉只来自这段聊天的信息；被删掉一部分消息的别的话题排一次摘要重写。检查点
+        免得删掉的内容还留在 WAL 里。日志只记用户、话题编号与条数。返回目标话题有没有删到（都已经
+        不在时为假，`extras` 照样删）。"""
+        extra = sorted({n for ids in (extras or {}).values() for n in ids})
+        erased, has_profile = await self._db.transaction(self._erase, user, topic_ids, extra)
+        missing = [topic_id for topic_id in topic_ids if topic_id not in erased.topics]
+        if missing:
+            logger.info("用户 %s 的话题 %s 已经不在了，不用再删", user.label, missing)
+        if erased.topics:
+            logger.info(
+                "按用户 %s 的要求删掉了话题 %s：用户消息 %d 条、回复 %d 条、附件 %d 个；"
+                "另有 %d 个话题变空删掉、%d 个话题重写摘要",
+                user.label,
+                list(erased.topics),
+                erased.user_messages,
+                erased.replies,
+                erased.attachments,
+                len(erased.emptied),
+                len(erased.rewritten),
+            )
+        if self._summarizer is not None:
+            if has_profile:
+                for summary in erased.summaries:
+                    self._summarizer.schedule_profile_forget(user, summary)
+            for topic_id in erased.rewritten:
+                self._summarizer.schedule(user, topic_id)
+        # 事务已经提交：删附件文件与 WAL 截断交给后台（记进 `_in_flight`，`drain()` 会等它），不在这个用户的锁里等。
+        cleanup = asyncio.ensure_future(self._clean_up_after_erase(user, erased.paths))
+        self._in_flight.add(cleanup)
+        cleanup.add_done_callback(self._in_flight.discard)
+        cleanup.add_done_callback(_retrieve_any)
+        return bool(erased.topics)
+
+    async def _clean_up_after_erase(self, user: User, paths: Sequence[str]) -> None:
+        """删掉话题之后：删附件的本地文件，再做 WAL 检查点（被别的读者挡住时按 `CHECKPOINT_RETRY_DELAYS` 退避
+        重试，都失败就记警告）。"""
+        store = None if self._fetcher is None else self._fetcher.store
+        failed = 0
+        for path in paths:
+            if store is None:
+                failed += 1
+                continue
+            try:
+                await asyncio.to_thread(store.delete, user.id, path)
+            except OSError:
+                failed += 1
+        if failed:
+            # 没删掉的文件已经不在附件表里，之后由孤儿清理删掉。
+            logger.warning("用户 %s 有 %d 个被删话题的附件文件没能删掉", user.label, failed)
+        for delay in (*CHECKPOINT_RETRY_DELAYS, None):
+            try:
+                if await self._db.checkpoint():
+                    return
+            except sqlite3.Error as exc:
+                logger.warning("删掉话题后的 WAL 检查点出错：%s", type(exc).__name__)
+                return
+            if delay is None:
+                break
+            await self._sleep(delay)
+        logger.warning("删掉话题后的 WAL 检查点一直被别的读者挡住，留给之后的检查点")
+
+    def _erase(
+        self, conn: sqlite3.Connection, user: User, topic_ids: Sequence[int], extra: Sequence[int]
+    ) -> tuple[topics.Erased, bool]:
+        """删掉这些话题（连同 `extra` 里这个用户的消息），并看这个用户有没有档案（不复查授权：用户自己要求的删除
+        照删）。"""
+        erased = topics.erase_topics(conn, user.id, topic_ids, extra)
+        return erased, profiles.get_profile(conn, user.id) is not None
 
     def _draws(self, enabled: bool) -> bool:
         """这次调用的模型（`ModelSettings.image_generation` 为 `enabled`）能不能调用画图函数。"""
@@ -2365,6 +2660,11 @@ class _TurnChannel:
         self.budget.replies += 1
         return await self._channel.send_image(data, mime_type, replying)
 
+    async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
+        self._claim()
+        self.budget.replies += 1
+        await self._channel.send_buttons(markdown, buttons)
+
     def open_process(self) -> ProcessStream:
         """开始一条过程消息（调用方在要发第一片时才调用，所以这时就计数）。"""
         self.budget.replies += 1
@@ -2391,8 +2691,8 @@ class _ProcessChannel:
 
 
 class _RevokedError(Exception):
-    """执行画图函数之前复查授权不通过：抛给适配器，它原样往外抛，这次模型调用就此停下、不再发下一跳请求；
-    `_consume()` 接住它。"""
+    """执行函数（画图、查看与遗忘记忆）时复查授权不通过：抛给适配器，它原样往外抛，这次模型调用就此停下、不再发
+    下一跳请求；`_consume()` 接住它。"""
 
 
 class _Refusal(Enum):
@@ -2656,6 +2956,179 @@ class _Drawer:
             logger.warning("给用户 %s 画的图没能存盘：%s", user.label, type(exc).__name__)
             return None
         return DrawnImage(path=path, mime_type=mime_type, size=len(data), description=prompt)
+
+
+class _Tools:
+    """一次模型调用的函数执行方（`llm.ToolRunner`）：按函数名分派给各自的执行方（画图给 `_Drawer`，查看与遗忘记忆
+    给 `_Recall`）。没有声明过的函数名交给其中任意一个，它们都会复查授权后交回「没有这个函数」。"""
+
+    def __init__(self, runners: Mapping[str, ToolRunner]) -> None:
+        assert runners
+        self._runners = dict(runners)
+        self._fallback = next(iter(self._runners.values()))
+
+    async def __call__(self, call: FunctionCall) -> FunctionResult:
+        return await self._runners.get(call.name, self._fallback)(call)
+
+
+@dataclass(frozen=True, slots=True)
+class _ForgetToken:
+    """忘掉话题的确认按钮背后的请求：用户、他的 openid（点按钮的人要对得上）、话题、那一轮的用户消息（删除时一并
+    删掉）与到期时刻（`Conversation` 的单调时钟）。"""
+
+    user_id: int
+    openid: str = field(repr=False)
+    topic_id: int
+    title: str = field(repr=False)
+    messages: tuple[int, ...]
+    expires_at: float
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _RecallDeps:
+    """`_Recall` 用到的 `Conversation` 的部分。`summarizer` 为空（没有 `[memory]`）时不提供 `forget_profile_item`。"""
+
+    db: Database
+    allowed: Callable[[sqlite3.Connection, User], bool]
+    timezone: ZoneInfo
+    summarizer: Summarizer | None
+
+
+class _Recall:
+    """一次模型调用的查看与遗忘记忆的执行方（`llm.ToolRunner`），函数说明与参数校验在 `memory_tools.py`。
+
+    - `view_memory`：只读这个用户的档案与编号小于游标的话题（每页 `memory_tools.VIEW_LIMIT` 个，最新开始的在前）。
+    - `forget_topic`：不删任何东西。话题属于这个用户、这一轮还没安排过、被动回复留得出发确认按钮的余量时，把话题记进
+      `_Turn.forget`（这一轮记账之后 `Conversation._offer_forget()` 发按钮，用户点了才删）；否则交回出错说明。
+    - `forget_profile_item`：经 `Summarizer.forget_profile_item()` 同步地按行删档案（调用模型之前它在事务里复查授权），
+      交回真实的结果。`reply_to` 是这一轮最后一条用户消息，用量挂在它上面。
+    交回任何结果之前（成功与失败都一样）复查授权，不通过就停下这次模型调用（`_RevokedError`），不再发下一跳。执行
+    期间暂停这次调用的空闲时限。日志只记用户、话题编号与结果的分类，不记标题、档案与参数原文。
+    """
+
+    def __init__(self, deps: _RecallDeps, turn: _Turn, *, reply_to: int) -> None:
+        self._deps = deps
+        self._turn = turn
+        self._reply_to = reply_to
+
+    @property
+    def functions(self) -> tuple[FunctionTool, ...]:
+        """声明给模型的函数。"""
+        return memory_tools.memory_functions(self._deps.summarizer is not None)
+
+    async def __call__(self, call: FunctionCall) -> FunctionResult:
+        run = self._turn.run
+        deadlines = None if run is None else run.deadlines
+        with nullcontext() if deadlines is None else deadlines.paused():
+            result = await self._run(call)
+            # 交回结果之后适配器会再发一跳（计费的）请求：已不能使用对话的就此停下。安排了的删除照样执行。
+            deps = self._deps
+            if not await deps.db.transaction(deps.allowed, self._turn.user):
+                self._revoke()
+            return result
+
+    def _revoke(self) -> None:
+        logger.info("用户 %s 已不能使用对话，停下这次模型调用", self._turn.user.label)
+        self._turn.outbox.stop()  # 排队的正文不再发出去（同 `_Drawer._revoke()`）
+        raise _RevokedError
+
+    async def _run(self, call: FunctionCall) -> FunctionResult:
+        user = self._turn.user
+        match call.name:
+            case memory_tools.VIEW_MEMORY_NAME:
+                return await self._view(call.arguments)
+            case memory_tools.FORGET_TOPIC_NAME:
+                return await self._forget_topic(call.arguments)
+            case memory_tools.FORGET_PROFILE_ITEM_NAME if self._deps.summarizer is not None:
+                self._turn.profile_forgotten = True  # 分派到就算，不看参数对不对、删没删成
+                return await self._forget_item(self._deps.summarizer, call.arguments)
+            case _:
+                logger.warning("模型给用户 %s 调用了没有声明的函数，交回说明", user.label)
+                return drawing.unknown_function(call.name)
+
+    async def _view(self, text: str) -> FunctionResult:
+        deps, user = self._deps, self._turn.user
+        before = memory_tools.parse_view(text)
+        if isinstance(before, str):
+            logger.info("给用户 %s 查看记忆的参数不合法，交回说明", user.label)
+            return memory_tools.bad_arguments(before)
+        profile, listings, total = await deps.db.transaction(_memory_view, user.id, before)
+        more = len(listings) > memory_tools.VIEW_LIMIT
+        listings = listings[: memory_tools.VIEW_LIMIT]
+        logger.info(
+            "给用户 %s 查看了记忆：游标 %d，话题 %d 个（共 %d 个）",
+            user.label,
+            before,
+            len(listings),
+            total,
+        )
+        return memory_tools.viewed(
+            profile,
+            listings,
+            before=before,
+            total=total,
+            more=more,
+            timezone=deps.timezone,
+            profile_tool=deps.summarizer is not None,
+        )
+
+    async def _forget_topic(self, text: str) -> FunctionResult:
+        deps, turn = self._deps, self._turn
+        user = turn.user
+        topic_id = memory_tools.parse_forget_topic(text)
+        if isinstance(topic_id, str):
+            logger.info("给用户 %s 忘掉话题的参数不合法，交回说明", user.label)
+            return memory_tools.bad_arguments(topic_id)
+        topic = await deps.db.transaction(topics.get_topic, user.id, topic_id)
+        if topic is None:
+            logger.info("给用户 %s 忘掉话题 %d：不是他的话题，不删", user.label, topic_id)
+            return memory_tools.no_such_topic(topic_id)
+        if turn.forget is not None and turn.forget[0] != topic.id:
+            logger.info("用户 %s 这一轮已经要忘掉别的话题，不再安排第二个", user.label)
+            return memory_tools.one_at_a_time()
+        if turn.forget is None and not turn.channel.budget.affords(1):
+            # 确认按钮要另发一条消息，还得给回答留余量。
+            logger.info("用户 %s 这条消息的被动回复次数不够发确认按钮，不安排忘掉话题", user.label)
+            return memory_tools.no_room_for_buttons()
+        turn.forget = (topic.id, topic.display_title)
+        logger.info("用户 %s 要忘掉话题 %d：这一轮结束后发确认按钮", user.label, topic.id)
+        return memory_tools.buttons_coming(
+            topic.id, topic.display_title, profile_tool=deps.summarizer is not None
+        )
+
+    async def _forget_item(self, summarizer: Summarizer, text: str) -> FunctionResult:
+        user = self._turn.user
+        arguments = memory_tools.parse_forget_item(text)
+        if isinstance(arguments, str):
+            logger.info("给用户 %s 忘掉档案条目的参数不合法，交回说明", user.label)
+            return memory_tools.bad_arguments(arguments)
+        forgot, removed = await summarizer.forget_profile_item(
+            user, arguments.item, message_id=self._reply_to
+        )
+        logger.info("用户 %s 要求从档案里删掉一条信息：%s", user.label, forgot.value)
+        match forgot:
+            case ProfileForget.REVOKED:
+                self._revoke()
+                raise AssertionError("不会到这里")
+            case ProfileForget.REMOVED:
+                return memory_tools.item_removed(removed)
+            case ProfileForget.ABSENT:
+                return memory_tools.item_absent()
+            case ProfileForget.CONFLICT:
+                return memory_tools.item_conflict()
+            case ProfileForget.FAILED:
+                return memory_tools.item_failed()
+
+
+def _memory_view(
+    conn: sqlite3.Connection, user_id: int, before: int
+) -> tuple[str | None, list[topics.TopicListing], int]:
+    """查看记忆要的东西：这个用户的档案（没有时为 `None`）、编号小于 `before` 的话题（0 时从最新的起；多取一个，
+    看后面还有没有）与话题总数。只取这个用户的。"""
+    profile = profiles.get_profile(conn, user_id)
+    listings = topics.list_topics(conn, user_id, memory_tools.VIEW_LIMIT + 1, before)
+    total = topics.count_topics(conn, user_id)
+    return (None if profile is None else profile.content), listings, total
 
 
 async def _typing(channel: ReplyChannel, user: User) -> None:

@@ -746,7 +746,7 @@ async def test_no_drawing_when_the_passive_replies_would_run_out(
     await say(drawing_chat(db, MediaStore.under(tmp_path), model, generator), alice, "画", channel)
 
     assert generator.calls == []
-    assert "回复的次数快用完" in text_parts(model.results[0])
+    assert "受平台限制，这一轮不能再发图片了" in text_parts(model.results[0])
     assert channel.images == []
     assert channel.streamed == "画不了，换成文字说说"
 

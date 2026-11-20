@@ -520,3 +520,34 @@ def download_host_refused(user_label: str, shown: str, *, is_host: bool) -> str:
         f"用户 {user_label} 的附件下载地址是「{shown}」，没有下载。"
         f"如果平台改用了新的下载域名，确认可信后可以加进配置的 {DOWNLOAD_HOSTS_SETTING}。"
     )
+
+
+# ---- 忘掉话题的确认按钮（里程碑 6b） ----
+
+FORGET_CONFIRM_LABEL = "确认删除"
+FORGET_CONFIRMED_LABEL = "已确认"
+FORGET_KEEP_LABEL = "取消"
+FORGET_KEPT_LABEL = "已取消"
+
+
+def forget_prompt(topic_id: int, title: str, minutes: int) -> str:
+    """带确认按钮的那条消息（Markdown）；标题来自用户的对话，经 `escape_markdown()`。`minutes` 是按钮的有效期。"""
+    return (
+        f"要忘掉话题 #{topic_id}「{escape_markdown(title)}」吗？这个话题里的全部对话、图片与摘要，连同刚才提出要求的"
+        f"这一轮对话，都会删掉，找不回来。按钮 {minutes} 分钟内有效。"
+    )
+
+
+def forget_expired(minutes: int) -> str:
+    """点的按钮已经失效（过期、点过，或机器人重启过）。"""
+    return f"这个按钮已经失效了（超过 {minutes} 分钟，或已经点过）。还想删的话，请再跟我说一次。"
+
+
+FORGET_CANCELLED = "好的，不删了。"
+FORGET_TOPIC_GONE = "这个话题已经不在了。"
+FORGET_BUTTONS_FAILED = "确认按钮没能发出来，什么都没有删。还想删的话请再说一次要忘掉哪个话题。"
+
+
+def forget_done(topic_id: int) -> str:
+    """点了「确认删除」、删完之后的回复（不重复标题）。"""
+    return f"已经忘掉话题 #{topic_id} 了，刚才提出要求的那一轮对话也一起删掉了。"

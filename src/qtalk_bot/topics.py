@@ -10,10 +10,12 @@
   有好几轮。
 - 标题与摘要由后台的小模型写（`memory.Summarizer` 经 `set_summary()` 写回）；没写出来之前用临时标题（建行时这一轮用户消息
   文字版的前 `PROVISIONAL_TITLE_CHARS` 字），摘要为空。
+- 查看记忆列出话题（`list_topics()`）；用户要求忘掉一个话题时 `erase_topic()` 彻底删掉它的消息与话题本身（里程碑
+  6b），这是流水「只追加」唯一的例外。
 """
 
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 
 PROVISIONAL_TITLE_CHARS = 40
@@ -65,6 +67,22 @@ def recent_topics(conn: sqlite3.Connection, user_id: int, limit: int) -> list[To
         (user_id, limit),
     ).fetchall()
     return [_topic(row) for row in rows]
+
+
+def topics_of(conn: sqlite3.Connection, user_id: int, message_ids: Iterable[int]) -> dict[int, int]:
+    """这些消息各自所在的话题（消息编号 → 话题编号）；没有归属或不是这个用户的不在结果里。"""
+    ids = sorted(set(message_ids))
+    found: dict[int, int] = {}
+    for start in range(0, len(ids), 500):
+        chunk = ids[start : start + 500]
+        placeholders = ", ".join("?" * len(chunk))
+        for row in conn.execute(
+            "SELECT message_id, topic_id FROM topic_messages"  # noqa: S608  只拼 ? 占位符
+            f" WHERE user_id = ? AND message_id IN ({placeholders})",
+            (user_id, *chunk),
+        ):
+            found[int(row["message_id"])] = int(row["topic_id"])
+    return found
 
 
 def get_topic(conn: sqlite3.Connection, user_id: int, topic_id: int) -> Topic | None:
@@ -179,3 +197,226 @@ def set_summary(
         (title, summary, through, topic_id, user_id, through),
     )
     return cursor.rowcount > 0
+
+
+@dataclass(frozen=True, slots=True)
+class TopicListing:
+    """查看记忆时列出的一条话题：编号、给模型看的标题、建行与最近活跃的时刻（Unix 秒）、轮数（归进来的回复数）。"""
+
+    id: int
+    title: str = field(repr=False)
+    created_at: int
+    active_at: int
+    turns: int
+
+
+def count_topics(conn: sqlite3.Connection, user_id: int) -> int:
+    """这个用户有多少个话题。"""
+    row = conn.execute("SELECT count(*) AS n FROM topics WHERE user_id = ?", (user_id,)).fetchone()
+    return int(row["n"])
+
+
+def list_topics(
+    conn: sqlite3.Connection, user_id: int, limit: int, before: int = 0
+) -> list[TopicListing]:
+    """这个用户的话题，按开始的先后、最新开始的在前（编号只增不减），最多 `limit` 条；`before` 大于 0 时只列编号
+    小于它的（游标翻页：不随之后的轮次或删除错位）。"""
+    if limit <= 0 or before < 0:
+        return []
+    rows = conn.execute(
+        "SELECT t.id, t.provisional_title, t.title, t.created_at, t.active_at,"
+        " (SELECT count(*) FROM topic_messages AS tm"
+        "  JOIN messages AS m ON m.id = tm.message_id AND m.user_id = tm.user_id"
+        "  WHERE tm.topic_id = t.id AND tm.user_id = t.user_id AND m.role = 'assistant') AS turns"
+        " FROM topics AS t WHERE t.user_id = ? AND (? = 0 OR t.id < ?)"
+        " ORDER BY t.id DESC LIMIT ?",
+        (user_id, before, before, limit),
+    ).fetchall()
+    return [
+        TopicListing(
+            row["id"],
+            row["title"] or row["provisional_title"],
+            int(row["created_at"]),
+            int(row["active_at"]),
+            int(row["turns"]),
+        )
+        for row in rows
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class Erased:
+    """`erase_topics()` 删掉的东西。
+
+    Attributes:
+        topics: 实际删掉的目标话题（属于这个用户的），按给出的顺序。
+        summaries: 它们删之前的摘要（没有摘要的不在里面），用来让档案去掉相关信息。
+        paths: 附件文件的相对路径，调用方在事务提交之后删文件。
+        user_messages / replies / attachments: 删掉的用户消息、回复与附件行的条数（日志用）。
+        emptied: 因此变空、一并删掉的别的话题。
+        rewritten: 仍有消息、但被删掉了一部分的别的话题：摘要已清掉、临时标题已重取，调用方排一次摘要重写。
+    """
+
+    topics: tuple[int, ...]
+    summaries: tuple[str, ...] = field(repr=False)
+    paths: tuple[str, ...] = field(repr=False)
+    user_messages: int
+    replies: int
+    attachments: int
+    emptied: tuple[int, ...] = ()
+    rewritten: tuple[int, ...] = ()
+
+
+_ERASE_CHUNK = 500  # 一条语句里最多带的编号数，远低于 SQLite 的变量上限
+
+
+def _chunks(ids: Sequence[int]) -> list[list[int]]:
+    return [list(ids[start : start + _ERASE_CHUNK]) for start in range(0, len(ids), _ERASE_CHUNK)]
+
+
+def erase_topics(
+    conn: sqlite3.Connection, user_id: int, topic_ids: Sequence[int], extra: Iterable[int] = ()
+) -> Erased:
+    """彻底删掉这个用户的这些话题：话题里他的全部消息（用户消息与回复；附件行与归属随外键级联），以及话题本身。
+    不属于这个用户的编号什么都不动。在调用方的一个事务里先核对全部目标、收集要删的消息与附件，再统一删除。
+
+    `extra` 是另外要一并删掉的这个用户的消息（提出要忘掉的那一轮的用户消息，连同它们的回复），不论归在哪个话题，
+    也不论目标话题还在不在：那一轮里提到的标题不会留在别处，那句要求也不会被下一轮带上。回答被删的用户消息的回复（`reply_to`
+    随外键级联删除）即使归在别的话题，也一并算进来。
+
+    受影响的别的话题：变空的一并删掉（它们的临时标题取自被删的消息）；仍有消息的，摘要与覆盖范围清掉、标题清掉、
+    临时标题按剩下的第一条用户消息重取（它们可能写着被删的内容），「最近活跃」（`last_message_id`、`active_at`）按
+    保留下来的最新一条回复重算，由调用方排一次摘要重写。用量、决策记录照外键
+    只断开引用（置空），不删。
+    """
+    targets: list[Topic] = []
+    for topic_id in dict.fromkeys(topic_ids):
+        topic = get_topic(conn, user_id, topic_id)
+        if topic is not None:
+            targets.append(topic)
+    target_ids = [topic.id for topic in targets]
+    seen: dict[int, str] = {}  # 消息编号 → 角色
+    for chunk in _chunks(target_ids):
+        marks = ", ".join("?" * len(chunk))
+        for row in conn.execute(
+            "SELECT m.id, m.role FROM messages AS m WHERE m.user_id = ? AND ("  # noqa: S608  只拼 ? 占位符
+            f" m.id IN (SELECT message_id FROM topic_messages WHERE user_id = ? AND topic_id IN ({marks}))"
+            " OR m.reply_to IN (SELECT message_id FROM topic_messages"
+            f" WHERE user_id = ? AND topic_id IN ({marks})))",
+            (user_id, user_id, *chunk, user_id, *chunk),
+        ):
+            seen[int(row["id"])] = row["role"]
+    for chunk in _chunks(sorted(set(extra) - set(seen))):
+        marks = ", ".join("?" * len(chunk))
+        for row in conn.execute(
+            "SELECT id, role FROM messages"  # noqa: S608  只拼 ? 占位符
+            f" WHERE user_id = ? AND (id IN ({marks}) OR reply_to IN ({marks}))",
+            (user_id, *chunk, *chunk),
+        ):
+            seen[int(row["id"])] = row["role"]
+    ids = sorted(seen)
+    touched: set[int] = set()
+    paths: list[str] = []
+    attachments = 0
+    # 先收集完（受影响的话题、全部附件的路径）再删：删用户消息时回复连同它的附件行随外键级联删掉，之后就取不到了。
+    for chunk in _chunks(ids):
+        marks = ", ".join("?" * len(chunk))
+        touched.update(
+            int(row["topic_id"])
+            for row in conn.execute(
+                "SELECT DISTINCT topic_id FROM topic_messages"  # noqa: S608  只拼 ? 占位符
+                f" WHERE user_id = ? AND message_id IN ({marks})",
+                (user_id, *chunk),
+            )
+        )
+        for row in conn.execute(
+            "SELECT path FROM attachments"  # noqa: S608  只拼 ? 占位符
+            f" WHERE user_id = ? AND message_id IN ({marks})",
+            (user_id, *chunk),
+        ):
+            attachments += 1
+            if row["path"] is not None:
+                paths.append(row["path"])
+    touched.difference_update(target_ids)
+    for chunk in _chunks(ids):
+        marks = ", ".join("?" * len(chunk))
+        conn.execute(
+            f"DELETE FROM messages WHERE user_id = ? AND id IN ({marks})",  # noqa: S608  只拼 ? 占位符
+            (user_id, *chunk),
+        )
+    for topic_id in target_ids:
+        conn.execute("DELETE FROM topics WHERE id = ? AND user_id = ?", (topic_id, user_id))
+    emptied: list[int] = []
+    rewritten: list[int] = []
+    for other in sorted(touched):
+        first = conn.execute(
+            "SELECT min(message_id) AS first FROM topic_messages AS t"
+            " JOIN messages AS m ON m.id = t.message_id AND m.user_id = t.user_id"
+            " WHERE t.topic_id = ? AND t.user_id = ?",
+            (other, user_id),
+        ).fetchone()
+        if first is None or first["first"] is None:
+            conn.execute("DELETE FROM topics WHERE id = ? AND user_id = ?", (other, user_id))
+            emptied.append(other)
+            continue
+        # 「最近活跃」按保留下来的最新一条（一般是回复）重算，不能还指着已删的回复。
+        latest = conn.execute(
+            "SELECT m.id, m.created_at FROM topic_messages AS t"
+            " JOIN messages AS m ON m.id = t.message_id AND m.user_id = t.user_id"
+            " WHERE t.topic_id = ? AND t.user_id = ?"
+            " ORDER BY (m.role = 'assistant') DESC, m.id DESC LIMIT 1",
+            (other, user_id),
+        ).fetchone()
+        conn.execute(
+            "UPDATE topics SET title = NULL, summary = NULL, summarized_through = NULL,"
+            " provisional_title = ?, last_message_id = ?, active_at = ? WHERE id = ? AND user_id = ?",
+            (
+                _remaining_title(conn, user_id, other),
+                int(latest["id"]),
+                int(latest["created_at"]),
+                other,
+                user_id,
+            ),
+        )
+        rewritten.append(other)
+    replies = sum(1 for role in seen.values() if role == "assistant")
+    return Erased(
+        topics=tuple(target_ids),
+        summaries=tuple(topic.summary for topic in targets if topic.summary),
+        paths=tuple(paths),
+        user_messages=len(ids) - replies,
+        replies=replies,
+        attachments=attachments,
+        emptied=tuple(emptied),
+        rewritten=tuple(rewritten),
+    )
+
+
+def _remaining_title(conn: sqlite3.Connection, user_id: int, topic_id: int) -> str:
+    """话题里剩下的第一条用户消息的文字（正文加附件的文字版）取出的临时标题；没有用户消息时是 `UNTITLED`。"""
+    row = conn.execute(
+        "SELECT m.id, m.content FROM topic_messages AS t"
+        " JOIN messages AS m ON m.id = t.message_id AND m.user_id = t.user_id"
+        " WHERE t.topic_id = ? AND t.user_id = ? AND m.role = 'user' ORDER BY m.id LIMIT 1",
+        (topic_id, user_id),
+    ).fetchone()
+    if row is None:
+        return UNTITLED
+    pieces = [row["content"]]
+    pieces.extend(
+        r["text"]
+        for r in conn.execute(
+            "SELECT text FROM attachments WHERE message_id = ? AND user_id = ? ORDER BY position",
+            (row["id"], user_id),
+        )
+    )
+    return provisional_title(" ".join(pieces))
+
+
+def erase_topic(
+    conn: sqlite3.Connection, user_id: int, topic_id: int, extra: Iterable[int] = ()
+) -> Erased | None:
+    """只删一个话题的 `erase_topics()`；话题不存在或属于别人时返回 `None`，什么都不动（`extra` 也不删）。"""
+    if get_topic(conn, user_id, topic_id) is None:
+        return None
+    return erase_topics(conn, user_id, (topic_id,), extra)

@@ -170,7 +170,16 @@ async def test_profile_alone_is_asked_when_nothing_else_is(query: TopicQuery) ->
 
 @pytest.mark.parametrize(
     ("threshold", "chance", "update"),
-    [(0.5, 0.5, True), (0.5, 0.49, False), (0.8, 0.79, False), (0.8, 0.8, True), (1.0, 1.0, True)],
+    [
+        (0.5, 0.5, True),
+        (0.5, 0.49, False),
+        (0.8, 0.79, False),
+        (0.8, 0.8, True),
+        (1.0, 1.0, True),
+        # 评审修正：直接比较，阈值很小时 0.0 不触发（之前减了容差，会触发）。
+        (1e-10, 0.0, False),
+        (1e-10, 1e-10, True),
+    ],
 )
 async def test_threshold(threshold: float, chance: float, update: bool) -> None:
     decider = FakeDecider(answers(profile=chance))

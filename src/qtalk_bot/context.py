@@ -313,7 +313,11 @@ def decision_latest(current: Sequence[HistoryEntry], announce: Collection[int], 
 
 
 def decision_history(history: Sequence[HistoryEntry]) -> list[HistoryEntry]:
-    return [HistoryEntry(entry.role, decision_text(entry)) for entry in history]
+    """决策题目里的历史：附件写成简短的标记；保留消息编号（选话题时据此标出每条所在的话题）。"""
+    return [
+        HistoryEntry(entry.role, decision_text(entry), message_id=entry.message_id)
+        for entry in history
+    ]
 
 
 def merge_history(*groups: Sequence[HistoryEntry]) -> list[HistoryEntry]:
@@ -385,6 +389,7 @@ class RequestBuilder:
         announce: Collection[int] | None = None,
         max_size_mb: int = 20,
         memory: Memory | None = None,
+        drawing_possible: bool = True,
     ) -> None:
         self._store = store
         self._user_id = user_id
@@ -398,6 +403,9 @@ class RequestBuilder:
         self._announce = announce
         self._max_size_mb = max_size_mb
         self._memory = memory
+        # 整个部署里有没有模型能画图：不能画图的请求据此选系统提示词里的说明（`prompt.NO_DRAWING` 或
+        # `prompt.NO_DRAWING_AT_ALL`）。
+        self._drawing_possible = drawing_possible
 
     def set_context(self, history: Sequence[HistoryEntry], memory: Memory | None) -> None:
         """换上选完话题之后才组装出的历史与记忆（分话题时，决策之后调用，组装请求之前）。"""
@@ -455,6 +463,7 @@ class RequestBuilder:
                 ]
                 if referable_images
                 else None,
+                drawing_possible=self._drawing_possible,
             ),
             messages=tuple(messages),
             max_output_tokens=self._max_output_tokens,

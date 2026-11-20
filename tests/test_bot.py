@@ -66,6 +66,7 @@ from qtalk_bot.config import (
 )
 from qtalk_bot.conversation import (
     TYPING_PULSE_SECONDS,
+    ChoiceButton,
     Conversation,
     SendRejectedError,
     SendUncertainError,
@@ -2736,3 +2737,79 @@ async def test_admin_command_goes_to_its_own_message_when_the_answer_needs_the_r
     ours = [r.getMessage() for r in caplog.records if r.name.startswith("qtalk_bot")]
     assert ours
     assert all(ADMIN not in line for line in ours)  # 日志不记 openid
+
+
+# ---- 忘掉话题的确认按钮（里程碑 6b） ----
+
+
+class _FakeButtonMessage:
+    def __init__(self) -> None:
+        self.replies: list[dict[str, object]] = []
+
+    async def reply(self, **kwargs: object) -> object:
+        self.replies.append(kwargs)
+        return pyqbot.SentMessage(id="sent-1")
+
+
+async def test_reply_channel_sends_markdown_with_one_row_of_callback_buttons() -> None:
+    message = _FakeButtonMessage()
+    channel = bot_module._QQReplyChannel(cast(pyqbot.C2CMessage, message))  # pyright: ignore[reportPrivateUsage]  测接线层的通道本身
+
+    await channel.send_buttons(
+        "要忘掉吗？",
+        (ChoiceButton("确认删除", "forget:t", "已确认"), ChoiceButton("取消", "keep:t", "已取消")),
+    )
+
+    (sent,) = message.replies
+    assert sent["markdown"] == "要忘掉吗？"
+    keyboard = sent["keyboard"]
+    assert isinstance(keyboard, pyqbot.Keyboard)
+    assert keyboard.content is not None
+    (row,) = keyboard.content.rows
+    assert [
+        (b.render_data.label, b.render_data.visited_label, b.action.data, b.action.type)
+        for b in row.buttons
+    ] == [
+        ("确认删除", "已确认", "forget:t", pyqbot.ButtonActionType.CALLBACK),
+        ("取消", "已取消", "keep:t", pyqbot.ButtonActionType.CALLBACK),
+    ]
+
+
+class _FakeInteraction:
+    def __init__(self, data: str | None, openid: str | None = ALICE) -> None:
+        self.button_data = data
+        self.user_openid = openid
+        self.replies: list[str] = []
+
+    async def reply(self, text: str) -> None:
+        self.replies.append(text)
+
+
+@pytest.mark.parametrize(
+    ("data", "answer", "called", "replied"),
+    [
+        ("forget:t", "已经忘掉话题 #1 了。", True, True),
+        ("keep:t", None, True, False),  # 处理方不回复时不回
+        ("like", "不该出现", False, False),  # 别的按钮不理会
+        (None, "不该出现", False, False),  # 资料卡开关等别的互动
+    ],
+)
+async def test_interactions_go_to_the_button_handler(
+    data: str | None, answer: str | None, called: bool, replied: bool
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def buttons(openid: str, button: str, reply: Callable[[str], Awaitable[None]]) -> None:
+        calls.append((openid, button))
+        if answer is not None:
+            await reply(answer)
+
+    handlers = Handlers(cast(Gate, None), cast(ChatHandler, None), buttons=buttons)
+    interaction = _FakeInteraction(data)
+
+    await handlers.on_interaction(cast(pyqbot.Interaction, interaction))
+
+    assert bool(calls) is called
+    if called:
+        assert calls == [(ALICE, data)]
+    assert interaction.replies == ([answer] if replied else [])

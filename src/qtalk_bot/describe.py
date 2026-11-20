@@ -304,7 +304,8 @@ def _add_usage(
     journal.add_usage(
         conn,
         user_id=user.id,
-        message_id=record.message_id,
+        # 描述期间这条消息可能已被删掉（遗忘话题）：挂不上就以空引用记下，用量照记。
+        message_id=journal.owned_message(conn, user.id, record.message_id),
         model=DESCRIBE_USAGE_MODEL,
         provider=model.provider,
         provider_model=model.model,

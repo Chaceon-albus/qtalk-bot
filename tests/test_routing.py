@@ -501,7 +501,11 @@ async def test_steer_verdict_follows_the_probability(chance: float, verdict: Ste
     (question,) = request.questions
     assert question.name == STEER_QUESTION
     assert question.instructions == STEER_INSTRUCTIONS
-    assert json.loads(request.input) == {"answering": ["写个排序"], "latest": ["用 Python"]}
+    assert json.loads(request.input) == {
+        "answering": ["写个排序"],
+        "latest": ["用 Python"],
+        "displaying": False,
+    }
     assert call.record == DecisionRecord(
         question=STEER_QUESTION,
         provider=Provider.OPENAI,
