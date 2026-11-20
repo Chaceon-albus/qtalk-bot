@@ -89,7 +89,7 @@
 | 7a | 内置搜索与引用 | 已完成 |
 | 7b | 处理过程的展示 | 已完成 |
 | 8 | 提醒 | 未开始 |
-| 9 | 部署：compose、备份调度与加密、管理员告警 | 未开始 |
+| 9 | 部署：镜像与 compose、健康检查、定时备份、管理员告警 | 进行中 |
 | 10 | 生成图片：自己的画图函数与可配置的图片模型 | 已完成 |
 
 ## 文件索引
@@ -105,7 +105,7 @@
 | [search-and-process.md](search-and-process.md) | 处理过程的展示原则、内置搜索与引用（7a）、过程消息与「正在输入」（7b） | 改搜索、来源、过程消息、「正在输入」或被动回复的预算时 |
 | [image-generation.md](image-generation.md) | 生成图片（里程碑 10）：做法、配置、写死在程序里的行为、试调用与步骤 | 做里程碑 10 时 |
 | [reminders.md](reminders.md) | 提醒事项的建议做法（未定） | 做里程碑 8 时 |
-| [deployment.md](deployment.md) | 部署的数据保护要求（里程碑 9）与给管理员的提醒模块 `alerts.py` | 做里程碑 9，或加新的管理员提醒时 |
+| [deployment.md](deployment.md) | 部署（里程碑 9）：数据保护的要求，镜像与 compose、健康检查、备份、告警的做法，给管理员的提醒模块 `alerts.py` | 做里程碑 9，或加新的管理员提醒时 |
 | [external-facts.md](external-facts.md) | 查证过的外部事实：Decisions API、模型、内置搜索、思考摘要与过程标记、QQ 平台 | 写调用服务商或 QQ 的代码之前，核对接口与平台的真实行为 |
 | [live-tests.md](live-tests.md) | QQ 端到端实测的各次记录、搜索与过程展示的模型实测、还需要实测的事 | 做实测前后，或想知道某个行为在真实平台上验证过没有时 |
 | [open-questions.md](open-questions.md) | 其它待定的事（配额、时间感、数据去留、pyqbot 可以改进的地方等）与已知的薄弱处 | 动手做一块新功能之前，看有没有相关的待定项 |
