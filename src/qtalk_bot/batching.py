@@ -710,6 +710,12 @@ class _RoutedChannel:
     async def send(self, text: str) -> str | None:
         return await self._target().send(text)
 
+    async def send_image(
+        self, data: bytes, mime_type: str, replying: Callable[[], None]
+    ) -> str | None:
+        # 收消息时不发图；为了符合协议照样转发，计数与发送落在同一个通道上（同 `send()`）。
+        return await self._target().send_image(data, mime_type, replying)
+
     def open_process(self) -> ReplyStream:
         raise AssertionError("收消息时不发过程消息")
 

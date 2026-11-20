@@ -97,6 +97,26 @@
 - 话题题的决策记录与选模型的写在一起，同一次调用只记一次用量。
 - 写了归属、正常结束的一轮，交给 `memory.Summarizer` 在后台更新这个话题的标题与摘要（配置了 `[memory]` 时）。
 
+**画图**（里程碑 10）：构造时给了出图器与 `[image_generation]`、这次调用的模型打开了 `image_generation`（且能存附件）
+时，组装请求时列出「可以引用的图片」（`RequestBuilder.build(referable_images=True)`），请求带上画图函数
+（`drawing.GENERATE_IMAGE`）与这次调用专用的执行方（`_Drawer`）。适配器在同一次 `stream()` 里调用它，每次依次：
+1. 解析参数；这一轮已经画满 `drawing.MAX_IMAGES_PER_TURN` 张时不画。不合法、画满时也先复查授权。
+2. 一个事务里复查授权、校验参考图的编号（既在这次的 `Built.referable` 里，又能经 `journal.referable_image()` 按
+   这个用户取到）、按 `[image_generation]` 查当天的次数（管理员不受限，按 `[chat]` 所在的时区算日）。**复查不通过时
+   不出图，抛 `_RevokedError` 让这次模型调用就此停下**：适配器原样往外抛，不再发下一跳请求（那是又一次计费的调用）；
+   `_consume()` 接住它，这一轮按「已不能使用对话」收尾（送达状态 `withheld`，已经开始的回答流式消息只结束、
+   不再接任何东西）。
+3. 发图要占一次被动回复，发了之后还要给回答留够余量（`ReplyBudget.affords(1)`），不够就不画。
+4. 过程消息里写一行「正在画图🎨」（模型 `show_process` 时；过程消息还没开始、开它又会挤掉余量时不写），
+   `turn.pulse()`。
+5. 按用户读参考图的原件，调用出图器。执行函数期间暂停这次调用的空闲时限（`_Deadlines.paused()`），总时限照常。
+6. 出好之后立即记一行出图的用量（挂在这一轮最后一条用户消息上），把图存进这个用户的附件目录，经通道先
+   `claim()` 再 `send_image()` 发给用户；把结果（一段说明加这张图）交回给模型。失败（审核拒绝、超时、其它、
+   发送失败、限额用完、参数不对）都交回一段说明（`is_error`），由模型向用户解释。
+发出去（含说不准是否送达）的图记在这一轮的状态里，记账时挂到助手的回复上（`journal.add_generated_images()`，
+描述是画面描述）；存了盘却没发出的不记，由孤儿清理删掉。发出过图之后不再换备用模型；模型只发了图、没写文字时
+不发失败说明，送达状态记 `images`；文字回答没送达但有图确认送达时也记 `images`（这一轮照样结束）。
+
 **判断插话**（`judge()`）：在事务里复查授权、取出正在回答的消息与新消息的文字版（只有这个用户自己的），交给
 `routing.SteerJudge`；决策记录与用量挂在新消息里最后一条上，被取消时也照记。
 """
@@ -105,18 +125,35 @@ import asyncio
 import logging
 import sqlite3
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Mapping, Sequence
-from contextlib import AbstractAsyncContextManager, aclosing, asynccontextmanager, nullcontext
+from collections.abc import (
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Collection,
+    Coroutine,
+    Generator,
+    Mapping,
+    Sequence,
+)
+from contextlib import (
+    AbstractAsyncContextManager,
+    aclosing,
+    asynccontextmanager,
+    contextmanager,
+    nullcontext,
+)
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
+from math import inf
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
-from . import access, citations, faces, journal, texts, topics
+from . import access, citations, drawing, faces, journal, texts, topics
 from .access import User
 from .citations import Source
-from .config import AttachmentSettings, ChatSettings
+from .commands import day_start
+from .config import AttachmentSettings, ChatSettings, ImageGenerationSettings
 from .context import (
     Built,
     RequestBuilder,
@@ -128,6 +165,8 @@ from .context import (
     plan_turn,
 )
 from .describe import Describer
+from .imagegen import GeneratedImage as ImageResult
+from .imagegen import ImageGenerator
 from .journal import (
     DECISION_USAGE_MODEL,
     NOTICE_DELIVERIES,
@@ -137,20 +176,26 @@ from .journal import (
     UsagePurpose,
 )
 from .llm import (
+    FUNCTION_RESULT_IMAGE_TYPES,
     AudioPart,
     ChatEvent,
     ChatModel,
     ChatRequest,
     Citation,
     Commentary,
+    ErrorKind,
     Finished,
     FinishReason,
+    FunctionCall,
+    FunctionResult,
+    ImagePart,
     Modality,
     ModelError,
     Provider,
     SearchProgress,
     SearchStage,
     TextDelta,
+    TextPart,
     ThoughtSummary,
     Usage,
     inline_size,
@@ -170,8 +215,10 @@ from .media import (
     placeholders,
     skipped,
 )
+from .media import GeneratedImage as DrawnImage
 from .memory import Summarizer
 from .process import (
+    Drawing,
     ProcessEvent,
     ProcessPresenter,
     ProcessSendError,
@@ -343,6 +390,15 @@ class ReplyChannel(Protocol):
         """发一条纯文本的普通消息，返回它的引用索引（平台没有给出时为 `None`）。"""
         ...
 
+    async def send_image(
+        self, data: bytes, mime_type: str, replying: Callable[[], None]
+    ) -> str | None:
+        """发一张图片（`mime_type` 是按文件头判断的实际类型），算一次被动回复；返回值同 `send()`。
+
+        准备工作（如上传）做完、真正发起回复的请求之前调用一次 `replying()`：从那时起被取消的，平台可能已经
+        接受了这条回复，调用方按送达说不准处理。"""
+        ...
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ChatInput:
@@ -401,6 +457,7 @@ class _Attempt:
     text: str = field(repr=False)  # 模型生成的全部文字（未经 MarkdownGuard 处理）
     given: frozenset[int] = frozenset()  # 这次请求里实际以原件交给模型的、本轮的附件
     sources: tuple[Source, ...] = ()  # 回答引用的来源，整理过（见 `citations.collect()`）
+    revoked: bool = False  # 执行画图函数前复查授权不通过，这次调用就此停下（见 `_RevokedError`）
 
     @property
     def has_answer(self) -> bool:
@@ -440,6 +497,8 @@ class _Run:
         )  # 与 `steered` 同时置位：`_attempt()` 从这时起限时等读流的任务收尾
         self.parts: list[str] = []
         self.citations: list[Citation] = []  # 模型引用的来源，原样
+        self.deadlines: _Deadlines | None = None  # 这次调用的时限，执行画图函数时暂停空闲时限
+        self.revoked = False  # 执行画图函数前复查授权不通过（`_RevokedError`）
 
     def attempt(self, ending: Ending | None = None) -> _Attempt:
         ending = self.ending if ending is None else ending
@@ -456,6 +515,7 @@ class _Run:
             text,
             self.given,
             _sources(self.citations, model.name),
+            self.revoked,
         )
 
 
@@ -475,6 +535,9 @@ class _Deadlines:
 
     到期时如果读流的任务已经在被别处取消（`task.cancelling()` 大于开始时的值），就不再取消它：它正在收尾（如 SDK
     异步关闭响应流），再取消一次会打断清理；那次取消的发起方自己限时等它。
+
+    执行画图函数期间流没有动静，空闲时限暂停（`paused()`），结束时重新计时；总时限照常。暂停期间看门的任务至少
+    每 `idle` 秒醒一次，恢复之后不会错过空闲到期。
     """
 
     def __init__(self, timer: Timer, sleep: Sleep, idle: float, total: float) -> None:
@@ -483,11 +546,22 @@ class _Deadlines:
         self._idle = idle
         self._total = total
         self._started = self._active = timer()
+        self._paused = 0
         self.expired: _Expiry | None = None
 
     def touch(self) -> None:
         """流里出现了事件（任何事件，含 `Heartbeat`）。"""
         self._active = self._timer()
+
+    @contextmanager
+    def paused(self) -> Generator[None]:
+        """在这段时间里不按空闲时限判超时（执行函数调用）；结束时重新计时。"""
+        self._paused += 1
+        try:
+            yield
+        finally:
+            self._paused -= 1
+            self.touch()
 
     async def watch(self, task: asyncio.Task[object], cancelling: int) -> None:
         """在后台盯着：醒来时重新算两个到期时刻，有动静就接着等，到期就取消 `task`（`cancelling` 是它开始时的
@@ -495,13 +569,14 @@ class _Deadlines:
         while True:
             now = self._timer()
             total_at = self._started + self._total
-            idle_at = self._active + self._idle
+            idle_at = inf if self._paused else self._active + self._idle
             if now >= total_at:
                 expired = _Expiry.TOTAL
             elif now >= idle_at:
                 expired = _Expiry.IDLE
             else:
-                await self._sleep(min(total_at, idle_at) - now)
+                wake = min(total_at, now + self._idle if self._paused else idle_at)
+                await self._sleep(wake - now)
                 continue
             if task.cancelling() > cancelling:
                 return  # 已经在被别处取消、正在收尾
@@ -589,7 +664,19 @@ class _Turn:
         self.consumer: asyncio.Task[None] | None = None  # 读模型流的任务
         # 正文停在没闭合的代码围栏里时闭合它的那一行（`MarkdownGuard.closing_fence()`），接固定说明之前先接上。
         self.fence = ""
+        self.drawings = 0  # 这一轮成功出图的张数（`drawing.MAX_IMAGES_PER_TURN`）
+        self.images: list[
+            DrawnImage
+        ] = []  # 发出去（含说不准是否送达）、存了盘的图，记账时挂到回复上
+        self.images_delivered = 0  # 确认发给了用户的图
+        self.images_uncertain = 0  # 说不准是否送达的图
+        self.image_ref: str | None = None  # 第一张确认送达的图的引用索引
         self.control.on_cut(self.cut)
+
+    @property
+    def images_shown(self) -> bool:
+        """有图发给了用户（含说不准是否送达的）：之后不再换备用模型重来。"""
+        return bool(self.images_delivered or self.images_uncertain)
 
     def cut(self) -> bool:
         """插话被判为补充、回答已经开始显示时停下这段回答（`TurnControl.cut()`）：只有回答本身的流式消息已经开始、
@@ -703,6 +790,8 @@ class Conversation:
         describer: Describer | None = None,
         summarizer: Summarizer | None = None,
         steer: SteerJudge | None = None,
+        image_generator: ImageGenerator | None = None,
+        image_generation: ImageGenerationSettings | None = None,
         clock: Callable[[], float] = time.time,
         timer: Timer | None = None,
         sleep: Sleep = asyncio.sleep,
@@ -711,7 +800,8 @@ class Conversation:
 
         `fetcher` 为 `None` 时不下载附件（都按「没有下载」处理，只用文字版）；`describer` 为 `None` 时不给
         图片写描述、不给 PDF 写摘要；`summarizer` 为 `None` 时不给话题写标题与摘要（只在分话题时用到）；`steer` 为
-        `None` 时不判断插话，一律当作补充。
+        `None` 时不判断插话，一律当作补充。`image_generator` 与 `image_generation`（`[image_generation]`）都给了、
+        又有 `fetcher`（出的图要存进附件目录）时，打开了 `image_generation` 的模型能调用画图函数。
 
         `clock` 是写进流水的时间（墙上时钟）；`timer` 与 `sleep` 是过程消息的节流与「正在输入」的间隔用的单调时钟与等待
         （默认是事件循环的），测试可以换成可控的。
@@ -726,6 +816,8 @@ class Conversation:
         self._describer = describer
         self._summarizer = summarizer
         self._steer = SteerJudge() if steer is None else steer
+        self._image_generator = image_generator
+        self._image_generation = image_generation
         self._timezone = timezone
         self._clock = clock
         self._timer: Timer = timer or (lambda: asyncio.get_running_loop().time())
@@ -1124,6 +1216,12 @@ class Conversation:
             ending = Ending.SKIPPED
         else:
             ending = Ending.CANCELLED
+        if turn.images_delivered and not journal.ends_turn(outcome.content, outcome.delivery):
+            # 文字回答没送达（被取消、复查不通过、说明也没能确认送达等），但画的图确认发给了用户：这一轮已经结束，
+            # 图要留在之后的历史里，画图的请求不该在下一轮被重新并入。结局照旧。
+            outcome = _Outcome("", ReplyDelivery.IMAGES)
+        if outcome.ref_idx is None and turn.image_ref is not None:
+            outcome = replace(outcome, ref_idx=turn.image_ref)  # 没有文字回答的引用索引时用图的
         if not outcome.content and outcome.delivery not in NOTICE_DELIVERIES and turn.sent_notices:
             # 回答没送达（被取消、复查不通过等），但附件的说明已确认送达：用户实际收到了东西，这一轮已经结束
             # （`journal.ends_turn()`），不该在下一轮被重新并入。结局照旧（如取消）。
@@ -1144,18 +1242,27 @@ class Conversation:
             message_id,
             turn.selection.records,
             _Reply(
-                model, ending, turn.attempts, outcome, tuple(turn_messages), given, process, topic
+                model,
+                ending,
+                turn.attempts,
+                outcome,
+                tuple(turn_messages),
+                given,
+                process,
+                topic,
+                tuple(turn.images),
             ),
         )
         commentaries, _ = turn.process.notes.counts
         streams = turn.outbox.streams
         logger.info(
-            "回复了用户 %s：模型 %s，结局 %s，送达 %s%s，搜索 %d 次，说明 %d 段，过程消息 %d 片",
+            "回复了用户 %s：模型 %s，结局 %s，送达 %s%s%s，搜索 %d 次，说明 %d 段，过程消息 %d 片",
             turn.user.label,
             model,
             ending.value,
             outcome.delivery.value,
             f"（分 {streams} 条）" if streams > 1 else "",
+            f"，发图 {len(turn.images)} 张" if turn.images else "",
             sum(attempt.searches for attempt in turn.attempts),
             commentaries,
             turn.process.chunks,
@@ -1335,6 +1442,10 @@ class Conversation:
             msg_idx=reply.outcome.ref_idx,
         )
         journal.set_given(conn, user.id, reply.messages, reply.given)
+        if reply.images:
+            journal.add_generated_images(
+                conn, user_id=user.id, message_id=reply_id, images=reply.images, now=now
+            )
         _record_usage(conn, user.id, message_id, reply.attempts, now)
         if reply.topic is None:
             return None
@@ -1381,6 +1492,61 @@ class Conversation:
         self, conn: sqlite3.Connection, user: User, message_id: int, record: DecisionRecord
     ) -> None:
         _record_decisions(conn, user.id, message_id, (record,), int(self._clock()))
+
+    def _draw_check(
+        self,
+        conn: sqlite3.Connection,
+        user: User,
+        references: Sequence[int],
+        referable: Collection[int],
+    ) -> _DrawCheck:
+        """画图之前：复查授权、校验参考图的编号、查当天的次数。参考图只取这个用户的（`journal.referable_image()`），
+        编号还得是这次请求列出的（`referable`）。"""
+        if not access.chat_allowed(conn, user.id, self._admin_openid):
+            return _DrawCheck(_Refusal.REVOKED)
+        records: list[AttachmentRecord] = []
+        bad: list[int] = []
+        for number in references:
+            record = journal.referable_image(conn, user.id, number) if number in referable else None
+            if record is None:
+                bad.append(number)
+            else:
+                records.append(record)
+        if bad:
+            return _DrawCheck(_Refusal.REFERENCE, bad=tuple(bad))
+        settings = self._image_generation
+        assert settings is not None
+        if user.openid != self._admin_openid:  # 管理员不受限
+            if settings.daily_limit == 0:
+                return _DrawCheck(_Refusal.ADMIN_ONLY)
+            since = day_start(int(self._clock()), self._timezone)
+            if journal.image_count(conn, user.id, since) >= settings.daily_limit:
+                return _DrawCheck(_Refusal.USER_LIMIT)
+            total = settings.total_daily_limit
+            if total is not None and journal.total_image_count(conn, since) >= total:
+                return _DrawCheck(_Refusal.TOTAL_LIMIT)
+        return _DrawCheck(None, tuple(records))
+
+    def _record_image_usage(
+        self,
+        conn: sqlite3.Connection,
+        user: User,
+        message_id: int,
+        provider: Provider,
+        provider_model: str,
+        input_tokens: int | None,
+        output_tokens: int | None,
+    ) -> None:
+        journal.add_image_usage(
+            conn,
+            user_id=user.id,
+            message_id=message_id,
+            provider=provider,
+            provider_model=provider_model,
+            now=int(self._clock()),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
 
     def _waiting_counts(
         self, conn: sqlite3.Connection, user: User, messages: Sequence[int]
@@ -1429,7 +1595,9 @@ class Conversation:
                 logger.info("用户 %s 已不能使用对话，不再组装上下文", turn.user.label)
                 return self._withhold(turn)
             builder.set_context(*context)
-        withheld = await self._attempts(turn, builder, self._chain(chosen, current))
+        withheld = await self._attempts(
+            turn, builder, self._chain(chosen, current), begun.last_message_id
+        )
         if withheld and not turn.attempts:
             return self._withhold(turn)
         if not turn.attempts:
@@ -1443,9 +1611,20 @@ class Conversation:
             return _Outcome("", ReplyDelivery.FAILED if delivered else ReplyDelivery.NOTICE_LOST)
         await turn.typing_settled()  # 之后要发的说明或纯文本不能排在「正在输入」前面
         if withheld:
-            turn.outbox.discard()
-            return _Outcome("", ReplyDelivery.WITHHELD)
+            return await self._stop_withheld(turn)
         return await self._deliver(turn)
+
+    async def _stop_withheld(self, turn: _Turn) -> _Outcome:
+        """调用过模型之后发现已不能使用对话（换备用模型之前，或执行画图函数之前）：不再发任何东西。回答的流式消息
+        已经开始时（画图前模型先写了几句）只结束它，按已确认送达的部分记。"""
+        outbox = turn.outbox
+        outbox.stop()
+        if not outbox.handed:
+            outbox.discard()
+            return _Outcome("", ReplyDelivery.WITHHELD)
+        await outbox.close()
+        turn.process.seal()
+        return outbox.outcome(ReplyDelivery.WITHHELD)
 
     def _decision_voices(self, current: Sequence[HistoryEntry]) -> list[AttachmentRecord]:
         """本轮语音里决策接口收这种格式、单件放得进它的内联上限的那些（要读原声交给决策）。"""
@@ -1511,18 +1690,22 @@ class Conversation:
         return chain
 
     async def _attempts(
-        self, turn: _Turn, builder: RequestBuilder, models: list[ChatModel]
+        self, turn: _Turn, builder: RequestBuilder, models: list[ChatModel], reply_to: int
     ) -> bool:
         """依次调用选出的模型与它的备用模型（各自按自己的能力组装上下文）；调用前复查授权，发现已不能使用
-        对话时返回 `True`。"""
+        对话时（含执行画图函数之前，`_RevokedError`）返回 `True`。`reply_to` 是回复所挂的那条用户消息，出图的用量
+        挂在它上面。"""
         for index, model in enumerate(models):
             settings = self._router.model(model.name)
             # 读原件、编码、等模型回复这段时间占着进程级的名额（见 MULTIMODAL_REQUESTS）；不带附件的请求不受限。
+            holds_slot = builder.needs_originals(settings)
             slot: AbstractAsyncContextManager[object] = (
-                self._media_slots if builder.needs_originals(settings) else nullcontext()
+                self._media_slots if holds_slot else nullcontext()
             )
+            draws = self._draws(settings.image_generation)
             async with slot:
-                built: Built | None = await builder.build(settings)  # 先读完文件再复查
+                # 先读完文件再复查
+                built: Built | None = await builder.build(settings, referable_images=draws)
                 assert built is not None
                 for notice in built.notices:
                     if notice not in turn.notices:
@@ -1537,7 +1720,22 @@ class Conversation:
                 await self._notify(turn, built.notices)
                 if not await self._still_allowed(turn, "备用模型" if index else "对话模型"):
                     return True
-                request, given, built = built.request, built.given, None
+                request, given, referable = built.request, built.given, built.referable
+                built = None
+                if draws:
+                    request = replace(
+                        request,
+                        tools=(*request.tools, drawing.GENERATE_IMAGE),
+                        tool_runner=_Drawer(
+                            self._draw_deps(),
+                            turn,
+                            reply_to=reply_to,
+                            referable=referable,
+                            show=settings.show_process,
+                            # 这次调用已经占着名额时，读参考图与出图不再另占（免得几轮互相等着死锁）。
+                            slots=None if holds_slot else self._media_slots,
+                        ),
+                    )
                 # 进展：真正开始调用这个模型。它与之后的备用模型里有会发过程消息的，就给过程消息留余量。
                 turn.process_ahead = any(
                     self._router.model(later.name).show_process for later in models[index:]
@@ -1556,7 +1754,15 @@ class Conversation:
                     raise
                 del request  # 归还名额之前丢掉对请求（原件）的引用
             turn.attempts.append(attempt)
-            retry = not attempt.has_answer and not turn.outbox.handed and index + 1 < len(models)
+            if attempt.revoked:
+                return True
+            # 发出过图（含说不准的）也算用户已经看到了内容：不换备用模型从头来。
+            retry = (
+                not attempt.has_answer
+                and not turn.outbox.handed
+                and not turn.images_shown
+                and index + 1 < len(models)
+            )
             if retry and (left := self._time_left(turn)) is not None and left < MIN_CALL_SECONDS:
                 # 离被动回复的截止点太近：备用模型来不及写出回答，直接给说明，免得说明也赶不上。
                 logger.warning(
@@ -1589,6 +1795,31 @@ class Conversation:
                 turn.fence = ""
             break
         return False
+
+    def _draw_deps(self) -> _DrawDeps:
+        generator, settings, fetcher = self._image_generator, self._image_generation, self._fetcher
+        assert generator is not None
+        assert settings is not None
+        assert fetcher is not None
+        return _DrawDeps(
+            db=self._db,
+            generator=generator,
+            store=fetcher.store,
+            daily_limit=settings.daily_limit,
+            timer=self._timer,
+            allowed=self._allowed,
+            check=self._draw_check,
+            record_usage=self._record_image_usage,
+        )
+
+    def _draws(self, enabled: bool) -> bool:
+        """这次调用的模型（`ModelSettings.image_generation` 为 `enabled`）能不能调用画图函数。"""
+        return (
+            enabled
+            and self._image_generator is not None
+            and self._image_generation is not None
+            and self._fetcher is not None
+        )
 
     def _time_left(self, turn: _Turn) -> float | None:
         """离这一轮被动回复的截止点还有多少秒（可能为负）；不知道截止点时为 `None`。"""
@@ -1720,6 +1951,7 @@ class Conversation:
         cancelling = task.cancelling()
         settings = self._settings
         deadlines = _Deadlines(self._timer, self._sleep, settings.idle_timeout_seconds, total)
+        run.deadlines = deadlines
         watcher = asyncio.create_task(deadlines.watch(task, cancelling))
         try:
             async with aclosing(model.stream(request)) as events:
@@ -1743,6 +1975,10 @@ class Conversation:
         except ModelError as exc:
             logger.warning("模型 %s 调用失败：%s", model.name, exc)
             run.ending = Ending.ERROR
+        except _RevokedError:
+            logger.info("模型 %s 的这次调用就此停下，不再发下一跳请求", model.name)
+            run.revoked = True
+            run.ending = Ending.CANCELLED
         except asyncio.CancelledError:
             # 时限与插话各自只在没有别的取消在进行时才取消这个任务（`_Deadlines.watch()`、`_Turn.cut()`），所以
             # 两个标记至多有一个；之后又来的取消（关停、发送出错后停止读模型）让 `uncancel()` 回不到开始时的值，
@@ -1791,6 +2027,9 @@ class Conversation:
         if outbox.error is None:
             if not outbox.handed:  # 模型什么也没给，或只给了空白
                 outbox.discard()
+                if turn.images_delivered and last.ending is Ending.EMPTY:
+                    logger.info("模型只给用户 %s 发了图、没有写文字，不发失败说明", user.label)
+                    return _Outcome("", ReplyDelivery.IMAGES, turn.image_ref)
                 sent = await _send_notice(channel, texts.MODEL_FAILED, user)
                 return _Outcome("", ReplyDelivery.FAILED if sent else ReplyDelivery.NOTICE_LOST)
             if outbox.unclosed:
@@ -1876,6 +2115,7 @@ class _Reply:
     )  # 其中实际以原件交给了模型的附件（见 `journal.set_given()`）
     process: str | None = field(default=None, repr=False)  # 处理过程的全文，只存档
     topic: _TopicWrite | None = None  # 分话题、这一轮结束了时要写的话题归属
+    images: tuple[DrawnImage, ...] = field(default=(), repr=False)  # 这一轮发出去的图，挂到回复上
 
 
 @dataclass(frozen=True, slots=True)
@@ -2086,6 +2326,13 @@ class _TurnChannel:
         self.budget.replies += 1
         return await self._channel.send(text)
 
+    async def send_image(
+        self, data: bytes, mime_type: str, replying: Callable[[], None]
+    ) -> str | None:
+        self._claim()
+        self.budget.replies += 1
+        return await self._channel.send_image(data, mime_type, replying)
+
     def open_process(self) -> ProcessStream:
         """开始一条过程消息（调用方在要发第一片时才调用，所以这时就计数）。"""
         self.budget.replies += 1
@@ -2109,6 +2356,273 @@ class _ProcessChannel:
             await self._stream.finish()
         except SendError as exc:
             raise ProcessSendError(str(exc)) from None
+
+
+class _RevokedError(Exception):
+    """执行画图函数之前复查授权不通过：抛给适配器，它原样往外抛，这次模型调用就此停下、不再发下一跳请求；
+    `_consume()` 接住它。"""
+
+
+class _Refusal(Enum):
+    """画图之前的检查没通过的原因。"""
+
+    REVOKED = "已不能使用对话"
+    REFERENCE = "参考图的编号不对"
+    ADMIN_ONLY = "只有管理员能画"
+    USER_LIMIT = "每人每天的限额用完"
+    TOTAL_LIMIT = "全体每天的限额用完"
+
+
+@dataclass(frozen=True, slots=True)
+class _DrawCheck:
+    """画图之前的检查（`Conversation._draw_check()`）的结果：通过时 `refusal` 为 `None`，`references` 是参考图的
+    记录（按参数的顺序）；编号不对时 `bad` 是不对的那些。"""
+
+    refusal: _Refusal | None
+    references: tuple[AttachmentRecord, ...] = ()
+    bad: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _DrawDeps:
+    """`_Drawer` 用到的 `Conversation` 的部分（事务函数在数据库线程里执行）。"""
+
+    db: Database
+    generator: ImageGenerator
+    store: MediaStore
+    daily_limit: int
+    timer: Timer
+    allowed: Callable[[sqlite3.Connection, User], bool]
+    check: Callable[[sqlite3.Connection, User, Sequence[int], Collection[int]], _DrawCheck]
+    record_usage: Callable[
+        [sqlite3.Connection, User, int, Provider, str, int | None, int | None], None
+    ]
+
+
+class _Drawer:
+    """一次模型调用的画图函数执行方（`llm.ToolRunner`），步骤见模块 docstring「画图」。
+
+    `referable` 是这次请求列出的「可以引用的图片」（`Built.referable`）；`reply_to` 是这一轮最后一条用户消息，
+    出图的用量挂在它上面；`show` 是这个模型要不要显示过程。日志里只有用户称呼、模型、耗时、字节数与失败的分类，
+    不记画面描述、参数原文与文件名。
+    """
+
+    def __init__(
+        self,
+        deps: _DrawDeps,
+        turn: _Turn,
+        *,
+        reply_to: int,
+        referable: Mapping[int, AttachmentRecord],
+        show: bool,
+        slots: asyncio.Semaphore | None,
+    ) -> None:
+        self._deps = deps
+        self._slots = slots
+        self._turn = turn
+        self._generator = deps.generator
+        self._store = deps.store
+        self._reply_to = reply_to
+        self._referable = frozenset(referable)
+        self._show = show
+
+    async def __call__(self, call: FunctionCall) -> FunctionResult:
+        run = self._turn.run
+        deadlines = None if run is None else run.deadlines
+        with nullcontext() if deadlines is None else deadlines.paused():
+            result = await self._run(call)
+            # 交回结果之后适配器会再发一跳（计费的）请求：执行期间（出图、上传）被停用的就此停下。已经记下的出图
+            # 用量与已经发出的图照样记账。
+            await self._allowed()
+            return result
+
+    async def _allowed(self) -> None:
+        """只复查授权（参数不对、这一轮已经画满时：交回说明之后适配器会发下一跳，所以照样要查）。"""
+        deps = self._deps
+        if not await deps.db.transaction(deps.allowed, self._turn.user):
+            self._revoke()
+
+    def _revoke(self) -> None:
+        logger.info("用户 %s 已不能使用对话，停下这次模型调用，不再画图", self._turn.user.label)
+        # 立即停掉回答的正文队列：模型先写了几句、发送任务还在等「正在输入」时，排队的部分不能再发出去。
+        self._turn.outbox.stop()
+        raise _RevokedError
+
+    async def _run(self, call: FunctionCall) -> FunctionResult:
+        deps, turn = self._deps, self._turn
+        user = turn.user
+        if call.name != drawing.FUNCTION_NAME:
+            await self._allowed()
+            logger.warning("模型给用户 %s 调用了没有声明的函数，交回说明", user.label)
+            return drawing.unknown_function(call.name)
+        arguments = drawing.parse_arguments(call.arguments)
+        if isinstance(arguments, str):
+            await self._allowed()
+            logger.info("给用户 %s 画图的参数不合法，交回说明", user.label)
+            return drawing.bad_arguments(arguments)
+        if turn.drawings >= drawing.MAX_IMAGES_PER_TURN:
+            await self._allowed()
+            logger.info("用户 %s 这一轮已经画了 %d 张图，不再画", user.label, turn.drawings)
+            return drawing.turn_full()
+        check = await deps.db.transaction(
+            deps.check,
+            user,
+            arguments.references,
+            self._referable,
+        )
+        match check.refusal:
+            case None:
+                pass
+            case _Refusal.REVOKED:
+                self._revoke()
+            case refusal:
+                logger.info("不给用户 %s 画图：%s", user.label, refusal.value)
+                return self._refused(refusal, check.bad)
+        budget = turn.channel.budget
+        if not budget.affords(1):
+            logger.info("用户 %s 这条消息的被动回复次数不够给回答留余量，不画图", user.label)
+            return drawing.no_room()
+        # 过程消息还没开始时，开它也要占一次被动回复：发图之后余量不够就不写这一行。
+        process = turn.process
+        show = self._show and (process.opened or budget.affords(2))
+        process.feed(Drawing(call.call_id), show=show)
+        turn.pulse()
+        # 带参考图时，读原图到出图结束占着进程级的多模态名额（见 MULTIMODAL_REQUESTS）。
+        slot: AbstractAsyncContextManager[object] = (
+            self._slots if check.references and self._slots is not None else nullcontext()
+        )
+        async with slot:
+            outcome = await self._generate(arguments, check.references)
+        if isinstance(outcome, FunctionResult):
+            return outcome
+        image, seconds = outcome
+        generator = self._generator
+        turn.drawings += 1
+        # 出图已经计费：先记用量，再做别的；记账不随取消撤掉。
+        writing = asyncio.ensure_future(
+            deps.db.transaction(
+                deps.record_usage,
+                user,
+                self._reply_to,
+                generator.provider,
+                generator.model,
+                image.input_tokens,
+                image.output_tokens,
+            )
+        )
+        writing.add_done_callback(_retrieve_any)
+        await asyncio.shield(writing)
+        logger.info(
+            "给用户 %s 画了一张图：模型 %s，%.1f 秒，%d 字节",
+            user.label,
+            generator.model,
+            seconds,
+            len(image.data),
+        )
+        saved = await self._save(image.data, image.mime_type, arguments.prompt)
+        if not budget.affords(1):
+            logger.info("用户 %s 这条消息的被动回复次数不够给回答留余量，画好的图不发", user.label)
+            return drawing.no_room()
+        await turn.typing_settled()  # 图不能排在「正在输入」前面
+        replying = False
+
+        def mark() -> None:
+            nonlocal replying
+            replying = True
+
+        try:
+            ref_idx = await turn.channel.send_image(image.data, image.mime_type, mark)
+        except asyncio.CancelledError:
+            if replying:
+                # 回复的请求已经发起：平台可能已经接受了，只是回执还没回来。按送达说不准记下，也不再换备用模型。
+                logger.warning("给用户 %s 发图时被取消，不确定是否送达", user.label)
+                turn.images_uncertain += 1
+                if saved is not None:
+                    turn.images.append(saved)
+            raise
+        except SendRejectedError as exc:
+            logger.warning("画好的图没能发给用户 %s：%s", user.label, exc)
+            return drawing.send_rejected()
+        except SendUncertainError as exc:
+            logger.warning("给用户 %s 发图时不确定是否送达：%s", user.label, exc)
+            turn.images_uncertain += 1
+            if saved is not None:
+                turn.images.append(saved)
+            return drawing.send_uncertain()
+        turn.images_delivered += 1
+        if saved is not None:
+            turn.images.append(saved)
+        if turn.image_ref is None:
+            turn.image_ref = ref_idx
+        parts: list[TextPart | ImagePart] = [TextPart(drawing.drawn(arguments.references))]
+        if image.mime_type in FUNCTION_RESULT_IMAGE_TYPES:
+            parts.append(ImagePart(image.data, image.mime_type))
+        return FunctionResult(tuple(parts))
+
+    async def _generate(
+        self, arguments: drawing.Arguments, records: Sequence[AttachmentRecord]
+    ) -> tuple[ImageResult, float] | FunctionResult:
+        """读参考图的原件、调用出图器；成功时返回图与耗时（秒），失败时返回交回给模型的说明。"""
+        deps, user = self._deps, self._turn.user
+        references: list[ImagePart] = []
+        try:
+            for record in records:
+                data = (
+                    None
+                    if record.path is None
+                    else await _read_whole(self._store, user.id, record.path)
+                )
+                if data is None or record.mime_type is None:
+                    logger.info("用户 %s 要参照的图片读不出来，不画图", user.label)
+                    return drawing.bad_references((record.id,))
+                references.append(ImagePart(data, record.mime_type))
+            if records:
+                await self._allowed()  # 读图期间可能被停用：紧挨着出图（计费）再查一次
+            generator = self._generator
+            started = deps.timer()
+            try:
+                image = await generator.generate(arguments.prompt, arguments.aspect, references)
+            except ModelError as exc:
+                logger.warning(
+                    "没能给用户 %s 画图：模型 %s，%.1f 秒，%s",
+                    user.label,
+                    generator.model,
+                    deps.timer() - started,
+                    exc.kind.value,
+                )
+                match exc.kind:
+                    case ErrorKind.BLOCKED:
+                        return drawing.blocked()
+                    case ErrorKind.CONNECTION:
+                        return drawing.timed_out()
+                    case _:
+                        return drawing.failed()
+            return image, deps.timer() - started
+        finally:
+            references.clear()  # 归还名额之前丢掉对原图的引用
+
+    def _refused(self, refusal: _Refusal, bad: Sequence[int]) -> FunctionResult:
+        match refusal:
+            case _Refusal.REFERENCE:
+                return drawing.bad_references(bad)
+            case _Refusal.ADMIN_ONLY:
+                return drawing.admin_only()
+            case _Refusal.USER_LIMIT:
+                return drawing.user_limit(self._deps.daily_limit)
+            case _Refusal.TOTAL_LIMIT:
+                return drawing.total_limit()
+            case _Refusal.REVOKED:
+                raise AssertionError("复查授权不通过时不交回结果")
+
+    async def _save(self, data: bytes, mime_type: str, prompt: str) -> DrawnImage | None:
+        """把图存进这个用户的附件目录。存不下时只记日志：图照样发给用户，只是不记进附件表。"""
+        user = self._turn.user
+        try:
+            path = await asyncio.to_thread(self._store.save, user.id, data, mime_type)
+        except Exception as exc:  # noqa: BLE001  见 docstring；文案可能带路径，只记类型
+            logger.warning("给用户 %s 画的图没能存盘：%s", user.label, type(exc).__name__)
+            return None
+        return DrawnImage(path=path, mime_type=mime_type, size=len(data), description=prompt)
 
 
 async def _typing(channel: ReplyChannel, user: User) -> None:

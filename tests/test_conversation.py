@@ -240,6 +240,9 @@ class FakeChannel:
         self.process_finish_gate: asyncio.Event | None = (
             None  # 不为空时过程消息的结束分片要等它置位
         )
+        self.images: list[bytes] = []  # 发出的图片
+        self.image_failure: SendError | None = None
+        self.image_ref: str | None = None
 
     def open_process(self) -> FakeProcess:
         process = FakeProcess(self)
@@ -307,6 +310,18 @@ class FakeChannel:
             raise error
         self.log.append(("send", text))
         return self.send_ref
+
+    async def send_image(
+        self, data: bytes, mime_type: str, replying: Callable[[], None]
+    ) -> str | None:
+        """发图：记成（`image`，MIME 类型），字节记进 `images`。`image_failure` 不为空时这次发送抛出它。"""
+        await asyncio.sleep(0)
+        replying()
+        if self.image_failure is not None:
+            raise self.image_failure
+        self.log.append(("image", mime_type))
+        self.images.append(data)
+        return self.image_ref
 
 
 class FakeProcess:

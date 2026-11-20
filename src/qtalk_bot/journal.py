@@ -69,6 +69,9 @@ class ReplyDelivery(StrEnum):
     # 没有送达任何回答（被取消、复查不通过、说不准送达了多少），但附件的说明（下载失败、看不了等）已确认送达；
     # 结局记的是真实的情况（如 cancelled、skipped）
     NOTICED = "noticed"
+    # 没有送达任何文字回答（模型只画了图没写字，或文字回答没能送达、说明也没能确认送达），但这一轮画的图至少有
+    # 一张已确认发给用户：图记成这条回复的附件，这一轮照样结束；结局记的是真实的情况
+    IMAGES = "images"
 
 
 class UsagePurpose(StrEnum):
@@ -476,8 +479,10 @@ def add_reply(
     return message_id
 
 
-NOTICE_DELIVERIES = frozenset((ReplyDelivery.FAILED, ReplyDelivery.REJECTED, ReplyDelivery.NOTICED))
-"""这几种送达状态下，用户确实收到了固定说明或附件的说明（即使 `content` 为空）。"""
+NOTICE_DELIVERIES = frozenset(
+    (ReplyDelivery.FAILED, ReplyDelivery.REJECTED, ReplyDelivery.NOTICED, ReplyDelivery.IMAGES)
+)
+"""这几种送达状态下，用户确实收到了固定说明、附件的说明或模型画的图（即使 `content` 为空）。"""
 
 
 def _ends_turn_sql(alias: str = "") -> str:
@@ -495,7 +500,7 @@ _ENDS_TURN_SQL = _ends_turn_sql()
 
 def ends_turn(content: str, delivery: ReplyDelivery) -> bool:
     """一条回复是否真正结束了一轮：用户实际看到了回答（`content` 不为空），或收到了固定说明（`failed`、
-    `rejected`）或附件的说明（`noticed`）。
+    `rejected`）、附件的说明（`noticed`）或模型画的图（`images`）。
 
     正文为空、又没有确认送达说明的（`withheld`、`cancelled`、`uncertain`、`notice_lost` 等）没有给用户任何
     东西，不算轮次的边界：它回复的那些用户消息仍属于下一轮的输入，例如 PDF 已落库、还在等名额时关停，

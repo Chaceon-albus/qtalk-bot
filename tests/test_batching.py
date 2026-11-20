@@ -4,7 +4,7 @@
 import asyncio
 import itertools
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 import pytest
@@ -182,6 +182,10 @@ class Channel:
 
     async def send(self, text: str) -> None:
         self.sent.append(text)
+
+    async def send_image(self, data: bytes, mime_type: str, replying: Callable[[], None]) -> None:
+        replying()
+        self.sent.append(f"[图片 {mime_type}]")
 
     def open_process(self) -> ReplyStream:
         raise AssertionError("这里的替身不发过程消息")

@@ -3,7 +3,7 @@
 不依赖 pyqbot 与 SDK，时钟与等待可以注入。
 
 **来源**是两种流式事件（`llm`）：调用工具前的说明（`Commentary`，OpenAI 的 `phase` 为 `commentary` 的消息）与
-搜索进展（`SearchProgress`）。思考摘要不展示、不存档，也不请求（用户 2026-11-19 决定：实测里摘要很稀疏、而且
+搜索进展（`SearchProgress`），加上程序执行画图函数时自己给出的 `Drawing`。思考摘要不展示、不存档，也不请求（用户 2026-11-19 决定：实测里摘要很稀疏、而且
 总是英文）；模型只是在思考、还没有内容可显示时，靠「正在输入」提示用户（见 `conversation.py` 的补发）。
 
 **写什么**（`ProcessNotes`）：只写步骤级的短句，每步一行，纯文本。QQ 的流式消息只能往后追加、不能改已经发出的
@@ -18,6 +18,7 @@
   它后面（第一次是「 查询词」，之后是「、新查询词」），之后已经发出过别的内容时另起一行「正在搜索🔍 新查询词」。
   不写「搜索完成」：完成时没有新的查询词就什么也不接。还没发出就完成、又始终没有查询词的动作（OpenAI 的打开网页
   等）整行去掉。每次写出的查询词经 `shorten()` 截断，已经写过的不再写。
+- 画图（`Drawing`）每次另起一行「正在画图🎨」，不接别的文字，也不与上一行去重。
 - 说明与上一行完全相同时不重复写；搜索不去重，每次搜索各占一行（用户 2026-11-19 决定：不要几次搜索挤在一行里）。
   最多 `MAX_STEPS` 行，之后写一行「……」就不再增加。接在行末的文字不算行。
 
@@ -81,7 +82,16 @@ ANSWER_RESERVE = 2
 
 type Timer = Callable[[], float]
 type Sleep = Callable[[float], Awaitable[None]]
-type ProcessEvent = Commentary | SearchProgress
+
+
+@dataclass(frozen=True, slots=True)
+class Drawing:
+    """程序开始执行一次画图函数（不是模型流里的事件，由 `conversation.py` 给出）。`call_id` 是那次函数调用的编号。"""
+
+    call_id: str
+
+
+type ProcessEvent = Commentary | SearchProgress | Drawing
 
 
 @dataclass(slots=True)
@@ -198,7 +208,7 @@ class _Step:
     line: _Step | None = field(default=None, repr=False)
     """交出之后显示在哪一行：写出时是自己，与上一行相同而没写时是上一行，没写时为 None。"""
     search: bool = False
-    """一次搜索的一行：不与上一行去重，每次搜索各占一行。"""
+    """一次搜索或画图的一行：不与上一行去重，每次各占一行。"""
     tail: str = ""
     """已经定下、还没交出的、要接在这一行末尾的文字。"""
     queried: bool = False
@@ -212,6 +222,11 @@ class _Segment:
     kind: _Kind
     text: str = ""
     step: _Step | None = None  # 显示用的一行；不显示（超出行数、不展示）时为 None
+
+
+@dataclass(slots=True)
+class _Drawn:
+    """一次画图（只存档「画了一张图」，不存画面描述）。"""
 
 
 @dataclass(slots=True)
@@ -238,7 +253,7 @@ class ProcessNotes:
         self._open: _Segment | None = None  # 还可能接着写的那段说明
         self._segments: dict[tuple[_Kind, str], _Segment] = {}
         self._searches: dict[str, _Search] = {}
-        self._archive: list[_Segment | _Search] = []
+        self._archive: list[_Segment | _Search | _Drawn] = []
 
     @property
     def counts(self) -> tuple[int, int]:
@@ -252,6 +267,8 @@ class ProcessNotes:
                 return self._text(_Kind.COMMENTARY, segment, text, display)
             case SearchProgress():
                 return self._search(event, display)
+            case Drawing():
+                return self._drawing(display)
 
     def take(self) -> list[Piece]:
         """交出已经能确定的新内容：先是要接在上一行末尾的文字，再是新的行（按顺序，遇到还看不出写什么的一行
@@ -285,6 +302,8 @@ class ProcessNotes:
             if isinstance(item, _Segment):
                 if item.text.strip():
                     entries.append(f"[{item.kind.value}] {item.text.strip()}")
+            elif isinstance(item, _Drawn):
+                entries.append("[画图]")
             else:
                 queries = "、".join(item.queries) if item.queries else "（没有查询词）"
                 entries.append(f"[{_Kind.SEARCH.value}] {queries}")
@@ -330,6 +349,16 @@ class ProcessNotes:
             return closed  # 已经定下来的不再改（之后补发的部分只存档）
         segment.step.text = headline(segment.text, final=False)
         return closed or segment.step.text is not None
+
+    def _drawing(self, display: bool) -> bool:
+        closed = self._close_open()
+        self._archive.append(_Drawn())
+        if not display:
+            return closed
+        step = self._append(texts.PROCESS_DRAWING)
+        if step is not None:
+            step.search = True
+        return True
 
     def _search(self, event: SearchProgress, display: bool) -> bool:
         closed = self._close_open()  # 前一段说明定了下来：即使这次搜索没有可写的，也要唤醒发送

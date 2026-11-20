@@ -596,9 +596,15 @@ async def test_unanswered_messages_do_not_use_up_history_turns(db: Database) -> 
 
 @pytest.mark.parametrize("delivery", list(ReplyDelivery))
 def test_only_replies_that_gave_the_user_something_end_a_turn(delivery: ReplyDelivery) -> None:
-    # 有正文送达的总算；正文为空时，只有确认送达了固定说明或附件说明的（failed、rejected、noticed）才算。
+    # 有正文送达的总算；正文为空时，只有确认送达了固定说明、附件说明或画的图的（failed、rejected、noticed、
+    # images）才算。
     assert journal.ends_turn("回答", delivery)
-    expected = delivery in (ReplyDelivery.FAILED, ReplyDelivery.REJECTED, ReplyDelivery.NOTICED)
+    expected = delivery in (
+        ReplyDelivery.FAILED,
+        ReplyDelivery.REJECTED,
+        ReplyDelivery.NOTICED,
+        ReplyDelivery.IMAGES,
+    )
     assert journal.ends_turn("", delivery) is expected
 
 
@@ -1208,6 +1214,30 @@ async def test_a_reply_with_only_drawn_images_still_shows_in_the_history(db: Dat
         (Role.ASSISTANT, "", 1),
         (Role.USER, "问2", 0),
     ]
+
+
+async def test_a_reply_whose_only_delivery_was_drawn_images_ends_the_turn(db: Database) -> None:
+    # 评审（P2）：图已发出、文字回答发出前被取消时，回复记成正文为空的 images。它要算一轮的边界：图留在历史里，
+    # 画图的请求不再被并进下一轮。
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> int:
+        question = turn(conn, alice, "画只猫", "", delivery=ReplyDelivery.IMAGES)
+        journal.add_generated_images(
+            conn, user_id=alice, message_id=question + 1, images=[drawn("1/a.png")], now=0
+        )
+        return journal.add_user_message(conn, alice, "把刚才那张改一下", "qq-x", 0)
+
+    current = await db.transaction(fill)
+
+    pending = await db.transaction(journal.pending_messages, alice, current + 1)
+    assert [entry.content for entry in pending] == ["把刚才那张改一下"]
+    history = await db.transaction(journal.recent_history, alice, current + 1, 5)
+    assert [(e.role, e.content, len(e.attachments)) for e in history] == [
+        (Role.USER, "画只猫", 0),
+        (Role.ASSISTANT, "", 1),
+    ]
+    assert history[1].attachments[0].generated
 
 
 async def test_generated_images_only_go_on_this_users_own_reply(db: Database) -> None:

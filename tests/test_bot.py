@@ -9,6 +9,7 @@ import json
 import logging
 import sqlite3
 import time
+import types
 from collections.abc import (
     AsyncGenerator,
     AsyncIterator,
@@ -63,7 +64,12 @@ from qtalk_bot.config import (
     ModelSettings,
     TurnSettings,
 )
-from qtalk_bot.conversation import TYPING_PULSE_SECONDS, Conversation, SendUncertainError
+from qtalk_bot.conversation import (
+    TYPING_PULSE_SECONDS,
+    Conversation,
+    SendRejectedError,
+    SendUncertainError,
+)
 from qtalk_bot.gate import (
     Delivery,
     FriendAdded,
@@ -1155,6 +1161,85 @@ async def test_reply_channel_starts_a_new_stream_even_if_the_finish_failed() -> 
         await channel.finish_stream()
     assert await channel.stream("二") == "REF2"
     assert [stream.chunks for stream in message.streams] == [["一"], ["二"]]
+
+
+class _FakeImageMessage:
+    """上传与回复图片的替身：记下上传的文件名与字节、回复带的 media。"""
+
+    def __init__(
+        self,
+        *,
+        upload_error: Exception | None = None,
+        reply_error: Exception | None = None,
+    ) -> None:
+        self.upload_error = upload_error
+        self.reply_error = reply_error
+        self.uploads: list[tuple[bytes, str | None]] = []
+        self.replies: list[object] = []
+
+    async def upload(self, *, data: bytes | None = None, file_name: str | None = None) -> object:
+        if self.upload_error is not None:
+            raise self.upload_error
+        assert data is not None
+        self.uploads.append((data, file_name))
+        return ("media", file_name)
+
+    async def reply(self, content: str | None = None, *, media: object = None) -> object:
+        assert content is None
+        if self.reply_error is not None:
+            raise self.reply_error
+        self.replies.append(media)
+        return types.SimpleNamespace(ext_info=types.SimpleNamespace(ref_idx="REFIDX_image"))
+
+
+async def test_reply_channel_uploads_then_replies_with_the_image() -> None:
+    message = _FakeImageMessage()
+    channel = bot_module._QQReplyChannel(cast(pyqbot.C2CMessage, message))  # pyright: ignore[reportPrivateUsage]  测接线层的通道本身
+
+    replying: list[int] = []
+
+    def mark() -> None:
+        replying.append(len(message.uploads))  # 发起回复时已经上传了几张
+
+    assert await channel.send_image(b"\xff\xd8\xffJPEG", "image/jpeg", mark) == "REFIDX_image"
+    assert await channel.send_image(b"\x89PNG", "image/png", mark) == "REFIDX_image"
+
+    assert replying == [1, 2]  # 每次都在上传之后、回复之前
+
+    assert message.uploads == [(b"\xff\xd8\xffJPEG", "image.jpg"), (b"\x89PNG", "image.png")]
+    assert message.replies == [("media", "image.jpg"), ("media", "image.png")]
+
+
+@pytest.mark.parametrize(
+    ("message", "mime_type", "expected"),
+    [
+        # 上传失败时消息还没发出：网络错误也算明确没发出。
+        (
+            _FakeImageMessage(upload_error=pyqbot.NetworkError("超时", outcome_unknown=True)),
+            "image/jpeg",
+            SendRejectedError,
+        ),
+        (_FakeImageMessage(upload_error=api_error(400, 40034006)), "image/jpeg", SendRejectedError),
+        (_FakeImageMessage(), "image/heic", SendRejectedError),  # 扩展名推不出 QQ 收的图片类型
+        (_FakeImageMessage(reply_error=api_error(400, 40034006)), "image/jpeg", SendRejectedError),
+        (
+            _FakeImageMessage(reply_error=pyqbot.NetworkError("超时", outcome_unknown=True)),
+            "image/jpeg",
+            SendUncertainError,
+        ),
+    ],
+)
+async def test_reply_channel_maps_image_errors(
+    message: _FakeImageMessage, mime_type: str, expected: type[Exception]
+) -> None:
+    channel = bot_module._QQReplyChannel(cast(pyqbot.C2CMessage, message))  # pyright: ignore[reportPrivateUsage]  测接线层的通道本身
+
+    replying: list[None] = []
+    with pytest.raises(expected):
+        await channel.send_image(b"\xff\xd8\xff", mime_type, lambda: replying.append(None))
+    assert message.replies == []
+    # 只有发起了回复（上传之后）才算可能已送达。
+    assert len(replying) == (1 if message.reply_error is not None else 0)
 
 
 async def test_reply_without_a_reference_index_leaves_it_empty(db: Database) -> None:

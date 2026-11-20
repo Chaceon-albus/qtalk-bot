@@ -21,7 +21,7 @@ import contextlib
 import ipaddress
 import logging
 import re
-from collections.abc import AsyncGenerator, Awaitable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from http.cookiejar import DefaultCookiePolicy
 from typing import Protocol, runtime_checkable
@@ -37,6 +37,10 @@ from .chat import ChatHandler
 from .conversation import ChatInput, SendError, SendRejectedError, SendUncertainError
 from .gate import Chat, Delivery, FriendAdded, Gate, IncomingMessage, Reply, ShareLinkError
 from .media import (
+    GIF,
+    JPEG,
+    PNG,
+    WEBP,
     AttachmentKind,
     DownloadError,
     DownloadTooLargeError,
@@ -473,6 +477,10 @@ def refuse_cookies(client: pyqbot.Client) -> None:
     client.http_client.cookies.jar.set_policy(DefaultCookiePolicy(allowed_domains=[]))
 
 
+# pyqbot 上传时按扩展名推断为图片的格式（guide 第 4 节；实测 jpg、gif、webp 都能发）里，生成的图可能用到的几种。
+_IMAGE_EXTENSIONS = {PNG: "png", JPEG: "jpg", GIF: "gif", WEBP: "webp"}
+
+
 class _QQReplyChannel:
     """用 pyqbot 被动回复一条单聊消息，符合 `conversation.ReplyChannel`。
 
@@ -518,6 +526,27 @@ class _QQReplyChannel:
 
     async def send(self, text: str) -> str | None:
         sent = await _guarded(self._message.reply(text))
+        return None if sent.ext_info is None else _ref_value(sent.ext_info.ref_idx)
+
+    async def send_image(
+        self, data: bytes, mime_type: str, replying: Callable[[], None]
+    ) -> str | None:
+        """先上传（文件类型由 pyqbot 按扩展名推断，扩展名按 MIME 类型取），再以 `media=` 被动回复。
+
+        上传这一步失败时消息还没有发出，一律算 `SendRejectedError`（含网络错误：上传不会把消息发给用户）；回复
+        这一步的错误照 `send()` 分成「确定没发出」与「说不准」。
+        """
+        extension = _IMAGE_EXTENSIONS.get(mime_type)
+        if extension is None:
+            raise SendRejectedError("不支持发送这种格式的图片")
+        try:
+            photo = await self._message.upload(data=data, file_name=f"image.{extension}")
+        except pyqbot.QQBotError as exc:
+            raise SendRejectedError(f"上传图片失败：{_describe(exc)}") from None
+        except (RuntimeError, ValueError, OSError) as exc:
+            raise SendRejectedError(f"上传图片失败：{type(exc).__name__}") from None
+        replying()
+        sent = await _guarded(self._message.reply(media=photo))
         return None if sent.ext_info is None else _ref_value(sent.ext_info.ref_idx)
 
 

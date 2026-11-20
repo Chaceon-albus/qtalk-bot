@@ -16,6 +16,7 @@ from qtalk_bot.process import (
     MAX_STEPS,
     MAX_TYPINGS,
     MIN_UPDATE_SECONDS,
+    Drawing,
     Piece,
     ProcessNotes,
     ProcessPresenter,
@@ -281,6 +282,18 @@ def test_transcript_keeps_everything_and_display_can_be_off() -> None:
         "[说明] **标题**\n\n很长的思考\n\n[说明] 我先查一下。\n\n[搜索] 上海天气、气温\n\n[搜索] （没有查询词）"
     )
     assert notes.counts == (2, 2)
+
+
+def test_each_drawing_gets_its_own_line_and_only_a_mark_in_the_transcript() -> None:
+    notes = ProcessNotes()
+    assert not notes.add(comment("m#0", "先构思一下"))  # 第一句还没结束
+    assert notes.add(Drawing("d1"))  # 前一段说明因此定了下来
+    assert notes.add(Drawing("d2"))
+    assert notes.take() == [Piece("先构思一下"), Piece("正在画图🎨"), Piece("正在画图🎨")]
+    assert not notes.add(Drawing("d3"), display=False)
+    assert notes.take() == []
+    assert notes.transcript() == "[说明] 先构思一下\n\n[画图]\n\n[画图]\n\n[画图]"
+    assert notes.counts == (1, 0)
 
 
 def test_render_puts_each_line_after_a_single_newline() -> None:

@@ -192,6 +192,8 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                     describer=describer,
                     summarizer=summarizer,
                     steer=SteerJudge(settings.decisions, models.decider),
+                    image_generator=models.image_generator,
+                    image_generation=image_generation,
                 )
                 batcher = Batcher(conversation, settings.turns)
                 chat = QQChat(batcher)
