@@ -46,6 +46,7 @@ class MarkdownGuard:
         self._pending = ""  # 还不能确定怎么处理的输入
         self._line_start = True
         self._fence: str | None = None  # 所在围栏代码块的开头标记，如 "```"
+        self._opening: str | None = None  # 所在围栏代码块的开头那一行（不含换行）
         self._fence_indent = 0  # 所在代码块属于列表项时，列表项内容的缩进；否则是 0
         self._verbatim_line = False  # 这一行剩下的部分原样输出（围栏标记所在的行）
         self._ticks = 0  # 所在行内代码的反引号个数；0 表示不在行内代码里
@@ -61,10 +62,16 @@ class MarkdownGuard:
     def closing_fence(self) -> str:
         """`finish()` 之后调用：正文停在围栏代码块里（没写完就超时、断流或达到输出上限）时，返回闭合它的那一行
         （不在行首时先换行），否则返回空串。要在正文后面接别的 Markdown（如「来源」）时先接上它，免得后面的
-        内容被渲染成代码。"""
+        内容被渲染成代码。刚喂完以换行结尾的输入时也可以调用（流式回复分条时用，见 `splitting.py`）。"""
         if self._fence is None:
             return ""
         return ("" if self._line_start else "\n") + " " * self._fence_indent + self._fence
+
+    @property
+    def fence_opening(self) -> str | None:
+        """所在围栏代码块的开头那一行（不含换行，含列表标记与信息串，如 ```` ```python ````），不在代码块里时为
+        `None`。按已经处理完的整行判断：刚喂完以换行结尾的输入时就是那个位置的状态。"""
+        return self._opening
 
     def _drain(self, *, final: bool) -> str:
         s = self._pending
@@ -164,6 +171,7 @@ class MarkdownGuard:
                 self._line_start = False
                 return "", i  # 代码块里的普通一行
             self._fence = None  # 代码块随列表项结束；这一行按普通的行首处理
+            self._opening = None
             self._fence_indent = 0
         opening = _OPEN.match(line)
         if not complete and (opening is not None or _MAYBE_OPEN.fullmatch(line)):
@@ -181,6 +189,7 @@ class MarkdownGuard:
         if marker[0] == "`" and "`" in rest:
             return False  # 反引号围栏的信息串里不能有反引号：这是行内代码
         self._fence = marker
+        self._opening = lead + marker + rest
         self._fence_indent = len(lead) if lead.strip() else 0  # 有列表标记时才是列表项内容的缩进
         self._ticks = 0  # 没配对的行内代码让位给代码块
         return True
@@ -190,6 +199,7 @@ class MarkdownGuard:
         assert self._fence is not None
         if marker[0] == self._fence[0] and len(marker) >= len(self._fence) and not rest.strip():
             self._fence = None
+            self._opening = None
             self._fence_indent = 0
             return True
         return False

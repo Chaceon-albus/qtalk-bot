@@ -463,8 +463,11 @@ class _QQReplyChannel:
     内容确实送达了。pyqbot 的异常按 `is_rejection()` 分成「确定没发出」与「说不准」。`budget` 由
     `Conversation` 计数，这里只是让它跟着这条消息。
 
-    引用索引：流式回复取 `StreamMessage.ref_idx`（pyqbot 实测：每个分片的响应，含结束分片，都带同一个
+    引用索引：流式回复取当前这条 `StreamMessage.ref_idx`（pyqbot 实测：每个分片的响应，含结束分片，都带同一个
     `ext_info.ref_idx`），纯文本取发送结果的 `ext_info.ref_idx`；超过 `MAX_REF_LENGTH` 的当作没有。
+
+    回答分条：`finish_stream()` 之后（不论成功与否）再调 `stream()`，对同一条消息另开一条流式消息
+    （pyqbot 实测同一条消息可以先后回复几条流式消息；前一条要先结束，否则平台会提前结束它）。
     """
 
     def __init__(self, message: pyqbot.C2CMessage) -> None:
@@ -485,10 +488,11 @@ class _QQReplyChannel:
         return _ref_value(self._stream.ref_idx)
 
     async def finish_stream(self) -> str | None:
-        if self._stream is None:
+        stream, self._stream = self._stream, None  # 之后再调 stream() 就开新的一条
+        if stream is None:
             return None
-        await _guarded(self._stream.finish())
-        return _ref_value(self._stream.ref_idx)
+        await _guarded(stream.finish())
+        return _ref_value(stream.ref_idx)
 
     async def send(self, text: str) -> str | None:
         sent = await _guarded(self._message.reply(text))

@@ -62,6 +62,9 @@ from qtalk_bot.llm import (
     ThoughtSummary,
 )
 from qtalk_bot.process import (
+    ANSWER_RESERVE,
+    MAX_PASSIVE_REPLIES,
+    MAX_TYPINGS,
     MIN_UPDATE_SECONDS,
     ReplyBudget,
 )
@@ -336,7 +339,8 @@ async def test_no_process_message_when_the_reply_budget_is_short(db: Database) -
     clock = ManualClock()
     model = ScriptedModel("main", [])
     channel = FakeChannel()
-    channel.budget = ReplyBudget(typings=2, replies=1)  # 例如之前已经两次「正在输入」和一句说明
+    # 例如之前已经发过 3 次「正在输入」和几条回复：再发过程消息，连同「正在输入」就超过上限。
+    channel.budget = ReplyBudget(typings=MAX_TYPINGS, replies=MAX_PASSIVE_REPLIES - 3)
     gate, reached = asyncio.Event(), asyncio.Event()
     gate.set()
     model.script = steps(gate, reached)
@@ -345,7 +349,7 @@ async def test_no_process_message_when_the_reply_budget_is_short(db: Database) -
     assert channel.processes == []
     assert channel.kinds == ["stream", "finish"]  # 「正在输入」也不发：要给回答留余量
     assert channel.streamed == "今天晴。"
-    assert channel.budget == ReplyBudget(typings=2, replies=2)
+    assert channel.budget == ReplyBudget(typings=MAX_TYPINGS, replies=MAX_PASSIVE_REPLIES - 2)
     (archived,) = await process_column(db)
     assert archived is not None  # 没有展示，照样存档
 
@@ -449,6 +453,34 @@ async def test_steer_is_still_possible_while_the_first_process_chunk_is_in_fligh
     assert len(decider.requests) == 1
     assert first.streamed == ""  # 被重来的那次没有发出任何正文
     assert ("process", "\n收到补充，重新开始") in first.log
+    assert second.streamed == "答案"
+
+
+async def test_steer_is_still_possible_while_the_process_message_is_ending(db: Database) -> None:
+    # 回答的第一片在等过程消息的结束分片：还没有任何正文交给 QQ，插话照常可以重来（claim 放在最后，评审修正）。
+    alice = await invited(db, ALICE, "小王")
+    clock = ManualClock()
+    gate = asyncio.Event()
+    model = ScriptedModel("main", [Commentary("msg_c#0", "**想想**"), gate, *answer("答案")])
+    decider = FakeDecider(steer_result(0.9))
+    chat = process_chat(db, model, clock, decider=decider)
+    batcher = batcher_of(chat, clock)
+    first, second = FakeChannel(), FakeChannel()
+    held = asyncio.Event()
+    first.process_finish_gate = held
+
+    await submit(batcher, alice, message("写个排序"), first)
+    await wait_for(lambda: bool(first.process_text))  # 过程消息的第一片已经发出
+    gate.set()  # 回答的正文进了发送队列：先结束过程消息，结束分片卡着
+    await settle()
+    assert first.streamed == ""
+    await submit(batcher, alice, message("用 Python"), second)
+    held.set()
+    await finish(batcher)
+    await chat.drain()
+
+    assert len(decider.requests) == 1
+    assert first.streamed == ""  # 被重来的那次没有发出任何正文
     assert second.streamed == "答案"
 
 
@@ -562,7 +594,8 @@ async def test_no_typing_when_the_reply_budget_is_short(db: Database) -> None:
     model = ScriptedModel("main", script)
     chat = process_chat(db, model, clock, show=False)
     channel = FakeChannel()
-    channel.budget = ReplyBudget(replies=2)  # 只够再发一次「正在输入」，还要留两次给回答
+    # 连同「正在输入」只够再发一次「正在输入」，还要留两次给回答。
+    channel.budget = ReplyBudget(typings=1, replies=MAX_PASSIVE_REPLIES - ANSWER_RESERVE)
     task = asyncio.create_task(say(chat, await invited(db, ALICE, "小王"), "问", channel))
     await wait_for(lambda: typings(channel) == 1)
     await started(model, 1)  # 开始调用模型时的那次判断已经做完，再拨时钟
@@ -721,7 +754,8 @@ async def test_pulses_keep_room_for_the_process_of_a_later_fallback(db: Database
     # 主模型不发过程消息，备用模型发：主模型阶段的「正在输入」也要给备用模型的过程消息留余量。
     chat = process_chat(db, primary, clock, show=False, fallback=backup, fallback_show=True)
     channel = FakeChannel()
-    channel.budget = ReplyBudget(replies=1)
+    # 给备用模型的过程消息留一次时只够再发一次「正在输入」，不留时够两次。
+    channel.budget = ReplyBudget(typings=1, replies=MAX_PASSIVE_REPLIES - ANSWER_RESERVE - 1)
     task = asyncio.create_task(say(chat, await invited(db, ALICE, "小王"), "问", channel))
     await wait_for(lambda: typings(channel) == 1)
     await started(primary, 1)

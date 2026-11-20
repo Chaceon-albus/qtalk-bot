@@ -9,6 +9,9 @@ from tests.test_batching import ManualClock, settle
 
 from qtalk_bot.llm import Commentary, SearchProgress, SearchStage
 from qtalk_bot.process import (
+    ANSWER_RESERVE,
+    MAX_PASSIVE_REPLIES,
+    MAX_PASSIVE_SENDS,
     MAX_STEP_CHARS,
     MAX_STEPS,
     MAX_TYPINGS,
@@ -51,20 +54,38 @@ def test_shorten_flattens_markup_and_truncates() -> None:
     assert len(shorten("字" * 100)) == MAX_STEP_CHARS
 
 
+def test_reply_budget_limits_follow_the_measured_platform_behaviour() -> None:
+    # pyqbot 实测同一条消息收了 12 条回复都被接受（官方文档早先写 4 次）；「正在输入」与回答的余量不变。
+    assert (MAX_PASSIVE_REPLIES, MAX_PASSIVE_SENDS) == (10, 12)
+    assert (MAX_TYPINGS, ANSWER_RESERVE) == (3, 2)
+
+
 def test_reply_budget_keeps_room_for_the_answer() -> None:
     assert ReplyBudget(typings=1).affords_process()  # 正在输入 + 过程 + 回答 + 说明
-    assert ReplyBudget(typings=1, replies=1).affords_process()  # 再加一条附件的说明，正好用满 5 次
-    assert not ReplyBudget(typings=2, replies=1).affords_process()
-    assert not ReplyBudget(typings=0, replies=2).affords_process()  # 被动回复最多 4 条
+    last = MAX_PASSIVE_REPLIES - 1 - ANSWER_RESERVE  # 发完过程消息正好用满被动回复的条数
+    assert ReplyBudget(typings=2, replies=last).affords_process()  # 连同「正在输入」正好用满 12 次
+    assert not ReplyBudget(typings=3, replies=last).affords_process()  # 连同「正在输入」超过 12 次
+    assert not ReplyBudget(replies=last + 1).affords_process()  # 被动回复超过 10 条
 
 
 def test_typing_budget_caps_the_count_and_keeps_room_for_the_answer() -> None:
     assert ReplyBudget().affords_typing()
     assert ReplyBudget(typings=2).affords_typing()  # 第 3 次：发完共 3 次，还留着回答的 2 次
     assert not ReplyBudget(typings=MAX_TYPINGS).affords_typing()
-    assert ReplyBudget(typings=1).affords_typing(process=True)
-    assert not ReplyBudget(typings=2).affords_typing(process=True)  # 还要给过程消息留一次
-    assert not ReplyBudget(replies=2, typings=1).affords_typing()
+    near = MAX_PASSIVE_REPLIES - ANSWER_RESERVE
+    assert ReplyBudget(replies=near).affords_typing()
+    assert not ReplyBudget(replies=near).affords_typing(process=True)  # 还要给过程消息留一次
+    assert not ReplyBudget(replies=near, typings=2).affords_typing()  # 连同「正在输入」超过 12 次
+    assert not ReplyBudget(replies=near + 1).affords_typing()
+
+
+def test_continuation_keeps_two_replies_for_the_fallbacks() -> None:
+    # 回答分条：再开一条之后，还给兜底留两次（新的一条被拒时改发纯文本，纯文本也被拒再发固定说明）。
+    assert ReplyBudget(typings=1, replies=2).affords_continuation()
+    assert ReplyBudget(replies=MAX_PASSIVE_REPLIES - 3).affords_continuation()
+    assert not ReplyBudget(replies=MAX_PASSIVE_REPLIES - 2).affords_continuation()
+    assert ReplyBudget(typings=2, replies=MAX_PASSIVE_REPLIES - 3).affords_continuation()
+    assert not ReplyBudget(typings=3, replies=MAX_PASSIVE_REPLIES - 3).affords_continuation()
 
 
 # ---- 合并步骤 ----

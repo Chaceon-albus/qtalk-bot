@@ -85,7 +85,7 @@ from qtalk_bot.media import (
     IncomingAttachment,
     MediaStore,
 )
-from qtalk_bot.process import ReplyBudget
+from qtalk_bot.process import MAX_PASSIVE_REPLIES, ReplyBudget
 from qtalk_bot.prompt import FORMAT_GUIDE
 from qtalk_bot.routing import QUESTION, STEER_QUESTION, Router, SteerJudge
 from qtalk_bot.storage import DATABASE_FILENAME, Database
@@ -237,6 +237,9 @@ class FakeChannel:
         self.processes: list[FakeProcess] = []  # 开过的过程消息
         self.process_failure: Failure = never  # 过程消息的某一片是否失败
         self.process_gate: Callable[[str], asyncio.Event | None] = lambda _: None
+        self.process_finish_gate: asyncio.Event | None = (
+            None  # 不为空时过程消息的结束分片要等它置位
+        )
 
     def open_process(self) -> FakeProcess:
         process = FakeProcess(self)
@@ -322,6 +325,8 @@ class FakeProcess:
 
     async def finish(self) -> None:
         await asyncio.sleep(0)
+        if self.channel.process_finish_gate is not None:
+            await self.channel.process_finish_gate.wait()
         self.channel.log.append(("process_finish", ""))
 
 
@@ -3176,7 +3181,8 @@ async def test_fallback_notice_is_skipped_when_the_answer_would_run_out_of_repli
     alice = await invited(db, ALICE, "小王")
     chat, _, _ = fallback_over_budget_chat(db, tmp_path)
     channel = FakeChannel(stream_failure=reject_if("收到"))  # 备用模型的流式回答被拒，要改发纯文本
-    channel.budget = ReplyBudget(replies=1)  # 这条消息之前已经用掉一次（例如过程消息）
+    # 这条消息之前已经用掉几次（例如过程消息），只剩三次。
+    channel.budget = ReplyBudget(replies=MAX_PASSIVE_REPLIES - 3)
 
     await send(
         chat, alice, "在吗", image_attachment(), image_attachment(MISSING_URL), channel=channel
@@ -3184,7 +3190,7 @@ async def test_fallback_notice_is_skipped_when_the_answer_would_run_out_of_repli
 
     # 「正在输入」、附件说明之后只剩两次：留给回答（被拒的流式回答与改发的纯文本），备用模型的说明不发。
     assert channel.sent == [texts.ATTACHMENT_FAILED, "收到"]
-    assert channel.budget == ReplyBudget(typings=1, replies=4)
+    assert channel.budget == ReplyBudget(typings=1, replies=MAX_PASSIVE_REPLIES)
     assert (await rows(db))[-1].delivery == "plain"
 
 

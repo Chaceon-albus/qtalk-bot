@@ -63,7 +63,7 @@ from qtalk_bot.config import (
     ModelSettings,
     TurnSettings,
 )
-from qtalk_bot.conversation import TYPING_PULSE_SECONDS, Conversation
+from qtalk_bot.conversation import TYPING_PULSE_SECONDS, Conversation, SendUncertainError
 from qtalk_bot.gate import (
     Delivery,
     FriendAdded,
@@ -224,7 +224,8 @@ class Platform:
     `attempts`。
 
     单聊消息的响应带引用索引 `REFIDX_sent-<序号>`；`stream_ref_at` 不为空时，从第这么多个分片（从 0 数）起，
-    分片的响应带 `REFIDX_stream`（平台在哪一片给出还没有实测）。
+    分片的响应带 `REFIDX_stream`（平台在哪一片给出还没有实测）；`stream_ref_by_seq` 为真时改带
+    `REFIDX_stream-<msg_seq>`，每条流式消息各不相同。
     """
 
     def __init__(
@@ -236,9 +237,11 @@ class Platform:
         delay: Callable[[Payload], float] | None = None,
         files: dict[str, bytes] | None = None,
         stream_ref_at: int | None = None,
+        stream_ref_by_seq: bool = False,
     ) -> None:
         self.events = events
         self.stream_ref_at = stream_ref_at
+        self.stream_ref_by_seq = stream_ref_by_seq
         self.respond = respond
         self.delay = delay  # 某条单聊消息要拖多久才响应（秒），用来制造交错
         self.share_link_fails = share_link_fails
@@ -296,7 +299,9 @@ class Platform:
             self.streamed.append(body)
             self.changed.set()
             sent: Payload = {"id": "STREAM_fake", "remain_msg_len": 0}
-            if self.stream_ref_at is not None and len(self.streamed) > self.stream_ref_at:
+            if self.stream_ref_by_seq:
+                sent["ext_info"] = {"ref_idx": f"REFIDX_stream-{body['msg_seq']}"}
+            elif self.stream_ref_at is not None and len(self.streamed) > self.stream_ref_at:
                 sent["ext_info"] = {"ref_idx": "REFIDX_stream"}
             return httpx2.Response(200, json=sent)
         raise AssertionError(f"意外的请求：{request.method} {path}")
@@ -1054,6 +1059,91 @@ async def test_streamed_answer_records_the_reference_index_of_the_stream(
     row = await db.fetch_one("SELECT delivery, msg_idx FROM messages WHERE role = 'assistant'")
     assert row is not None
     assert tuple(row) == ("streamed", "REFIDX_stream")
+
+
+async def test_long_answer_opens_another_stream_after_finishing_the_first(db: Database) -> None:
+    # 回答分条：finish 之后再 stream() 对同一条消息另开一条流式消息（msg_seq 递增），先结束前一条再开下一条；
+    # 回复行存第一条的引用索引。
+    await welcomed_alice(db)
+    pieces = [f"段落{i}：" + "字" * 190 + "\n\n" for i in range(30)]
+    events: list[ChatEvent] = [TextDelta(piece) for piece in pieces]
+    events += [Usage(30, 8), Finished(FinishReason.COMPLETED)]
+    platform = Platform([c2c(ALICE, "长文", "ROBOT1.0_fake-1")], stream_ref_by_seq=True)
+    chat = real_chat(db, FakeModel(events), platform)
+
+    await run_until_handled(platform, db, chat, events=1, sent=0, until=lambda: chat.handled == 1)
+
+    seqs = [chunk["msg_seq"] for chunk in platform.streamed]
+    assert seqs == sorted(seqs)  # 第二条的第一片在第一条的结束分片之后
+    assert set(seqs) == {2, 3}
+    for seq in (2, 3):
+        chunks = [chunk for chunk in platform.streamed if chunk["msg_seq"] == seq]
+        assert chunks[-1]["input_state"] == 10  # 每条都有结束分片
+        assert [chunk["input_state"] for chunk in chunks[:-1]] == [1] * (len(chunks) - 1)
+    assert "".join(chunk["content_raw"] for chunk in platform.streamed) == "".join(pieces)
+    row = await db.fetch_one("SELECT delivery, msg_idx FROM messages WHERE role = 'assistant'")
+    assert row is not None
+    assert tuple(row) == ("streamed", "REFIDX_stream-2")
+
+
+class _FakeStream:
+    """`pyqbot.StreamMessage` 的替身：第一片之后才有引用索引；`fail_finish` 为真时结束分片失败。"""
+
+    def __init__(self, ref_idx: str, *, fail_finish: bool) -> None:
+        self.ref_idx: str | None = None
+        self._ref = ref_idx
+        self.fail_finish = fail_finish
+        self.chunks: list[str] = []
+        self.finished = False
+
+    async def append(self, text: str) -> None:
+        self.chunks.append(text)
+        self.ref_idx = self._ref
+
+    async def finish(self) -> None:
+        if self.fail_finish:
+            raise RuntimeError("流式消息已终止")
+        self.finished = True
+
+
+class _FakeStreamingMessage:
+    def __init__(self, *, fail_finish: bool = False) -> None:
+        self.fail_finish = fail_finish
+        self.streams: list[_FakeStream] = []
+        self.coalesce: list[bool] = []
+
+    def reply_stream(self, *, markdown: bool = True, coalesce: bool = True) -> _FakeStream:
+        stream = _FakeStream(f"REF{len(self.streams) + 1}", fail_finish=self.fail_finish)
+        self.streams.append(stream)
+        self.coalesce.append(coalesce)
+        return stream
+
+
+async def test_reply_channel_starts_a_new_stream_after_finish() -> None:
+    message = _FakeStreamingMessage()
+    channel = bot_module._QQReplyChannel(cast(pyqbot.C2CMessage, message))  # pyright: ignore[reportPrivateUsage]  测接线层的通道本身
+
+    assert await channel.finish_stream() is None  # 没有开着的流式消息
+    assert await channel.stream("一") == "REF1"
+    assert await channel.stream("二") == "REF1"
+    assert await channel.finish_stream() == "REF1"
+    assert await channel.stream("三") == "REF2"  # 新的一条，引用索引按当前这条
+    assert await channel.finish_stream() == "REF2"
+
+    assert [stream.chunks for stream in message.streams] == [["一", "二"], ["三"]]
+    assert all(stream.finished for stream in message.streams)
+    assert message.coalesce == [False, False]
+
+
+async def test_reply_channel_starts_a_new_stream_even_if_the_finish_failed() -> None:
+    message = _FakeStreamingMessage(fail_finish=True)
+    channel = bot_module._QQReplyChannel(cast(pyqbot.C2CMessage, message))  # pyright: ignore[reportPrivateUsage]  测接线层的通道本身
+
+    await channel.stream("一")
+    with pytest.raises(SendUncertainError):
+        await channel.finish_stream()
+    assert await channel.stream("二") == "REF2"
+    assert [stream.chunks for stream in message.streams] == [["一"], ["二"]]
 
 
 async def test_reply_without_a_reference_index_leaves_it_empty(db: Database) -> None:

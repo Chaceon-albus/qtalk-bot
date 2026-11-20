@@ -36,9 +36,10 @@ Markdown 引用块：流式消息还没结束时客户端把 `>` 原样显示出
 **存档**：过程的全文（说明的原文、每次搜索的查询词，含回答开始之后的）由 `ProcessNotes.transcript()`
 给出，存进回复行，只供排查，不进之后的上下文。
 
-**被动回复的次数**（`ReplyBudget`）：平台对同一条消息的被动回复次数有限（官方文档写 4 次；pyqbot 实测「正在
-输入」加 4 条被接受）。每条被回复的消息记下已用的次数，开始过程消息之前确认用掉这一次之后还给回答留着
-`ANSWER_RESERVE` 次，不够就不发过程消息，保证回答能发出。
+**被动回复的次数**（`ReplyBudget`）：平台对同一条消息的被动回复次数有限。上限按 pyqbot 的实测取（`docs/errata.md`
+「流式消息：超过约 15000 字节被拆成几条气泡」：同一条消息收了 12 条回复都被接受），不按官方文档早先的 4 次。
+每条被回复的消息记下已用的次数，开始过程消息之前确认用掉这一次之后还给回答留着 `ANSWER_RESERVE` 次，不够就
+不发过程消息，保证回答能发出；回答分条时每多开一条也算一次（`affords_continuation()`）。
 
 日志不记过程的内容与查询词。
 """
@@ -65,11 +66,12 @@ MAX_STEPS = 12
 MIN_UPDATE_SECONDS = 2.0
 """过程消息两次更新之间的最短间隔（秒），期间的变化合成一片。"""
 
-MAX_PASSIVE_REPLIES = 4
-"""同一条消息最多被动回复几条（官方文档的说法；「正在输入」不算）。"""
+MAX_PASSIVE_REPLIES = 10
+"""同一条消息最多被动回复几条（「正在输入」不算）。依据是 pyqbot 的实测：同一条消息收了 12 条回复都被接受
+（官方文档早先写 4 次），这里留些余量。"""
 
-MAX_PASSIVE_SENDS = 5
-"""同一条消息连同「正在输入」最多被动发几次（pyqbot 实测：「正在输入」加 4 条被接受，再多没有测过）。"""
+MAX_PASSIVE_SENDS = 12
+"""同一条消息连同「正在输入」最多被动发几次（pyqbot 实测：同一条消息的 12 条回复都被接受，再多没有测过）。"""
 
 MAX_TYPINGS = 3
 """同一条消息最多发几次「正在输入」，免得把被动回复的次数耗在它上面。"""
@@ -110,6 +112,12 @@ class ReplyBudget:
     def affords_process(self) -> bool:
         """再发一条过程消息之后，是否还给回答留着 `ANSWER_RESERVE` 次。"""
         return self.affords(1)
+
+    def affords_continuation(self) -> bool:
+        """回答已经开始显示，再开一条流式消息接着写（主动分条）之后，是否还给兜底留着 2 次：新的一条被拒时先改发
+        纯文本，纯文本也被拒再发固定说明，两次都计数（评审修正）。"""
+        replies = self.replies + 3
+        return replies <= MAX_PASSIVE_REPLIES and replies + self.typings <= MAX_PASSIVE_SENDS
 
 
 # ---- 步骤短句 ----

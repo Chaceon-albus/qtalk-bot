@@ -32,6 +32,12 @@
 5. 按选出的模型的能力组装上下文（`context.RequestBuilder`），调用它，文字增量经 `MarkdownGuard` 处理后流式
    回复。出现非空白的正文之前不开始流式消息。模型引用了来源（开了服务商内置搜索时的 `llm.Citation`）的，
    回答写完后在末尾接上「来源」一段（`citations.py`），它也算回答的一部分；改发纯文本时用纯文本的写法。
+   回答接近平台的长度上限（约 15000 字节，超过时平台不看 Markdown 结构硬切）时主动分条（`splitting.py`）：在
+   段落之间（或硬上限前的行边界）结束这条流式消息，等结束分片返回，再对同一条消息另开一条接着写；切在代码块里
+   时这一条补上闭合围栏、下一条重开同样的围栏。「来源」与固定说明照常接在当前这一条上（也可能跨边界）。每多开
+   一条算一次被动回复，开之前给固定说明留一次（`ReplyBudget.affords_continuation()`），不够就交给平台去拆。
+   流水里存模型的原文（不含补上的围栏行），回复行的引用索引是第一条的（用户引用后面几条时定不到话题）。改发
+   纯文本时不分条。
 6. 出错时：还没有任何内容交给 QQ 发送、选出的模型又配置了备用模型、备用模型也能处理这一轮的附件，就在
    事务里再确认一次授权，然后按备用模型的能力重新组装上下文、重试一次；否则给用户固定的说明。流式回复被平台拒绝时，把全文改用纯文本的普通消息再发一次，
    仍然失败就发固定说明。发送分片时出了说不准是否送达的错误，立刻停止等模型。
@@ -60,8 +66,9 @@
 `process.ProcessPresenter` 写成单独的一条流式消息（经 `ReplyChannel.open_process()`）。过程消息不算「已开始
 显示」（不 `claim()`），所以只显示了过程时插话照常可以重来：被重来的一轮给过程消息写一行「收到补充，重新开始」
 再结束它，它留在 `TurnControl.earlier` 里，由重来的那一轮连同自己的过程一起存档。回答的第一片交出之前（以及之后
-要发固定说明、纯文本时）结束过程消息；过程消息之后一直留着：QQ 的流式消息撤回不了（pyqbot `docs/errata.md`
-实测，用户 2026-11-19 决定留着）。过程的全文存进回复行的 `process` 列，不进之后的上下文。每条被回复的消息记下已用的被动回复次数
+要发固定说明、纯文本时）结束过程消息，回答的第一片还要等它的结束分片发完（最多 `PROCESS_SETTLE_SECONDS`）：
+同一条消息再开流式消息时，平台会提前结束还没结束的那条（pyqbot `docs/errata.md`）。过程消息之后一直留着：QQ 的
+流式消息撤回不了（pyqbot `docs/errata.md` 实测，用户 2026-11-19 决定留着）。过程的全文存进回复行的 `process` 列，不进之后的上下文。每条被回复的消息记下已用的被动回复次数
 （`ReplyChannel.budget`，经本模块的通道包装计数），不够给回答留余量时不发过程消息。思考摘要不展示、不存档。
 
 **「正在输入」像真人一样输一会、停一会**（用户 2026-11-19 决定）：每次只请求 `TYPING_PULSE_SECONDS`，在有进展时
@@ -184,6 +191,7 @@ from .routing import (
     TopicOption,
     TopicQuery,
 )
+from .splitting import Cut, Piece, StreamSplitter
 from .storage import Database
 
 logger = logging.getLogger(__name__)
@@ -201,6 +209,9 @@ TYPING_PULSE_SECONDS = 8
 """每次「正在输入」的时长（秒）。不一口气请求很久（平台允许 60 秒），而是有进展时再请求一次：程序卡住、没有进展时
 它很快到期，用户看到的是「输一会、停一会」。两次之间至少隔这么久；机器人发出消息时它会自动消失。"""
 GRACE_SECONDS = 3.0  # 被取消后收拢后台任务（在途的分片、结束分片）的时限
+# 回答的第一片之前最多等过程消息的结束分片这么久：平台会提前结束还没结束的流式消息（pyqbot errata「流式消息：
+# 被下一条流式消息或另一条回复提前结束」），所以先等它结束再开回答流；一次往返约 0.4 秒，卡住时不再等。
+PROCESS_SETTLE_SECONDS = 2.0
 # 一轮回复要在这个时刻之前送达：从回复所挂的那条用户消息记进流水时算起。QQ 单聊被动回复的有效期约 60 分钟
 # （pyqbot 的 errata：实测 55 分钟后仍能回复），留 5 分钟给超时之后发说明、结束流式消息，以及两边时钟的误差。
 REPLY_DEADLINE_SECONDS = 55 * 60
@@ -297,8 +308,13 @@ class ReplyChannel(Protocol):
     长期存在的 `ReplyBudget`）。
 
     `stream()`、`finish_stream()`、`send()` 成功时返回发出的那条消息的引用索引（用户引用它时平台带回的索引，
-    见 `ChatInput.ref_msg_idx`），平台没有给出时返回 `None`。回答送达后它存进回复行的 `msg_idx`，用户引用
-    机器人的回复时据此定位话题；过程消息不是回答，它的引用索引不存。
+    见 `ChatInput.ref_msg_idx`），平台没有给出时返回 `None`；流式回复返回当前这一条的。回答送达后它存进回复行的
+    `msg_idx`，用户引用机器人的回复时据此定位话题；回答分成几条时只存第一条的；过程消息不是回答，它的引用索引
+    不存。
+
+    回答的流式消息可以分成几条（见 `splitting.py`）：`finish_stream()` 返回之后（不论成功与否）再调 `stream()`，
+    就对同一条消息开始一条新的流式消息，又是一次被动回复。调用方总是等前一条的 `finish_stream()` 返回之后才开
+    下一条（平台会提前结束还没结束的那条）。
     """
 
     @property
@@ -315,12 +331,12 @@ class ReplyChannel(Protocol):
         ...
 
     async def stream(self, text: str) -> str | None:
-        """把 `text` 作为流式回复的下一片发出，等它发完才返回。第一次调用时开始这条流式消息。返回这条流式消息
-        目前已知的引用索引（平台还没有给出时为 `None`）。"""
+        """把 `text` 作为流式回复的下一片发出，等它发完才返回。第一次调用时（以及 `finish_stream()` 之后）开始
+        一条新的流式消息。返回当前这条流式消息目前已知的引用索引（平台还没有给出时为 `None`）。"""
         ...
 
     async def finish_stream(self) -> str | None:
-        """结束流式回复，返回这条流式消息已知的引用索引（同 `stream()`）。"""
+        """结束当前这条流式消息，返回它已知的引用索引（同 `stream()`）；没有开着的就什么也不做。"""
         ...
 
     async def send(self, text: str) -> str | None:
@@ -562,6 +578,8 @@ class _Turn:
             self.control.claim,
             self.process.make_way,
             self.process.seal,
+            self._process_ended,
+            label=user.label,
         )
         self.attempts: list[_Attempt] = []
         self.run: _Run | None = None  # 正在进行的调用
@@ -593,6 +611,11 @@ class _Turn:
             return True
         logger.info("用户 %s 插话：%s，不停下这段回答", self.user.label, why)
         return False
+
+    async def _process_ended(self) -> None:
+        """回答的第一片之前：发出过过程消息时等它的结束分片发完（调用方负责限时；`settle()` 不随取消撤掉它）。"""
+        if self.process.opened:
+            await self.process.settle()
 
     @property
     def shown(self) -> bool:
@@ -1123,12 +1146,14 @@ class Conversation:
             ),
         )
         commentaries, _ = turn.process.notes.counts
+        streams = turn.outbox.streams
         logger.info(
-            "回复了用户 %s：模型 %s，结局 %s，送达 %s，搜索 %d 次，说明 %d 段，过程消息 %d 片",
+            "回复了用户 %s：模型 %s，结局 %s，送达 %s%s，搜索 %d 次，说明 %d 段，过程消息 %d 片",
             turn.user.label,
             model,
             ending.value,
             outcome.delivery.value,
+            f"（分 {streams} 条）" if streams > 1 else "",
             sum(attempt.searches for attempt in turn.attempts),
             commentaries,
             turn.process.chunks,
@@ -2029,7 +2054,7 @@ class _TurnChannel:
     def __init__(self, channel: ReplyChannel, control: TurnControl | None = None) -> None:
         self._channel = channel
         self._control = control
-        self._streamed = False  # 回答的流式消息已经开始（一条流式消息只算一次被动回复）
+        self._streamed = False  # 当前这条回答的流式消息已经开始（一条流式消息只算一次被动回复）
 
     @property
     def budget(self) -> ReplyBudget:
@@ -2051,6 +2076,7 @@ class _TurnChannel:
         return await self._channel.stream(text)
 
     async def finish_stream(self) -> str | None:
+        self._streamed = False  # 之后再 stream() 就是新的一条（分条），另算一次
         return await self._channel.finish_stream()
 
     async def send(self, text: str) -> str | None:
@@ -2126,12 +2152,19 @@ class _Outbox:
     同时只有一片在路上。和 pyqbot 的「合并分片」做法相同，但这里自己做，是为了确切知道哪些内容已经送达：
     pyqbot 合并模式下失败时说不清失败的是哪一段。
 
-    内容有三种状态：已入队（`_pending`）、已交给通道（`handed`，结果可能还不知道）、已确认送达
+    内容有三种状态：已入队（`_queue`）、已交给通道（`handed`，结果可能还不知道）、已确认送达
     （`_delivered`）。出现非空白的正文之前不开始流式消息；第一片要等「正在输入」发完再发，交出之前先问
-    `may_show`（`TurnControl.claim()`）。
+    `may_show`（`TurnControl.claim()`），成功后结束过程消息，并限时（`PROCESS_SETTLE_SECONDS`）等它的结束分片
+    发完：平台会提前结束还没结束的那条流式消息。
 
-    `ref_idx` 记下通道在成功的分片与结束分片之后报告的引用索引（第一个不为空的为准；pyqbot 实测每个分片的响应
-    都带同一个），回答送达后存进回复行。
+    分条（`splitting.StreamSplitter`）：推进来的内容先经它决定在哪里结束这一条。执行切点时先交出这一条的最后一片
+    （含补上的闭合围栏），等结束分片返回，再开新的一条，第一片以重开的围栏开头；结束分片失败时记下 `unclosed`，
+    照样开新的一条。每开一条都是一次被动回复，开之前确认还给固定说明留着一次
+    （`ReplyBudget.affords_continuation()`），不够就不再分条，交给平台去拆。`_delivered` 只记模型的原文（不含补上
+    的围栏行）。
+
+    `ref_idx` 记下通道在第一条流式消息的成功分片与结束分片之后报告的引用索引（第一个不为空的为准；pyqbot 实测
+    每个分片的响应都带同一个），回答送达后存进回复行；分条之后的几条不记。
 
     没有改用 pyqbot 的 `StreamMessage.sent_text` 记录已送达的内容：本模块不依赖 pyqbot，替身也要同样成立；
     这里仍要自己逐片发送（第一片之前的 `claim()`、送达不明时立即停读），还要把回答与接在后面的固定说明分开
@@ -2145,53 +2178,73 @@ class _Outbox:
         may_show: Callable[[], bool] = lambda: True,
         before_show: Callable[[], Awaitable[None]] = _skip,
         on_show: Callable[[], None] = lambda: None,
+        after_show: Callable[[], Awaitable[None]] = _skip,
+        *,
+        label: str = "",
     ) -> None:
         self._channel = channel
         self._before_first: Callable[[], Awaitable[None]] | None = before_first
         self._may_show = may_show  # 第一片交出之前调用；返回假（这一轮已被插话重来）就不再发
         # 第一片：先等 `before_show`（过程消息的第一片回来，见 `ProcessPresenter.make_way()`），`may_show` 成功
-        # 之后调用 `on_show`（结束过程消息）。
+        # 之后调用 `on_show`（结束过程消息），再限时等 `after_show`（过程消息的结束分片发完）。
         self._before_show = before_show
         self._on_show = on_show
-        self._pending = ""
-        self._delivered: list[str] = []
+        self._after_show = after_show
+        self._label = label  # 只用于日志
+        self._splitter = StreamSplitter(label=label)
+        self._queue: list[Piece] = []  # 已入队、还没交给通道的文字与切点
+        self._prefix = ""  # 下一条的第一片开头要补上的（重开的围栏）
+        self._delivered: list[str] = []  # 确认送达的原文（不含补上的围栏行）
         self._answer_length = 0  # 推进来的内容里，回答本身（不含固定说明）的长度
         self._sender: asyncio.Task[None] | None = None
         self._finishing: asyncio.Task[str | None] | None = (
-            None  # 结束分片；只发一次，始终由这里管着
+            None  # 最后一条的结束分片；只发一次，始终由这里管着
         )
         self._closed = False  # 不再接受新内容
+        self._open = False  # 当前这条流式消息有内容确认送达、还没结束
+        self._splitting = True  # 还在主动分条（被动回复的次数不够时停下）
         self.handed = False  # 有内容交给过通道（可能还在途、结果未知）
-        self.unclosed = False  # 正文都已确认，但结束分片失败
-        self.ref_idx: str | None = None  # 这条流式消息的引用索引，平台给出之后才有
+        self.streams = 0  # 开始过几条流式消息（有内容确认送达的）
+        self.unclosed = False  # 正文都已确认，但某一条的结束分片失败
+        self.ref_idx: str | None = None  # 第一条流式消息的引用索引，平台给出之后才有
         self.error: SendError | None = None
         self.broken = asyncio.Event()  # 出现说不准是否送达的错误时置位
 
     @property
     def has_content(self) -> bool:
-        """交给过通道，或者排着非空白的内容。"""
-        return self.handed or bool(self._pending.strip())
+        """交给过通道，或者排着（含分条时攒着的）非空白的内容。"""
+        return self.handed or bool(self._queued_text().strip()) or bool(self._splitter.held.strip())
 
     @property
     def delivered_answer(self) -> str:
-        """确认送达的回答（不含固定说明）。"""
+        """确认送达的回答（模型的原文，不含固定说明与分条时补上的围栏行）。"""
         return "".join(self._delivered)[: self._answer_length]
 
     def outcome(self, delivery: ReplyDelivery) -> _Outcome:
-        """以确认送达的回答与这条流式消息的引用索引写成的结局。"""
+        """以确认送达的回答与第一条流式消息的引用索引写成的结局。"""
         return _Outcome(self.delivered_answer, delivery, self.ref_idx)
 
     def _note_ref(self, ref_idx: str | None) -> None:
-        if self.ref_idx is None:
+        if self.ref_idx is None and self.streams <= 1:
             self.ref_idx = ref_idx
+
+    def _queued_text(self) -> str:
+        return "".join(piece for piece in self._queue if isinstance(piece, str))
 
     def push(self, text: str, *, answer: bool = True) -> None:
         if not text or self.error is not None or self._closed:
             return
         if answer:
             self._answer_length += len(text)
-        self._pending += text
-        if not self.handed and not self._pending.strip():
+        self._enqueue(self._splitter.feed(text))
+
+    def _enqueue(self, pieces: Sequence[Piece]) -> None:
+        for piece in pieces:
+            if isinstance(piece, str) and self._queue and isinstance(self._queue[-1], str):
+                self._queue[-1] += piece
+            else:
+                self._queue.append(piece)
+        if not self._queue or (not self.handed and not self._queued_text().strip()):
             return  # 只有空白：先不开始流式消息
         if self._sender is None or self._sender.done():
             self._sender = asyncio.create_task(self._send_pending())
@@ -2199,21 +2252,25 @@ class _Outbox:
     def discard(self) -> None:
         """丢掉排队的内容。只能在还没有任何内容交给通道时调用。"""
         assert not self.handed, "已经交给通道的内容不能撤回"
-        self._pending = ""
+        self._queue.clear()
+        self._splitter = StreamSplitter(label=self._label)
         self._answer_length = 0
 
     async def close(self) -> None:
-        """等攒着的内容发完，再结束流式回复。结束失败时记下 `unclosed`：正文已经送达，不重发。
+        """交出分条时攒着的最后一行，等攒着的内容发完，再结束流式回复。结束失败时记下 `unclosed`：正文已经
+        送达，不重发。
 
         两处都用 `asyncio.wait()` 而不是直接 await：这里被取消时不连带打断在途的分片或结束分片，留给
         `wind_down()` 限时等它们。
         """
+        if not self._closed and self.error is None:
+            self._enqueue(self._splitter.finish())
         sender = self._sender
         if sender is not None:
             await asyncio.wait((sender,))
             if not sender.cancelled() and (exc := sender.exception()) is not None:
                 raise exc  # 发送任务只自己处理 SendError，其余是意外
-        if not self.handed or self.error is not None:
+        if not self._open or self.error is not None:
             return
         finishing = self._start_finish()
         await asyncio.wait((finishing,))
@@ -2222,7 +2279,7 @@ class _Outbox:
     def stop(self) -> None:
         """不再接受新内容，丢掉还没交给通道的部分。在途的分片不受影响。"""
         self._closed = True
-        self._pending = ""
+        self._queue.clear()
 
     async def wind_down(self, deadline: float) -> None:
         """被取消后的收尾：限时等在途的分片，然后尽量结束流式消息（已经在发的结束分片就接着等它）。"""
@@ -2235,7 +2292,7 @@ class _Outbox:
                 if self.handed and self.error is None:
                     self.error = SendUncertainError("关停时分片仍在途")
                 return
-        if not self.handed or self.error is not None:
+        if not self._open or self.error is not None:
             return
         finishing = self._start_finish()
         await asyncio.wait((finishing,), timeout=_remaining(deadline))
@@ -2268,34 +2325,98 @@ class _Outbox:
         else:
             self._note_ref(finishing.result())
 
+    def _take(self) -> tuple[str, Cut | None]:
+        """取出下一个切点之前的文字与这个切点（没有切点时为 `None`）。被动回复的次数不够时不再分条：这个与之后的
+        切点都丢掉，分条时攒着的文字一并取出。"""
+        parts: list[str] = []
+        while self._queue:
+            piece = self._queue.pop(0)
+            if isinstance(piece, str):
+                parts.append(piece)
+                continue
+            if self._splitting and not self._channel.budget.affords_continuation():
+                self._splitting = False
+                logger.info(
+                    "用户 %s 这条消息的被动回复次数不够，回答不再主动分条，超长的部分交给平台去拆",
+                    self._label,
+                )
+                if held := self._splitter.stop():
+                    self._queue.append(held)
+            if self._splitting:
+                return "".join(parts), piece
+        return "".join(parts), None
+
+    async def _show(self) -> bool:
+        """第一片交出之前：等过程消息的第一片，结束过程消息并限时等它结束，然后 `claim()`。返回是否接着发。
+
+        `claim()` 放在最后、紧挨着交出第一片（评审修正）：等过程消息结束的这段时间里还没有任何正文交给 QQ，插话
+        仍应能重来；先 claim 的话这段时间里判为补充的插话既不能重来（已开始显示），也停不下（还没有正文），只能
+        排队。代价是这时被重来的话，过程消息已经结束，写不上「收到补充，重新开始」那一行。"""
+        # 先等过程消息的第一片回来：免得回答排到过程前面。
+        await self._before_show()
+        if self.error is not None or not self._queued_text().strip():
+            return False  # 等待期间被停下了，或排队的正文被丢掉了
+        self._on_show()
+        # 平台会提前结束还没结束的流式消息（pyqbot errata：之后的分片报 40034019），所以等过程消息的结束分片
+        # 发完再开回答流。
+        try:
+            async with asyncio.timeout(PROCESS_SETTLE_SECONDS):
+                await self._after_show()
+        except TimeoutError:
+            logger.warning(
+                "用户 %s 的过程消息 %g 秒内没有结束，不再等，照发回答",
+                self._label,
+                PROCESS_SETTLE_SECONDS,
+            )
+        if self.error is not None or self._closed or not self._queued_text().strip():
+            return False
+        if not self._may_show():
+            self.stop()
+            return False
+        return True
+
     async def _send_pending(self) -> None:
         if self._before_first is not None:
             await self._before_first()
             self._before_first = None
-        while self._pending and self.error is None:
-            if not self.handed and not self._pending.strip():
+        while self._queue and self.error is None:
+            if not self.handed and not self._queued_text().strip():
                 return  # 换模型时排队的正文被丢掉了，只剩空白
-            if not self.handed:
-                # 先等过程消息的第一片回来，再 claim()：等待期间还没有任何正文交给 QQ，插话仍可以重来。
-                await self._before_show()
-                if self.error is not None or not self._pending.strip():
-                    return  # 等待期间被停下了，或排队的正文被丢掉了
-                if not self._may_show():
-                    self.stop()
-                    return
-                self._on_show()
-            chunk, self._pending = self._pending, ""
-            self.handed = True
-            try:
-                ref_idx = await self._channel.stream(chunk)
-            except SendError as exc:
-                self.error = exc
-                self._pending = ""
-                if isinstance(exc, SendUncertainError):
-                    self.broken.set()
+            if not self.handed and not await self._show():
                 return
-            self._delivered.append(chunk)
+            text, cut = self._take()
+            chunk = self._prefix + text + ("" if cut is None else cut.close)
+            if chunk:
+                self.handed = True
+                try:
+                    ref_idx = await self._channel.stream(chunk)
+                except SendError as exc:
+                    self.error = exc
+                    self._queue.clear()
+                    if isinstance(exc, SendUncertainError):
+                        self.broken.set()
+                    return
+                self._prefix = ""
+                self._delivered.append(text)
+                if not self._open:
+                    self._open = True
+                    self.streams += 1
+                self._note_ref(ref_idx)
+            if cut is not None:
+                await self._finish_part()
+                self._prefix = cut.reopen
+
+    async def _finish_part(self) -> None:
+        """分条：结束当前这一条，等结束分片返回之后才开下一条（平台会提前结束还没结束的那条）。失败时记下
+        `unclosed`，照样开下一条。"""
+        try:
+            ref_idx = await self._channel.finish_stream()
+        except SendError as exc:
+            logger.warning("分条时流式回复的结束分片没能送达：%s", exc)
+            self.unclosed = True
+        else:
             self._note_ref(ref_idx)
+        self._open = False
 
 
 class _UserLocks:
