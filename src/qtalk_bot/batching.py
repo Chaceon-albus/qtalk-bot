@@ -45,8 +45,8 @@
   就断了；对同一条消息插一条普通回复则不受影响。它计进那条消息的被动回复次数。每轮只回一次（重来之后接着算）：这一轮里第一条排队的
   回，之后的不回。带上它重来的、停下了正在显示的回答的不回（过程消息或回答末尾已有说明；停下之后再来的也不回，
   它们紧接着就开轮）；判断还没有结论时不回；判断期间这一轮先结束了的不回（新消息立刻自己开轮）。单独的图片或文件不触发。
-  下一轮开始之前先等这句发完（最多 `GRACE_SECONDS`）：它是对上一条消息的回复，晚于下一轮的流式消息到达会把
-  那条提前结束，也会排在那一轮的「正在输入」、过程与回答之后。
+  下一轮开始之前先等这句发完（最多 `ACK_WAIT_SECONDS`，到时取消它）：它是对上一条消息的回复，晚于下一轮的流式
+  消息到达会把那条提前结束，也会排在那一轮的「正在输入」、过程与回答之后。
 
 只显示了过程消息（`process.py`）不算回答已开始显示，照常可以重来；重来时把上一次的 `TurnControl` 交给新的
 （`previous`），被重来的过程消息由最后答完的那一次处理，上次实际发出「正在输入」的时刻（`TurnControl.typed_at`）
@@ -69,12 +69,17 @@ from typing import Protocol
 
 from .access import User
 from .config import AttachmentTimeoutAction, TurnSettings
-from .conversation import GRACE_SECONDS, ChatInput, Received, ReplyChannel, TurnControl
+from .conversation import ChatInput, Received, ReplyChannel, TurnControl
 from .journal import ROWS_PER_TURN
 from .media import SUPPORTED_KINDS, AttachmentKind
 from .routing import Steer
 
 logger = logging.getLogger(__name__)
+
+ACK_WAIT_SECONDS = 45.0
+"""下一轮开始之前，最多等上一轮回的那句收到这么久（秒），到时取消它。那句收到回在上一轮的那条消息上，晚于下一轮的
+流式消息到达会让平台提前结束那条（pyqbot errata，40034019），所以不能只等一小会儿就放它在后台接着发（评审修正）。
+pyqbot 一次请求的时限是 30 秒，再留些余量给复查授权；过了这么久它的请求早已放弃，几乎不可能再送达。"""
 
 
 class InputKind(StrEnum):
@@ -346,7 +351,7 @@ class Batcher:
                 await self._until(state, step.until)
                 continue
             if isinstance(step, Start) and state.acknowledging is not None:
-                # 先等上一轮回的那句收到发完（最多 `GRACE_SECONDS`），再按那时的队列重新选这一轮带上的消息：
+                # 先等上一轮回的那句收到发完（最多 `ACK_WAIT_SECONDS`），再按那时的队列重新选这一轮带上的消息：
                 # 等待期间到达的消息属于这一轮，不能被当成这一轮进行中的插话。
                 await self._after_acknowledgement(state)
                 continue
@@ -598,13 +603,13 @@ class Batcher:
             logger.warning("给用户 %s 排队的消息回收到时出错：%s", user.label, type(exc).__name__)
 
     async def _after_acknowledgement(self, state: _UserState) -> None:
-        """下一轮开始之前，等上一轮给排队的消息回的那句收到发完，最多 `GRACE_SECONDS`：它要排在这一轮的
-        「正在输入」、过程与回答之前。一般早已发完（它在上一轮进行中就发出了）；发送卡住时不再等，接受极小概率的
-        乱序，不让一句收到拖住回答。"""
+        """下一轮开始之前，等上一轮给排队的消息回的那句收到发完，最多 `ACK_WAIT_SECONDS`，到时取消它：它回在上一轮的
+        那条消息上，晚于这一轮的流式消息到达会让平台提前结束那条，也会排在这一轮的「正在输入」、过程与回答之后。
+        一般早已发完（它在上一轮进行中就发出了），只有发送卡住时才要等。"""
         task, state.acknowledging = state.acknowledging, None
         if task is None or task.done():
             return
-        sleeper = asyncio.ensure_future(self._sleep(GRACE_SECONDS))
+        sleeper = asyncio.ensure_future(self._sleep(ACK_WAIT_SECONDS))
         try:
             await asyncio.wait((task, sleeper), return_when=asyncio.FIRST_COMPLETED)
         finally:
@@ -612,10 +617,11 @@ class Batcher:
                 sleeper.cancel()
                 await asyncio.wait((sleeper,))  # 不留下没人管的任务
         if not task.done():
-            logger.info(
-                "给用户 %s 回的收到 %g 秒还没发完，不再等它，开始下一轮",
+            task.cancel()
+            logger.warning(
+                "给用户 %s 回的收到 %g 秒还没发完，取消它，不再等它，开始下一轮",
                 state.user.label,
-                GRACE_SECONDS,
+                ACK_WAIT_SECONDS,
             )
 
     async def _woken(

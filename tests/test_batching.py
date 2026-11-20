@@ -1492,7 +1492,7 @@ async def test_next_turn_waits_for_the_acknowledgement_in_flight(clock: ManualCl
     await settle()
     assert len(responder.started) == 1  # 那句收到还在路上：下一轮先等它
 
-    await clock.advance_to(batching.GRACE_SECONDS - 0.1)
+    await clock.advance_to(batching.ACK_WAIT_SECONDS - 0.1)
     assert len(responder.started) == 1
     assert responder.ack_gate is not None
     responder.ack_gate.set()
@@ -1516,10 +1516,16 @@ async def test_next_turn_stops_waiting_for_a_stuck_acknowledgement(
     await settle()
     assert len(responder.started) == 1
 
-    await clock.advance_to(batching.GRACE_SECONDS)
+    await clock.advance_to(batching.ACK_WAIT_SECONDS / 2)
+    assert (
+        len(responder.started) == 1
+    )  # 回在上一条消息上：没发完之前不开下一轮（晚到会截断下一轮的流）
+    await clock.advance_to(batching.ACK_WAIT_SECONDS)
+    await settle()
 
     assert turns(responder) == [([1], "问一"), ([2], "二")]
     assert "不再等它" in caplog.text
+    assert responder.acks_cancelled == 1  # 到时取消，不放它在后台接着发
     async with asyncio.timeout(HANG_GUARD):
         await chat.drain()
     assert responder.acks_cancelled == 1
