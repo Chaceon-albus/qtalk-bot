@@ -44,9 +44,8 @@ ls -l config.toml             # 应是 -rw-r----- 你 1000
 容器里以 uid、gid 1000 的非 root 账户运行，挂进去的 `data/` 要属于它：
 
 ```sh
-mkdir -p data
-sudo chown 1000:1000 data
-chmod 700 data
+sudo mkdir -p data
+sudo chown 1000:1000 data && sudo chmod 700 data   # 换成实际的 UID、GID；chown 之后目录已不属于你，chmod 也要 sudo
 ```
 
 宿主机上想用别的 uid 时，改 `compose.yaml` 里 `build.args` 的 `UID`、`GID`，再按新的 uid 改 `data/` 的属主。
@@ -64,6 +63,7 @@ docker compose start           # 再启动
 - 日志只写到标准输出，由 docker 的 json-file 驱动轮转：单个文件 10 MB，保留 5 个。默认不记录消息正文。
 - 重启策略是 `unless-stopped`：进程退出（包括网关无法恢复时）会被自动拉起，手动 `stop` 之后不会。
 - 配置或密钥有误时进程会打印原因并退出，`docker compose logs bot` 里能看到；改好后 `docker compose up -d` 即可。
+- **已知的边界**：程序的关停有 15 秒的总时限，但心跳、备份这类维护的文件操作是放在后台线程里做的，挂载卷卡死时取消不了：关停只能放弃等待，Python 退出时仍会等这些线程结束，容器可能一直等到 docker 的 30 秒停机宽限后被强杀。被强杀时没做完的备份留下的临时文件，下次启动时会清掉。
 
 ## 6. 看健康状态
 
@@ -133,35 +133,49 @@ docker compose up -d --build
   gid=$(docker compose run --rm --no-deps -T --entrypoint id bot -g)
 
   # 1. 先把备份复制成数据目录里的临时文件（同时确认它存在、可读、磁盘放得下），属主与 0600 一步设好；
-  #    再用镜像里的 Python 只读打开它跑一遍 PRAGMA integrity_check，宿主机不用装 sqlite3
+  #    再用镜像里的 Python 只读打开它校验，宿主机不用装 sqlite3：
+  #    - PRAGMA integrity_check 是 ok（零字节的文件也会是 ok，所以还要看下面两条）；
+  #    - 有 users 表，确实是机器人的库；
+  #    - PRAGMA user_version 大于 0，且不高于这个镜像里的程序支持的最新版本（从 qtalk_bot.storage 读）。
   staged=data/qtalk.db.restoring
   sudo install -m 600 -o "$uid" -g "$gid" "data/backups/$name" "$staged"
   docker compose run --rm --no-deps -T --entrypoint python bot -c '
 import sqlite3, sys
+from qtalk_bot.storage import MIGRATIONS
+latest = len(MIGRATIONS)
 conn = sqlite3.connect("file:/app/data/qtalk.db.restoring?mode=ro", uri=True)
 result = conn.execute("PRAGMA integrity_check").fetchone()[0]
-print("integrity_check:", result)
-sys.exit(0 if result == "ok" else 1)
+version = conn.execute("PRAGMA user_version").fetchone()[0]
+users = conn.execute(
+    "SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?", ("table", "users")
+).fetchone() is not None
+print(f"integrity_check: {result}；user_version: {version}（程序支持 1 到 {latest}）；users 表：{users}")
+sys.exit(0 if result == "ok" and users and 0 < version <= latest else 1)
 '
 
-  # 2. 停机，把现在的库连同 -wal、-shm 一起挪进「恢复前」目录（已提交的数据可能还在 WAL 里，只复制主库会丢）
+  # 2. 停机，把现在的库连同 -wal、-shm 一起挪进「恢复前」目录（已提交的数据可能还在 WAL 里，只复制主库会丢）；
+  #    附件目录用硬链接（cp -al）整个保全一份：不额外占空间。恢复后的实例启动时，会把快照里没有引用的附件当作
+  #    孤儿删掉（其中有现在的库还在引用的），删的是 data/attachments 下的那个路径，硬链接的这份还在，回退时换回去
   docker compose stop bot
   keep="data/restore-$(date -u +%Y%m%dT%H%M%SZ)"
   sudo install -d -m 700 -o "$uid" -g "$gid" "$keep"
   for f in qtalk.db qtalk.db-wal qtalk.db-shm; do
     if sudo test -e "data/$f"; then sudo mv "data/$f" "$keep/"; fi
   done
+  if sudo test -d data/attachments; then sudo cp -al data/attachments "$keep/attachments"; fi
 
   # 3. 放上校验过的备份，再启动
   sudo mv "$staged" data/qtalk.db
   docker compose start bot
-  echo "已恢复；原来的库在 $keep"
+  echo "已恢复；原来的库与附件在 $keep"
 )
 ```
 
 数据目录属于容器账户，别的账户进不去，所以这里的文件操作都用 `sudo`。校验没通过时停在第 1 步，现在的库没动过；留下的 `data/qtalk.db.restoring` 可以删掉，换一份备份再试。
 
-确认恢复无误后再删掉最后打印的那个 `data/restore-…` 目录。恢复错了想退回原来的库，同样整段执行（先把 `keep=` 换成那个目录）：先把恢复出来的那一套挪开，再把原来的挪回去。
+硬链接要求两份在同一个文件系统上：`restore-…` 目录就建在 `data/` 里面，所以不用另外操心；不要把 `data/attachments` 单独挂到别的卷上，否则 `cp -al` 会报错、脚本就此停下（这时库已经挪走、容器没有启动，把 `$keep` 里的三个文件挪回 `data/` 再 `docker compose start bot` 即可）。
+
+确认不需要回退之后，再删掉最后打印的那个 `data/restore-…` 目录（附件的硬链接一并删掉，`data/attachments` 里的文件不受影响）。恢复错了想退回原来的库，同样整段执行（先把 `keep=` 换成那个目录）：先把恢复出来的那一套（库与附件目录）挪开，再把原来的换回去。
 
 ```sh
 (
@@ -179,6 +193,10 @@ sys.exit(0 if result == "ok" else 1)
   for f in qtalk.db qtalk.db-wal qtalk.db-shm; do
     if sudo test -e "$keep/$f"; then sudo mv "$keep/$f" data/; fi
   done
+  if sudo test -d "$keep/attachments"; then
+    if sudo test -d data/attachments; then sudo mv data/attachments "$wrong/attachments"; fi
+    sudo mv "$keep/attachments" data/attachments
+  fi
   docker compose start bot
 )
 ```
@@ -187,7 +205,7 @@ sys.exit(0 if result == "ok" else 1)
 
 **附件原件与恢复**：附件原件不在备份里，放在 `data/attachments/<目录名>/`，每个用户一个目录。目录名是随机生成的 32 位十六进制串（记在数据库的 `users.media_dir` 里），不含编号、openid 等任何信息，永不复用。不属于任何用户的目录（名字是 32 位十六进制或全数字的），过了附件的保存期限（`[attachments].retention_days`）就由后台清理删掉；别的名字的目录与符号链接不会被碰。
 
-- 从备份恢复后，备份之后才加入的用户的附件目录在库里找不到主人，会按上面的规则删掉。
+- 从备份恢复后，备份之后才加入的用户的附件目录在库里找不到主人，会按上面的规则删掉；快照里没有引用的附件文件也会被当作孤儿删掉。上面的恢复脚本在启动恢复后的实例之前，已经用硬链接把整个 `data/attachments` 保全在 `restore-…/attachments` 里，回退时一并换回，所以回退之后原来的附件还在。
 - **已知的边界**：从表结构第 16 版之前的备份（即用户目录还是数字编号的那些版本）恢复时，启动时的迁移会重新跑一遍、给每个用户生成新的目录名，而之前已经搬到随机名下的目录对不上了。这部分附件的原件找不回：历史里退回文字版（与附件过期后的表现相同），这些目录之后按无主目录删掉。
 - 要从某个目录找到它属于哪个用户，在 QQ 里给机器人发管理员命令 `/users`：每个用户后面写着它的附件目录名。
 
