@@ -16,7 +16,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -97,6 +97,28 @@ MAX_DESCRIBE_TIMEOUT_SECONDS = 600
 DEFAULT_FILE_INSTRUCTIONS = """用不超过 400 字概括这份文件，写成连贯的一段话：主题、主要内容，以及关键的事实、数字、结论和用户之后
 可能追问的细节。只输出摘要本身，不要加「这份文件」之类的开头。"""
 
+DEFAULT_IMAGE_TIMEOUT_SECONDS = 120
+MAX_IMAGE_TIMEOUT_SECONDS = 600
+DEFAULT_IMAGE_DAILY_LIMIT = 10
+MAX_IMAGE_DAILY_LIMIT = 1000
+MAX_IMAGE_TOTAL_DAILY_LIMIT = 100_000
+
+type GeminiImageSize = Literal["512", "1K", "2K", "4K"]
+"""Gemini 出图的分辨率（Interactions API `response_format.image_size` 的取值）。"""
+type OpenAIImageQuality = Literal["low", "medium", "high", "xhigh", "max", "auto"]
+"""OpenAI 出图的质量（Images API 的 `quality`）。"""
+
+# 取值到类型的对照：校验时按它查，查到的值本身就是 Literal 类型，不用 cast。
+_GEMINI_IMAGE_SIZES: dict[str, GeminiImageSize] = {"512": "512", "1K": "1K", "2K": "2K", "4K": "4K"}
+_OPENAI_IMAGE_QUALITIES: dict[str, OpenAIImageQuality] = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max",
+    "auto": "auto",
+}
+
 # 下载白名单里的一个域名后缀：至少两段，每段 1–63 个字母、数字或连字符（不以连字符开头或结尾），最后一段是
 # 2–63 个字母，总长不超过 253。与 `bot.py` 判断主机名的规则一致，否则追加的后缀永远匹配不上。
 _DOMAIN = re.compile(r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
@@ -172,6 +194,8 @@ class ModelSettings:
         show_process: 把处理过程（调用工具前的说明、搜索进展）以单独的一条消息展示给用户，回答之后留着
             （QQ 的流式消息撤回不了），见 `process.py`。不请求思考摘要（用户 2026-11-19 决定：实测里摘要稀疏
             且总是英文），服务商仍给了也不展示。
+        image_generation: 这个模型能用画图函数（出图由 `[image_generation]` 配置的图片模型完成）。没有
+            `[image_generation]` 时不起作用，启动时记一条警告。
     """
 
     name: str
@@ -184,6 +208,7 @@ class ModelSettings:
     inputs: frozenset[Modality] = frozenset()
     search: bool = False
     show_process: bool = False
+    image_generation: bool = False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -344,6 +369,29 @@ class MemorySettings:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ImageGenerationSettings:
+    """`[image_generation]` 表：对话模型调用画图函数时出图用的图片模型。不写这个表就不出图。
+
+    Attributes:
+        provider: 服务商，与对话模型是哪家无关；客户端与同一家的对话模型共用。
+        model: 服务商那边的图片模型名。
+        timeout_seconds: 一次出图（含改图）的时限（秒）。
+        daily_limit: 每个用户每天最多几张（改图也算）；0 表示只有管理员能用。管理员不受限。
+        total_daily_limit: 所有用户每天合计最多几张；`None` 时不设。
+        gemini_image_size: 只对 Gemini：图片的分辨率；`None` 时不传，用服务商的默认值。
+        openai_quality: 只对 OpenAI：图片的质量；`None` 时不传，用服务商的默认值。
+    """
+
+    provider: Provider
+    model: str
+    timeout_seconds: float = DEFAULT_IMAGE_TIMEOUT_SECONDS
+    daily_limit: int = DEFAULT_IMAGE_DAILY_LIMIT
+    total_daily_limit: int | None = None
+    gemini_image_size: GeminiImageSize | None = None
+    openai_quality: OpenAIImageQuality | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ProviderSettings:
     """`[providers.<服务商>]` 表：调用这家服务商时的端点与代理。
 
@@ -432,6 +480,7 @@ class Settings:
     describe: DescribeSettings | None = None
     memory: MemorySettings | None = None  # 只在 `decisions` 不为空时生效
     turns: TurnSettings = TurnSettings()
+    image_generation: ImageGenerationSettings | None = None
 
     @property
     def default_model(self) -> ModelSettings:
@@ -442,8 +491,8 @@ class Settings:
 
 
 def check_provider_secrets(settings: Settings, secrets: Secrets) -> None:
-    """配置里用到的每家服务商（对话模型、`[decisions]`、`[describe]`，以及生效时的 `[memory]`），对应的密钥
-    都要已设置。
+    """配置里用到的每家服务商（对话模型、`[decisions]`、`[describe]`、`[image_generation]`，以及生效时的
+    `[memory]`），对应的密钥都要已设置。
 
     Raises:
         ConfigError: 有服务商缺少密钥；只说变量名。
@@ -454,6 +503,8 @@ def check_provider_secrets(settings: Settings, secrets: Secrets) -> None:
         used.add(settings.decisions.provider)
     if settings.describe is not None:
         used.add(settings.describe.provider)
+    if settings.image_generation is not None:
+        used.add(settings.image_generation.provider)
     if settings.memory is not None and settings.decisions is not None:
         used.add(settings.memory.provider)  # 没有 [decisions] 时 [memory] 不起作用，不要求它的密钥
     problems = [
@@ -689,6 +740,7 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
     memory_ok, memory = _parse_memory(table)
     turns_table = table.table("turns")
     turns = None if turns_table is None else _parse_turns(turns_table)
+    image_ok, image_generation = _parse_image_generation(table)
     table.finish()
     if decisions is not None and models is not None and len(models) > MAX_OPTIONS:
         # 每个模型是选模型那道选择题的一个选项，两家接口都最多 255 个。
@@ -713,6 +765,7 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         or not describe_ok
         or not memory_ok
         or turns is None
+        or not image_ok
     ):
         return None
     return Settings(
@@ -729,6 +782,7 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         describe=describe,
         memory=memory,
         turns=turns,
+        image_generation=image_generation,
     )
 
 
@@ -940,6 +994,78 @@ def _parse_memory(root: _Table) -> tuple[bool, MemorySettings | None]:
     )
 
 
+def _parse_image_generation(root: _Table) -> tuple[bool, ImageGenerationSettings | None]:
+    """可选的 `[image_generation]`：返回（是否没有问题，值）；没写这个表时值是 `None`。"""
+    if not root.has("image_generation"):
+        root.table("image_generation")  # 标记为已读
+        return True, None
+    table = root.table("image_generation")
+    if table is None:
+        return False, None
+    provider = _parse_provider_name(table)
+    model = table.required_string("model")
+    timeout = table.number("timeout_seconds", DEFAULT_IMAGE_TIMEOUT_SECONDS)
+    if timeout is not None and not 0 < timeout <= MAX_IMAGE_TIMEOUT_SECONDS:
+        table.problem("timeout_seconds", f"应大于 0、不大于 {MAX_IMAGE_TIMEOUT_SECONDS}")
+        timeout = None
+    daily_limit = _bounded_int(
+        table, "daily_limit", DEFAULT_IMAGE_DAILY_LIMIT, 0, MAX_IMAGE_DAILY_LIMIT
+    )
+    total_ok, total_daily_limit = _optional_positive_int(
+        table, "total_daily_limit", MAX_IMAGE_TOTAL_DAILY_LIMIT
+    )
+    size_ok, image_size = _optional_choice(
+        table, "gemini_image_size", _GEMINI_IMAGE_SIZES, Provider.GEMINI, provider
+    )
+    quality_ok, quality = _optional_choice(
+        table, "openai_quality", _OPENAI_IMAGE_QUALITIES, Provider.OPENAI, provider
+    )
+    table.finish()
+    if (
+        provider is None
+        or model is None
+        or timeout is None
+        or daily_limit is None
+        or not total_ok
+        or not size_ok
+        or not quality_ok
+    ):
+        return False, None
+    return True, ImageGenerationSettings(
+        provider=provider,
+        model=model,
+        timeout_seconds=timeout,
+        daily_limit=daily_limit,
+        total_daily_limit=total_daily_limit,
+        gemini_image_size=image_size,
+        openai_quality=quality,
+    )
+
+
+def _optional_choice[T: str](
+    table: _Table,
+    key: str,
+    choices: Mapping[str, T],
+    only_for: Provider,
+    provider: Provider | None,
+) -> tuple[bool, T | None]:
+    """只对服务商 `only_for` 有效的可选项，取值须是 `choices` 的键（区分大小写）：返回（是否没有问题，值）。
+    `provider` 是另一家时写了就报错；`provider` 本身有误（`None`）时只校验取值。"""
+    if not table.has(key):
+        table.string(key, "")  # 标记为已读
+        return True, None
+    value = table.required_string(key)
+    if value is None:
+        return False, None
+    if provider is not None and provider is not only_for:
+        table.problem(key, f"只对 {only_for.value} 有效，provider 是 {provider.value} 时不能写")
+        return False, None
+    if value not in choices:
+        table.problem(key, f"应为 {'、'.join(choices)} 之一（区分大小写）")
+        return False, None
+    return True, choices[value]
+
+
 def _optional_reasoning(table: _Table) -> tuple[bool, str | None]:
     """可选的 `reasoning`：返回（是否没有问题，值）。"""
     if not table.has("reasoning"):
@@ -1116,6 +1242,7 @@ class _ModelDraft:
     inputs: frozenset[Modality]
     search: bool | None
     show_process: bool | None
+    image_generation: bool | None
     ok: bool  # 这一项自身没有问题
 
 
@@ -1166,6 +1293,7 @@ def _parse_models(root: _Table) -> tuple[ModelSettings, ...] | None:
             inputs=d.inputs,
             search=cast(bool, d.search),
             show_process=cast(bool, d.show_process),
+            image_generation=cast(bool, d.image_generation),
         )
         for d in drafts
     )
@@ -1194,6 +1322,7 @@ def _parse_model(table: _Table) -> _ModelDraft:
     inputs = _parse_inputs(table, provider)
     search = table.boolean("search", False)
     show_process = table.boolean("show_process", False)
+    image_generation = table.boolean("image_generation", False)
     table.finish()
     ok = (
         name is not None
@@ -1206,6 +1335,7 @@ def _parse_model(table: _Table) -> _ModelDraft:
         and inputs is not None
         and search is not None
         and show_process is not None
+        and image_generation is not None
     )
     return _ModelDraft(
         table=table,
@@ -1220,6 +1350,7 @@ def _parse_model(table: _Table) -> _ModelDraft:
         inputs=inputs or frozenset(),
         search=search,
         show_process=show_process,
+        image_generation=image_generation,
         ok=ok,
     )
 

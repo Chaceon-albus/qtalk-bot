@@ -1,7 +1,7 @@
 """启动入口：`python -m qtalk_bot`。
 
-读配置与密钥、打开数据库、创建对话模型、决策模型与写图片描述的模型、构造 `pyqbot.Bot`、注册处理函数（经
-`batching.Batcher` 交给对话）并运行；
+读配置与密钥、打开数据库、创建对话模型、决策模型、写图片描述的模型与出图的图片模型、构造 `pyqbot.Bot`、
+注册处理函数（经 `batching.Batcher` 交给对话）并运行；
 运行期间在后台定期清理过期的附件。退出时按 `_shut_down()` 的顺序先停收事件、等前台与对话收尾，再停后台的任务，
 最后关闭模型的客户端与数据库。配置或数据库有误、连不上平台时打印原因并以非零状态退出，不打印 traceback。
 """
@@ -33,6 +33,7 @@ from .bot import (
 from .chat import ChatHandler
 from .config import (
     ConfigError,
+    ImageGenerationSettings,
     MemorySettings,
     Secrets,
     Settings,
@@ -61,6 +62,24 @@ def memory_settings(settings: Settings) -> MemorySettings | None:
         logger.warning("配置了 [memory] 但没有 [decisions]：话题线没有启用，[memory] 不起作用")
         return None
     return settings.memory
+
+
+def image_generation_settings(settings: Settings) -> ImageGenerationSettings | None:
+    """生效的 `[image_generation]`。有模型打开了 `image_generation` 却没有这个表时视为不出图，没有任何模型打开
+    时照常创建（用不上）；两种情况都只记一条警告，不报错。"""
+    enabled = [model.name for model in settings.models if model.image_generation]
+    if settings.image_generation is None:
+        if enabled:
+            logger.warning(
+                "模型 %s 打开了 image_generation，但没有 [image_generation]：不出图",
+                "、".join(enabled),
+            )
+        return None
+    if not enabled:
+        logger.warning(
+            "配置了 [image_generation]，但没有模型打开 image_generation：画图函数不会被调用"
+        )
+    return settings.image_generation
 
 
 def private_data_dir(path: Path) -> None:
@@ -98,6 +117,7 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
     调用方要先用 `check_provider_secrets()` 确认用到的服务商都有密钥。
     """
     memory = memory_settings(settings)
+    image_generation = image_generation_settings(settings)
     private_data_dir(settings.data_dir)
     async with (
         await Database.open(settings.data_dir / DATABASE_FILENAME) as db,
@@ -108,6 +128,7 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
             settings.decisions,
             settings.describe,
             memory,
+            image_generation,
         ) as models,
     ):
         store = MediaStore.under(settings.data_dir)

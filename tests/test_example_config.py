@@ -10,6 +10,7 @@ from qtalk_bot.config import (
     ChatSettings,
     DecisionSettings,
     DescribeSettings,
+    ImageGenerationSettings,
     InviteSettings,
     MemorySettings,
     Provider,
@@ -65,6 +66,10 @@ def test_example_config_is_valid_and_spells_out_the_defaults() -> None:
     assert example.describe == DescribeSettings(provider=Provider.OPENAI, model="gpt-6-luna")
     # [memory] 同理；reasoning 默认不传。
     assert example.memory == MemorySettings(provider=Provider.OPENAI, model="gpt-6-luna")
+    # [image_generation] 同理；按服务商区分的两项与合计上限默认不设。
+    assert example.image_generation == ImageGenerationSettings(
+        provider=Provider.OPENAI, model="gpt-image-2.6-flare"
+    )
     # OpenAI 的模型不接受音频；示例里两个模型的输入能力与实测、文档一致。
     assert [sorted(m.value for m in model.inputs) for model in example.models] == [
         ["file", "image"],
@@ -79,6 +84,7 @@ def test_example_config_shows_both_providers_and_a_fallback() -> None:
     assert example.default_model.fallback in {model.name for model in example.models}
     assert all(model.search for model in example.models)
     assert [model.show_process for model in example.models] == [True, False]
+    assert [model.image_generation for model in example.models] == [True, False]
     # 可选项在示例里是注释掉的，照抄示例不会意外带上代理、改掉端点或指定推理强度。
     assert example.default_model.reasoning is None
     assert example.qq == QQSettings()
@@ -111,6 +117,10 @@ def test_commented_out_examples_are_valid_once_uncommented(tmp_path: Path) -> No
         1024,
         4096,
     )
+    assert settings.image_generation is not None
+    assert settings.image_generation.total_daily_limit == 100
+    assert settings.image_generation.openai_quality == "medium"
+    assert settings.image_generation.gemini_image_size is None
     assert settings.qq.base_url == "https://api.bot.qq.com"
     assert settings.qq.proxy == "socks5h://127.0.0.1:1080"
     assert settings.providers.openai.base_url == "https://api.openai.com/v1"

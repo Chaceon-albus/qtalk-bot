@@ -16,6 +16,7 @@ from qtalk_bot.config import (
     ConfigError,
     DecisionSettings,
     DescribeSettings,
+    ImageGenerationSettings,
     InviteSettings,
     MemorySettings,
     ModelSettings,
@@ -1392,3 +1393,167 @@ def test_memory_provider_needs_its_key_only_when_topics_are_on() -> None:
     assert "GEMINI_API_KEY" in str(info.value)
     # 没有 [decisions] 时 [memory] 不起作用，不要求它的密钥。
     check_provider_secrets(memory_settings_with(False), secrets)
+
+
+# ---- 里程碑 10：[image_generation] 与 [[models]].image_generation ----
+
+IMAGE_OPENAI = '[image_generation]\nprovider = "openai"\nmodel = "gpt-image-fake"\n'
+IMAGE_GEMINI = '[image_generation]\nprovider = "gemini"\nmodel = "gemini-image-fake"\n'
+
+
+def test_image_generation_is_optional_and_has_defaults(tmp_path: Path) -> None:
+    settings = load_settings(write_config(tmp_path, ""))
+    assert settings.image_generation is None
+    assert settings.models[0].image_generation is False
+    image = load_settings(write_config(tmp_path, IMAGE_OPENAI, "b.toml")).image_generation
+    assert image == ImageGenerationSettings(provider=Provider.OPENAI, model="gpt-image-fake")
+    assert image is not None
+    assert (image.timeout_seconds, image.daily_limit, image.total_daily_limit) == (120, 10, None)
+    assert (image.gemini_image_size, image.openai_quality) == (None, None)
+
+
+def test_image_generation_values_are_read(tmp_path: Path) -> None:
+    text = IMAGE_GEMINI + (
+        "timeout_seconds = 600\ndaily_limit = 0\ntotal_daily_limit = 100000\n"
+        'gemini_image_size = "4K"\n'
+    )
+    image = load_settings(write_config(tmp_path, text)).image_generation
+    assert image == ImageGenerationSettings(
+        provider=Provider.GEMINI,
+        model="gemini-image-fake",
+        timeout_seconds=600,
+        daily_limit=0,
+        total_daily_limit=100000,
+        gemini_image_size="4K",
+    )
+    text = IMAGE_OPENAI + 'daily_limit = 1000\ntotal_daily_limit = 1\nopenai_quality = "xhigh"\n'
+    image = load_settings(write_config(tmp_path, text, "b.toml")).image_generation
+    assert image is not None
+    assert (image.daily_limit, image.total_daily_limit, image.openai_quality) == (1000, 1, "xhigh")
+
+
+@pytest.mark.parametrize("size", ["512", "1K", "2K", "4K"])
+def test_every_gemini_image_size_is_accepted(tmp_path: Path, size: str) -> None:
+    text = IMAGE_GEMINI + f'gemini_image_size = "{size}"\n'
+    image = load_settings(write_config(tmp_path, text)).image_generation
+    assert image is not None
+    assert image.gemini_image_size == size
+
+
+@pytest.mark.parametrize("quality", ["low", "medium", "high", "xhigh", "max", "auto"])
+def test_every_openai_quality_is_accepted(tmp_path: Path, quality: str) -> None:
+    text = IMAGE_OPENAI + f'openai_quality = "{quality}"\n'
+    image = load_settings(write_config(tmp_path, text)).image_generation
+    assert image is not None
+    assert image.openai_quality == quality
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ('model = "m"', "image_generation.provider：缺少这个键"),
+        ('provider = "claude"\nmodel = "m"', "image_generation.provider：应为 openai、gemini 之一"),
+        ('provider = "openai"', "image_generation.model：缺少这个键"),
+        ('provider = "openai"\nmodel = " "', "image_generation.model：不能为空"),
+        (
+            'provider = "openai"\nmodel = "m"\ntimeout_seconds = 0',
+            "image_generation.timeout_seconds：应大于 0、不大于 600",
+        ),
+        (
+            'provider = "openai"\nmodel = "m"\ntimeout_seconds = 601',
+            "image_generation.timeout_seconds：应大于 0、不大于 600",
+        ),
+        (
+            'provider = "openai"\nmodel = "m"\ndaily_limit = -1',
+            "image_generation.daily_limit：不能小于 0",
+        ),
+        (
+            'provider = "openai"\nmodel = "m"\ndaily_limit = 1001',
+            "image_generation.daily_limit：不能大于 1000",
+        ),
+        (
+            'provider = "openai"\nmodel = "m"\ndaily_limit = 1.5',
+            "image_generation.daily_limit：应为整数，实际是浮点数",
+        ),
+        (
+            'provider = "openai"\nmodel = "m"\ntotal_daily_limit = 0',
+            "image_generation.total_daily_limit：应为正整数",
+        ),
+        (
+            'provider = "openai"\nmodel = "m"\ntotal_daily_limit = 100001',
+            "image_generation.total_daily_limit：不能大于 100000",
+        ),
+        (
+            'provider = "gemini"\nmodel = "m"\ngemini_image_size = "1k"',
+            "image_generation.gemini_image_size：应为 512、1K、2K、4K 之一（区分大小写）",
+        ),
+        (
+            'provider = "gemini"\nmodel = "m"\ngemini_image_size = 512',
+            "image_generation.gemini_image_size：应为字符串，实际是整数",
+        ),
+        (
+            'provider = "openai"\nmodel = "m"\nopenai_quality = "hd"',
+            "image_generation.openai_quality：应为 low、medium、high、xhigh、max、auto 之一（区分大小写）",
+        ),
+        (
+            'provider = "openai"\nmodel = "m"\ngemini_image_size = "1K"',
+            "image_generation.gemini_image_size：只对 gemini 有效，provider 是 openai 时不能写",
+        ),
+        (
+            'provider = "gemini"\nmodel = "m"\nopenai_quality = "low"',
+            "image_generation.openai_quality：只对 openai 有效，provider 是 gemini 时不能写",
+        ),
+        ('provider = "openai"\nmodel = "m"\nsize = "1K"', "image_generation.size：未知的键"),
+        (
+            'provider = "openai"\nmodel = "m"\nopenai_api_key = "x"',
+            (
+                "image_generation.openai_api_key：未知的键；密钥只能由环境变量 OPENAI_API_KEY 提供，"
+                "不要写进配置文件"
+            ),
+        ),
+    ],
+)
+def test_invalid_image_generation(tmp_path: Path, text: str, problem: str) -> None:
+    error = config_error(write_config(tmp_path, f"[image_generation]\n{text}\n"))
+    assert error.problems == (problem,)
+
+
+def test_image_generation_problems_are_all_reported(tmp_path: Path) -> None:
+    text = (
+        '[image_generation]\nprovider = "openai"\ndaily_limit = 2000\n'
+        'gemini_image_size = "1K"\nunknown = 1\n'
+    )
+    assert config_error(write_config(tmp_path, text)).problems == (
+        "image_generation.model：缺少这个键",
+        "image_generation.daily_limit：不能大于 1000",
+        "image_generation.gemini_image_size：只对 gemini 有效，provider 是 openai 时不能写",
+        "image_generation.unknown：未知的键",
+    )
+
+
+def test_image_generation_must_be_a_table(tmp_path: Path) -> None:
+    error = config_error(write_config(tmp_path, 'image_generation = "openai"\n'))
+    assert error.problems == ("image_generation：应为表，实际是字符串",)
+
+
+def test_model_image_generation_switch(tmp_path: Path) -> None:
+    on = MODELS + "image_generation = true\n"
+    settings = load_settings(write_config(tmp_path, on, models=False))
+    assert settings.models[0].image_generation is True
+    wrong = MODELS + 'image_generation = "yes"\n'
+    error = config_error(write_config(tmp_path, wrong, "b.toml", models=False))
+    assert error.problems == ("models[0].image_generation：应为布尔值，实际是字符串",)
+
+
+def test_image_generation_provider_needs_its_key() -> None:
+    settings = Settings(
+        timezone=ZoneInfo("UTC"),
+        data_dir=Path("/data"),
+        models=(ModelSettings(name="a", provider=Provider.OPENAI, model="m", default=True),),
+        image_generation=ImageGenerationSettings(provider=Provider.GEMINI, model="g"),
+    )
+    secrets = load_secrets({k: v for k, v in FAKE_SECRETS.items() if k != "GEMINI_API_KEY"})
+    with pytest.raises(ConfigError) as info:
+        check_provider_secrets(settings, secrets)
+    assert info.value.problems == ("配置里用到了 gemini 的模型，但环境变量 GEMINI_API_KEY 未设置",)
+    check_provider_secrets(settings, load_secrets(FAKE_SECRETS))

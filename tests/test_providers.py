@@ -3,12 +3,14 @@
 from qtalk_bot.config import (
     DecisionSettings,
     DescribeSettings,
+    ImageGenerationSettings,
     MemorySettings,
     ModelSettings,
     ProviderSettings,
     ProvidersSettings,
     Secrets,
 )
+from qtalk_bot.imagegen import GeminiImageGenerator, OpenAIImageGenerator
 from qtalk_bot.llm import Provider
 from qtalk_bot.llm.gemini_decisions import GeminiDecisionModel
 from qtalk_bot.llm.gemini_interactions import GeminiChatModel
@@ -186,3 +188,66 @@ async def test_memorizer_shares_the_client_of_its_provider() -> None:
         assert "memory" not in models
     async with ChatModels(settings, SECRETS) as models:
         assert models.memorizer is None
+
+
+async def test_gemini_image_generator_gets_its_own_client_without_retries() -> None:
+    settings = (ModelSettings(name="main", provider=Provider.GEMINI, model="g", default=True),)
+    providers = ProvidersSettings(
+        gemini=ProviderSettings(base_url="https://gm.example.com/", proxy="http://127.0.0.1:7890")
+    )
+    image = ImageGenerationSettings(
+        provider=Provider.GEMINI, model="gemini-image", timeout_seconds=30, gemini_image_size="2K"
+    )
+    async with ChatModels(settings, SECRETS, providers, image_generation=image) as models:
+        generator = models.image_generator
+        assert isinstance(generator, GeminiImageGenerator)
+        assert (generator.provider, generator.model) == (Provider.GEMINI, "gemini-image")
+        assert generator._timeout == 30  # pyright: ignore[reportPrivateUsage]
+        assert generator._image_size == "2K"  # pyright: ignore[reportPrivateUsage]
+        main = models["main"]
+        assert isinstance(main, GeminiChatModel)
+        # 出图不自动重试（重试次数是整个客户端的设置），所以另建客户端；端点与代理相同，对话的重试不变。
+        image_client = generator._client  # pyright: ignore[reportPrivateUsage]
+        assert image_client is not main._client  # pyright: ignore[reportPrivateUsage]
+        image_options = image_client._api_client._http_options  # pyright: ignore[reportPrivateUsage]
+        chat_options = main._client._api_client._http_options  # pyright: ignore[reportPrivateUsage]
+        assert image_options.retry_options is not None
+        assert chat_options.retry_options is not None
+        assert (image_options.retry_options.attempts, chat_options.retry_options.attempts) == (1, 2)
+        assert image_options.base_url == chat_options.base_url == "https://gm.example.com/"
+        assert image_options.async_client_args == {"proxy": "http://127.0.0.1:7890"}
+        assert "fake-" not in repr(generator)
+
+
+async def test_openai_image_generator_uses_a_no_retry_copy_of_the_chat_client() -> None:
+    settings = (ModelSettings(name="main", provider=Provider.OPENAI, model="m", default=True),)
+    image = ImageGenerationSettings(provider=Provider.OPENAI, model="gpt-image")
+    async with ChatModels(settings, SECRETS, image_generation=image) as models:
+        generator = models.image_generator
+        main = models["main"]
+        assert isinstance(generator, OpenAIImageGenerator)
+        assert isinstance(main, OpenAIChatModel)
+        image_client = generator._client  # pyright: ignore[reportPrivateUsage]
+        chat_client = main._client  # pyright: ignore[reportPrivateUsage]
+        assert (image_client.max_retries, chat_client.max_retries) == (0, 1)
+        assert image_client._client is chat_client._client  # pyright: ignore[reportPrivateUsage]  共用连接池
+
+
+async def test_image_generator_of_another_provider_uses_its_configured_client() -> None:
+    settings = (ModelSettings(name="main", provider=Provider.GEMINI, model="g", default=True),)
+    providers = ProvidersSettings(openai=ProviderSettings(base_url="https://oa.example.com/v1"))
+    image = ImageGenerationSettings(
+        provider=Provider.OPENAI, model="gpt-image", openai_quality="low"
+    )
+    async with ChatModels(settings, SECRETS, providers, image_generation=image) as models:
+        generator = models.image_generator
+        assert isinstance(generator, OpenAIImageGenerator)
+        assert generator._quality == "low"  # pyright: ignore[reportPrivateUsage]
+        client = generator._client  # pyright: ignore[reportPrivateUsage]
+        assert str(client.base_url) == "https://oa.example.com/v1/"
+
+
+async def test_no_image_generator_without_the_table() -> None:
+    settings = (ModelSettings(name="main", provider=Provider.OPENAI, model="m", default=True),)
+    async with ChatModels(settings, SECRETS) as models:
+        assert models.image_generator is None

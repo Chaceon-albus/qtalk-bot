@@ -5,7 +5,8 @@
 # - 配置文件的位置由环境变量 QTALK_CONFIG 指定，默认是当前目录下的 config.toml。
 # - 密钥（APP_SECRET、大模型的 key 等）不写在这里，只从环境变量读取，见 .env。
 # - 除了 [[models]] 必须至少有一项，其余每一项都可以省略，省略时取示例里的值。
-#   例外是 [decisions]、[describe] 与 [memory]：整个表删掉就不按消息选模型、不给图片写描述、不给话题写摘要。
+#   例外是 [decisions]、[describe]、[memory] 与 [image_generation]：整个表删掉就不按消息选模型、不给图片写描述、
+#   不给话题写摘要、不出图。
 # - 出现程序不认识的键会报错。
 
 # IANA 时区名，显示时间时使用
@@ -47,6 +48,8 @@ timeout_seconds = 1800       # 总时限：从发出请求到写完最多这么�
 # Gemini 的条款要求同时展示它给的「搜索建议」（一段 HTML），QQ 显示不了，这里没有展示。
 # 打开 show_process 后，这个模型调用工具前的说明与搜索的进展会以简短的步骤另发一条消息显示给用户，回答之后
 # 留着（QQ 的流式消息撤回不了）；思考摘要不展示。调用工具前的说明目前只有 OpenAI 的模型会给。偏闲聊、陪伴的模型建议关掉。
+# 打开 image_generation 后，这个模型能调用画图函数：用户想要一张图或想改一张图时由模型自己决定画，出图用下面
+# [image_generation] 配置的图片模型（两家可以不同）。没有 [image_generation] 时这一项不起作用（启动时记一条警告）。
 [[models]]
 name = "sol"              # 内部名字，用于日志、用量和互相引用
 provider = "openai"
@@ -55,6 +58,7 @@ description = "用户想解决一个具体问题：查资料、写代码、分�
 inputs = ["image", "file"]
 search = true
 show_process = true
+image_generation = true
 default = true
 fallback = "hydrogen"     # 可选：调用失败时改用的模型，写另一项的 name
 # reasoning = "high"      # 可选：推理强度，原样传给服务商；不写用服务商的默认值。
@@ -154,6 +158,21 @@ instructions = """
 严格按下面的格式只输出两行，不要输出别的内容：
 标题：……
 摘要：……"""
+
+# 出图：打开了 image_generation 的模型调用画图函数时，用这里的图片模型画图或改图。
+# provider 与对话模型是哪家无关，它的密钥必须在环境变量里。整个表删掉就不出图。
+# 出图按张计费，比一次对话贵得多（低质量的一张约几美分，高质量或大图更贵），用下面的限额控制花费；
+# 每张图还算一次被动回复，计进 QQ 的回复预算。
+# 两个键只对一家有效，写了另一家的会报错：
+# - openai_quality 只对 OpenAI：low、medium、high、xhigh、max、auto；不写用服务商的默认值。
+# - gemini_image_size 只对 Gemini：图片的分辨率，"512"、"1K"、"2K"、"4K"（K 必须大写）；不写用服务商的默认值。
+[image_generation]
+provider = "openai"             # "openai" 或 "gemini"
+model = "gpt-image-2.6-flare"   # 必填，没有默认值；Gemini 可以用 gemini-nano-banana-2.1
+timeout_seconds = 120           # 一次出图（含改图）的时限，单位秒，最大 600
+daily_limit = 10                # 每个用户每天最多几张（改图也算），0 到 1000；0 就是只有管理员能用。管理员不受限
+# total_daily_limit = 100       # 可选：所有用户加起来每天最多几张，1 到 100000；不写就不设
+# openai_quality = "medium"     # 可选，只对 OpenAI
 
 # ---- 以下各项默认都不设置；需要时去掉行首的 "# " ----
 #

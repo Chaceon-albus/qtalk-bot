@@ -23,6 +23,7 @@ from qtalk_bot.config import (
     AttachmentSettings,
     DecisionSettings,
     DescribeSettings,
+    ImageGenerationSettings,
     MemorySettings,
     ModelSettings,
     Settings,
@@ -509,6 +510,47 @@ def test_memory_without_decisions_is_ignored_with_a_log(caplog: pytest.LogCaptur
         base, decisions=DecisionSettings(provider=Provider.OPENAI, model="d")
     )
     assert entry.memory_settings(enabled) == base.memory
+
+
+def image_settings(*, switch: bool, table: bool) -> Settings:
+    return Settings(
+        timezone=ZoneInfo("Asia/Shanghai"),
+        data_dir=Path("/tmp/data"),
+        models=(
+            ModelSettings(
+                name="a", provider=Provider.OPENAI, model="m", default=True, image_generation=switch
+            ),
+            ModelSettings(name="b", provider=Provider.GEMINI, model="g"),
+        ),
+        image_generation=(
+            ImageGenerationSettings(provider=Provider.GEMINI, model="img") if table else None
+        ),
+    )
+
+
+def test_image_generation_switch_without_the_table_only_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        assert entry.image_generation_settings(image_settings(switch=True, table=False)) is None
+    assert "模型 a 打开了 image_generation，但没有 [image_generation]：不出图" in caplog.text
+
+
+def test_image_generation_table_without_any_switch_only_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = image_settings(switch=False, table=True)
+    with caplog.at_level(logging.WARNING):
+        assert entry.image_generation_settings(settings) == settings.image_generation
+    assert "没有模型打开 image_generation" in caplog.text
+
+
+def test_image_generation_configured_and_used_is_quiet(caplog: pytest.LogCaptureFixture) -> None:
+    settings = image_settings(switch=True, table=True)
+    with caplog.at_level(logging.WARNING):
+        assert entry.image_generation_settings(settings) == settings.image_generation
+        assert entry.image_generation_settings(image_settings(switch=False, table=False)) is None
+    assert caplog.text == ""
 
 
 async def test_batcher_stops_before_the_bot_closes_and_is_drained_after() -> None:
