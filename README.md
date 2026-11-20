@@ -21,7 +21,7 @@ uv run --env-file .env python -m qtalk_bot
 
 ## 开发
 
-需要 Python 3.14 及以上和 [uv](https://docs.astral.sh/uv/)。pyqbot 以本地路径依赖，要放在同级目录 `../pyqbot`。
+需要 Python 3.14 及以上、[uv](https://docs.astral.sh/uv/) 和 git。pyqbot 从 GitHub 安装，固定到 `pyproject.toml` 里写的 commit。
 
 ```sh
 uv sync                                         # 安装依赖

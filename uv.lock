@@ -680,25 +680,10 @@ wheels = [
 [[package]]
 name = "pyqbot"
 version = "0.1.0"
-source = { editable = "../pyqbot" }
+source = { git = "https://github.com/capric98/pyqbot?rev=54a2b7da098715123ea1eba14e607a37dfe1df8e#54a2b7da098715123ea1eba14e607a37dfe1df8e" }
 dependencies = [
     { name = "httpx2", extra = ["socks", "ws"] },
     { name = "msgspec" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "httpx2", extras = ["socks", "ws"], specifier = ">=2.16.0" },
-    { name = "msgspec", specifier = ">=0.22.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pyright", extras = ["nodejs"], specifier = ">=1.1.414" },
-    { name = "pytest", specifier = ">=9.2.0" },
-    { name = "pytest-asyncio", specifier = ">=1.5.0" },
-    { name = "pytest-cov", specifier = ">=7.1.0" },
-    { name = "ruff", specifier = ">=0.17.5" },
 ]
 
 [[package]]
@@ -770,7 +755,7 @@ dev = [
 requires-dist = [
     { name = "google-genai", specifier = ">=3.6.1" },
     { name = "openai", specifier = ">=3.55.1" },
-    { name = "pyqbot", editable = "../pyqbot" },
+    { name = "pyqbot", git = "https://github.com/capric98/pyqbot?rev=54a2b7da098715123ea1eba14e607a37dfe1df8e" },
     { name = "socksio", specifier = ">=1,<2" },
 ]
 

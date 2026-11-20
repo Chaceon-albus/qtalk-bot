@@ -19,7 +19,7 @@ uv run pytest                                   # 本地测试
 
 ## 约束
 
-- QQ 侧一律经由 pyqbot（本机在 `../pyqbot`，以可编辑方式安装）。用法看它的 `docs/guide.md`，平台的真实行为看它的 `docs/errata.md`，不凭记忆写。pyqbot 缺功能或有 bug 时先告诉用户，不在本仓库里绕过。
+- QQ 侧一律经由 pyqbot（从 GitHub 安装，固定到 `pyproject.toml` 里 `[tool.uv.sources]` 写的 commit；它的源码仓库在本机 `../pyqbot`）。用法看它的 `docs/guide.md`，平台的真实行为看它的 `docs/errata.md`，不凭记忆写，并以固定的那个 commit 为准。pyqbot 缺功能或有 bug 时先告诉用户，不在本仓库里绕过。
 - 大模型侧用官方 SDK。这些接口和模型（如 Decisions API）更新很快，写之前先查官方文档，不凭记忆写。
 - 只写 async 代码，并发用标准库 asyncio。直接用 3.14 的现代写法，全量类型标注并通过 pyright strict；`Any`、`# type: ignore` 只在写明原因时使用。
 - 文档、注释、docstring、日志与异常文案、提交描述用中文，标识符用英文。注释只写代码表达不了的东西。
