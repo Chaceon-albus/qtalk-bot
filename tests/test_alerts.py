@@ -223,6 +223,7 @@ async def test_incident_skips_recovery_when_the_alert_was_suppressed() -> None:
     assert incident.alert("备份失败")
     await settle()
     assert incident.resolve("已恢复")
+    await settle()  # 「已恢复」发出去了
     # 冷却中再次出事：告警被挡下，恢复时也不补。
     assert not incident.alert("又失败了")
     assert not incident.resolve("又恢复了")
@@ -238,6 +239,7 @@ async def test_each_alert_gets_its_own_recovery_key() -> None:
     assert incident.alert("第一次")
     await settle()
     assert incident.resolve("第一次恢复")
+    await settle()
     clock.now += DAY  # 告警的冷却过了，上一次「已恢复」的冷却还没过也不影响
     assert incident.alert("第二次")
     await settle()
@@ -455,3 +457,58 @@ async def test_delivery_callback_reports_the_outcome() -> None:
     assert not alerts.notify("a", "冷却中，不回调", on_delivered=outcomes.append)
 
     assert outcomes == [True, False]
+
+
+async def test_recovery_can_be_withdrawn_until_it_is_sent() -> None:
+    # 「已恢复」建了发送任务、还没发出时又出事：取消它，回到「告警已发出、未恢复」。
+    clock = Clock()
+    gate = asyncio.Event()
+    sender = Sender()
+    alerts = Alerts(sender, clock=clock)
+    incident = Incident(alerts, "model:a")
+
+    assert incident.alert("a 失败")
+    await settle()
+    sender.gate = gate  # 之后的发送卡在门口
+    assert incident.resolve("a 恢复")
+    assert incident.open  # 发送结果还没确定
+    assert not incident.alert("a 又失败")  # 撤回还没发出的「已恢复」
+    gate.set()
+    await settle()
+
+    assert sender.sent == ["a 失败"]  # 任务在开始发送之前就取消了
+    assert incident.open
+    # 之后真的恢复了：另用一个键重新补，不被刚才那条的冷却挡住。
+    assert incident.resolve("a 终于恢复")
+    await settle()
+    assert sender.sent == ["a 失败", "a 终于恢复"]
+    assert not incident.open
+
+
+async def test_recovery_that_fails_to_send_is_settled() -> None:
+    sender = Sender()
+    incident = Incident(Alerts(sender, clock=Clock()), "disk")
+
+    assert incident.alert("磁盘不足")
+    await settle()
+    sender.failure = AlertSendError("额度用尽")
+    assert incident.resolve("已恢复")
+    await settle()
+
+    assert not incident.open  # 发送失败也了结，同告警的规则
+
+
+async def test_send_returns_a_cancellable_task() -> None:
+    gate = asyncio.Event()
+    sender = Sender(gate=gate)
+    outcomes: list[bool] = []
+    alerts = Alerts(sender, clock=Clock())
+
+    task = alerts.send("k", "提醒", on_delivered=outcomes.append)
+    assert task is not None
+    assert alerts.send("k", "冷却中") is None
+    task.cancel()
+    await settle()
+
+    assert outcomes == [False]
+    assert sender.sent == []

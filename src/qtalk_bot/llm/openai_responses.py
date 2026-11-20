@@ -56,7 +56,9 @@ Responses API 不接受音频（文档只在 Chat Completions 里写了音频输
   `usage.input_tokens_details.cached_tokens`。
 - `response.incomplete`：同上，`Finished` 的原因按 `incomplete_details.reason`。
 - `response.failed`、`error`：有用量（或快照里补上了搜索次数）时先给出 `Usage`，再抛 `ModelError`。`response.failed`
-  的错误码按 `_FAILED_CODES` 分类（服务端出错、限流、内容策略拦截、输入的图片有问题），其余是 `FAILED`。
+  的错误码按 `_FAILED_CODES` 分类（服务端出错、限流、内容策略拦截、输入的图片有问题），其余是 `FAILED`；顶层
+  `error` 事件的 `code`、SDK 把 `event: error` 转成的 `APIError.code`（没有 HTTP 状态）也走同一套分类
+  （`_kind_for_code()`）。
 其余事件（创建、`web_search_call.searching`、`reasoning_summary_part.added` 等）现在忽略。
 每个事件（含忽略的）之前先交出一个 `Heartbeat`，供调用方计算空闲时限：推理时可能很久只有这些被忽略的事件。
 
@@ -477,7 +479,7 @@ class OpenAIChatModel:
                                     yield tokens.event(extras.count)
                                 error = event.response.error
                                 code = None if error is None else str(error.code)
-                                kind = _FAILED_CODES.get(code or "", ErrorKind.FAILED)
+                                kind = _kind_for_code(code)
                                 raise ModelError(
                                     Provider.OPENAI,
                                     kind,
@@ -486,7 +488,7 @@ class OpenAIChatModel:
                             case "error":
                                 raise ModelError(
                                     Provider.OPENAI,
-                                    ErrorKind.FAILED,
+                                    _kind_for_code(event.code),
                                     quota_exhausted=event.code == INSUFFICIENT_QUOTA_CODE,
                                 )
                             case _:
@@ -962,6 +964,12 @@ def _queries(action: object) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _kind_for_code(code: object) -> ErrorKind:
+    """流里的错误码（`response.failed` 的 `error.code`、顶层 `error` 事件的 `code`、SDK 转成的 `APIError.code`）按
+    `_FAILED_CODES` 分类，认不出的是 `FAILED`。只比较固定的字符串，不把上游的文字带出去。"""
+    return _FAILED_CODES.get(code, ErrorKind.FAILED) if isinstance(code, str) else ErrorKind.FAILED
+
+
 def _error(exc: Exception) -> ModelError:
     quota = is_quota_exhausted(exc)
     match exc:
@@ -971,8 +979,8 @@ def _error(exc: Exception) -> ModelError:
             )
         case openai.APIConnectionError():  # 含超时
             return ModelError(Provider.OPENAI, ErrorKind.CONNECTION)
-        case openai.APIError():  # 流里的 error 事件等
-            return ModelError(Provider.OPENAI, ErrorKind.FAILED, quota_exhausted=quota)
+        case openai.APIError(code=code):  # 流里的 error 事件等（SDK 转成的，没有 HTTP 状态）
+            return ModelError(Provider.OPENAI, _kind_for_code(code), quota_exhausted=quota)
         case ValueError():  # 含 JSONDecodeError：响应解析不了
             return ModelError(Provider.OPENAI, ErrorKind.MALFORMED)
         case _:

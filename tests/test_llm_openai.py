@@ -474,6 +474,55 @@ async def test_other_failure_codes_keep_their_kind(code: str, kind: ErrorKind) -
     assert error.kind is kind
 
 
+@pytest.mark.parametrize(
+    ("code", "kind"),
+    [
+        ("invalid_image", ErrorKind.BAD_REQUEST),
+        ("invalid_prompt", ErrorKind.BLOCKED),
+        ("server_error", ErrorKind.SERVER),
+        ("something_new", ErrorKind.FAILED),
+    ],
+)
+async def test_error_typed_event_codes_are_classified_like_failed_responses(
+    code: str, kind: ErrorKind
+) -> None:
+    error_event = {
+        "type": "error",
+        "sequence_number": 1,
+        "code": code,
+        "message": SECRET_TEXT,
+        "param": None,
+    }
+    _, error = await failure(model_on(streaming([CREATED, error_event])))
+    assert error.kind is kind
+    assert_clean(error)
+
+
+@pytest.mark.parametrize(
+    ("code", "kind"),
+    [("image_too_large", ErrorKind.BAD_REQUEST), ("bio_policy", ErrorKind.BLOCKED)],
+)
+async def test_sse_error_events_turned_into_api_errors_are_classified(
+    code: str, kind: ErrorKind
+) -> None:
+    # SDK 把 `event: error` 加 `{"error": {...}}` 转成没有 HTTP 状态的 APIError，code 取自错误体。
+    body = (
+        sse([CREATED])
+        + b'event: error\ndata: {"error": {"message": "'
+        + SECRET_TEXT.encode()
+        + b'", "type": "invalid_request_error", "code": "'
+        + code.encode()
+        + b'"}}\n\n'
+    )
+    server = Server(
+        lambda _: httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=body)
+    )
+    _, error = await failure(model_on(server))
+    assert error.kind is kind
+    assert error.status_code is None
+    assert_clean(error)
+
+
 async def test_error_event_in_stream_raises() -> None:
     body = (
         sse([CREATED])

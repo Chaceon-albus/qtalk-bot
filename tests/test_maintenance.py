@@ -180,6 +180,7 @@ def scheduler(
     alerts: Alerts | None = None,
     free: list[int] | None = None,
     keep: int = 7,
+    monotonic: Clock | None = None,
 ) -> BackupScheduler:
     free_bytes = free if free is not None else [PLENTY]
     return BackupScheduler(
@@ -190,6 +191,7 @@ def scheduler(
         clock=clock,
         sleep=sleeper,
         free_bytes=lambda _: free_bytes[0],
+        monotonic=clock if monotonic is None else monotonic,
     )
 
 
@@ -820,3 +822,78 @@ async def test_disk_check_errors_only_log(tmp_path: Path, caplog: pytest.LogCapt
 
     assert sender.sent == []
     assert "查不了数据目录的剩余空间" in caplog.text
+
+
+class SteadyClock:
+    """单调时钟的替身：只往前走，不受墙上时钟回拨影响。"""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+async def test_retry_after_a_failure_survives_the_wall_clock_going_back(db: Database) -> None:
+    wall, steady = Clock(), SteadyClock()
+    waits: list[float] = []
+    free = [0]
+
+    class WallClockStopError(Exception):
+        pass
+
+    async def sleep(seconds: float) -> None:
+        waits.append(seconds)
+        if len(waits) == 3:
+            raise WallClockStopError
+        steady.now += seconds
+        wall.now += seconds
+        if len(waits) == 2:
+            wall.now -= DAY  # 失败之后主机时钟被往回调了一天
+            free[0] = PLENTY
+
+    backups = BackupScheduler(
+        db,
+        directory_of(db),
+        BackupSettings(),
+        clock=wall,
+        sleep=sleep,
+        free_bytes=lambda _: free[0],
+        monotonic=steady,
+    )
+    with pytest.raises(WallClockStopError):
+        await backups.run()
+
+    # 启动 5 分钟 → 失败 → 退避约 1 小时（不是被墙钟拖成 25 小时）→ 备份做成 → 等满一天。
+    assert waits[:2] == [STARTUP_DELAY_SECONDS, BACKUP_RETRY_SECONDS]
+    assert len(list_backups(directory_of(db), SCHEDULED_PATTERN)) == 1
+
+
+async def test_listed_backups_decide_the_schedule_not_the_last_success(db: Database) -> None:
+    # 能列出目录时以盘上为准：唯一的备份被删掉（或从来没有）就立即补做，不看内存里上次成功的时间。
+    clock = Clock()
+    backups = scheduler(db, clock, Sleeper(clock, 0), keep=1)
+    assert await backups.backup_once()
+    for path in directory_of(db).iterdir():
+        path.unlink()
+
+    assert backups.plan(clock.now).due == clock.now
+
+
+async def test_last_success_is_used_only_when_the_directory_cannot_be_listed(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = Clock()
+    backups = scheduler(db, clock, Sleeper(clock, 0))
+    assert await backups.backup_once()
+    clock.now += HOUR
+
+    def unreadable(*args: object, **kwargs: object) -> list[object]:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(maintenance, "list_backups", unreadable)
+    monkeypatch.setattr(maintenance, "prune", unreadable)
+    plan = backups.plan(clock.now)
+
+    assert plan.due == NOW + DAY
+    assert plan.cleanup_error is not None

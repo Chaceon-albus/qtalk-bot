@@ -112,13 +112,25 @@ class Alerts:
     ) -> bool:
         """安排给管理员发一条提醒，返回是否安排了发送（冷却中、超过这一类或全局每小时的上限、已关停时为
         `False`）。安排了发送时，发送结束后调用 `on_delivered`（见 `DeliveryCallback`）；没安排时不调用。"""
+        return self.send(key, text, group=group, on_delivered=on_delivered) is not None
+
+    def send(
+        self,
+        key: str,
+        text: str,
+        *,
+        group: AlertGroup | None = None,
+        on_delivered: DeliveryCallback | None = None,
+    ) -> asyncio.Task[bool] | None:
+        """同 `notify()`，但返回发送的任务（没安排时为 `None`）：调用方可以在发出之前取消它（`on_delivered` 照常
+        回调 `False`）。已经开始发送的，取消不保证对方收不到。"""
         if self._closed:
             logger.info("正在关停，不再发提醒（%s）", key)
-            return False
+            return None
         now = self._clock()
         self._forget_before(now)
         if key in self._last_sent:
-            return False
+            return None
         group_recent = None if group is None else self._group_recent.setdefault(group.name, deque())
         if (
             group is not None
@@ -131,12 +143,12 @@ class Alerts:
                 group.hourly_limit,
                 key,
             )
-            return False
+            return None
         if len(self._recent) >= self._hourly_limit:
             logger.warning(
                 "给管理员的提醒已达每小时 %d 条的上限，这条不发（%s）", self._hourly_limit, key
             )
-            return False
+            return None
         self._last_sent[key] = now
         self._recent.append(now)
         if group_recent is not None:
@@ -147,7 +159,7 @@ class Alerts:
         if on_delivered is not None:
             # 挂在任务的完成回调上：还没开始就被取消（如紧接着 stop()）也会回调，且只回调一次。
             task.add_done_callback(lambda done: on_delivered(_delivered(done)))
-        return True
+        return task
 
     def room_in(self, group: AlertGroup | None = None) -> float | None:
         """还要过多少秒，全局与 `group` 这一类每小时的上限才都有空余的名额（现在就有时是 0）；已关停时是 `None`。
@@ -238,6 +250,7 @@ RECOVERED_KEY_SUFFIX = ":已恢复"
 class _AlertState(Enum):
     SENDING = "sending"  # 告警安排了发送，还不知道结果
     DELIVERED = "delivered"  # 告警确认发出去了，还没有补上「已恢复」
+    RECOVERING = "recovering"  # 「已恢复」安排了发送，还不知道结果；期间又出事就取消它
 
 
 class Incident:
@@ -245,13 +258,17 @@ class Incident:
     「已恢复」。
 
     - 告警用构造时给的 `key`，照常受 `Alerts` 的冷却与限流：已经告警过、还没补上「已恢复」时再调用 `alert()` 不会
-      再发（恢复后又出事，就撤回还没发出的「已恢复」）。
+      再发（恢复后又出事，就撤回还没发出的「已恢复」）。原键 24 小时的冷却也会挡住之后的新告警，这是 `Alerts` 的
+      设计。
     - 「已恢复」只在这次的告警确认发出去了之后才发：告警还在发时就恢复的，先记下，等发送结果，发出去了再补；发送
       失败或超时就不补。被每小时的上限挡下的「已恢复」留着：按 `Alerts.room_in()` 算出限额窗口腾出名额的时刻，
       经 `Alerts.call_later()` 到时（再加 `RETRY_MARGIN_SECONDS`）主动重试，又被挡下就按新的时刻再排；下一次
-      `resolve()` 也会立即再试。期间又出事就撤回并取消重试，关停时 `Alerts.stop()` 一并取消。
-    - 「已恢复」的键是 `key` 加 `RECOVERED_KEY_SUFFIX` 与这是第几次告警，每次告警各用一个，不会被上一次的「已恢复」
-      的冷却挡住；与告警同属构造时给的 `group`，占用这一类的预算。
+      `resolve()` 也会立即再试。
+    - 「已恢复」安排了发送之后、发送结果确定之前，仍然可以撤回：期间又出事就取消那个发送任务（已经开始发的，取消
+      不保证管理员收不到），回到「告警已发出、未恢复」。之后再恢复时另用一个键重新补。
+    - 期间又出事就撤回并取消重试，关停时 `Alerts.stop()` 一并取消。
+    - 「已恢复」的键是 `key` 加 `RECOVERED_KEY_SUFFIX`、第几次告警与第几次补发，每次各用一个，不会被之前的
+      「已恢复」的冷却挡住；与告警同属构造时给的 `group`，占用这一类的预算。
     """
 
     def __init__(self, alerts: Alerts, key: str, *, group: AlertGroup | None = None) -> None:
@@ -260,19 +277,20 @@ class Incident:
         self._group = group
         self._state: _AlertState | None = None  # None：没有待恢复的告警
         self._raised = 0  # 第几次告警，区分各次的「已恢复」和迟到的发送结果
+        self._attempt = 0  # 第几次补发「已恢复」，区分迟到的发送结果
         self._recovery: str | None = None  # 已经恢复、还没发出的「已恢复」文案
+        self._recovery_task: asyncio.Task[bool] | None = None  # 正在发的「已恢复」
         self._retry: Cancellable | None = None  # 被限额挡下后安排的重试
 
     @property
     def open(self) -> bool:
-        """告警发出去了（或还在发）、还没有补上「已恢复」。"""
+        """告警发出去了（或还在发）、还没有确认补上「已恢复」。"""
         return self._state is not None
 
     def alert(self, text: str) -> bool:
-        """告警，返回是否安排了发送。已经告警过、还没补上「已恢复」时不再发。"""
+        """告警，返回是否安排了发送。已经告警过、还没补上「已恢复」时不再发，并撤回还没发出的「已恢复」。"""
         if self._state is not None:
-            self._recovery = None  # 又出事了：还没发出的「已恢复」作废
-            self._cancel_retry()
+            self._withdraw_recovery()  # 又出事了：还没发出的「已恢复」作废
             return False
         raised = self._raised + 1
 
@@ -295,8 +313,8 @@ class Incident:
 
     def resolve(self, text: str) -> bool:
         """情况恢复了：这次的告警确认发出去了的话补一条「已恢复」，返回这次是否安排了发送（告警还在发、或被限流
-        挡下时为 `False`，留待之后再发）。"""
-        if self._state is None:
+        挡下时为 `False`，留待之后再发；「已恢复」已经在发时也是 `False`）。"""
+        if self._state is None or self._state is _AlertState.RECOVERING:
             return False
         self._recovery = text
         if self._state is _AlertState.SENDING:
@@ -307,14 +325,34 @@ class Incident:
         if self._recovery is None:
             return False
         self._cancel_retry()
-        key = f"{self._key}{RECOVERED_KEY_SUFFIX}:{self._raised}"
-        if self._alerts.notify(key, self._recovery, group=self._group):
-            self._state, self._recovery = None, None
+        self._attempt += 1
+        attempt = self._attempt
+        key = f"{self._key}{RECOVERED_KEY_SUFFIX}:{self._raised}.{attempt}"
+
+        def delivered(ok: bool) -> None:
+            if self._attempt != attempt or self._state is not _AlertState.RECOVERING:
+                return  # 已经撤回
+            # 发出去了就了结；发送本身失败（多半是额度用尽）也不再重发，同告警的规则。
+            self._state, self._recovery, self._recovery_task = None, None, None
+
+        task = self._alerts.send(key, self._recovery, group=self._group, on_delivered=delivered)
+        if task is not None:
+            self._state = _AlertState.RECOVERING
+            self._recovery_task = task
             return True
         wait = self._alerts.room_in(self._group)
         if wait is not None:  # 已关停时不再排
             self._retry = self._alerts.call_later(wait + RETRY_MARGIN_SECONDS, self._retry_recovery)
         return False
+
+    def _withdraw_recovery(self) -> None:
+        self._recovery = None
+        self._cancel_retry()
+        if self._state is _AlertState.RECOVERING:
+            task, self._recovery_task = self._recovery_task, None
+            self._state = _AlertState.DELIVERED
+            if task is not None:
+                task.cancel()
 
     def _retry_recovery(self) -> None:
         self._retry = None

@@ -294,7 +294,9 @@ class BackupScheduler:
         free_bytes: FreeBytes = disk_free_bytes,
         startup_delay: float = STARTUP_DELAY_SECONDS,
         retry_seconds: float = BACKUP_RETRY_SECONDS,
+        monotonic: Clock = time.monotonic,
     ) -> None:
+        """`clock` 是墙上时钟：备份文件名里的时间与保留期限按它算。`monotonic` 只用于失败后的退避。"""
         self._db = db
         self._directory = directory
         self._interval = settings.interval_hours * 3600.0
@@ -306,7 +308,8 @@ class BackupScheduler:
         self._startup_delay = startup_delay
         self._retry = retry_seconds
         self._abort = threading.Event()
-        self._retry_at = -math.inf  # 新备份失败后，下一次最早什么时候再做
+        self._monotonic = monotonic
+        self._retry_at = -math.inf  # 新备份失败后，下一次最早什么时候再做（单调时钟）
         self._last_success: float | None = (
             None  # 本次运行里最近一次做成备份的时刻（列不出目录时用它排程）
         )
@@ -318,9 +321,9 @@ class BackupScheduler:
         self._abort.set()
 
     def plan(self, now: float) -> _Plan:
-        """先清掉超龄与超出份数的定时备份（出错记在结果里，不抛出），再算下一次备份的时刻：文件名时间不在未来的
-        最新一份加间隔，没有这样的备份时是现在；列不出目录时按本次运行里最近一次做成的时间算。在线程里调用（扫描
-        与删除是文件系统操作）。"""
+        """先清掉超龄与超出份数的定时备份（出错记在结果里，不抛出），再算下一次备份的时刻：以盘上仍在的备份为准，
+        文件名时间不在未来的最新一份加间隔，没有这样的备份时是现在（立即补做）。只有列不出目录时，才按本次运行里
+        最近一次做成的时间算（也没有时是现在）。在线程里调用（扫描与删除是文件系统操作）。"""
         cleanup_error: BaseException | None = None
         try:
             self._prune(now, protect=())
@@ -332,9 +335,12 @@ class BackupScheduler:
             cleanup_error = cleanup_error or exc
             backups = None
         past = [] if backups is None else [backup for backup in backups if backup.at <= now]
-        due = past[-1].at + self._interval if past else now
-        if self._last_success is not None and self._last_success <= now:
-            due = max(due, self._last_success + self._interval)
+        if past:
+            due = past[-1].at + self._interval
+        elif backups is None and self._last_success is not None and self._last_success <= now:
+            due = self._last_success + self._interval
+        else:
+            due = now
         # 已经超龄、却没能删掉的不算：那是清理的事，由清理失败的重试管，不能让调度每秒醒一次。
         expiry = min(
             (at for backup in past if (at := backup.at + self._max_age) > now), default=math.inf
@@ -347,10 +353,11 @@ class BackupScheduler:
             now = self._clock()
             plan = await asyncio.to_thread(self.plan, now)
             self._settle_cleanup(plan.cleanup_error)
-            due = max(plan.due, self._retry_at)
+            # 失败后的退避按单调时钟计：失败之后主机时钟被往回调了，也还是约 1 小时后重试。
+            due = max(plan.due, now + (self._retry_at - self._monotonic()))
             if due <= now:
                 if not await self.backup_once():
-                    self._retry_at = self._clock() + self._retry
+                    self._retry_at = self._monotonic() + self._retry
                 continue
             wake = min(due, plan.expiry)
             if plan.cleanup_error is not None:
