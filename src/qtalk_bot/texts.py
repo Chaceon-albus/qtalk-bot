@@ -346,6 +346,7 @@ def _usage_part(
     unreported: int,
     decisions: tuple[int, int],
     searches: int = 0,
+    images: tuple[int, int, int] = (0, 0, 0),
 ) -> str:
     part = f"{calls} 次，输入 {input_tokens} / 输出 {output_tokens} token"
     if unreported:
@@ -355,6 +356,11 @@ def _usage_part(
         part += f"，含决策 {decision_calls} 次、输入 {decision_input} token"
     if searches:
         part += f"，联网搜索 {searches} 次"
+    image_count, image_input, image_output = images
+    if image_count:
+        part += f"，出图 {image_count} 张"
+        if image_input or image_output:
+            part += f"（输入 {image_input} / 输出 {image_output} token）"
     return part
 
 
@@ -368,13 +374,15 @@ def usage_line(
     total_decisions: tuple[int, int] = (0, 0),
     today_searches: int = 0,
     total_searches: int = 0,
+    today_images: tuple[int, int, int] = (0, 0, 0),
+    total_images: tuple[int, int, int] = (0, 0, 0),
 ) -> str:
-    """`today`、`total` 都是（调用次数，输入 token，输出 token，没有用量数据的次数），包括决策调用；
-    `*_decisions` 是其中决策调用的（次数，输入 token）；`*_searches` 是服务商内置搜索的执行次数，为 0 时不显示。"""
-    return (
-        f"#{user_id} {name}：今天 {_usage_part(*today, today_decisions, today_searches)}；"
-        f"累计 {_usage_part(*total, total_decisions, total_searches)}"
-    )
+    """`today`、`total` 都是（调用次数，输入 token，输出 token，没有用量数据的次数），包括决策调用、不包括出图；
+    `*_decisions` 是其中决策调用的（次数，输入 token）；`*_searches` 是服务商内置搜索的执行次数，为 0 时不显示；
+    `*_images` 是出图的（张数，输入 token，输出 token），张数为 0 时不显示，token 都为 0 时只显示张数。"""
+    today_part = _usage_part(*today, today_decisions, today_searches, today_images)
+    total_part = _usage_part(*total, total_decisions, total_searches, total_images)
+    return f"#{user_id} {name}：今天 {today_part}；累计 {total_part}"
 
 
 def usage_list(lines: list[str]) -> str:
@@ -393,13 +401,15 @@ class UsageRow:
     total_decisions: tuple[int, int] = (0, 0)
     today_searches: int = 0
     total_searches: int = 0
+    today_images: tuple[int, int, int] = (0, 0, 0)
+    total_images: tuple[int, int, int] = (0, 0, 0)
 
 
 def usage_message(rows: Sequence[UsageRow]) -> Rich:
     blocks = [
         f"- `#{r.user_id}` {escape_markdown(r.name)}\n"
-        f"  - 今天：{_usage_part(*r.today, r.today_decisions, r.today_searches)}\n"
-        f"  - 累计：{_usage_part(*r.total, r.total_decisions, r.total_searches)}"
+        f"  - 今天：{_usage_part(*r.today, r.today_decisions, r.today_searches, r.today_images)}\n"
+        f"  - 累计：{_usage_part(*r.total, r.total_decisions, r.total_searches, r.total_images)}"
         for r in rows
     ]
     markdown = "**用量**（今天从本地时间 0 点算起）\n\n" + "\n".join(blocks)
@@ -414,6 +424,8 @@ def usage_message(rows: Sequence[UsageRow]) -> Rich:
                 total_decisions=r.total_decisions,
                 today_searches=r.today_searches,
                 total_searches=r.total_searches,
+                today_images=r.today_images,
+                total_images=r.total_images,
             )
             for r in rows
         ]

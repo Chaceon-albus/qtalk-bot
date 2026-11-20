@@ -9,6 +9,8 @@ Unix 秒。查询一律按 `user_id` 过滤：一个用户的对话与附件不�
 
 只由表情组成的用户消息（`faces_only`，见 `faces.py`）照常记进流水，但取历史与这一轮的输入时一律跳过：表情不进
 模型的输入，也不影响轮次。
+
+模型在一轮里画的图记成那条助手回复的附件（`add_generated_images()`），取历史时随回复一起取回。
 """
 
 import bisect
@@ -20,7 +22,16 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from .llm import Provider, Role
-from .media import Acquired, AttachmentKind, AttachmentRecord, AttachmentStatus, DescribeStatus
+from .media import (
+    Acquired,
+    AttachmentKind,
+    AttachmentRecord,
+    AttachmentStatus,
+    DescribeStatus,
+    GeneratedImage,
+    clean_description,
+    generated_image_text,
+)
 
 
 class Ending(StrEnum):
@@ -67,6 +78,7 @@ class UsagePurpose(StrEnum):
     DECISION = "decision"  # 决策调用
     DESCRIBE = "describe"  # 给图片写描述、给 PDF 写摘要
     MEMORY = "memory"  # 给话题写标题与摘要
+    IMAGE = "image"  # 出图（含改图），一次一行
 
 
 DECISION_USAGE_MODEL = "decisions"
@@ -77,6 +89,9 @@ DESCRIBE_USAGE_MODEL = "describe"
 
 MEMORY_USAGE_MODEL = "memory"
 """给话题写标题与摘要的调用在用量表 `model` 列里记的固定值。"""
+
+IMAGE_USAGE_MODEL = "image"
+"""出图（含改图）在用量表 `model` 列里记的固定值；实际的图片服务商与模型名在 `provider`、`provider_model`。"""
 
 ROWS_PER_TURN = 32
 """取历史时每轮最多看的用户消息数，用来给查询设上限；也是当前这一轮最多取的待回复消息数。攒批的一轮一般远到
@@ -89,7 +104,7 @@ CURRENT_TURN = -1
 
 @dataclass(frozen=True, slots=True)
 class HistoryEntry:
-    """上下文里的一条消息。`attachments` 是用户消息的附件；`turns_ago` 是它属于往前数第几轮（0 是最近一轮
+    """上下文里的一条消息。`attachments` 是用户消息的附件，或助手回复那一轮里模型画的图；`turns_ago` 是它属于往前数第几轮（0 是最近一轮
     完整的对话，`CURRENT_TURN` 是当前这一轮）；`message_id` 是流水里的编号。后两项不参与比较。"""
 
     role: Role
@@ -109,8 +124,10 @@ class HistoryEntry:
 class UsageSummary:
     """一个用户的用量汇总。token 数只累加服务商返回了的；`*_unreported` 是没有返回用量的调用次数。
 
-    `*_calls`、`*_input`、`*_output`、`*_unreported` 包括决策调用；`*_decision_calls`、`*_decision_input`
-    是其中决策调用的部分（决策没有输出 token）。`*_searches` 是服务商内置搜索的执行次数（只累加报告了的）。
+    `*_calls`、`*_input`、`*_output`、`*_unreported` 包括决策调用，不包括出图；`*_decision_calls`、
+    `*_decision_input` 是其中决策调用的部分（决策没有输出 token）。`*_searches` 是服务商内置搜索的执行次数（只
+    累加报告了的）。`*_images` 是出图的张数（用途为 image 的行数），`*_image_input`、`*_image_output` 是这些
+    出图报告了的 token 数。
     """
 
     user_id: int
@@ -129,6 +146,12 @@ class UsageSummary:
     total_decision_input: int = 0
     today_searches: int = 0
     total_searches: int = 0
+    today_images: int = 0
+    today_image_input: int = 0
+    today_image_output: int = 0
+    total_images: int = 0
+    total_image_input: int = 0
+    total_image_output: int = 0
 
 
 def add_user_message(
@@ -228,9 +251,11 @@ def update_attachment(
     )
 
 
+# generated：附件挂在助手的回复上，就是那一轮里模型画的图（见迁移 `_V11_IMAGES`）。
 _ATTACHMENT_COLUMNS = (
     "id, message_id, kind, status, quoted, mime_type, size, path, text, filename, description,"
-    " given"
+    " given, coalesce((SELECT m.role = 'assistant' FROM messages AS m"
+    " WHERE m.id = attachments.message_id), 0) AS generated"
 )
 
 
@@ -248,6 +273,7 @@ def _record(row: sqlite3.Row) -> AttachmentRecord:
         filename=row["filename"],
         description=row["description"],
         given=bool(row["given"]),
+        generated=bool(row["generated"]),
     )
 
 
@@ -268,6 +294,85 @@ def message_attachments(
     for row in rows:
         grouped[row["message_id"]].append(_record(row))
     return {message_id: tuple(items) for message_id, items in grouped.items()}
+
+
+def add_generated_images(
+    conn: sqlite3.Connection,
+    *,
+    user_id: int,
+    message_id: int,
+    images: Sequence[GeneratedImage],
+    now: int,
+) -> list[AttachmentRecord]:
+    """把一轮里模型画的图记成这个用户的助手回复 `message_id` 的附件，返回写进去的记录（按顺序）。
+
+    文件要由调用方先经 `MediaStore.save()` 存好：先落盘、后记录，没能记进来的文件由孤儿清理删掉
+    （`media.purge_expired()`）。每张图记成 `image`、`stored`、不是引用的，`description` 是画面描述（压成一行、
+    过长的截断），`text` 是 `media.generated_image_text()`，`describe_status` 为 `done`（不再调用描述模型）。
+    同一条回复上已有附件时接着往后排。按 `retention_days` 的过期清理对它们照常生效。
+
+    Raises:
+        ValueError: `message_id` 不是这个用户的助手回复；事务随之回滚。
+    """
+    owner = conn.execute(
+        "SELECT 1 FROM messages WHERE id = ? AND user_id = ? AND role = 'assistant'",
+        (message_id, user_id),
+    ).fetchone()
+    if owner is None:
+        raise ValueError("生成的图只能挂在这个用户自己的助手回复上")
+    start: int = conn.execute(
+        "SELECT coalesce(max(position) + 1, 0) FROM attachments WHERE message_id = ?",
+        (message_id,),
+    ).fetchone()[0]
+    records: list[AttachmentRecord] = []
+    for offset, image in enumerate(images):
+        description = clean_description(image.description)
+        text = generated_image_text(description)
+        row = conn.execute(
+            "INSERT INTO attachments (user_id, message_id, position, quoted, kind, status, mime_type,"
+            " size, path, filename, text, describe_status, created_at, description)"
+            " VALUES (?, ?, ?, 0, 'image', 'stored', ?, ?, ?, NULL, ?, 'done', ?, ?) RETURNING id",
+            (
+                user_id,
+                message_id,
+                start + offset,
+                image.mime_type,
+                image.size,
+                image.path,
+                text,
+                now,
+                description or None,
+            ),
+        ).fetchone()
+        records.append(
+            AttachmentRecord(
+                id=row["id"],
+                message_id=message_id,
+                kind=AttachmentKind.IMAGE,
+                status=AttachmentStatus.STORED,
+                quoted=False,
+                mime_type=image.mime_type,
+                size=image.size,
+                path=image.path,
+                text=text,
+                description=description or None,
+                generated=True,
+            )
+        )
+    return records
+
+
+def referable_image(
+    conn: sqlite3.Connection, user_id: int, attachment_id: int
+) -> AttachmentRecord | None:
+    """这个用户的一张本地文件还在的图片（用户发的或模型画的），改图时按编号取；别人的、已过期的、不是图片的都
+    返回 `None`。调用方先确认编号在这次请求列出的 `context.Built.referable` 里，取原件时再用它复查一次。"""
+    row = conn.execute(
+        f"SELECT {_ATTACHMENT_COLUMNS} FROM attachments WHERE id = ? AND user_id = ?"  # noqa: S608  只拼列名常量
+        " AND kind = 'image' AND status = 'stored' AND path IS NOT NULL",
+        (attachment_id, user_id),
+    ).fetchone()
+    return None if row is None else _record(row)
 
 
 def pending_description(
@@ -470,10 +575,9 @@ def recent_history(
 def _entries(
     conn: sqlite3.Connection, user_id: int, picked: Sequence[tuple[sqlite3.Row, int]]
 ) -> list[HistoryEntry]:
-    """把（行，往前数第几轮）整理成上下文里的消息，带上用户消息的附件；正文为空的回复不带。"""
-    attachments = message_attachments(
-        conn, user_id, (row["id"] for row, _ in picked if row["role"] == Role.USER.value)
-    )
+    """把（行，往前数第几轮）整理成上下文里的消息，带上用户消息的附件与回复里模型画的图；正文为空、也没有画图的
+    回复不带。"""
+    attachments = message_attachments(conn, user_id, (row["id"] for row, _ in picked))
     return [
         HistoryEntry(
             Role(row["role"]),
@@ -485,7 +589,7 @@ def _entries(
             reply_to=row["reply_to"],
         )
         for row, age in picked
-        if row["role"] == Role.USER.value or row["content"] != ""
+        if row["role"] == Role.USER.value or row["content"] != "" or row["id"] in attachments
     ]
 
 
@@ -742,6 +846,53 @@ def add_usage(
     )
 
 
+def add_image_usage(
+    conn: sqlite3.Connection,
+    *,
+    user_id: int,
+    message_id: int | None,
+    provider: Provider,
+    provider_model: str,
+    now: int,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+) -> None:
+    """记一次出图（含改图）：一张图一行，`model` 列是 `IMAGE_USAGE_MODEL`，`provider` 与 `provider_model` 是实际的
+    图片服务商与模型名。`message_id` 是触发这一轮的用户消息。限额按这种行的行数算（`image_count()`）。"""
+    add_usage(
+        conn,
+        user_id=user_id,
+        message_id=message_id,
+        model=IMAGE_USAGE_MODEL,
+        provider=provider,
+        provider_model=provider_model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        now=now,
+        purpose=UsagePurpose.IMAGE,
+    )
+
+
+def image_count(conn: sqlite3.Connection, user_id: int, since: int) -> int:
+    """这个用户自 `since`（含）起出了几张图（用量表里用途为 image 的行数）。"""
+    row = conn.execute(
+        "SELECT count(*) FROM usage WHERE user_id = ? AND purpose = 'image' AND created_at >= ?",
+        (user_id, since),
+    ).fetchone()
+    count: int = row[0]
+    return count
+
+
+def total_image_count(conn: sqlite3.Connection, since: int) -> int:
+    """所有用户自 `since`（含）起一共出了几张图。"""
+    # purpose 写成字面量：部分索引 usage_images_by_time 只有条件里原样出现 purpose = 'image' 时才会被用上。
+    row = conn.execute(
+        "SELECT count(*) FROM usage WHERE purpose = 'image' AND created_at >= ?", (since,)
+    ).fetchone()
+    count: int = row[0]
+    return count
+
+
 def add_decision(
     conn: sqlite3.Connection,
     *,
@@ -779,7 +930,8 @@ def add_decision(
 
 
 def usage_summary(conn: sqlite3.Connection, since: int) -> list[UsageSummary]:
-    """按用户汇总用量：`since` 之后（「今天」）与累计。没有用量记录的用户不列出。
+    """按用户汇总用量：`since` 之后（「今天」）与累计。没有用量记录的用户不列出。出图另算张数，不计进调用次数
+    与 token（见 `UsageSummary`）。
 
     token 数用 `total()` 累加再转回整数，不用 `SUM()`：`SUM()` 的结果超出 64 位整数时抛 `integer overflow`，
     一行异常的大数（如绕过 `Usage` 校验写进来的）就会让整个 `/usage` 失败；`total()` 按浮点数累加，不会溢出，
@@ -789,17 +941,20 @@ def usage_summary(conn: sqlite3.Connection, since: int) -> list[UsageSummary]:
         """
         SELECT
           u.user_id, users.name,
-          SUM(u.created_at >= :since) AS today_calls,
-          CAST(total(CASE WHEN u.created_at >= :since THEN u.input_tokens END) AS INTEGER)
-            AS today_input,
-          CAST(total(CASE WHEN u.created_at >= :since THEN u.output_tokens END) AS INTEGER)
-            AS today_output,
-          SUM(u.created_at >= :since AND (u.input_tokens IS NULL OR u.output_tokens IS NULL))
-            AS today_unreported,
-          COUNT(*) AS total_calls,
-          CAST(total(u.input_tokens) AS INTEGER) AS total_input,
-          CAST(total(u.output_tokens) AS INTEGER) AS total_output,
-          SUM(u.input_tokens IS NULL OR u.output_tokens IS NULL) AS total_unreported,
+          SUM(u.created_at >= :since AND u.purpose != 'image') AS today_calls,
+          CAST(total(CASE WHEN u.created_at >= :since AND u.purpose != 'image'
+            THEN u.input_tokens END) AS INTEGER) AS today_input,
+          CAST(total(CASE WHEN u.created_at >= :since AND u.purpose != 'image'
+            THEN u.output_tokens END) AS INTEGER) AS today_output,
+          SUM(u.created_at >= :since AND u.purpose != 'image'
+            AND (u.input_tokens IS NULL OR u.output_tokens IS NULL)) AS today_unreported,
+          SUM(u.purpose != 'image') AS total_calls,
+          CAST(total(CASE WHEN u.purpose != 'image' THEN u.input_tokens END) AS INTEGER)
+            AS total_input,
+          CAST(total(CASE WHEN u.purpose != 'image' THEN u.output_tokens END) AS INTEGER)
+            AS total_output,
+          SUM(u.purpose != 'image' AND (u.input_tokens IS NULL OR u.output_tokens IS NULL))
+            AS total_unreported,
           SUM(u.created_at >= :since AND u.purpose = 'decision') AS today_decision_calls,
           CAST(total(CASE WHEN u.created_at >= :since AND u.purpose = 'decision'
             THEN u.input_tokens END) AS INTEGER) AS today_decision_input,
@@ -808,7 +963,17 @@ def usage_summary(conn: sqlite3.Connection, since: int) -> list[UsageSummary]:
             AS total_decision_input,
           CAST(total(CASE WHEN u.created_at >= :since THEN u.searches END) AS INTEGER)
             AS today_searches,
-          CAST(total(u.searches) AS INTEGER) AS total_searches
+          CAST(total(u.searches) AS INTEGER) AS total_searches,
+          SUM(u.created_at >= :since AND u.purpose = 'image') AS today_images,
+          CAST(total(CASE WHEN u.created_at >= :since AND u.purpose = 'image'
+            THEN u.input_tokens END) AS INTEGER) AS today_image_input,
+          CAST(total(CASE WHEN u.created_at >= :since AND u.purpose = 'image'
+            THEN u.output_tokens END) AS INTEGER) AS today_image_output,
+          SUM(u.purpose = 'image') AS total_images,
+          CAST(total(CASE WHEN u.purpose = 'image' THEN u.input_tokens END) AS INTEGER)
+            AS total_image_input,
+          CAST(total(CASE WHEN u.purpose = 'image' THEN u.output_tokens END) AS INTEGER)
+            AS total_image_output
         FROM usage AS u JOIN users ON users.id = u.user_id
         GROUP BY u.user_id ORDER BY u.user_id
         """,
@@ -832,6 +997,12 @@ def usage_summary(conn: sqlite3.Connection, since: int) -> list[UsageSummary]:
             total_decision_input=row["total_decision_input"],
             today_searches=row["today_searches"],
             total_searches=row["total_searches"],
+            today_images=row["today_images"],
+            today_image_input=row["today_image_input"],
+            today_image_output=row["today_image_output"],
+            total_images=row["total_images"],
+            total_image_input=row["total_image_input"],
+            total_image_output=row["total_image_output"],
         )
         for row in rows
     ]

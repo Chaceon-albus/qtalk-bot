@@ -15,7 +15,8 @@ pyqbot 的 HTTP 客户端实现）。
   只用附件表里存的相对路径，并确认解析后仍在这个用户的目录之内（`MediaStore.locate()`），否则当作不存在。
   附件根目录或用户目录本身是符号链接时，读、写、删一律拒绝（数据恢复或迁移后可能出现）。
 - **清理**（每小时一次）：附件表里过期的行改成 `expired` 并删掉文件；再按用户目录扫一遍，删掉附件表没有引用、
-  修改时间早于一小时前的孤儿文件（下载后没能写进流水的、中途留下的临时文件）。以后做「遗忘」与删除用户时可以整个删掉用户
+  修改时间早于一小时前的孤儿文件（下载后没能写进流水的、中途留下的临时文件，以及生成后没能记进附件表的图）。
+  模型画的图（挂在助手回复上的附件行）同样按保存期限清理。以后做「遗忘」与删除用户时可以整个删掉用户
   目录（`MediaStore.remove_user()`）。
 """
 
@@ -212,6 +213,22 @@ class AttachmentRecord:
     """模型写的图片描述或 PDF 摘要（只有内容本身，不带标签）；还没有时为空。"""
     given: bool = False
     """原件在回答它的那一轮实际交给过模型（`journal.set_given()`）。"""
+    generated: bool = False
+    """模型在那一轮里画的图：挂在助手的回复上，而不是用户消息上（`journal.add_generated_images()`）。"""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class GeneratedImage:
+    """一张生成的图，文件已经经 `MediaStore.save()` 存好，还没有写进附件表。
+
+    `path` 是相对于附件目录的路径；`description` 是模型写的画面描述。两者都不进 `repr`（日志里不能有文件名与
+    画面描述）。
+    """
+
+    path: str = field(repr=False)
+    mime_type: str
+    size: int
+    description: str = field(repr=False)
 
 
 # ---- 文字版 ----
@@ -240,6 +257,15 @@ def image_text(quoted: bool, description: str | None = None) -> str:
     """图片的文字版：有描述时带上描述，否则是占位。"""
     label = image_label(quoted)
     return f"[{label}：{description}]" if description else f"[{label}]"
+
+
+GENERATED_LABEL = "生成的图片"
+
+
+def generated_image_text(description: str) -> str:
+    """生成的图在附件表里的文字版（`text` 列），如「[生成的图片：一只橘猫]」。用第三人称：写摘要的后台模型也读
+    它。对话的历史里另用 `history_text()` 的措辞，让对话模型明白这是它自己画的。"""
+    return f"[{GENERATED_LABEL}：{description}]" if description else f"[{GENERATED_LABEL}]"
 
 
 def text_version(
@@ -313,7 +339,13 @@ def history_text(record: AttachmentRecord) -> str:
     原件在回答它的那一轮实际交给过模型时（`record.given`，按那一轮最终的请求记下）：说明里写清楚这一点，这里只
     保留描述、摘要或识别文本，没有时只保留这条说明。没有这个记录的（当时给的就是文字版、下载失败、太大、不支持、
     那一轮被取消等）照旧用当时的文字版（`record.text`），不声称给过。
+
+    模型自己画的图（`record.generated`）写成「[你之前画的图片：画面描述]」，接在那条回复的文字后面。
     """
+    if record.generated:
+        if record.description:
+            return f"[你之前画的图片：{record.description}]"
+        return "[你之前画的图片]"
     if not record.given:
         return record.text
     match record.kind:
@@ -342,9 +374,11 @@ def history_text(record: AttachmentRecord) -> str:
 
 
 def marker(record: AttachmentRecord) -> str:
-    """决策题目里的简短标记：图片只写「[图片]」（不带描述），文件只写标签（不带摘要），其余用文字版（本来
-    就短）。"""
+    """决策题目里的简短标记：图片只写「[图片]」（生成的图写「[生成的图片]」，都不带描述），文件只写标签（不带
+    摘要），其余用文字版（本来就短）。"""
     match record.kind:
+        case AttachmentKind.IMAGE if record.generated:
+            return f"[{GENERATED_LABEL}]"
         case AttachmentKind.IMAGE:
             return f"[{image_label(record.quoted)}]"
         case AttachmentKind.FILE if record.description:

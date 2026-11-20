@@ -920,3 +920,50 @@ async def test_a_failing_hook_does_not_change_the_download_result(
     assert (await acquire_one(f, image())).status is AttachmentStatus.FAILED
     assert "提醒管理员时出错：RuntimeError" in caplog.text
     assert "钩子里的秘密" not in caplog.text
+
+
+async def test_drawn_images_follow_the_same_cleanup_rules(tmp_path: Path, db: Database) -> None:
+    # 生成的图先落盘、后记录：记进附件表的按保存期限清理，没能记进去的（如这一轮没写回复就结束）按孤儿删掉。
+    store = MediaStore.under(tmp_path)
+    now = int(time.time())
+    recorded_old = store.save(1, PNG_BYTES, PNG)
+    recorded_new = store.save(1, PNG_BYTES, PNG)
+    unrecorded = store.save(1, PNG_BYTES, PNG)
+    for relative in (recorded_old, recorded_new, unrecorded):
+        located = store.locate(1, relative)
+        assert located is not None
+        os.utime(located, (now - 7200, now - 7200))
+
+    def fill(conn: sqlite3.Connection) -> None:
+        user = access.ensure_user(conn, "FAKE-OPENID-ALICE", "小王", 0)
+        assert user.id == 1
+        question = journal.add_user_message(conn, user.id, "画两张", "qq-1", 0)
+        reply_id = journal.add_reply(
+            conn,
+            user_id=user.id,
+            reply_to=question,
+            content="画好了",
+            model="main",
+            ending=journal.Ending.COMPLETED,
+            delivery=journal.ReplyDelivery.STREAMED,
+            now=0,
+        )
+        for path, created in ((recorded_old, 100), (recorded_new, now)):
+            journal.add_generated_images(
+                conn,
+                user_id=user.id,
+                message_id=reply_id,
+                images=[media.GeneratedImage(path=path, mime_type=PNG, size=10, description="猫")],
+                now=created,
+            )
+
+    await db.transaction(fill)
+
+    removed = await purge_expired(db, store, cutoff=1000, now=now)
+
+    assert removed == 2
+    assert store.read(1, recorded_old) is None
+    assert store.read(1, unrecorded) is None
+    assert store.read(1, recorded_new) == PNG_BYTES
+    rows = await db.fetch_all("SELECT status, path FROM attachments ORDER BY position")
+    assert [tuple(r) for r in rows] == [("expired", None), ("stored", recorded_new)]

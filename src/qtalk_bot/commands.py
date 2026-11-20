@@ -187,7 +187,7 @@ def day_start(now: int, timezone: ZoneInfo) -> int:
 
     `fold=0`：午夜正好遇上夏令时回拨的时区里，0 点会出现两次，取第一次，免得把回拨前的那段漏掉；
     `fromtimestamp()` 在重复的那一小时里给出的是 `fold=1`，不能沿用。午夜被夏令时跳过时，`fold=0` 对应
-    跳变后的第一个时刻，也就是这一天真正的开始。
+    跳变后的第一个时刻，也就是这一天真正的开始。出图的每日限额也按它定「当天」。
     """
     local = datetime.fromtimestamp(now, timezone)
     midnight = local.replace(hour=0, minute=0, second=0, microsecond=0, fold=0)
@@ -208,6 +208,8 @@ def _usage(conn: sqlite3.Connection, context: CommandContext, now: int) -> str |
             total_decisions=(s.total_decision_calls, s.total_decision_input),
             today_searches=s.today_searches,
             total_searches=s.total_searches,
+            today_images=(s.today_images, s.today_image_input, s.today_image_output),
+            total_images=(s.total_images, s.total_image_input, s.total_image_output),
         )
         for s in summaries
     ]

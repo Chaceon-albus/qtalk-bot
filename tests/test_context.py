@@ -1,6 +1,7 @@
 """能力筛选、要告诉用户的说明、带附件的上下文组装：纯逻辑，文件是真的（临时目录），不访问网络。"""
 
 import itertools
+import sqlite3
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -8,9 +9,10 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from qtalk_bot import texts
+from qtalk_bot import access, journal, texts
 from qtalk_bot.config import ModelSettings
 from qtalk_bot.context import (
+    MAX_REFERABLE_IMAGES,
     RequestBuilder,
     accepts,
     decision_latest,
@@ -18,7 +20,7 @@ from qtalk_bot.context import (
     fallback_allowed,
     plan_turn,
 )
-from qtalk_bot.journal import HistoryEntry
+from qtalk_bot.journal import CURRENT_TURN, Ending, HistoryEntry, ReplyDelivery
 from qtalk_bot.llm import (
     AudioPart,
     FilePart,
@@ -35,12 +37,17 @@ from qtalk_bot.media import (
     PDF,
     PNG,
     WAV,
+    Acquired,
     AttachmentKind,
     AttachmentRecord,
     AttachmentStatus,
+    GeneratedImage,
     MediaStore,
+    generated_image_text,
     text_version,
 )
+from qtalk_bot.prompt import NO_REFERABLE, REFERABLE_GUIDE
+from qtalk_bot.storage import DATABASE_FILENAME, Database
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n-png-"
 NOW = datetime(2027, 1, 15, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -641,3 +648,236 @@ def test_decision_marker_leaves_out_the_summary() -> None:
         text="[文件：a.pdf，PDF，8 B。摘要：很长的摘要]",
     )
     assert decision_text(user("总结一下", pdf)) == "总结一下\n[文件：a.pdf，PDF，8 B]"
+
+
+# ---- 里程碑 10：画的图与可以引用的图片 ----
+
+
+def drawn_record(
+    store: MediaStore, description: str = "一只橘猫", *, user_id: int = 1
+) -> AttachmentRecord:
+    path = store.save(user_id, PNG_BYTES, PNG)
+    return replace(
+        record(IMAGE, path=path, size=len(PNG_BYTES), text=generated_image_text(description)),
+        description=description,
+        generated=True,
+    )
+
+
+def message_text(messages: tuple[Message, ...]) -> str:
+    """请求里全部消息的文字（`TextPart` 的正文不进 `repr`，不能拿 `repr` 来查）。"""
+    return "\n".join(p.text for m in messages for p in m.parts if isinstance(p, TextPart))
+
+
+def drawn_reply(content: str, *records: AttachmentRecord, turns_ago: int = 0) -> HistoryEntry:
+    return HistoryEntry(Role.ASSISTANT, content, records, turns_ago=turns_ago)
+
+
+async def test_drawn_images_are_only_text_after_the_reply(tmp_path: Path) -> None:
+    store = MediaStore.under(tmp_path)
+    cat, nameless = drawn_record(store), replace(drawn_record(store), description=None)
+    history = [user("画只猫", turns_ago=0), drawn_reply("画好了", cat, nameless)]
+
+    # 能看图、文件也在、在最近几轮之内：助手消息里仍然只有文字。
+    built = await builder(store, history, [user("再改改")], image_turns=3).build(ALL)
+
+    assert built.request.messages[1] == Message.text(
+        Role.ASSISTANT, "画好了\n[你之前画的图片：一只橘猫]\n[你之前画的图片]"
+    )
+    assert all(
+        not isinstance(part, ImagePart)
+        for message in built.request.messages
+        for part in message.parts
+    )
+    assert REFERABLE_GUIDE not in built.request.system  # 没有要求时不列目录
+    assert built.referable == {}
+
+
+def test_decision_marker_of_a_drawn_image_is_short() -> None:
+    drawn = replace(record(IMAGE, text=generated_image_text("很长的描述")), generated=True)
+    assert decision_text(drawn_reply("画好了", drawn)) == "画好了\n[生成的图片]"
+
+
+async def test_referable_images_are_listed_newest_first_with_matching_labels(
+    tmp_path: Path,
+) -> None:
+    store = MediaStore.under(tmp_path)
+    old_sent = replace(stored_image(store), given=True)  # 两轮前用户发的，原图当时给过
+    cat = drawn_record(store)  # 上一轮画的
+    quoted = replace(stored_image(store), quoted=True, description=None, text="[被引用的图片]")
+    fresh = replace(stored_image(store), description=None, text="[图片]")  # 这一轮发的，还没有描述
+    history = [
+        user("看这张", old_sent, turns_ago=1),
+        reply("是猫", turns_ago=1),
+        user("画只猫", turns_ago=0),
+        drawn_reply("画好了", cat),
+    ]
+    current = [user("照这两张改", quoted, fresh)]
+
+    built = await builder(store, history, current, image_turns=1).build(SEES, referable_images=True)
+
+    assert list(built.referable) == [fresh.id, quoted.id, cat.id, old_sent.id]
+    assert built.referable[cat.id] == cat
+    section = (
+        f"{REFERABLE_GUIDE}\n"
+        f"- #{fresh.id}：用户发的，这一轮，还没有描述\n"
+        f"- #{quoted.id}：用户引用的消息里的，这一轮，还没有描述\n"
+        f"- #{cat.id}：你画的，上一轮，描述：一只橘猫\n"
+        f"- #{old_sent.id}：用户发的，2 轮前，描述：一只猫"
+    )
+    assert section in built.request.system
+    messages = built.request.messages
+    # 历史里的文字版后面、这一轮的原图前面标上同样的编号。
+    assert messages[0] == Message.text(
+        Role.USER,
+        f"看这张\n[图片。原图在当时那一轮已经给过你，这里只保留描述：一只猫]（编号 #{old_sent.id}）",
+    )
+    assert messages[3] == Message.text(
+        Role.ASSISTANT, f"画好了\n[你之前画的图片：一只橘猫]（编号 #{cat.id}）"
+    )
+    assert messages[4].parts == (
+        TextPart(f"照这两张改\n[被引用的图片（编号 #{quoted.id}）：]"),
+        ImagePart(PNG_BYTES, PNG),
+        TextPart(f"[图片（编号 #{fresh.id}）：]"),
+        ImagePart(PNG_BYTES, PNG),
+    )
+
+
+async def test_referable_images_are_capped_and_skip_missing_files(tmp_path: Path) -> None:
+    store = MediaStore.under(tmp_path)
+    images = [stored_image(store) for _ in range(MAX_REFERABLE_IMAGES + 2)]
+    gone = stored_image(store)
+    assert gone.path is not None
+    store.delete(1, gone.path)  # 表里还是 stored，文件却没了
+    expired = record(IMAGE, AttachmentStatus.EXPIRED, text="[图片：旧的]")
+    pdf = record(FILE, path=store.save(1, b"%PDF-1.4", PDF), size=8)
+    history = [user("", *images[:6], turns_ago=0), reply("好")]
+    current = [user("", *images[6:], gone, expired, pdf)]
+
+    built = await builder(store, history, current).build(TEXT_ONLY, referable_images=True)
+
+    newest = [r.id for r in reversed(images)][:MAX_REFERABLE_IMAGES]
+    assert list(built.referable) == newest
+    for left_out in (images[0], images[1], gone, expired, pdf):
+        assert f"#{left_out.id}：" not in built.request.system
+        assert f"编号 #{left_out.id}）" not in message_text(built.request.messages)
+    assert built.request.system.count("：用户发的，") == MAX_REFERABLE_IMAGES
+
+
+async def test_no_referable_images_says_so(tmp_path: Path) -> None:
+    store = MediaStore.under(tmp_path)
+    expired = record(IMAGE, AttachmentStatus.EXPIRED, text="[图片：旧的]")
+    b = builder(store, [user("", expired), reply("好")], [user("把刚才那张改一下")])
+
+    built = await b.build(SEES, referable_images=True)
+
+    assert NO_REFERABLE in built.request.system
+    assert built.referable == {}
+    assert NO_REFERABLE not in (await b.build(SEES)).request.system
+
+
+async def test_without_a_store_nothing_is_referable(tmp_path: Path) -> None:
+    # 没有 MediaStore 时确认不了文件还在：流水里仍是 stored 的图也不列进目录与 `referable`。
+    store = MediaStore.under(tmp_path)
+    sent = stored_image(store)
+    drawn = drawn_record(store)
+    history = [user("", sent), drawn_reply("画好了", drawn)]
+
+    built = await builder(None, history, [user("把刚才那张改一下")]).build(
+        SEES, referable_images=True
+    )
+
+    assert NO_REFERABLE in built.request.system
+    assert built.referable == {}
+    assert f"编号 #{sent.id}）" not in message_text(built.request.messages)
+
+
+async def test_another_users_images_never_reach_the_catalog(tmp_path: Path) -> None:
+    # AGENTS.md 的第二条不变量：两个用户的图在同一个库、同一个附件目录里，B 的图（发的与画的）绝不出现在 A 的
+    # 目录、`referable` 与消息里。
+    store = MediaStore.under(tmp_path)
+    async with await Database.open(tmp_path / DATABASE_FILENAME) as db:
+        alice = (await db.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)).id
+        bob = (await db.transaction(access.ensure_user, "FAKE-OPENID-BOB", "小李", 0)).id
+
+        def one_turn(conn: sqlite3.Connection, user_id: int, tag: str) -> tuple[int, int]:
+            question = journal.add_user_message(conn, user_id, f"{tag}画猫", f"qq-{tag}", 0)
+            sent = journal.add_attachment(
+                conn,
+                user_id=user_id,
+                message_id=question,
+                item=Acquired(
+                    position=0,
+                    kind=IMAGE,
+                    quoted=False,
+                    status=AttachmentStatus.STORED,
+                    mime_type=PNG,
+                    size=len(PNG_BYTES),
+                    path=store.save(user_id, PNG_BYTES, PNG),
+                    filename=None,
+                    text=f"[图片：{tag}的照片]",
+                ),
+                describe=False,
+                now=0,
+            )
+            reply_id = journal.add_reply(
+                conn,
+                user_id=user_id,
+                reply_to=question,
+                content=f"{tag}画好了",
+                model="main",
+                ending=Ending.COMPLETED,
+                delivery=ReplyDelivery.STREAMED,
+                now=0,
+            )
+            (drawn,) = journal.add_generated_images(
+                conn,
+                user_id=user_id,
+                message_id=reply_id,
+                images=[
+                    GeneratedImage(
+                        path=store.save(user_id, PNG_BYTES, PNG),
+                        mime_type=PNG,
+                        size=len(PNG_BYTES),
+                        description=f"{tag}的猫",
+                    )
+                ],
+                now=0,
+            )
+            return sent.id, drawn.id
+
+        def fill(conn: sqlite3.Connection) -> tuple[set[int], set[int], int]:
+            mine = set(one_turn(conn, alice, "A"))
+            theirs = set(one_turn(conn, bob, "B"))
+            theirs |= set(one_turn(conn, bob, "B2"))
+            current = journal.add_user_message(conn, alice, "改一下", "qq-now", 0)
+            return mine, theirs, current
+
+        mine, theirs, current = await db.transaction(fill)
+        history = await db.transaction(journal.recent_history, alice, current, 10)
+        pending = await db.transaction(journal.pending_messages, alice, current + 1)
+
+    built = await builder(store, history, pending, user_id=alice).build(SEES, referable_images=True)
+
+    assert set(built.referable) == mine
+    assert [e.turns_ago for e in pending] == [CURRENT_TURN]
+    assert "A的猫" in built.request.system
+    for attachment_id in theirs:
+        assert f"#{attachment_id}" not in built.request.system
+        assert f"#{attachment_id}" not in message_text(built.request.messages)
+    for text in ("B的猫", "B2的猫", "B的照片", "B画好了"):
+        assert text not in built.request.system
+        assert text not in message_text(built.request.messages)
+
+
+async def test_forged_paths_are_never_referable(tmp_path: Path) -> None:
+    store = MediaStore.under(tmp_path)
+    bobs = store.save(2, b"\x89PNG\r\n\x1a\nBOB-SECRET", PNG)
+    forged = [record(IMAGE, path=path, text="[图片]") for path in (bobs, f"1/../{bobs}")]
+
+    built = await builder(store, [], [user("", *forged)], user_id=1).build(
+        SEES, referable_images=True
+    )
+
+    assert built.referable == {}
+    assert NO_REFERABLE in built.request.system

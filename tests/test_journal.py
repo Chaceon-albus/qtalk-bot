@@ -9,7 +9,16 @@ import pytest
 from qtalk_bot import access, journal
 from qtalk_bot.journal import Ending, HistoryEntry, ReplyDelivery
 from qtalk_bot.llm import Provider, Role
-from qtalk_bot.media import Acquired, AttachmentKind, AttachmentStatus, DescribeStatus
+from qtalk_bot.media import (
+    JPEG,
+    PNG,
+    Acquired,
+    AttachmentKind,
+    AttachmentRecord,
+    AttachmentStatus,
+    DescribeStatus,
+    GeneratedImage,
+)
 from qtalk_bot.storage import DATABASE_FILENAME, MIGRATIONS, Database
 
 
@@ -1056,3 +1065,326 @@ async def test_message_time_is_read_only_for_this_users_own_messages(db: Databas
     )  # 回复不是用户消息
     assert await db.transaction(journal.message_time, alice, theirs) is None
     assert await db.transaction(journal.message_time, alice, 10**6) is None
+
+
+# ---- 里程碑 10：生成的图与出图用量 ----
+
+
+def drawn(path: str, description: str = "一只橘猫趴在窗台上") -> GeneratedImage:
+    return GeneratedImage(path=path, mime_type=PNG, size=123, description=description)
+
+
+async def test_version_10_usage_rows_survive_and_image_is_accepted(tmp_path: Path) -> None:
+    path = tmp_path / DATABASE_FILENAME
+    async with await Database.open(path, migrations=MIGRATIONS[:10]) as old:
+        user = await old.transaction(access.ensure_user, "FAKE-OPENID-ALICE", "小王", 0)
+        await old.execute(
+            "INSERT INTO usage (user_id, model, provider, provider_model, input_tokens,"
+            " output_tokens, created_at, purpose, searches)"
+            " VALUES (?, 'memory', 'openai', 'gpt-fake', 5, 6, 7, 'memory', NULL)",
+            (user.id,),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            await old.execute(
+                "INSERT INTO usage (user_id, model, provider, provider_model, created_at, purpose)"
+                " VALUES (?, 'image', 'gemini', 'img', 0, 'image')",
+                (user.id,),
+            )
+
+    async with await Database.open(path) as db:
+        row = await db.fetch_one(
+            "SELECT id, model, input_tokens, output_tokens, created_at, purpose, searches FROM usage"
+        )
+        assert row is not None
+        assert tuple(row) == (1, "memory", 5, 6, 7, "memory", None)
+        await db.transaction(
+            lambda conn: journal.add_image_usage(
+                conn,
+                user_id=user.id,
+                message_id=None,
+                provider=Provider.GEMINI,
+                provider_model="img",
+                now=10,
+            )
+        )
+        image = await db.fetch_one(
+            "SELECT model, provider, provider_model, purpose, input_tokens FROM usage WHERE id = 2"
+        )
+        assert image is not None
+        assert tuple(image) == (journal.IMAGE_USAGE_MODEL, "gemini", "img", "image", None)
+        indexes = {
+            r["name"]
+            for r in await db.fetch_all(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage'"
+            )
+        }
+        assert {"usage_by_user", "usage_images_by_time"} <= indexes
+        plan = await db.fetch_all(
+            "EXPLAIN QUERY PLAN SELECT count(*) FROM usage WHERE purpose = 'image'"
+            " AND created_at >= ?",
+            (0,),
+        )
+        assert any("usage_images_by_time" in r["detail"] for r in plan)
+        # 外键照常生效：用量行仍引用用户。
+        with pytest.raises(sqlite3.IntegrityError):
+            await db.execute(
+                "INSERT INTO usage (user_id, model, provider, provider_model, created_at)"
+                " VALUES (999, 'main', 'openai', 'm', 0)"
+            )
+
+
+async def test_generated_images_hang_on_the_reply_and_come_back_with_the_history(
+    db: Database,
+) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> tuple[int, list[AttachmentRecord], int]:
+        question = turn(conn, alice, "画只猫", "画好了", now=50)
+        reply_id = question + 1
+        records = journal.add_generated_images(
+            conn,
+            user_id=alice,
+            message_id=reply_id,
+            images=[drawn("1/a.png"), drawn("1/b.png", "  第二张\n 换个姿势  ")],
+            now=60,
+        )
+        return reply_id, records, journal.add_user_message(conn, alice, "再改改", "qq-2", 70)
+
+    reply_id, records, current = await db.transaction(fill)
+
+    assert [(r.message_id, r.generated, r.quoted, r.kind) for r in records] == [
+        (reply_id, True, False, AttachmentKind.IMAGE)
+    ] * 2
+    assert [r.description for r in records] == ["一只橘猫趴在窗台上", "第二张 换个姿势"]
+    assert [r.text for r in records] == [
+        "[生成的图片：一只橘猫趴在窗台上]",
+        "[生成的图片：第二张 换个姿势]",
+    ]
+    rows = await db.fetch_all(
+        "SELECT position, status, describe_status, quoted, created_at, mime_type, size, path"
+        " FROM attachments ORDER BY position"
+    )
+    assert [tuple(r) for r in rows] == [
+        (0, "stored", "done", 0, 60, PNG, 123, "1/a.png"),
+        (1, "stored", "done", 0, 60, PNG, 123, "1/b.png"),
+    ]
+
+    history = await db.transaction(journal.recent_history, alice, current, 5)
+    assert [(e.role, e.content) for e in history] == [
+        (Role.USER, "画只猫"),
+        (Role.ASSISTANT, "画好了"),
+    ]
+    assert history[0].attachments == ()
+    assert history[1].attachments == tuple(records)
+
+    # 同一条回复上再记一张时接着往后排。
+    more = await db.transaction(
+        lambda conn: journal.add_generated_images(
+            conn, user_id=alice, message_id=reply_id, images=[drawn("1/c.png")], now=61
+        )
+    )
+    row = await db.fetch_one("SELECT position FROM attachments WHERE id = ?", (more[0].id,))
+    assert row is not None
+    assert row["position"] == 2
+
+
+async def test_a_reply_with_only_drawn_images_still_shows_in_the_history(db: Database) -> None:
+    # 图已经画好、文字回答却没送达（只发了固定说明）：回复的正文为空，但画的图仍要留在历史里。
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> int:
+        question = turn(conn, alice, "画只猫", "", delivery=ReplyDelivery.FAILED)
+        journal.add_generated_images(
+            conn, user_id=alice, message_id=question + 1, images=[drawn("1/a.png")], now=0
+        )
+        turn(conn, alice, "问2", "", delivery=ReplyDelivery.FAILED)  # 没画图的照旧不带
+        return journal.add_user_message(conn, alice, "再改改", "qq-x", 0)
+
+    current = await db.transaction(fill)
+    history = await db.transaction(journal.recent_history, alice, current, 5)
+
+    assert [(e.role, e.content, len(e.attachments)) for e in history] == [
+        (Role.USER, "画只猫", 0),
+        (Role.ASSISTANT, "", 1),
+        (Role.USER, "问2", 0),
+    ]
+
+
+async def test_generated_images_only_go_on_this_users_own_reply(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+    bob = await new_user(db, "FAKE-OPENID-BOB", "小李")
+
+    def fill(conn: sqlite3.Connection) -> tuple[int, int]:
+        question = turn(conn, bob, "B问", "B答")
+        return question, question + 1
+
+    bobs_question, bobs_reply = await db.transaction(fill)
+
+    for message_id in (bobs_reply, bobs_question):
+        with pytest.raises(ValueError, match="助手回复"):
+            await db.transaction(
+                journal.add_generated_images,
+                user_id=alice,
+                message_id=message_id,
+                images=[drawn("1/a.png")],
+                now=0,
+            )
+    # 用户消息不行，即使是本人的。
+    with pytest.raises(ValueError, match="助手回复"):
+        await db.transaction(
+            lambda conn: journal.add_generated_images(
+                conn, user_id=bob, message_id=bobs_question, images=[drawn("2/a.png")], now=0
+            )
+        )
+    assert await db.fetch_all("SELECT id FROM attachments") == []
+
+
+async def test_referable_image_is_only_this_users_stored_image(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+    bob = await new_user(db, "FAKE-OPENID-BOB", "小李")
+
+    def fill(conn: sqlite3.Connection) -> tuple[int, int, int, int]:
+        question = turn(conn, alice, "画", "好")
+        (mine,) = journal.add_generated_images(
+            conn, user_id=alice, message_id=question + 1, images=[drawn("1/a.png")], now=0
+        )
+        sent = journal.add_attachment(
+            conn,
+            user_id=alice,
+            message_id=question,
+            item=Acquired(
+                position=0,
+                kind=AttachmentKind.IMAGE,
+                quoted=False,
+                status=AttachmentStatus.STORED,
+                mime_type=JPEG,
+                size=5,
+                path="1/sent.jpg",
+                filename=None,
+                text="[图片]",
+            ),
+            describe=False,
+            now=0,
+        )
+        pdf = journal.add_attachment(
+            conn,
+            user_id=alice,
+            message_id=question,
+            item=Acquired(
+                position=1,
+                kind=AttachmentKind.FILE,
+                quoted=False,
+                status=AttachmentStatus.STORED,
+                mime_type="application/pdf",
+                size=5,
+                path="1/a.pdf",
+                filename="a.pdf",
+                text="[文件]",
+            ),
+            describe=False,
+            now=0,
+        )
+        theirs_q = turn(conn, bob, "画", "好")
+        (theirs,) = journal.add_generated_images(
+            conn, user_id=bob, message_id=theirs_q + 1, images=[drawn("2/a.png")], now=0
+        )
+        return mine.id, sent.id, pdf.id, theirs.id
+
+    mine, sent, pdf, theirs = await db.transaction(fill)
+
+    found = await db.transaction(journal.referable_image, alice, mine)
+    assert found is not None
+    assert (found.generated, found.path) == (True, "1/a.png")
+    user_sent = await db.transaction(journal.referable_image, alice, sent)
+    assert user_sent is not None
+    assert not user_sent.generated
+    assert await db.transaction(journal.referable_image, alice, pdf) is None
+    assert await db.transaction(journal.referable_image, alice, theirs) is None
+    # 过期之后也取不到。
+    expired = await db.transaction(journal.expire_attachments, 1)
+    assert sorted(expired) == sorted(
+        [(alice, "1/a.png"), (alice, "1/sent.jpg"), (alice, "1/a.pdf"), (bob, "2/a.png")]
+    )
+    assert await db.transaction(journal.referable_image, alice, mine) is None
+
+
+async def test_image_counts_filter_by_user_and_time(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+    bob = await new_user(db, "FAKE-OPENID-BOB", "小李")
+
+    def fill(conn: sqlite3.Connection) -> None:
+        for user_id, now in [(alice, 99), (alice, 100), (alice, 150), (bob, 100), (bob, 50)]:
+            journal.add_image_usage(
+                conn,
+                user_id=user_id,
+                message_id=None,
+                provider=Provider.OPENAI,
+                provider_model="gpt-image-fake",
+                now=now,
+                output_tokens=824,
+            )
+        # 别的用途不算出图。
+        journal.add_usage(
+            conn,
+            user_id=alice,
+            message_id=None,
+            model="main",
+            provider=Provider.OPENAI,
+            provider_model="gpt-fake",
+            input_tokens=1,
+            output_tokens=1,
+            now=200,
+        )
+
+    await db.transaction(fill)
+
+    assert await db.transaction(journal.image_count, alice, 100) == 2
+    assert await db.transaction(journal.image_count, alice, 0) == 3
+    assert await db.transaction(journal.image_count, bob, 100) == 1
+    assert await db.transaction(journal.image_count, alice, 151) == 0
+    assert await db.transaction(journal.total_image_count, 100) == 3
+    assert await db.transaction(journal.total_image_count, 0) == 5
+
+
+async def test_usage_summary_counts_images_apart_from_model_calls(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> None:
+        journal.add_usage(
+            conn,
+            user_id=alice,
+            message_id=None,
+            model="main",
+            provider=Provider.OPENAI,
+            provider_model="gpt-fake",
+            input_tokens=100,
+            output_tokens=20,
+            now=2000,
+        )
+        for now, tokens in [(500, (10, 1000)), (2000, (20, 1120)), (2000, (None, None))]:
+            journal.add_image_usage(
+                conn,
+                user_id=alice,
+                message_id=None,
+                provider=Provider.GEMINI,
+                provider_model="img",
+                now=now,
+                input_tokens=tokens[0],
+                output_tokens=tokens[1],
+            )
+
+    await db.transaction(fill)
+    (summary,) = await db.transaction(journal.usage_summary, 1000)
+
+    assert (summary.today_calls, summary.today_input, summary.today_output) == (1, 100, 20)
+    assert (summary.total_calls, summary.total_unreported) == (1, 0)  # 出图不算进调用与缺数据
+    assert (summary.today_images, summary.today_image_input, summary.today_image_output) == (
+        2,
+        20,
+        1120,
+    )
+    assert (summary.total_images, summary.total_image_input, summary.total_image_output) == (
+        3,
+        30,
+        2120,
+    )

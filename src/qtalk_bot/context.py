@@ -34,17 +34,24 @@
 **分话题时的上下文**（里程碑 6a）：历史由几段合成（`merge_history()`）：不分话题的最近几轮，加上选中话题的最近
 几轮，按消息去重、按对话里的位置排列，「往前数第几轮」按合成后的各轮重算，所以「最近几轮给原图」的规则对合成
 出的各轮照常适用。话题目录与摘要经 `prompt.Memory` 放进系统提示词（`RequestBuilder.set_context()`）。
+
+**画的图与可以引用的图片**（里程碑 10）：模型之前画的图挂在助手的回复上，历史里只以文字出现，接在那条回复的
+文字后面（`media.history_text()`：「[你之前画的图片：画面描述]」），从不作为原件放进助手消息（OpenAI 的助手
+消息不能带图片）。调用方要求时（`build(model, referable_images=True)`），系统提示词里另列「可以引用的图片」：
+这次上下文里本地文件还在的图片（这一轮与历史里用户发的、历史里模型画的），从新到旧最多
+`MAX_REFERABLE_IMAGES` 张；消息里这些图片旁边标上同样的编号。列出的记录经 `Built.referable` 交给调用方，
+它据此校验模型给的编号。这些记录全部来自这次的上下文，而上下文只取这个用户自己的流水。
 """
 
 import asyncio
-from collections.abc import Callable, Collection, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 
 from . import texts
 from .config import ModelSettings
 from .faces import clean
-from .journal import HistoryEntry, position
+from .journal import CURRENT_TURN, HistoryEntry, position
 from .llm import (
     INPUT_LIMITS,
     AudioPart,
@@ -67,9 +74,13 @@ from .media import (
     AttachmentStatus,
     MediaStore,
     history_text,
+    image_label,
     marker,
 )
-from .prompt import Memory, system_prompt
+from .prompt import Memory, ReferableImage, image_reference, system_prompt
+
+MAX_REFERABLE_IMAGES = 10
+"""系统提示词里「可以引用的图片」最多列几张（从新到旧）。"""
 
 _MODALITIES = {
     AttachmentKind.IMAGE: Modality.IMAGE,
@@ -341,12 +352,15 @@ class Built:
         answerable: 请求里有没有可以回答的内容；没有时不该调用模型。
         notices: 按这个请求实际给了什么，要告诉用户的情况（只含这次新到的消息的附件）。
         given: 这一轮的附件里实际以原件放进了请求的那些（附件编号）；历史里重新带上的图片不算。
+        referable: 系统提示词里列为「可以引用的图片」的那些（附件编号 → 记录），只在
+            `build(model, referable_images=True)` 时有。模型调用画图函数给出的编号只能是这里的。
     """
 
     request: ChatRequest
     answerable: bool
     notices: tuple[str, ...]
     given: frozenset[int] = frozenset()
+    referable: Mapping[int, AttachmentRecord] = field(default_factory=dict[int, AttachmentRecord])
 
 
 class RequestBuilder:
@@ -398,8 +412,12 @@ class RequestBuilder:
             accepts(model, r) for r in self._recent_images()
         )
 
-    async def build(self, model: ModelSettings) -> Built:
+    async def build(self, model: ModelSettings, *, referable_images: bool = False) -> Built:
+        """为 `model` 组装请求。`referable_images` 为真（这个模型这次能调用画图函数）时，在系统提示词里列出
+        「可以引用的图片」，并在消息里这些图片旁边标上编号。"""
         originals, missing = await self._originals(model)
+        referable = await self._referable() if referable_images else []
+        labels = {record.id: image_reference(record.id) for record, _ in referable}
 
         def in_current(record: AttachmentRecord) -> str:
             return record.text
@@ -411,7 +429,7 @@ class RequestBuilder:
         ):
             if entry.faces_only:
                 continue
-            parts = _parts(entry, originals, render)
+            parts = _parts(entry, originals, render, labels)
             if not parts:
                 continue
             if messages and messages[-1].role is entry.role:
@@ -425,6 +443,18 @@ class RequestBuilder:
                 process=model.show_process,
                 preamble=model.provider is Provider.OPENAI and model.search,
                 memory=self._memory,
+                images=[
+                    ReferableImage(
+                        attachment_id=record.id,
+                        generated=record.generated,
+                        quoted=record.quoted,
+                        turns_ago=age,
+                        description=record.description,
+                    )
+                    for record, age in referable
+                ]
+                if referable_images
+                else None,
             ),
             messages=tuple(messages),
             max_output_tokens=self._max_output_tokens,
@@ -439,7 +469,48 @@ class RequestBuilder:
             max_size_mb=self._max_size_mb,
         )
         given = frozenset(r.id for r in records if r.id in originals)
-        return Built(request, _answerable(self._current, records, originals.keys()), notices, given)
+        return Built(
+            request,
+            _answerable(self._current, records, originals.keys()),
+            notices,
+            given,
+            {record.id: record for record, _ in referable},
+        )
+
+    async def _referable(self) -> list[tuple[AttachmentRecord, int]]:
+        """这次上下文里可以引用的图片与它在哪一轮（`turns_ago`），从新到旧最多 `MAX_REFERABLE_IMAGES` 张。
+
+        只看传进来的历史与这一轮（它们只取自这个用户的流水），记录是 `stored` 的图片，且本地文件确实在这个用户的
+        目录里（`MediaStore.locate()`），伪造或跑到别处的路径不列。没有 `MediaStore` 时确认不了文件，一张也不列。
+        """
+        store = self._store
+        if store is None:
+            return []
+        candidates = [
+            (record, CURRENT_TURN if current else entry.turns_ago)
+            for current, entry in (
+                *((False, e) for e in self._history),
+                *((True, e) for e in self._current),
+            )
+            if not entry.faces_only
+            for record in entry.attachments
+            if record.kind is AttachmentKind.IMAGE
+            and record.status is AttachmentStatus.STORED
+            and record.path is not None
+        ]
+        candidates.reverse()
+
+        def present() -> list[tuple[AttachmentRecord, int]]:
+            kept: list[tuple[AttachmentRecord, int]] = []
+            for record, age in candidates:
+                if len(kept) == MAX_REFERABLE_IMAGES:
+                    break
+                path = None if record.path is None else store.locate(self._user_id, record.path)
+                if path is not None and path.is_file():
+                    kept.append((record, age))
+            return kept
+
+        return await asyncio.to_thread(present)
 
     def _current_records(self) -> list[AttachmentRecord]:
         return [r for entry in self._current for r in entry.attachments]
@@ -507,18 +578,24 @@ def _parts(
     entry: HistoryEntry,
     originals: dict[int, bytes],
     render: Callable[[AttachmentRecord], str],
+    labels: Mapping[int, str],
 ) -> tuple[Part, ...]:
-    """一条消息的各部分。`render` 给出不给原件时附件的文字版（历史与本轮的措辞不同）。"""
+    """一条消息的各部分。`render` 给出不给原件时附件的文字版（历史与本轮的措辞不同）；`labels` 是可以引用的
+    图片旁边的编号标记（附件编号 → 标记）。助手的消息只有文字：它画的图只以文字版接在后面。"""
     content = clean(entry.content)
     parts: list[Part] = [TextPart(content)] if content.strip() else []
     for record in entry.attachments:
-        data = originals.get(record.id)
+        label = labels.get(record.id)
+        data = None if entry.role is Role.ASSISTANT else originals.get(record.id)
         if data is None or record.mime_type is None:
-            parts.append(_text(render(record)))
+            text = render(record)
+            parts.append(_text(text if label is None else f"{text}（{label}）"))
             continue
         match record.kind:
             case AttachmentKind.IMAGE:
-                if record.quoted:
+                if label is not None:
+                    parts.append(TextPart(f"[{image_label(record.quoted)}（{label}）：]"))
+                elif record.quoted:
                     parts.append(TextPart("[被引用的图片：]"))
                 parts.append(ImagePart(data, record.mime_type))
             case AttachmentKind.VOICE:

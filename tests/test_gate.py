@@ -301,6 +301,60 @@ async def test_admin_usage_shows_searches_only_when_there_are_some(h: Harness) -
     assert reply.fallbacks == (texts.usage_list([expected]),)
 
 
+async def test_admin_usage_shows_images_as_a_count(h: Harness) -> None:
+    assert await h.admin("/usage") == texts.NO_USAGE
+    admin = await h.user(ADMIN)
+    assert admin is not None
+
+    def record(conn: sqlite3.Connection) -> None:
+        journal.add_usage(
+            conn,
+            user_id=admin.id,
+            message_id=None,
+            model="main",
+            provider=Provider.OPENAI,
+            provider_model="gpt-fake",
+            input_tokens=10,
+            output_tokens=1,
+            now=START,
+        )
+        for now, output_tokens in [(START - 17 * HOUR, None), (START, 1120), (START, 1120)]:
+            journal.add_image_usage(
+                conn,
+                user_id=admin.id,
+                message_id=None,
+                provider=Provider.GEMINI,
+                provider_model="img-fake",
+                now=now,
+                output_tokens=output_tokens,
+            )
+
+    await h.db.transaction(record)
+
+    reply = await h.admin_reply("/usage")
+    assert reply.text == (
+        "**用量**（今天从本地时间 0 点算起）\n\n"
+        f"- `#{admin.id}` 管理员\n"
+        "  - 今天：1 次，输入 10 / 输出 1 token，出图 2 张（输入 0 / 输出 2240 token）\n"
+        "  - 累计：1 次，输入 10 / 输出 1 token，出图 3 张（输入 0 / 输出 2240 token）"
+    )
+
+
+def test_usage_line_shows_images_without_tokens_as_just_a_count() -> None:
+    line = texts.usage_line(
+        user_id=1,
+        name="小王",
+        today=(1, 2, 3, 0),
+        total=(4, 5, 6, 0),
+        today_images=(0, 0, 0),
+        total_images=(2, 0, 0),
+    )
+    assert (
+        line
+        == "#1 小王：今天 1 次，输入 2 / 输出 3 token；累计 4 次，输入 5 / 输出 6 token，出图 2 张"
+    )
+
+
 def test_usage_line_hides_zero_searches() -> None:
     line = texts.usage_line(
         user_id=1, name="小王", today=(1, 2, 3, 0), total=(4, 5, 6, 0), total_searches=7

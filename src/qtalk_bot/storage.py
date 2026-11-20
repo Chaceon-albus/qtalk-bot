@@ -370,6 +370,40 @@ ALTER TABLE usage_new RENAME TO usage;
 CREATE INDEX usage_by_user ON usage (user_id, created_at);
 """
 
+_V11_IMAGES = """
+-- 用量的用途加上 image（出图，含改图）：一次出图一行，model 列是固定的 image，provider 与 provider_model 是实际
+-- 的图片服务商与模型名，token 数照服务商的报告记（没有就为空）。限额按这种行的行数算张数。CHECK 约束改不了，
+-- 同第 10 版重建表，列的顺序与原表相同。
+CREATE TABLE usage_new (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users (id),
+    message_id INTEGER REFERENCES messages (id) ON DELETE SET NULL,
+    model TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    provider_model TEXT NOT NULL,
+    input_tokens INTEGER CHECK (input_tokens >= 0),
+    output_tokens INTEGER CHECK (output_tokens >= 0),
+    created_at INTEGER NOT NULL,
+    purpose TEXT NOT NULL DEFAULT 'chat'
+        CHECK (purpose IN ('chat', 'decision', 'describe', 'memory', 'image')),
+    searches INTEGER CHECK (searches >= 0)
+) STRICT;
+INSERT INTO usage_new (id, user_id, message_id, model, provider, provider_model, input_tokens,
+    output_tokens, created_at, purpose, searches)
+SELECT id, user_id, message_id, model, provider, provider_model, input_tokens, output_tokens,
+    created_at, purpose, searches FROM usage;
+DROP TABLE usage;
+ALTER TABLE usage_new RENAME TO usage;
+CREATE INDEX usage_by_user ON usage (user_id, created_at);
+-- 所有用户合计的每日限额每次出图前都要数一遍当天的出图行：usage_by_user 以用户开头帮不上，没有它就要扫整张
+-- 用量表（每轮都有几行）。按用户数时 usage_by_user 已经够用。
+CREATE INDEX usage_images_by_time ON usage (created_at) WHERE purpose = 'image';
+
+-- 附件表从此也有挂在助手回复上的行（message_id 指向 role 为 assistant 的消息）：那一轮里模型画的图。kind 为
+-- image、status 为 stored、quoted 为 0；description 是模型写的画面描述，text 是带标签的文字版，describe_status
+-- 为 done（不再调用描述模型）。是不是生成的只看所属消息的 role，不另设一列。表结构不变。
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     _V1_ACCESS,
     _V2_CHAT,
@@ -381,6 +415,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     _V8_PROCESS,
     _V9_TOPICS,
     _V10_MEMORY_USAGE,
+    _V11_IMAGES,
 )
 """本程序的迁移列表。业务表由各里程碑在末尾追加，已发布的不能修改。"""
 
