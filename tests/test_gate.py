@@ -3,8 +3,10 @@
 import asyncio
 import itertools
 import logging
+import os
 import re
 import sqlite3
+import stat
 import threading
 import uuid
 from collections.abc import AsyncIterator
@@ -1286,6 +1288,51 @@ async def test_no_user_is_created_when_every_name_is_taken(h: Harness) -> None:
     assert (await h.invite_row(code)).used_count == 0  # 整个事务回滚
     assert len(h.asked) == 1 + access.MEDIA_DIR_ATTEMPTS  # 管理员一次，小王试满次数
     assert len(set(h.asked)) == len(h.asked)
+
+
+def gate_with_store(h: Harness, store: media.MediaStore) -> Gate:
+    return Gate(
+        h.db,
+        admin_openid=ADMIN,
+        timezone=SHANGHAI,
+        invites=InviteSettings(),
+        share_link=h.links,
+        bot_name=BOT_NAME,
+        clock=h.clock,
+        new_code=lambda: code_for(42),
+        dir_taken=store.dir_taken,
+    )
+
+
+async def test_dangling_attachments_root_rolls_back_the_redemption(
+    h: Harness, tmp_path: Path
+) -> None:
+    store = media.MediaStore.under(tmp_path / "data")
+    store.root.parent.mkdir()
+    os.symlink(tmp_path / "nowhere", store.root)  # 悬空的符号链接：下面的子路径都「不存在」
+    code = await h.invite("小王")
+    h.gate = gate_with_store(h, store)
+
+    with pytest.raises(access.MediaDirUnavailableError):
+        await h.friend_add(ALICE, code)
+
+    assert await h.user(ALICE) is None
+    assert (await h.invite_row(code)).used_count == 0
+    assert not (tmp_path / "nowhere").exists()  # 没有沿链接建出任何东西
+
+
+async def test_missing_attachments_root_still_lets_new_users_in(h: Harness, tmp_path: Path) -> None:
+    store = media.MediaStore.under(tmp_path / "data")  # 全新安装：附件根目录还没有
+    code = await h.invite("小王")
+    h.gate = gate_with_store(h, store)
+
+    assert reply_text(await h.friend_add(ALICE, code)) == texts.welcome("小王")
+
+    user = await h.user(ALICE)
+    assert user is not None
+    name = store.save(user.media_dir, b"\x89PNG\r\n\x1a\n", media.PNG)  # 首次写入时建出根目录
+    assert store.read(user.media_dir, name) == b"\x89PNG\r\n\x1a\n"
+    assert stat.S_IMODE(store.root.stat().st_mode) == 0o700
 
 
 async def test_former_admin_redeeming_keeps_the_directory(h: Harness) -> None:
