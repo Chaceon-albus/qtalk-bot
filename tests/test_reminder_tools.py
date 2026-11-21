@@ -42,6 +42,7 @@ from qtalk_bot.llm import ChatRequest, FunctionResult, Provider
 from qtalk_bot.media import Fetcher, MediaStore
 from qtalk_bot.memory_tools import FORGET_TOPIC_NAME, VIEW_MEMORY_NAME
 from qtalk_bot.prompt import REMINDER_GUIDE, REMINDER_NOTICE
+from qtalk_bot.reminder_state import PushState, record_push
 from qtalk_bot.reminder_tools import (
     CANCEL_REMINDER,
     CANCEL_REMINDER_NAME,
@@ -54,11 +55,9 @@ from qtalk_bot.reminders import (
     Candidate,
     Created,
     FailureReason,
-    PushState,
     active_reminders,
     create_reminder,
     record_failure,
-    record_push,
 )
 from qtalk_bot.routing import Router
 from qtalk_bot.storage import DATABASE_FILENAME, Database
@@ -983,7 +982,7 @@ async def test_pending_from_a_failed_primary_is_not_offered_after_the_fallback(
 
 
 async def test_removed_friend_cannot_confirm_a_new_reminder(db: Database, tmp_path: Path) -> None:
-    from qtalk_bot.reminders import record_friend
+    from qtalk_bot.reminder_state import record_friend
 
     alice = await invited(db, ALICE, "小王")
     model = QueueModel()

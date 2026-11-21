@@ -724,6 +724,19 @@ CREATE INDEX reminder_send_items_by_reminder ON reminder_send_items (reminder_id
 """
 
 
+_V18_REMINDER_STATE = """
+-- 提醒的用户状态加几列（里程碑 8 第一部分的评审，见 reminder_state.py）：
+-- push_event_at：最近一次授权互动的平台时间，更早的授权互动（晚到的旧事件）不再覆盖开关状态；
+-- paused_since：提醒从什么时候起暂停（停用、删好友等），没有暂停时为空；
+-- pause_started、pause_ended：最近一次已经结束的暂停的起止。暂停与恢复都落在调度器两次检查之间时，据此把其间到期的
+-- 次数推进掉（不发、不补、不记失败）。
+ALTER TABLE reminder_user_state ADD COLUMN push_event_at INTEGER;
+ALTER TABLE reminder_user_state ADD COLUMN paused_since INTEGER;
+ALTER TABLE reminder_user_state ADD COLUMN pause_started INTEGER;
+ALTER TABLE reminder_user_state ADD COLUMN pause_ended INTEGER CHECK (pause_ended >= pause_started);
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     _V1_ACCESS,
     _V2_CHAT,
@@ -742,6 +755,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     _V15_PROFILE_VERSIONS,
     _v16_media_dirs,
     _V17_REMINDERS,
+    _V18_REMINDER_STATE,
 )
 """本程序的迁移列表。业务表由各里程碑在末尾追加，已发布的不能修改。"""
 

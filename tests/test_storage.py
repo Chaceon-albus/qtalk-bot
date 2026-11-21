@@ -941,11 +941,11 @@ async def test_version_17_adds_the_reminder_tables(db_path: Path) -> None:
         await old.transaction(access.ensure_user, "FAKE-OPENID-A", "小王", 0)
     before = _schema(db_path)
 
-    async with await Database.open(db_path) as db:
+    async with await Database.open(db_path, migrations=MIGRATIONS[:17]) as db:
         assert await db.fetch_all("PRAGMA foreign_key_check") == []
         users = await db.transaction(access.list_users)
 
-    assert user_version(db_path) == len(MIGRATIONS) == 17
+    assert user_version(db_path) == 17
     assert [user.name for user in users] == ["小王"]
     after = _schema(db_path)
     for name, sql in before.items():
@@ -960,3 +960,23 @@ async def test_version_17_adds_the_reminder_tables(db_path: Path) -> None:
     } <= added
     assert "AUTOINCREMENT" in after["reminders"]
     assert "ON DELETE CASCADE" in after["reminders"]
+
+
+async def test_version_18_adds_pause_and_switch_columns(db_path: Path) -> None:
+    from qtalk_bot import access
+    from qtalk_bot.reminder_state import PushState, get_user_state
+
+    async with await Database.open(db_path, migrations=MIGRATIONS[:17]) as old:
+        user = await old.transaction(access.ensure_user, "FAKE-OPENID-A", "小王", 0)
+        await old.execute(
+            "INSERT INTO reminder_user_state (user_id, push, push_updated_at) VALUES (?, 'off', 5)",
+            (user.id,),
+        )
+
+    async with await Database.open(db_path) as db:
+        assert await db.fetch_all("PRAGMA foreign_key_check") == []
+        state = await db.transaction(get_user_state, user.id)
+
+    assert user_version(db_path) == len(MIGRATIONS) == 18
+    assert (state.push, state.push_updated_at, state.push_event_at) == (PushState.OFF, 5, None)
+    assert (state.paused_since, state.pause_started, state.pause_ended) == (None, None, None)

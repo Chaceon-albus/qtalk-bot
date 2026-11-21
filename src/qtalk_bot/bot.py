@@ -88,7 +88,12 @@ class ReminderEvents(Protocol):
     """提醒关心的平台事件（`reminders.ReminderService` 符合它）。"""
 
     async def push_switched(
-        self, openid: str, *, on: bool, reply: Callable[[str], Awaitable[Delivery]]
+        self,
+        openid: str,
+        *,
+        on: bool,
+        reply: Callable[[str], Awaitable[Delivery]],
+        at: int | None = None,
     ) -> None: ...
 
     async def friend_changed(self, openid: str, *, present: bool, at: int | None) -> None: ...
@@ -779,8 +784,13 @@ class Handlers:
                     and authorize is not None
                     and authorize.scope == pyqbot.AuthorizeScope.C2C_PUSH
                 ):
+                    # 平台的事件时间：晚到的旧授权互动不覆盖较新的开关状态。
+                    stamp = interaction.timestamp
                     await self._reminders.push_switched(
-                        openid, on=authorize.switch, reply=_interaction_reply(interaction)
+                        openid,
+                        on=authorize.switch,
+                        reply=_interaction_reply(interaction),
+                        at=None if stamp is None else int(stamp.timestamp()),
                     )
                 return
             data = interaction.button_data or ""

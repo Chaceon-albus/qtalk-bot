@@ -20,6 +20,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import aclosing, asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -2802,6 +2803,7 @@ class _FakeInteraction:
             resolved=pyqbot.InteractionResolved(button_data=data, authorize_data=authorize),
         )
         self.failure = failure
+        self.timestamp: datetime | None = datetime.fromtimestamp(1794861200, UTC)
         self.replies: list[str] = []
 
     async def reply(self, text: str) -> None:
@@ -2850,14 +2852,19 @@ class _RecordingReminders:
 
     def __init__(self, answer: str | None = None) -> None:
         self.answer = answer
-        self.switches: list[tuple[str, bool]] = []
+        self.switches: list[tuple[str, bool, int | None]] = []
         self.friends: list[tuple[str, bool, int | None]] = []
         self.deliveries: list[Delivery] = []
 
     async def push_switched(
-        self, openid: str, *, on: bool, reply: Callable[[str], Awaitable[Delivery]]
+        self,
+        openid: str,
+        *,
+        on: bool,
+        reply: Callable[[str], Awaitable[Delivery]],
+        at: int | None = None,
     ) -> None:
-        self.switches.append((openid, on))
+        self.switches.append((openid, on, at))
         if self.answer is not None:
             self.deliveries.append(await reply(self.answer))
 
@@ -2883,7 +2890,7 @@ async def test_push_switch_interaction_goes_to_reminders_with_a_reply(switch: bo
 
     await handlers.on_interaction(cast(pyqbot.Interaction, interaction))
 
-    assert reminders.switches == [(ALICE, switch)]
+    assert reminders.switches == [(ALICE, switch, 1794861200)]  # 带上平台的事件时间
     assert interaction.replies == ["有 1 条提醒没能按时发出"]
     assert reminders.deliveries == [Delivery.SENT]
 

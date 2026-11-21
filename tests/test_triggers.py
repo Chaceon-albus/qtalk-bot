@@ -484,3 +484,70 @@ def test_final_occurrence() -> None:
 )
 def test_dump_and_load_round_trip(trigger: Trigger) -> None:
     assert load_trigger(dump_trigger(trigger)) == trigger
+
+
+# ---- 第一部分评审后补的 ----
+
+
+def test_relative_time_in_the_repeated_hour_keeps_the_real_moment() -> None:
+    # 纽约 2026-11-01 第一遍 01:50（夏令时）设「20 分钟后」：目标是第二遍的 01:10（标准时间）。
+    now = resolve(datetime(2026, 11, 1, 1, 50), NEW_YORK)
+    trigger = parse(NEW_YORK, now, kind="once", delay_minutes=20)
+
+    assert isinstance(trigger, Once)
+    assert trigger.moment == now + 20 * 60
+    (occurrence,) = upcoming(trigger, NEW_YORK, anchor=now, after=now)
+    assert occurrence.at == now + 20 * 60
+    assert local(occurrence.at, NEW_YORK) == "2026-11-01 01:10"
+    assert load_trigger(dump_trigger(trigger)) == trigger
+
+
+def test_default_interval_start_in_the_repeated_hour_keeps_the_real_moment() -> None:
+    now = resolve(datetime(2026, 11, 1, 1, 50), NEW_YORK)
+    trigger = parse(NEW_YORK, now, kind="interval", every=30, unit="minutes", count=2)
+
+    found = list(upcoming(trigger, NEW_YORK, anchor=now, after=now))
+    assert [o.at - now for o in found] == [30 * 60, 60 * 60]
+    assert load_trigger(dump_trigger(trigger)) == trigger
+
+
+def test_daily_start_in_the_gap_is_not_rewritten() -> None:
+    now = at("2026-03-07T12:00", NEW_YORK)
+    trigger = parse(
+        NEW_YORK, now, kind="interval", every=1, unit="days", start="2026-03-08T02:30", count=3
+    )
+
+    assert isinstance(trigger, Interval)
+    assert trigger.start == datetime(2026, 3, 8, 2, 30)
+    assert times(trigger, tz=NEW_YORK, now=now) == [
+        "2026-03-08 03:00",
+        "2026-03-09 02:30",
+        "2026-03-10 02:30",
+    ]
+
+
+def test_rows_stored_before_the_absolute_moments_still_load() -> None:
+    once = load_trigger('{"at": "2026-11-21T08:00", "kind": "once"}')
+    interval = load_trigger(
+        '{"count": null, "end": null, "every": 5, "kind": "interval", "start": "2026-11-21T08:00",'
+        ' "unit": "minutes"}'
+    )
+
+    assert once == Once(datetime(2026, 11, 21, 8, 0))
+    assert isinstance(interval, Interval)
+    assert interval.start_at is None
+
+
+def test_occurrence_at_recomputes_from_the_unconsumed_index() -> None:
+    from qtalk_bot.triggers import occurrence_at
+
+    daily = parse(kind="calendar", times=["08:00"], count=5)
+    hourly = parse(kind="interval", every=1, unit="hours", start="2026-11-21T08:00", count=3)
+
+    assert occurrence_at(daily, SHANGHAI, anchor=NOW, index=2) == Occurrence(
+        2, at("2026-11-23T08:00")
+    )
+    assert occurrence_at(hourly, SHANGHAI, anchor=NOW, index=1) == Occurrence(
+        1, at("2026-11-21T09:00")
+    )
+    assert occurrence_at(hourly, SHANGHAI, anchor=NOW, index=3) is None

@@ -25,15 +25,14 @@ from . import texts
 from .confirmations import TOKEN_SECONDS, CancelItem, Pending, PendingCancel, PendingForget
 from .llm import FunctionResult, FunctionTool, TextPart
 from .memory_tools import MAX_SQL_INTEGER
+from .reminder_state import PauseReason, PushState
 from .reminders import (
     MAX_TEXT_CHARS,
     ActiveView,
     Admission,
     Admitted,
     NothingLeft,
-    PauseReason,
     Period,
-    PushState,
     RateExceeded,
     ReminderTextError,
     ScheduleSummary,

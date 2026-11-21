@@ -198,6 +198,7 @@ from . import (
     journal,
     memory_tools,
     profiles,
+    reminder_state,
     reminder_tools,
     reminders,
     texts,
@@ -1245,7 +1246,7 @@ class Conversation:
         if (
             current is None
             or not self._allowed(conn, user)
-            or reminders.pause_reason(conn, current, self._admin_openid) is not None
+            or reminder_state.pause_reason(conn, current, self._admin_openid) is not None
         ):
             return None  # 已不能使用对话，或提醒暂停中（如删了好友）：不建、不回复
         now = int(self._clock())
@@ -1255,7 +1256,10 @@ class Conversation:
         )
         match result:
             case reminders.Created(reminder=reminder, first=first, remaining=remaining):
-                push_off = reminders.get_user_state(conn, user.id).push is reminders.PushState.OFF
+                push_off = (
+                    reminder_state.get_user_state(conn, user.id).push
+                    is reminder_state.PushState.OFF
+                )
                 logger.info("用户 %s 确认设置提醒 #%d", user.label, reminder.id)
                 return texts.reminder_created(
                     reminder_id=reminder.id,
@@ -1854,7 +1858,7 @@ class Conversation:
         recent = reminders.recent_deliveries(
             conn, user.id, now - RECENT_SENT_SECONDS, RECENT_SENT_SHOWN
         )
-        state = reminders.get_user_state(conn, user.id)
+        state = reminder_state.get_user_state(conn, user.id)
         return ReminderBrief(
             reminders=entries,
             recent=tuple(
@@ -1867,7 +1871,7 @@ class Conversation:
             ),
             push_switch=reminder_tools.push_label(state.push),
             paused=reminder_tools.pause_label(
-                reminders.pause_reason(conn, user, self._admin_openid)
+                reminder_state.pause_reason(conn, user, self._admin_openid)
             ),
         )
 
@@ -3528,7 +3532,7 @@ class _ReminderTools:
         )
         assert summary is not None  # 通过了准入检查就至少还有一次
         replaced = isinstance(turn.pending, PendingSet)
-        push_off = push is reminders.PushState.OFF
+        push_off = push is reminder_state.PushState.OFF
         turn.accept(PendingSet(candidate=candidate, summary=summary, push_off=push_off))
         logger.info(
             "用户 %s 要设置一条提醒%s：这一轮结束后发确认按钮",
@@ -3541,13 +3545,13 @@ class _ReminderTools:
 
     def _admit(
         self, conn: sqlite3.Connection, candidate: reminders.Candidate, now: int
-    ) -> tuple[reminders.Admission, reminders.PushState]:
+    ) -> tuple[reminders.Admission, reminder_state.PushState]:
         deps = self._deps
         user_id = self._turn.user.id
         admission = reminders.check_admission(
             conn, user_id, candidate, settings=deps.settings, timezone=deps.timezone, now=now
         )
-        return admission, reminders.get_user_state(conn, user_id).push
+        return admission, reminder_state.get_user_state(conn, user_id).push
 
     async def _list(self) -> FunctionResult:
         deps, user = self._deps, self._turn.user
@@ -3560,15 +3564,15 @@ class _ReminderTools:
         self, conn: sqlite3.Connection, now: int
     ) -> tuple[
         list[reminders.ActiveView],
-        reminders.UserReminderState,
-        reminders.PauseReason | None,
+        reminder_state.UserReminderState,
+        reminder_state.PauseReason | None,
         int,
     ]:
         deps, user = self._deps, self._turn.user
         return (
             reminders.describe_active(conn, user.id, deps.timezone, now),
-            reminders.get_user_state(conn, user.id),
-            reminders.pause_reason(conn, user, deps.admin_openid),
+            reminder_state.get_user_state(conn, user.id),
+            reminder_state.pause_reason(conn, user, deps.admin_openid),
             reminders.count_unnotified(conn, user.id),
         )
 

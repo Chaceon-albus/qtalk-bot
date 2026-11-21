@@ -122,6 +122,9 @@ class TriggerError(ValueError):
 class Once:
     at: datetime
     """本地时刻（不带时区，秒为 0），一定存在（不落在夏令时跳过的那段里）。"""
+    moment: int | None = None
+    """由相对时间（`delay_minutes`）换算出的绝对时刻（UTC 秒）；有它时以它为准，`at` 只用来显示。本地钟点在夏令时
+    回拨的那一小时里有两个，换回去会丢掉是哪一个。"""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -129,9 +132,12 @@ class Interval:
     every: int
     unit: IntervalUnit
     start: datetime
-    """第 0 次的本地时刻（不带时区，秒为 0）。"""
+    """第 0 次的本地时刻（不带时区，秒为 0），照用户写的存，落在夏令时缺口里也不改写：天、周按它加 k 倍间隔后
+    分别解析。"""
     end: datetime | None = None
     count: int | None = None
+    start_at: int | None = None
+    """由相对时间或默认起点换算出的第 0 次的绝对时刻（UTC 秒）；有它时以它为准（同 `Once.moment`）。"""
 
     @property
     def minutes(self) -> int:
@@ -236,7 +242,8 @@ def _parse_once(args: Mapping[str, object], now: int, timezone: ZoneInfo) -> Onc
         raise TriggerError("delay_minutes", "at 与 delay_minutes 只能填一个")
     if delay is not None:
         minutes = _integer("delay_minutes", delay, MIN_LEAD_SECONDS // 60, MAX_DELAY_MINUTES)
-        return Once(local_of(ceil_minute(now + minutes * 60), timezone))
+        moment = ceil_minute(now + minutes * 60)
+        return Once(local_of(moment, timezone), moment)
     local = _parse_local("at", at)
     moment = resolve(local, timezone)
     if moment <= now:
@@ -272,19 +279,22 @@ def _parse_interval(args: Mapping[str, object], now: int, timezone: ZoneInfo) ->
             raise TriggerError("start", "起始时刻最远只能设到一年之内")
         if moment < now - MAX_AHEAD_DAYS * 86400:
             raise TriggerError("start", "起始时刻不能早于一年前")
-        start = local_of(moment, timezone)
+        start_at: int | None = None
     elif delay is not None:
         minutes = _integer("delay_minutes", delay, 0, MAX_DELAY_MINUTES)
-        start = local_of(ceil_minute(now + minutes * 60), timezone)
+        start_at = ceil_minute(now + minutes * 60)
+        start = local_of(start_at, timezone)
     else:
         # 没写起点：以调用时刻为起点，第一次在一个间隔之后（同 APScheduler 的 IntervalTrigger）。
         base = ceil_minute(now)
         if unit in _UNIT_SECONDS:
-            start = local_of(base + every * _UNIT_SECONDS[unit], timezone)
+            start_at = base + every * _UNIT_SECONDS[unit]
+            start = local_of(start_at, timezone)
         else:
+            start_at = None
             start = local_of(base, timezone) + timedelta(days=every * _UNIT_DAYS[unit])
     end, count = _end_and_count(args)
-    return Interval(every=every, unit=unit, start=start, end=end, count=count)
+    return Interval(every=every, unit=unit, start=start, end=end, count=count, start_at=start_at)
 
 
 def _parse_calendar(args: Mapping[str, object]) -> Calendar:
@@ -339,7 +349,7 @@ def _check_fires(trigger: Trigger, now: int, timezone: ZoneInfo) -> None:
             raise TriggerError("end", "结束时刻已经过去了")
         case Interval() if trigger.end is not None and resolve(
             trigger.end, timezone, latest=True
-        ) < resolve(trigger.start, timezone):
+        ) < interval_origin(trigger, timezone):
             raise TriggerError("end", "结束时刻早于第一次提醒")
         case Interval():
             raise TriggerError(
@@ -443,8 +453,10 @@ def dump_trigger(trigger: Trigger) -> str:
     """存进数据库的写法：JSON，本地钟点写成 `LOCAL_FORMAT` 与 `TIME_FORMAT`。"""
     data: dict[str, object]
     match trigger:
-        case Once(at=at):
+        case Once(at=at, moment=moment):
             data = {"kind": TriggerKind.ONCE.value, "at": at.strftime(LOCAL_FORMAT)}
+            if moment is not None:
+                data["at_utc"] = moment
         case Interval():
             data = {
                 "kind": TriggerKind.INTERVAL.value,
@@ -452,6 +464,8 @@ def dump_trigger(trigger: Trigger) -> str:
                 "unit": trigger.unit.value,
                 "start": trigger.start.strftime(LOCAL_FORMAT),
             }
+            if trigger.start_at is not None:
+                data["start_utc"] = trigger.start_at
         case Calendar():
             data = {
                 "kind": TriggerKind.CALENDAR.value,
@@ -469,7 +483,8 @@ def dump_trigger(trigger: Trigger) -> str:
 
 
 def load_trigger(text: str) -> Trigger:
-    """`dump_trigger()` 的逆过程。存进去的规则当时校验过，这里只做还原（不再查「是否已经过去」）。
+    """`dump_trigger()` 的逆过程。存进去的规则当时校验过，这里只做还原（不再查「是否已经过去」）。`at_utc`、
+    `start_utc` 是后来加的可选键，以前存的没有它们，照样能读。
 
     Raises:
         ValueError: 不是 `dump_trigger()` 写出的内容（JSON 不对、缺字段或取值不对）。
@@ -496,7 +511,8 @@ def load_trigger(text: str) -> Trigger:
             at = local("at")
             if at is None:
                 raise ValueError("一次性提醒缺少 at")
-            return Once(at)
+            moment = fields.get("at_utc")
+            return Once(at, None if moment is None else int(cast(int, moment)))
         case TriggerKind.INTERVAL:
             start = local("start")
             if start is None:
@@ -507,6 +523,9 @@ def load_trigger(text: str) -> Trigger:
                 start=start,
                 end=local("end"),
                 count=None if count is None else int(cast(int, count)),
+                start_at=None
+                if (start_at := fields.get("start_utc")) is None
+                else int(cast(int, start_at)),
             )
         case TriggerKind.CALENDAR:
             weekdays = fields.get("weekdays")
@@ -528,6 +547,44 @@ def load_trigger(text: str) -> Trigger:
 # ---- 触发时刻 ----
 
 
+class TooManyStepsError(Exception):
+    """`Steps` 扣完了：要算的太多。"""
+
+
+class Steps:
+    """算触发时刻时的步数上限（准入检查用）：每算一步扣一，扣完抛 `TooManyStepsError`。"""
+
+    def __init__(self, limit: int) -> None:
+        self.left = limit
+
+    def take(self) -> None:
+        self.left -= 1
+        if self.left < 0:
+            raise TooManyStepsError
+
+
+def occurrence_at(
+    trigger: Trigger, timezone: ZoneInfo, *, anchor: int, index: int
+) -> Occurrence | None:
+    """日程上编号不小于 `index` 的第一次（按 `timezone` 算），不看是否已经过去；日程没有这么多次时为 `None`。配置的
+    时区变了时，用它从还没消费的那一次接着算（`ReminderScheduler.recover()`），过去了的交给正常的到期与宽限流程。"""
+    match trigger:
+        case Once():
+            return Occurrence(0, once_at(trigger, timezone)) if index == 0 else None
+        case Interval():
+            if trigger.count is not None and index >= trigger.count:
+                return None
+            moment = _interval_at(trigger, timezone, index)
+            if trigger.end is not None and moment > resolve(trigger.end, timezone, latest=True):
+                return None
+            return Occurrence(index, moment)
+        case Calendar():
+            for occurrence in _calendar(trigger, timezone, anchor, 0):
+                if occurrence.index >= index:
+                    return occurrence
+            return None
+
+
 def upcoming(
     trigger: Trigger,
     timezone: ZoneInfo,
@@ -535,8 +592,10 @@ def upcoming(
     anchor: int,
     after: int,
     resume: Occurrence | None = None,
+    steps: Steps | None = None,
 ) -> Iterator[Occurrence]:
-    """日程上严格晚于 `after` 的各次，按时间先后。
+    """日程上严格晚于 `after` 的各次，按时间先后。`steps` 给了时，每算一步（含被跳过的）都从里面扣，扣完抛
+    `TooManyStepsError`。
 
     `anchor` 是日历式日程的起点（建提醒时的调用时刻，日程只含它之后的时刻）；另两种不用它。`resume` 是日程上已知的
     某一次（通常是存着的下一次）：给了就从它（含）往后接着算，不必从头数；编号接着它的往下排。
@@ -545,14 +604,16 @@ def upcoming(
         case Once():
             if resume is not None and resume.index > 0:
                 return
-            moment = resolve(trigger.at, timezone)
+            moment = once_at(trigger, timezone)
             if moment > after:
                 yield Occurrence(0, moment)
         case Interval():
-            yield from _interval(trigger, timezone, after, 0 if resume is None else resume.index)
+            yield from _interval(
+                trigger, timezone, after, 0 if resume is None else resume.index, steps
+            )
         case Calendar():
             base, index = (anchor, 0) if resume is None else (resume.at - 1, resume.index)
-            for occurrence in _calendar(trigger, timezone, base, index):
+            for occurrence in _calendar(trigger, timezone, base, index, steps):
                 if occurrence.at > after:
                     yield occurrence
 
@@ -564,9 +625,12 @@ def first_upcoming(
     anchor: int,
     after: int,
     resume: Occurrence | None = None,
+    steps: Steps | None = None,
 ) -> Occurrence | None:
     """`upcoming()` 的第一个；没有了时为 `None`。"""
-    return next(upcoming(trigger, timezone, anchor=anchor, after=after, resume=resume), None)
+    return next(
+        upcoming(trigger, timezone, anchor=anchor, after=after, resume=resume, steps=steps), None
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -631,7 +695,7 @@ def final_occurrence(trigger: Trigger, timezone: ZoneInfo, *, anchor: int) -> Oc
     `None`。"""
     match trigger:
         case Once():
-            return Occurrence(0, resolve(trigger.at, timezone))
+            return Occurrence(0, once_at(trigger, timezone))
         case Interval():
             if trigger.count is None and trigger.end is None:
                 return None
@@ -651,16 +715,28 @@ def final_occurrence(trigger: Trigger, timezone: ZoneInfo, *, anchor: int) -> Oc
             return found
 
 
+def once_at(trigger: Once, timezone: ZoneInfo) -> int:
+    """一次性提醒的时刻：有换算好的绝对时刻就用它，否则按本地钟点解析。"""
+    return trigger.moment if trigger.moment is not None else resolve(trigger.at, timezone)
+
+
+def interval_origin(trigger: Interval, timezone: ZoneInfo) -> int:
+    """间隔式第 0 次的时刻：有换算好的绝对时刻就用它，否则按本地钟点解析。"""
+    return trigger.start_at if trigger.start_at is not None else resolve(trigger.start, timezone)
+
+
 def _interval_at(trigger: Interval, timezone: ZoneInfo, index: int) -> int:
     if (seconds := _UNIT_SECONDS.get(trigger.unit)) is not None:
-        return resolve(trigger.start, timezone) + index * trigger.every * seconds
+        return interval_origin(trigger, timezone) + index * trigger.every * seconds
+    if index == 0:
+        return interval_origin(trigger, timezone)
     days = trigger.every * _UNIT_DAYS[trigger.unit]
     return resolve(trigger.start + timedelta(days=index * days), timezone)
 
 
 def _first_index_after(trigger: Interval, timezone: ZoneInfo, moment: int) -> int:
     """日程上第一个严格晚于 `moment` 的编号（不看 `count` 与 `end`）。"""
-    start = resolve(trigger.start, timezone)
+    start = interval_origin(trigger, timezone)
     if moment < start:
         return 0
     if (seconds := _UNIT_SECONDS.get(trigger.unit)) is not None:
@@ -674,11 +750,17 @@ def _first_index_after(trigger: Interval, timezone: ZoneInfo, moment: int) -> in
 
 
 def _interval(
-    trigger: Interval, timezone: ZoneInfo, after: int, minimum: int
+    trigger: Interval,
+    timezone: ZoneInfo,
+    after: int,
+    minimum: int,
+    steps: Steps | None = None,
 ) -> Iterator[Occurrence]:
     end = None if trigger.end is None else resolve(trigger.end, timezone, latest=True)
     index = max(minimum, _first_index_after(trigger, timezone, after))
     while trigger.count is None or index < trigger.count:
+        if steps is not None:
+            steps.take()
         moment = _interval_at(trigger, timezone, index)
         if end is not None and moment > end:
             return
@@ -700,7 +782,7 @@ def day_matches(trigger: Calendar, day: date) -> bool:
 
 
 def _calendar(
-    trigger: Calendar, timezone: ZoneInfo, after: int, index: int
+    trigger: Calendar, timezone: ZoneInfo, after: int, index: int, steps: Steps | None = None
 ) -> Iterator[Occurrence]:
     """严格晚于 `after` 的各次，编号从 `index` 起；`HORIZON_DAYS` 天里找不到下一次就停。"""
     end = None if trigger.end is None else resolve(trigger.end, timezone, latest=True)
@@ -708,6 +790,8 @@ def _calendar(
     found_on = day
     previous = after
     while (day - found_on).days <= HORIZON_DAYS:
+        if steps is not None:
+            steps.take()  # 每看一天算一步（含没有时刻的、早于 after 被跳过的）
         if trigger.count is not None and index >= trigger.count:
             return
         if end is not None and resolve(datetime.combine(day, time()), timezone) > end:
@@ -717,6 +801,8 @@ def _calendar(
                 {resolve(datetime.combine(day, item), timezone) for item in trigger.times}
             )
             for moment in moments:
+                if steps is not None:
+                    steps.take()  # 每个时刻也算一步，含早于 after 被跳过的
                 if moment <= previous:
                     continue  # 已经过去，或夏令时顺延后与前一个重合
                 if end is not None and moment > end:

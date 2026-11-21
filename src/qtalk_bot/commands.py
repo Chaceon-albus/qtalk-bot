@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from . import access, journal, texts
+from . import access, journal, reminder_state, texts
 from .access import Invite, UserStatus
 from .config import InviteSettings
 from .texts import Rich
@@ -82,9 +82,9 @@ def execute(
         case "users":
             return _list_users(conn, context)
         case "disable":
-            return _set_status(conn, command.argument, UserStatus.DISABLED, context)
+            return _set_status(conn, command.argument, UserStatus.DISABLED, context, now)
         case "enable":
-            return _set_status(conn, command.argument, UserStatus.ACTIVE, context)
+            return _set_status(conn, command.argument, UserStatus.ACTIVE, context, now)
         case "pause":
             changed = access.set_paused(conn, True, now)
             return texts.SERVICE_PAUSED if changed else texts.SERVICE_ALREADY_PAUSED
@@ -168,7 +168,11 @@ def _list_users(conn: sqlite3.Connection, context: CommandContext) -> Rich:
 
 
 def _set_status(
-    conn: sqlite3.Connection, argument: str, status: UserStatus, context: CommandContext
+    conn: sqlite3.Connection,
+    argument: str,
+    status: UserStatus,
+    context: CommandContext,
+    now: int,
 ) -> str:
     command = "disable" if status is UserStatus.DISABLED else "enable"
     user_id = _parse_id(argument)
@@ -182,12 +186,22 @@ def _set_status(
             return texts.CANNOT_DISABLE_ADMIN
         if user.status is UserStatus.DISABLED:
             return texts.user_already_disabled(user.id, user.name)
-        access.set_user_status(conn, user.id, status)
+        _change_status(conn, user.id, status, context, now)
         return texts.user_disabled(user.id, user.name)
     if user.status is UserStatus.ACTIVE:
         return texts.user_already_active(user.id, user.name)
-    access.set_user_status(conn, user.id, status)
+    _change_status(conn, user.id, status, context, now)
     return texts.user_enabled(user.id, user.name)
+
+
+def _change_status(
+    conn: sqlite3.Connection, user_id: int, status: UserStatus, context: CommandContext, now: int
+) -> None:
+    """改用户的状态，并记下提醒暂停或恢复的时刻（停用期间到期的提醒不补，见 `reminder_state.py`）。"""
+    access.set_user_status(conn, user_id, status)
+    changed = access.get_user(conn, user_id)
+    if changed is not None:
+        reminder_state.sync_pause(conn, changed, context.admin_openid, now)
 
 
 def day_start(now: int, timezone: ZoneInfo) -> int:

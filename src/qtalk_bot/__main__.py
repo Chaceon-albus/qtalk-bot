@@ -187,7 +187,6 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
         handlers: Handlers | None = None
         cleanup: asyncio.Task[None] | None = None
         maintenance: list[Background] = []
-        reminder_service: ReminderService | None = None
         fallback_locks = UserLocks()
 
         def user_lock(user_id: int) -> AbstractAsyncContextManager[None]:
@@ -231,13 +230,14 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                 dir_taken=store.dir_taken,
             )
             await gate.prepare()
-            if settings.reminders.enabled:
-                reminder_service = ReminderService(
-                    db,
-                    admin_openid=secrets.admin_openid,
-                    timezone=settings.timezone,
-                    lock=user_lock,
-                )
+            # 关掉提醒时也照样记好友与开关的状态（重新打开后用得上），只是不发送、不通知。
+            reminder_service = ReminderService(
+                db,
+                admin_openid=secrets.admin_openid,
+                timezone=settings.timezone,
+                lock=user_lock,
+                notify=settings.reminders.enabled,
+            )
             if settings.describe is not None and models.describer is not None:
                 describer = Describer(
                     db,
@@ -281,12 +281,12 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                     steer=SteerJudge(settings.decisions, models.decider),
                     image_generator=models.image_generator,
                     image_generation=image_generation,
-                    reminders=reminder_service,
-                    reminder_settings=None if reminder_service is None else settings.reminders,
+                    reminders=reminder_service if settings.reminders.enabled else None,
+                    reminder_settings=settings.reminders if settings.reminders.enabled else None,
                 )
                 batcher = Batcher(conversation, settings.turns)
                 chat = QQChat(batcher)
-            if reminder_service is not None:
+            if settings.reminders.enabled:
                 # 在 Conversation 建好之后才开始：之前开始的话，最初几次会拿到另一套锁。
                 reminders = ReminderScheduler(
                     db,
