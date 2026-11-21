@@ -21,7 +21,7 @@ pyqbot 的 HTTP 客户端实现）。
 - **清理**（每小时一次）：附件表里过期的行改成 `expired` 并删掉文件；再按用户目录扫一遍，删掉附件表没有引用、
   修改时间早于一小时前的孤儿文件（下载后没能写进流水的、中途留下的临时文件，以及生成后没能记进附件表的图）；
   最后删掉不属于任何用户、过了保存期限的目录（`MediaStore.sweep_unowned()`）。模型画的图（挂在助手回复上的附件
-  行）同样按保存期限清理。以后做「遗忘」与删除用户时可以整个删掉用户目录（`MediaStore.remove_user()`）。
+  行）同样按保存期限清理。以后做删除用户时可以整个删掉用户目录（`MediaStore.remove_user()`；忘掉话题是逐个删文件）。
 """
 
 import asyncio
@@ -781,7 +781,7 @@ class MediaStore:
         return Relocation.MERGED
 
     def remove_user(self, media_dir: str) -> None:
-        """删掉这个用户的全部附件（以后做遗忘与删除用户时用）。用户目录是符号链接时只删链接本身。
+        """删掉这个用户的全部附件（留给以后做删除用户时用，现在没有调用方）。用户目录是符号链接时只删链接本身。
 
         Raises:
             ValueError: `media_dir` 不是合法的用户目录名。
