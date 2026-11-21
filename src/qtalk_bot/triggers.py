@@ -563,6 +563,25 @@ class Steps:
             raise TooManyStepsError
 
 
+def relocate(
+    trigger: Trigger,
+    old: ZoneInfo,
+    new: ZoneInfo,
+    *,
+    anchor: int,
+    current: Occurrence,
+) -> Occurrence | None:
+    """配置的时区从 `old` 换成 `new` 时，还没消费的那一次（`current`，按 `old` 算的）在新时区里对应的那一次，不看
+    是否已经过去；没有了时为 `None`。日历式保留它的本地日期与钟点（同一个编号在新时区里重新从 `anchor` 数，可能
+    指向别的日子）；其余按编号在新时区里重算（间隔式第 k 次的本地钟点不变，以绝对时刻为准的不变）。"""
+    if isinstance(trigger, Calendar):
+        moment = resolve(local_of(current.at, old), new)
+        if trigger.end is not None and moment > resolve(trigger.end, new, latest=True):
+            return None
+        return Occurrence(current.index, moment)
+    return occurrence_at(trigger, new, anchor=anchor, index=current.index)
+
+
 def occurrence_at(
     trigger: Trigger, timezone: ZoneInfo, *, anchor: int, index: int
 ) -> Occurrence | None:
@@ -730,8 +749,11 @@ def _interval_at(trigger: Interval, timezone: ZoneInfo, index: int) -> int:
         return interval_origin(trigger, timezone) + index * trigger.every * seconds
     if index == 0:
         return interval_origin(trigger, timezone)
+    # 有绝对起点的（由相对时间换算的）以它在现在的时区里的本地钟点为基准，第 0 次与之后各次同一个基准：换了时区
+    # 仍是同一钟点，时序单调。
+    base = trigger.start if trigger.start_at is None else local_of(trigger.start_at, timezone)
     days = trigger.every * _UNIT_DAYS[trigger.unit]
-    return resolve(trigger.start + timedelta(days=index * days), timezone)
+    return resolve(base + timedelta(days=index * days), timezone)
 
 
 def _first_index_after(trigger: Interval, timezone: ZoneInfo, moment: int) -> int:

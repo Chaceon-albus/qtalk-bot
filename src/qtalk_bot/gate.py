@@ -29,7 +29,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from zoneinfo import ZoneInfo
 
-from . import access, commands, texts
+from . import access, commands, reminder_state, texts
 from .access import DirTaken, Invite, InviteState, User, UserStatus
 from .commands import CommandContext
 from .config import InviteSettings
@@ -349,7 +349,16 @@ class Gate:
     def _apply(self, conn: sqlite3.Connection, followup: Followup) -> None:
         match followup:
             case MarkWelcomed(user_id=user_id):
-                access.mark_welcomed(conn, user_id, self._clock())
+                before = access.get_user(conn, user_id)
+                now = self._clock()
+                access.mark_welcomed(conn, user_id, now)
+                after = access.get_user(conn, user_id)
+                if before is not None and before.welcomed_at is None and after is not None:
+                    # 欢迎语确认发出让用户重新可以使用（如兑换邀请之后）：提醒「从暂停变回可发」，同一个事务里把暂停
+                    # 期间到期的次数推进掉（见 `reminder_state.py`）。
+                    reminder_state.sync_pause(
+                        conn, after, self._admin_openid, self._timezone, now, resumed=True
+                    )
             case ReleaseRefusal(openid=openid):
                 access.release_refusal(conn, openid)
                 logger.info("拒绝语没有发出，撤销「已拒绝」的记录")

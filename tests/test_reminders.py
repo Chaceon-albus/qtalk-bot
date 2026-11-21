@@ -734,6 +734,16 @@ async def test_push_off_tries_only_the_first_each_day(db: Database) -> None:
     assert (await db.transaction(get_user_state, alice.id)).push is PushState.ON
 
 
+def enable(conn: sqlite3.Connection, user: User, now: int) -> None:
+    """同 `/enable`：恢复用户，并在同一个事务里恢复时推进。"""
+    from qtalk_bot.reminder_state import sync_pause
+
+    access.set_user_status(conn, user.id, UserStatus.ACTIVE)
+    current = access.get_user(conn, user.id)
+    assert current is not None
+    sync_pause(conn, current, ADMIN, TZ, now, resumed=True)
+
+
 async def test_paused_users_get_nothing_and_once_reminders_expire(db: Database) -> None:
     alice = await invited(db, ALICE, "小王")
     once = await add(db, alice, "一次", kind="once", at="2026-11-20T16:00")
@@ -750,8 +760,8 @@ async def test_paused_users_get_nothing_and_once_reminders_expire(db: Database) 
     gone = await db.transaction(get_reminder, alice.id, once.reminder.id)
     assert gone is not None
     assert gone.status is ReminderStatus.FINISHED  # 停用期间过了时刻的一次性提醒作废
-    # 重新启用后周期性的从下一次接着发，跳过的不补。
-    await db.transaction(access.set_user_status, alice.id, UserStatus.ACTIVE)
+    # 重新启用（同 /enable：恢复时推进）后周期性的从下一次接着发，跳过的不补。
+    await db.transaction(enable, alice, at("2026-11-21T16:20"))
     await run_at(scheduler, clock, at("2026-11-21T16:30"))
     assert sender.sent == []
     await run_at(scheduler, clock, at("2026-11-22T16:00"))
@@ -1448,3 +1458,204 @@ async def test_purge_keeps_reminders_with_unnotified_failures(db: Database) -> N
     await db.execute("UPDATE reminder_failures SET notified_at = ?", (T0,))
     await db.transaction(purge_reminders, now, 3)
     assert await db.fetch_all("SELECT id FROM reminders") == []
+
+
+# ---- 第二轮评审后补的 ----
+
+
+async def test_resuming_skips_every_overdue_occurrence(db: Database) -> None:
+    # 09:00、09:05 到期，09:01 停用、09:06 启用，调度器 09:07 才拿到锁：都不补、也不记失败（恢复时推进）。
+    from qtalk_bot import commands
+    from qtalk_bot.config import InviteSettings
+
+    alice = await invited(db, ALICE, "小王")
+    daily = await add(
+        db,
+        alice,
+        "喝水",
+        kind="interval",
+        every=5,
+        unit="minutes",
+        start="2026-11-21T09:00",
+        count=6,
+    )
+    context = commands.CommandContext(
+        admin_openid=ADMIN, timezone=TZ, invites=InviteSettings(), new_code=lambda: "x" * 32
+    )
+
+    def act(conn: sqlite3.Connection, text: str, now: int) -> None:
+        parsed = commands.parse_command(text)
+        assert parsed is not None
+        commands.execute(conn, parsed, context, now)
+
+    await db.transaction(act, f"/disable {alice.id}", at("2026-11-21T09:01"))
+    await db.transaction(act, f"/enable {alice.id}", at("2026-11-21T09:06"))
+    sender, clock = Sender(), Clock(T0)
+    await run_at(make_scheduler(db, sender, clock), clock, at("2026-11-21T09:07"))
+
+    assert sender.sent == []
+    assert await failures(db, alice) == []
+    current = await db.transaction(get_reminder, alice.id, daily.reminder.id)
+    assert current is not None
+    assert current.next == Occurrence(2, at("2026-11-21T09:10"))  # 照常消耗次数
+
+
+async def test_friend_added_back_after_an_upgrade_still_skips(db: Database) -> None:
+    # 升级前就删了好友（没有 paused_since）：重新加好友照样恢复时推进。
+    alice = await invited(db, ALICE, "小王")
+    once = await add(db, alice, "一次", kind="once", at="2026-11-20T16:00")
+    await db.execute(
+        "INSERT INTO reminder_user_state (user_id, friend_removed, friend_updated_at)"
+        " VALUES (?, 1, ?)",
+        (alice.id, T0),
+    )
+    service = ReminderService(
+        db, admin_openid=ADMIN, timezone=TZ, clock=lambda: at("2026-11-20T16:05")
+    )
+    sender, clock = Sender(), Clock(T0)
+
+    await service.friend_changed(ALICE, present=True, at=at("2026-11-20T16:05"))
+    await run_at(make_scheduler(db, sender, clock), clock, at("2026-11-20T16:06"))
+
+    assert sender.sent == []
+    gone = await db.transaction(get_reminder, alice.id, once.reminder.id)
+    assert gone is not None
+    assert gone.status is ReminderStatus.FINISHED
+
+
+async def test_confirmed_welcome_resumes_and_skips(db: Database) -> None:
+    from qtalk_bot.config import InviteSettings
+    from qtalk_bot.gate import Gate, MarkWelcomed, Reply
+
+    alice = await invited(db, ALICE, "小王")
+    once = await add(db, alice, "一次", kind="once", at="2026-11-20T16:00")
+    await db.execute("UPDATE users SET welcomed_at = NULL WHERE id = ?", (alice.id,))
+
+    async def links(code: str) -> str:
+        return code
+
+    gate = Gate(
+        db,
+        admin_openid=ADMIN,
+        timezone=TZ,
+        invites=InviteSettings(),
+        share_link=links,
+        clock=lambda: at("2026-11-20T16:05"),
+    )
+
+    await gate.settle(Reply("欢迎", on_sent=MarkWelcomed(alice.id)), Delivery.SENT)
+
+    gone = await db.transaction(get_reminder, alice.id, once.reminder.id)
+    assert gone is not None
+    assert gone.status is ReminderStatus.FINISHED
+
+
+async def test_timezone_change_keeps_the_local_slot_of_calendar_reminders(db: Database) -> None:
+    tokyo = ZoneInfo("Asia/Tokyo")
+    alice = await invited(db, ALICE, "小王")
+    created_at = at("2026-11-20T09:30", tokyo)
+    trigger = parse_trigger(
+        {"kind": "calendar", "times": ["09:00"]}, now=created_at, timezone=tokyo
+    )
+    created = await db.transaction(
+        create_reminder,
+        alice.id,
+        Candidate(content="早安", trigger=trigger, anchor=created_at),
+        settings=ReminderSettings(),
+        timezone=tokyo,
+        now=created_at,
+    )
+    assert isinstance(created, Created)
+    # 21 日的已经发过，还没消费的是 22 日。
+    await db.execute(
+        "UPDATE reminders SET next_index = 1, next_fire_at = ? WHERE id = ?",
+        (at("2026-11-22T09:00", tokyo), created.reminder.id),
+    )
+    sender, clock = Sender(), Clock(at("2026-11-21T09:05"))
+    scheduler = make_scheduler(db, sender, clock)
+
+    await scheduler.recover()
+    await run_at(scheduler, clock, at("2026-11-21T09:05"))
+
+    assert sender.sent == []  # 不把同一天的再发一次
+    current = await db.transaction(get_reminder, alice.id, created.reminder.id)
+    assert current is not None
+    assert current.next == Occurrence(1, at("2026-11-22T09:00"))
+
+
+async def test_confirming_counts_due_reminders_not_yet_sent(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    await add(db, alice, "整点", kind="once", at="2026-11-20T16:00")
+    settings = ReminderSettings(hourly_limit=1)
+
+    result = await try_add(
+        db,
+        alice,
+        "半点",
+        settings=settings,
+        anchor=T0,
+        now=at("2026-11-20T16:00") + 5,  # 16:00 的还没拿到锁、没发出
+        kind="once",
+        at="2026-11-20T16:30",
+    )
+
+    assert result == RateExceeded(Period.HOUR, at("2026-11-20T16:00"), 2, 1)
+
+
+async def test_hour_bucket_splits_the_half_hour_fall_back() -> None:
+    from qtalk_bot.reminders import hour_start, next_hour_start
+
+    lord_howe = ZoneInfo("Australia/Lord_Howe")  # 2026-04-05 02:00 回拨到 01:30
+    first = resolve(datetime(2026, 4, 5, 1, 45), lord_howe)  # 第一遍
+    second = resolve(datetime(2026, 4, 5, 1, 45), lord_howe, latest=True)  # 第二遍
+    second_start = resolve(datetime(2026, 4, 5, 1, 30), lord_howe, latest=True)
+
+    assert hour_start(first, lord_howe) == resolve(datetime(2026, 4, 5, 1, 0), lord_howe)
+    assert hour_start(second, lord_howe) == second_start
+    assert next_hour_start(hour_start(first, lord_howe), lord_howe) == second_start
+
+
+async def test_success_proves_the_switch_against_late_events(db: Database) -> None:
+    from qtalk_bot.reminder_state import PROVEN_ON_TOLERANCE_SECONDS, record_proven_on
+
+    alice = await invited(db, ALICE, "小王")
+    service = ReminderService(db, admin_openid=ADMIN, timezone=TZ, clock=lambda: T0)
+    sent_at = T0
+    await db.transaction(record_proven_on, alice.id, sent_at)
+
+    stale = sent_at - PROVEN_ON_TOLERANCE_SECONDS - 60
+    await service.push_switched(ALICE, on=False, reply=Replies(), at=stale)
+    assert (await db.transaction(get_user_state, alice.id)).push is PushState.ON
+    await service.push_switched(ALICE, on=False, reply=Replies(), at=sent_at - 10)
+    assert (await db.transaction(get_user_state, alice.id)).push is PushState.OFF
+
+
+def test_rule_of_relative_reminders_uses_the_current_timezone() -> None:
+    from qtalk_bot.reminders import rule_text
+
+    tokyo = ZoneInfo("Asia/Tokyo")
+    once = parse_trigger({"kind": "once", "delay_minutes": 30}, now=T0, timezone=TZ)
+    interval = parse_trigger({"kind": "interval", "every": 1, "unit": "hours"}, now=T0, timezone=TZ)
+
+    assert rule_text(once, tokyo, T0) == "一次：11 月 20 日（周五）17:00"
+    assert rule_text(interval, tokyo, T0) == "每小时一次，从 11 月 20 日（周五）17:30 起"
+
+
+def test_admission_stops_early_on_the_new_schedule_alone() -> None:
+    from qtalk_bot.reminders import Schedule, check_rates
+
+    forever = parse_trigger(
+        {"kind": "interval", "every": 1, "unit": "minutes"}, now=T0, timezone=TZ
+    )
+
+    result = check_rates(
+        Schedule(trigger=forever, anchor=T0),
+        [],
+        TZ,
+        now=T0,
+        hourly=20,
+        daily=50,
+        max_iterations=500,
+    )
+
+    assert result == RateExceeded(Period.HOUR, at("2026-11-20T15:00"), 29, 20)

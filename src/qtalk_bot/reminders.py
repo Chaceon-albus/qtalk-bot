@@ -23,7 +23,7 @@ Unix 秒，由调用方传入。所有查询都带 `user_id`。
   「开」）。被平台拒发时，开关为「关」记「未开启主动消息」，否则记「发送出错」；结果不明（超时等）不重试，记
   「可能没送到」。
 - 停用、删了好友、没有授权的用户（`pause_reason()`）：不发，跳过的不补，也不进失败记录；期间已过时刻的一次性提醒
-  作废。暂停与恢复都落在两次检查之间时，按记下的最近一次暂停的起止把其间到期的次数推进掉（`reminder_state.py`）。
+  作废。从暂停变回可发时，在记下恢复的同一个事务里把已经过去、还没处理的次数静默推进（恢复时推进，`reminder_state.py`）。
   管理员 `/pause` 期间照发（第一版到点不调用模型）。
 
 **失败通知**：失败表按「提醒 × 原因 × 未告知」合并成一行。用户真正开始一轮对话时（`Conversation` 在他的锁里、发
@@ -52,10 +52,10 @@ from .config import ReminderSettings
 from .gate import Delivery
 from .reminder_state import (
     PushState,
-    UserReminderState,
     get_user_state,
     pause_reason,
     record_friend,
+    record_proven_on,
     record_push,
     record_trial,
     sync_pause,
@@ -75,6 +75,7 @@ from .triggers import (
     load_trigger,
     local_of,
     occurrence_at,
+    relocate,
     resolve,
     upcoming,
 )
@@ -333,18 +334,18 @@ def check_admission(
     now: int,
 ) -> Admission:
     """新建之前的准入检查（不看授权，由调用方另查）：有效条数、`now` 之后还有没有、频率上限的模拟
-    （`check_rates()`，计入这个人在当前小时与今天已经发出的提醒消息）。"""
+    （`check_rates()`，计入这个人在当前小时与今天已经发出的提醒消息，以及已经到期、还在宽限内、还没发出的那一批：
+    它们马上会合成一条发出，算在当前时段里）。"""
     active = count_active(conn, user_id)
     if active >= settings.max_active:
         return TooManyActive(active, settings.max_active)
-    existing = [
-        Schedule(trigger=r.trigger, anchor=r.anchor_at, resume=r.next)
-        for r in active_reminders(conn, user_id)
-    ]
+    reminders = active_reminders(conn, user_id)
+    existing = [Schedule(trigger=r.trigger, anchor=r.anchor_at, resume=r.next) for r in reminders]
     hour, day = hour_start(now, timezone), day_start(now, timezone)
+    pending = 1 if any(_dispatchable(r, settings, timezone, now) for r in reminders) else 0
     sent = {
-        (Period.HOUR, hour): count_sends_since(conn, user_id, hour),
-        (Period.DAY, day): count_sends_since(conn, user_id, day),
+        (Period.HOUR, hour): count_sends_since(conn, user_id, hour) + pending,
+        (Period.DAY, day): count_sends_since(conn, user_id, day) + pending,
     }
     return check_rates(
         Schedule(trigger=candidate.trigger, anchor=candidate.anchor),
@@ -355,6 +356,19 @@ def check_admission(
         daily=settings.daily_limit,
         sent=sent,
     )
+
+
+def _dispatchable(
+    reminder: Reminder, settings: ReminderSettings, timezone: ZoneInfo, now: int
+) -> bool:
+    """已经到期、还没发出、按宽限规则还会发出的（同 `ReminderScheduler._plan()`：本分钟到期的照发，更早的在宽限内照发）。"""
+    due = reminder.next
+    if due is None or due.at > now:
+        return False
+    latest = catch_up(
+        reminder.trigger, timezone, anchor=reminder.anchor_at, due=due, now=now
+    ).latest
+    return latest.at >= now - now % 60 or now - latest.at <= settings.grace_minutes * 60
 
 
 def check_rates(
@@ -410,8 +424,9 @@ def _check_rates(
             day_start(moment, timezone),
         )
 
-    # 第一遍：新日程在窗口里落进的小时与日。
+    # 第一遍：新日程在窗口里落进的小时与日。光是新日程自己（加上已经发出的）就超了的，当场只复算那一段。
     buckets: dict[tuple[Period, int], set[int]] = {}
+    own: dict[tuple[Period, int], int] = {}
     end = first.at + window
     for occurrence in upcoming(
         new.trigger, timezone, anchor=new.anchor, after=now, resume=new.resume, steps=steps
@@ -420,6 +435,9 @@ def _check_rates(
             break
         for key in keys(occurrence.at):
             buckets.setdefault(key, set())
+            own[key] = own.get(key, 0) + 1
+            if own[key] + sent.get(key, 0) > limits[key[0]]:
+                return _exceeded(key, new, existing, timezone, now, sent, limits[key[0]], steps)
     # 第二遍：选中的各段时间按整段统计全部日程（含新日程在窗口之外的）。
     days = [start for period, start in buckets if period is Period.DAY]
     low, high = min(days), next_day_start(max(days), timezone)
@@ -552,7 +570,7 @@ def _advance(
 
 def rule_text(trigger: Trigger, timezone: ZoneInfo, now: int) -> str:
     """规则的中文描述（不在今年的日期写上年份）。"""
-    return texts.reminder_rule(trigger, local_of(now, timezone))
+    return texts.reminder_rule(trigger, local_of(now, timezone), timezone)
 
 
 def moment_text(moment: int, timezone: ZoneInfo, now: int) -> str:
@@ -697,10 +715,15 @@ def hour_start(moment: int, timezone: ZoneInfo) -> int:
     if datetime.fromtimestamp(candidate, timezone).utcoffset() == local.utcoffset():
         return candidate  # 中间没有跳变：本地钟点与 UTC 同步走
     # 中间有跳变：往回一分钟一分钟地找这个本地小时最早的那一刻。
+    # 同一个本地小时、但 UTC 偏移不同的（如 Lord_Howe 从 02:00 回拨到 01:30，两遍的 01:45）是不同的两段。
     start = moment - local.second
     while True:
         earlier = datetime.fromtimestamp(start - 60, timezone)
-        if (earlier.date(), earlier.hour) != (local.date(), local.hour):
+        if (earlier.date(), earlier.hour, earlier.utcoffset()) != (
+            local.date(),
+            local.hour,
+            local.utcoffset(),
+        ):
             return start
         start -= 60
 
@@ -1077,13 +1100,20 @@ class ReminderService:
             logger.info("用户 %s 删了好友，提醒暂停", user.label)
 
     def _friend(self, conn: sqlite3.Connection, user: User, present: bool, at: int) -> bool:
+        was_removed = get_user_state(conn, user.id).friend_removed
         if not record_friend(conn, user.id, present=present, at=at):
             return False
         current = access.get_user(conn, user.id)
         if current is not None:
+            # 重新加好友是「从暂停变回可发」：同一个事务里把暂停期间到期的次数推进掉（见 `reminder_state.py`）。
             sync_pause(
-                conn, current, self._admin_openid, at
-            )  # 暂停与恢复的时刻，见 `reminder_state.py`
+                conn,
+                current,
+                self._admin_openid,
+                self._timezone,
+                int(self._clock()),
+                resumed=present and was_removed,
+            )
         return True
 
     async def _deliver(
@@ -1272,6 +1302,9 @@ class ReminderScheduler:
         user = access.get_user(conn, user_id)
         if user is None:
             return None
+        # 之前记过暂停、现在已经恢复的，先把暂停期间到期的次数推进掉（恢复时推进，见 `reminder_state.py`）。
+        if sync_pause(conn, user, self._admin_openid, self._timezone, now):
+            logger.info("用户 %s 的提醒已经恢复，跳过暂停期间到期的", user.label)
         due = [
             reminder
             for reminder in (
@@ -1287,7 +1320,6 @@ class ReminderScheduler:
         ]
         if not due:
             return None
-        sync_pause(conn, user, self._admin_openid, now)
         paused = pause_reason(conn, user, self._admin_openid)
         if paused is not None:
             for reminder in due:
@@ -1308,18 +1340,13 @@ class ReminderScheduler:
         this_minute = now - now % 60
         state = get_user_state(conn, user_id)
         items: list[_Item] = []
-        skipped = 0
         for reminder in due:
             assert reminder.next is not None
-            due_now = self._skip_pause(conn, reminder, state, now)
-            if due_now is None:
-                skipped += 1
-                continue
             caught = catch_up(
                 reminder.trigger,
                 self._timezone,
                 anchor=reminder.anchor_at,
-                due=due_now,
+                due=reminder.next,
                 now=now,
             )
             rule = self._rule(reminder.trigger, now)
@@ -1359,11 +1386,8 @@ class ReminderScheduler:
                     )
                 )
             _advance(conn, reminder.id, caught.following, now)
-        if skipped:
-            logger.info("用户 %s 有 %d 条提醒到期在暂停期间，跳过", user.label, skipped)
         if not items:
-            if len(due) > skipped:
-                logger.info("用户 %s 有提醒晚得太多，没有补发，记为失败", user.label)
+            logger.info("用户 %s 有提醒晚得太多，没有补发，记为失败", user.label)
             return None
         hour = count_sends_since(conn, user_id, hour_start(now, self._timezone))
         day = count_sends_since(conn, user_id, day_start(now, self._timezone))
@@ -1405,29 +1429,6 @@ class ReminderScheduler:
             send_id=send_id, openid=user.openid, label=user.label, text=text, items=tuple(items)
         )
 
-    def _skip_pause(
-        self, conn: sqlite3.Connection, reminder: Reminder, state: UserReminderState, now: int
-    ) -> Occurrence | None:
-        """最近一次暂停（停用、删好友）已经结束、到期的这一次落在暂停期间时，把暂停期间到期的次数静默推进掉（不发、
-        不补、不记失败，照常消耗次数）：还有已到期的就返回它，没有了（已推进到将来或发完）返回 `None`。暂停与恢复都
-        落在两次检查之间时（如等用户锁时删好友又加回）靠它。"""
-        due = reminder.next
-        assert due is not None
-        start, end = state.pause_started, state.pause_ended
-        if start is None or end is None or not start <= due.at < end:
-            return due
-        following = first_upcoming(
-            reminder.trigger,
-            self._timezone,
-            anchor=reminder.anchor_at,
-            after=end - 1,
-            resume=due,
-        )
-        _advance(conn, reminder.id, following, now)
-        if following is None or following.at > now:
-            return None
-        return following
-
     def _fail_items(
         self,
         conn: sqlite3.Connection,
@@ -1467,8 +1468,8 @@ class ReminderScheduler:
         state = get_user_state(conn, user_id)
         match delivery:
             case Delivery.SENT:
-                if state.push is not PushState.ON:
-                    record_push(conn, user_id, PushState.ON, now)
+                # 发送成功证明开关是「开」，更早的授权互动之后不再改状态（`record_proven_on()`）。
+                record_proven_on(conn, user_id, now)
             case Delivery.NOT_SENT:
                 reason = (
                     FailureReason.PUSH_OFF
@@ -1478,6 +1479,17 @@ class ReminderScheduler:
                 self._fail_items(conn, user_id, plan.items, reason, now)
             case Delivery.UNKNOWN:
                 self._fail_items(conn, user_id, plan.items, FailureReason.MAYBE_LOST, now)
+
+    def _relocate(self, reminder: Reminder, current: Occurrence) -> Occurrence | None:
+        try:
+            old = ZoneInfo(reminder.timezone)
+        except ValueError, OSError:  # 旧时区名认不出来：按编号重算
+            return occurrence_at(
+                reminder.trigger, self._timezone, anchor=reminder.anchor_at, index=current.index
+            )
+        return relocate(
+            reminder.trigger, old, self._timezone, anchor=reminder.anchor_at, current=current
+        )
 
     def _recover(self, conn: sqlite3.Connection, now: int) -> tuple[int, int]:
         lost = conn.execute(
@@ -1510,11 +1522,9 @@ class ReminderScheduler:
             (self._timezone.key,),
         ).fetchall():
             reminder = _reminder(row)
-            stored = 0 if reminder.next is None else reminder.next.index
-            # 从还没消费的那一次接着算（不论是否已经过去）：过去了的交给正常的到期与宽限流程补发或记失败。
-            following = occurrence_at(
-                reminder.trigger, self._timezone, anchor=reminder.anchor_at, index=stored
-            )
+            # 从还没消费的那一次接着算（不论是否已经过去）：过去了的交给正常的到期与宽限流程补发或记失败。日历式保留
+            # 那一次的本地日期与钟点，其余按编号重算（见 `triggers.relocate()`）。
+            following = None if reminder.next is None else self._relocate(reminder, reminder.next)
             _advance(conn, reminder.id, following, now)
             conn.execute(
                 "UPDATE reminders SET timezone = ? WHERE id = ?", (self._timezone.key, reminder.id)

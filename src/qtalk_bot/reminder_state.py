@@ -1,12 +1,19 @@
-"""提醒的用户状态（里程碑 8）：资料卡上的主动消息开关、好友状态，以及提醒暂停与恢复的时刻。
+"""提醒的用户状态（里程碑 8）：资料卡上的主动消息开关、好友状态，以及提醒的暂停与恢复。
 
-单独成一个模块，只依赖 `access`：管理员停用、启用用户的命令（`commands.py`）也要记暂停与恢复的时刻，而 `reminders.py`
-依赖 `commands`，不能反过来。表是第 17 版的 `reminder_user_state`，第 18 版加了暂停与开关事件的列。
+单独成一个模块，只依赖 `access` 与 `triggers`：管理员停用、启用用户的命令（`commands.py`）与确认欢迎语（`gate.py`）
+也要处理恢复，而 `reminders.py` 依赖 `commands` 与 `gate`，不能反过来。表是第 17 版的 `reminder_user_state`，第 18 版
+加了暂停与开关事件的列。
 
-提醒暂停（`pause_reason()`）：删了好友、被停用、没有授权。暂停期间到期的次数不发、不补、不记失败。调度器每分钟检查时
-会把暂停用户的到期次数静默推进；暂停与恢复都发生在两次检查之间（如等用户锁时删好友又加回）时，靠这里记下的最近一次
-暂停的起止（`pause_started`、`pause_ended`）把落在其间的次数推进掉。每次可能改变暂停状态的地方都调用 `sync_pause()`：
-删好友与加好友（`ReminderService.friend_changed()`）、管理员停用与启用（`commands.py`）；调度器派发时也调用一次。
+提醒暂停（`pause_reason()`）：删了好友、被停用、没有授权。暂停期间到期的次数不发、不补、不记失败。
+
+- 调度器每分钟检查时，把仍在暂停的用户的到期次数静默推进。
+- **恢复时推进**（`sync_pause(resumed=True)`）：在每个「从暂停变回可发」的地方，在记下恢复的同一个事务里，把这个用户
+  所有有效提醒里时刻已经过去、还没处理的次数静默推进（不发、不记失败，照常消耗次数，一次性的作废）。暂停开始之前
+  就到期、还没来得及处理的几次（如正在等用户锁）也一起推进，这是接受的代价。这些地方是：`/enable`、重新加好友、
+  欢迎语确认发出（兑换邀请之后，或补发的欢迎语）；调度器派发时发现之前记过暂停（`paused_since` 不为空）而现在已经
+  恢复，也同样推进。
+- 第 18 版的 `paused_since` 记下暂停从什么时候开始（派发时据此认出「已经恢复」）；`pause_started`、`pause_ended` 只是
+  记录最近一次暂停的起止，程序不再据此判断。
 
 函数都是同步的，第一个参数是连接，由调用方放进事务里；时间一律是 UTC 的 Unix 秒。
 """
@@ -14,8 +21,14 @@
 import sqlite3
 from dataclasses import dataclass
 from enum import StrEnum
+from zoneinfo import ZoneInfo
 
 from .access import User, UserStatus
+from .triggers import Occurrence, first_upcoming, load_trigger
+
+PROVEN_ON_TOLERANCE_SECONDS = 60
+"""发送成功证明开关是「开」：比这一刻早这么多秒以上的授权互动（平台时间）不再改状态。平台与我们的时钟不同源，留这么多
+余量：成功发送前后几十秒内用户关掉开关，那条「关」照样生效。"""
 
 
 class PushState(StrEnum):
@@ -97,8 +110,9 @@ def record_push(
 ) -> bool:
     """记下主动消息开关的状态。改成「开」时清掉今天试发过的记录。
 
-    `event_at` 是授权互动的平台时间（来自授权互动时给）：比上一次授权互动的平台时间更早（晚到的旧事件）时不改，返回
-    `False`。我们自己推断出的状态（发送成功就记成「开」）不给它，只和上一次授权互动比，不和推断的比。
+    `event_at` 是授权互动的平台时间（来自授权互动时给）：比已知状态的时刻更早（晚到的旧事件）时不改，返回 `False`。
+    「已知状态的时刻」（`push_event_at`）是上一次授权互动的平台时间，或发送成功所证明的「开」的时刻减去
+    `PROVEN_ON_TOLERANCE_SECONDS`（`record_proven_on()`），取较晚的。
     """
     cursor = conn.execute(
         "INSERT INTO reminder_user_state (user_id, push, push_updated_at, push_event_at)"
@@ -112,6 +126,20 @@ def record_push(
         (user_id, state.value, now, event_at),
     )
     return cursor.rowcount == 1
+
+
+def record_proven_on(conn: sqlite3.Connection, user_id: int, now: int) -> None:
+    """主动消息发送成功：开关一定是「开」。记成「开」，并把已知状态的时刻推到 `now - PROVEN_ON_TOLERANCE_SECONDS`
+    （不往回退），更早的授权互动之后不再改状态（如漏收「打开」之后晚到的旧「关闭」）。"""
+    watermark = now - PROVEN_ON_TOLERANCE_SECONDS
+    conn.execute(
+        "INSERT INTO reminder_user_state (user_id, push, push_updated_at, push_event_at)"
+        " VALUES (?, 'on', ?, ?)"
+        " ON CONFLICT (user_id) DO UPDATE SET push = 'on', push_updated_at = excluded.push_updated_at,"
+        " push_trial_day = NULL,"
+        " push_event_at = max(coalesce(push_event_at, excluded.push_event_at), excluded.push_event_at)",
+        (user_id, now, watermark),
+    )
 
 
 def record_trial(conn: sqlite3.Connection, user_id: int, day: str) -> None:
@@ -150,20 +178,68 @@ def pause_reason(conn: sqlite3.Connection, user: User, admin_openid: str) -> Pau
     return None
 
 
-def sync_pause(conn: sqlite3.Connection, user: User, admin_openid: str, now: int) -> None:
-    """按现在的状态记下暂停与恢复的时刻：刚变成暂停的记下开始；刚恢复的把这次暂停的起止记成最近一次暂停。`user` 要
-    是改动之后的那一行。"""
+def sync_pause(
+    conn: sqlite3.Connection,
+    user: User,
+    admin_openid: str,
+    timezone: ZoneInfo,
+    now: int,
+    *,
+    resumed: bool = False,
+) -> int:
+    """按现在的状态处理暂停与恢复，返回静默推进了几条提醒。`user` 要是改动之后的那一行。
+
+    - 仍在暂停：没记过开始的记下 `paused_since`。
+    - 可以发了，且 `resumed` 为真（调用方刚清掉一个暂停原因：启用、重新加好友、欢迎语确认发出）或之前记过暂停：推进
+      这个用户已经过去、还没处理的次数（`skip_overdue()`），把这次暂停的起止记下来，清掉 `paused_since`。
+    """
     paused = pause_reason(conn, user, admin_openid) is not None
     state = get_user_state(conn, user.id)
-    if paused and state.paused_since is None:
-        conn.execute(
-            "INSERT INTO reminder_user_state (user_id, paused_since) VALUES (?, ?)"
-            " ON CONFLICT (user_id) DO UPDATE SET paused_since = excluded.paused_since",
-            (user.id, now),
-        )
-    elif not paused and state.paused_since is not None:
+    if paused:
+        if state.paused_since is None:
+            conn.execute(
+                "INSERT INTO reminder_user_state (user_id, paused_since) VALUES (?, ?)"
+                " ON CONFLICT (user_id) DO UPDATE SET paused_since = excluded.paused_since",
+                (user.id, now),
+            )
+        return 0
+    if not resumed and state.paused_since is None:
+        return 0
+    skipped = skip_overdue(conn, user.id, timezone, now)
+    if state.paused_since is not None:
         conn.execute(
             "UPDATE reminder_user_state SET pause_started = paused_since, pause_ended = ?,"
             " paused_since = NULL WHERE user_id = ?",
             (max(now, state.paused_since), user.id),
         )
+    return skipped
+
+
+def skip_overdue(conn: sqlite3.Connection, user_id: int, timezone: ZoneInfo, now: int) -> int:
+    """把这个用户所有有效提醒里时刻已经过去（不晚于 `now`）的次数静默推进到 `now` 之后：不发、不记失败，照常消耗
+    次数；一次性的与没有下一次的记为发完。返回推进了几条。"""
+    rows = conn.execute(
+        "SELECT id, trigger, anchor_at, next_index, next_fire_at FROM reminders"
+        " WHERE user_id = ? AND status = 'active' AND next_fire_at <= ?",
+        (user_id, now),
+    ).fetchall()
+    for row in rows:
+        following = first_upcoming(
+            load_trigger(row["trigger"]),
+            timezone,
+            anchor=row["anchor_at"],
+            after=now,
+            resume=Occurrence(row["next_index"], row["next_fire_at"]),
+        )
+        if following is None:
+            conn.execute(
+                "UPDATE reminders SET status = 'finished', next_index = NULL, next_fire_at = NULL,"
+                " ended_at = ? WHERE id = ?",
+                (now, row["id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE reminders SET next_index = ?, next_fire_at = ? WHERE id = ?",
+                (following.index, following.at, row["id"]),
+            )
+    return len(rows)

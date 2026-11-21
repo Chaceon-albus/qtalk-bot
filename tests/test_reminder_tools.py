@@ -1095,3 +1095,38 @@ async def test_prompt_lists_at_most_twenty_reminders(db: Database, tmp_path: Pat
     system = system_of(model.requests[0])
     block = json.loads(system.split("提醒资料：\n", 1)[1].split("\n", 1)[0])
     assert len(block["reminders"]) == 20
+
+
+# ---- 第二轮评审后补的 ----
+
+
+def test_notice_asks_to_check_the_full_list_before_saying_cancelled() -> None:
+    assert "不要断言是哪一种" in REMINDER_NOTICE
+
+
+async def test_budget_is_checked_again_right_before_accepting(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from qtalk_bot import reminders as reminders_module
+    from qtalk_bot.process import MAX_PASSIVE_REPLIES
+
+    alice = await invited(db, ALICE, "小王")
+    model = QueueModel()
+    chat = reminder_chat(db, tmp_path, model)
+    channel = FakeChannel()
+    original = reminders_module.check_admission
+
+    def busy(*args: object, **kwargs: object) -> object:
+        channel.budget.replies = MAX_PASSIVE_REPLIES  # 等数据库期间余量被别处用光
+        return original(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(reminders_module, "check_admission", busy)
+    model.then(once(), *answer("好"))
+
+    await say(chat, alice, "明早提醒我", channel=channel)
+
+    error, text = result(model)
+    assert error
+    assert "发不了确认按钮" in text
+    assert channel.budget.reserved == 0
+    assert channel.buttons == []

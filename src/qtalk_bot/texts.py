@@ -11,9 +11,10 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from .journal import UsagePurpose, UsageSummary, UsageTotals
-from .triggers import LAST_DAY, Calendar, Interval, IntervalUnit, Once, Trigger
+from .triggers import LAST_DAY, Calendar, Interval, IntervalUnit, Once, Trigger, local_of
 
 ADMIN_NAME = "管理员"
 """管理员在用户表里的名字。"""
@@ -701,15 +702,20 @@ def reminder_moment(moment: datetime, now: datetime) -> str:
     return f"{reminder_date(moment, now)}{moment:%H:%M}"
 
 
-def reminder_rule(trigger: Trigger, now: datetime) -> str:
-    """触发规则的中文描述，如「每周一、周三 08:00，最多 10 次」。`now` 是本地时刻，只用来决定写不写年份。"""
+def reminder_rule(trigger: Trigger, now: datetime, timezone: ZoneInfo) -> str:
+    """触发规则的中文描述，如「每周一、周三 08:00，最多 10 次」。`now` 是本地时刻，只用来决定写不写年份。以绝对时刻为准
+    的（由相对时间换算出的一次性时刻与间隔起点）按 `timezone`（现在配置的时区）换算显示，与「下一次」一致。"""
     match trigger:
-        case Once(at=at):
-            return f"一次：{reminder_moment(at, now)}"
+        case Once(at=at, moment=moment):
+            shown = at if moment is None else local_of(moment, timezone)
+            return f"一次：{reminder_moment(shown, now)}"
         case Interval():
             unit = _UNIT_NAMES[trigger.unit]
             every = f"每{unit}" if trigger.every == 1 else f"每 {trigger.every} {unit}"
-            rule = f"{every}一次，从 {reminder_moment(trigger.start, now)} 起"
+            start = (
+                trigger.start if trigger.start_at is None else local_of(trigger.start_at, timezone)
+            )
+            rule = f"{every}一次，从 {reminder_moment(start, now)} 起"
         case Calendar():
             rule = f"{_calendar_days(trigger)} {'、'.join(f'{t:%H:%M}' for t in trigger.times)}"
     if trigger.end is not None:

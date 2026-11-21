@@ -197,11 +197,19 @@ def _set_status(
 def _change_status(
     conn: sqlite3.Connection, user_id: int, status: UserStatus, context: CommandContext, now: int
 ) -> None:
-    """改用户的状态，并记下提醒暂停或恢复的时刻（停用期间到期的提醒不补，见 `reminder_state.py`）。"""
+    """改用户的状态，并处理提醒的暂停与恢复：启用是「从暂停变回可发」，在同一个事务里把停用期间到期的提醒次数推进掉
+    （不发、不补，见 `reminder_state.py`）。"""
     access.set_user_status(conn, user_id, status)
     changed = access.get_user(conn, user_id)
     if changed is not None:
-        reminder_state.sync_pause(conn, changed, context.admin_openid, now)
+        reminder_state.sync_pause(
+            conn,
+            changed,
+            context.admin_openid,
+            context.timezone,
+            now,
+            resumed=status is UserStatus.ACTIVE,
+        )
 
 
 def day_start(now: int, timezone: ZoneInfo) -> int:

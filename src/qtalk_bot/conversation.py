@@ -3481,7 +3481,8 @@ class _ReminderTools:
                 return drawing.unknown_function(call.name)
 
     def _slot(self, kind: type[PendingSet | PendingCancel]) -> FunctionResult | None:
-        """这一轮待确认的一项能不能换成这一种：别的种类已经在了就拒绝；还没有时要留得出发按钮的余量。"""
+        """这一轮待确认的一项能不能换成这一种：别的种类已经在了就拒绝；还没有时要留得出发按钮的余量。调用开始时查一次
+        （省掉注定失败的数据库查询），`accept()` 之前在同一步里再查一次（之间不能有 await）。"""
         turn = self._turn
         pending = turn.pending
         if pending is not None and not isinstance(pending, kind):
@@ -3531,6 +3532,9 @@ class _ReminderTools:
             candidate.trigger, deps.timezone, anchor=now, now=now
         )
         assert summary is not None  # 通过了准入检查就至少还有一次
+        # 等数据库期间同一条消息的余量可能被别处用掉：复查与预留放在同一步里，中间不让出事件循环。
+        if (refused := self._slot(PendingSet)) is not None:
+            return refused
         replaced = isinstance(turn.pending, PendingSet)
         push_off = push is reminder_state.PushState.OFF
         turn.accept(PendingSet(candidate=candidate, summary=summary, push_off=push_off))
@@ -3591,6 +3595,8 @@ class _ReminderTools:
                 "给用户 %s 取消提醒：有 %d 个编号不是他有效的提醒", user.label, len(missing)
             )
             return self._failed(reminder_tools.not_found(missing), PendingCancel)
+        if (refused := self._slot(PendingCancel)) is not None:  # 同上：复查与预留在同一步里
+            return refused
         replaced = isinstance(turn.pending, PendingCancel)
         turn.accept(PendingCancel(tuple(items)))
         logger.info("用户 %s 要取消 %d 条提醒：这一轮结束后发确认按钮", user.label, len(items))

@@ -1,7 +1,7 @@
 """提醒的触发规则：解析与校验、触发时刻、夏令时、月底与闰年、补算与总次数。纯函数，时区与「现在」都是注入的。"""
 
 from datetime import datetime, time
-from itertools import islice
+from itertools import islice, pairwise
 from typing import cast
 from zoneinfo import ZoneInfo
 
@@ -551,3 +551,12 @@ def test_occurrence_at_recomputes_from_the_unconsumed_index() -> None:
         1, at("2026-11-21T09:00")
     )
     assert occurrence_at(hourly, SHANGHAI, anchor=NOW, index=3) is None
+
+
+def test_relative_daily_interval_keeps_one_base_across_timezones() -> None:
+    west, east = ZoneInfo("Etc/GMT+12"), ZoneInfo("Pacific/Kiritimati")  # UTC−12 与 UTC+14
+    now = resolve(datetime(2026, 11, 20, 9, 0), west)
+    trigger = parse(west, now, kind="interval", every=1, unit="days", delay_minutes=10, count=3)
+
+    found = list(upcoming(trigger, east, anchor=now, after=now - 1))
+    assert [b.at - a.at for a, b in pairwise(found)] == [86400, 86400]
