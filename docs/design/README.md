@@ -91,6 +91,7 @@
 | 8 | 提醒 | 已完成 |
 | 9 | 部署：镜像与 compose、健康检查、定时备份、管理员告警 | 已完成（Docker 构建待在 VPS 上实测） |
 | 10 | 生成图片：自己的画图函数与可配置的图片模型 | 已完成 |
+| 11 | 发送记录，之后把迁移合并回 V1 | 已定，等展示与交互的优化做完再做 |
 
 ## 文件索引
 
@@ -111,7 +112,7 @@
 | [live-tests.md](live-tests.md) | QQ 端到端实测的各次记录、搜索与过程展示的模型实测、还需要实测的事 | 做实测前后，或想知道某个行为在真实平台上验证过没有时 |
 | [open-questions.md](open-questions.md) | 其它待定的事（配额、时间感、数据去留、pyqbot 可以改进的地方等）与已知的薄弱处 | 动手做一块新功能之前，看有没有相关的待定项 |
 
-各里程碑在哪个文件：1 → `storage-and-config.md`；2 → `access.md`；3、5b、5c → `conversation.md`；4 → `model-routing.md`；5a → `attachments.md`；6a、6b → `memory.md`；7a、7b → `search-and-process.md`；8 → `reminders.md`；9 → `deployment.md`；10 → `image-generation.md`。
+各里程碑在哪个文件：1 → `storage-and-config.md`；2 → `access.md`；3、5b、5c → `conversation.md`；4 → `model-routing.md`；5a → `attachments.md`；6a、6b → `memory.md`；7a、7b → `search-and-process.md`；8 → `reminders.md`；9 → `deployment.md`；10 → `image-generation.md`；11 → `conversation.md` 的「发送记录」与 `storage-and-config.md` 的「存储」。
 
 ## 使用约定
 
