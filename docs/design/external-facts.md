@@ -2,7 +2,7 @@
 
 写代码时依赖的服务商接口、模型与 QQ 平台的行为，各条注明了出处与查证的时间。
 
-2026-11-18 查自官方文档，经摘要工具读取，没有实际调用过。这些接口都很新，写代码前以官方文档为准。
+Decisions API、模型、内置搜索、思考摘要与过程标记这四节里没有另注日期的条目是 2026-11-18 查自官方文档，经摘要工具读取，当时没有实际调用过；QQ 平台一节的出处写在那一节里。之后的实际调用见 [live-tests.md](live-tests.md) 与各模块的文件。这些接口都很新，写代码前以官方文档为准。
 
 ## Decisions API
 
@@ -48,7 +48,7 @@
 | 引用 | 文本里的 `url_citation` 标注 | `model_output` 文本块上的 `url_citation` 标注 |
 | 展示要求 | 引用必须显示成醒目的、可点击的链接 | 必须同时展示它给的「搜索建议」，那是一段 HTML |
 
-Gemini 的展示要求在 QQ 里做不到：QQ 渲染不了 HTML。两家的条款由用户另行确认，确认前不要默认在 Gemini 的模型上开启搜索。
+Gemini 的「搜索建议」在搜索结果的单独字段里，不在回答正文里；QQ 渲染不了 HTML，本项目忽略它，见[「内置搜索与来源」](search-and-process.md#内置搜索与来源)。
 
 文档：[OpenAI 搜索工具](https://developers.openai.com/api/docs/guides/tools-web-search)、[OpenAI 流式事件](https://developers.openai.com/api/reference/resources/responses/streaming-events)、[Gemini 搜索](https://aistudio.google.com/docs/google-search)、[Gemini 流式](https://aistudio.google.com/docs/streaming)、[Gemini 条款](https://aistudio.google.com/docs/terms#grounding-with-google-search)。
 
@@ -61,7 +61,7 @@ Gemini 的展示要求在 QQ 里做不到：QQ 渲染不了 HTML。两家的条�
 | 调用工具前的说明 | 消息输出项的 `phase` 为 `"commentary"`，最终回答为 `"final_answer"` | 没有标记；只能事后判断：后面跟着工具步骤的文本就是说明 |
 | 注意 | 可能要先通过组织验证；自己重放历史时要把 `phase` 原样带回 | 摘要可能为空 |
 
-`gpt-6.2-sol` 对思考摘要和 `phase` 的支持，官方文档只是暗示，没有明说。
+`gpt-6.2-sol` 对思考摘要和 `phase` 的支持，官方文档只是暗示，没有明说；2026-11-19 实测两者都有（摘要很稀疏，没有遇到组织验证的拒绝），见[「搜索与过程展示的模型实测」](live-tests.md#搜索与过程展示的模型实测2026-11-19)。
 
 文档：[OpenAI 推理指南](https://developers.openai.com/api/docs/guides/reasoning)、[Gemini 思考](https://aistudio.google.com/docs/thinking)、[Gemini 函数调用](https://aistudio.google.com/docs/function-calling)。
 
@@ -72,7 +72,7 @@ Gemini 的展示要求在 QQ 里做不到：QQ 渲染不了 HTML。两家的条�
 - 单聊被动回复的有效期约 60 分钟，实测 55 分钟后仍能回复。
 - 同一条消息实测能先发「正在输入」再被动回复 4 条；之后的分条实测里同一条消息收了 12 条回复都被接受（见下）。
 - Markdown 里形如链接、目标却不是 URL 的文字会被判「消息内容违规」（40034006），大模型的输出要先处理。
-- 语音附件带 `voice_wav_url`（转成 WAV 后的地址）与 `asr_refer_text`（识别的参考文本）。pyqbot 已有这两个字段，没有实测过。
+- 语音附件带 `voice_wav_url`（转成 WAV 后的地址）与 `asr_refer_text`（识别的参考文本）。pyqbot 已有这两个字段；第一次 QQ 实测收到的语音两者都有，见[「实测记录」](live-tests.md#qq-端到端实测记录)。
 - 单聊主动消息的官方限额是每个用户每天 1000 条。用户切换资料卡里的开关时，平台推的是 `type` 18 的互动事件。
 
 2026-11-20 pyqbot 的实测（它的 `tests/live/test_live_quote.py`，结论记在它的 `docs/errata.md`，提交 84d1604）：
@@ -81,7 +81,7 @@ Gemini 的展示要求在 QQ 里做不到：QQ 渲染不了 HTML。两家的条�
 - **同一条用户消息可以先后被动回复两条流式消息**，两条都正常显示、正常结束：过程消息加回答的做法成立。
 - 流式消息的每个分片响应（含结束分片）都带同一个 `id`（`stream_msg_id`）与同一个 `ext_info.ref_idx`。
 - **引用**：`message.ref_msg_idx` 四次都对上——引用机器人的普通消息时等于发送结果的 `ext_info.ref_idx`，引用流式消息时等于 `StreamMessage.ref_idx`，引用用户自己的消息时等于那条消息的 `msg_idx`。`msg_elements` 只有一项，就是被引用的那条：`msg_elements[0].msg_idx == ref_msg_idx`，`content` 是完整正文，`message_type` 总是 103，没有 `author`。
-- **等待气泡**：用户每发一条单聊消息，客户端底部先出现一个三个点在跳的空气泡；机器人回复后它变成回复，不回复时约 1 分钟后才消失。用户决定接受、保持现状：表情照旧忽略，单独的附件照旧等下文或 60 秒后问一句。
+- **等待气泡**：用户每发一条单聊消息，客户端底部先出现一个三个点在跳的空气泡；机器人回复后它变成回复，不回复时约 1 分钟后才消失。接受、保持现状：表情照旧忽略，单独的附件照旧等下文或 60 秒后问一句。
 
 2026-11-20 pyqbot 的流式分条实测（它的 `tests/live/test_live_stream_split.py`，errata「流式消息：超过约 15000 字节被拆成几条气泡，多出的每条占一个 `msg_seq`」，提交 1257474..0217465）：
 
