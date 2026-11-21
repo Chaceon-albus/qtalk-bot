@@ -238,6 +238,16 @@ def active_reminders(conn: sqlite3.Connection, user_id: int) -> list[Reminder]:
     return [_reminder(row) for row in rows]
 
 
+def next_reminders(conn: sqlite3.Connection, user_id: int, limit: int) -> list[Reminder]:
+    """这个用户当前有效的提醒里下一次最早的 `limit` 条（给系统提示词，查询里就限好条数）。"""
+    rows = conn.execute(
+        f"SELECT {_REMINDER_COLUMNS} FROM reminders"  # noqa: S608  只拼列名常量
+        " WHERE user_id = ? AND status = 'active' ORDER BY next_fire_at, id LIMIT ?",
+        (user_id, limit),
+    ).fetchall()
+    return [_reminder(row) for row in rows]
+
+
 def count_active(conn: sqlite3.Connection, user_id: int) -> int:
     row = conn.execute(
         "SELECT count(*) FROM reminders WHERE user_id = ? AND status = 'active'", (user_id,)
@@ -589,6 +599,66 @@ def summarize_schedule(
         final=final,
         remaining=None if final is None else final.index - shown[0].index + 1,
         text=text,
+    )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ActiveView:
+    """一条有效提醒写好的样子（列表、系统提示词里的资料用）。
+
+    Attributes:
+        id: 编号。
+        content: 提醒文字。
+        rule: 规则的中文描述。
+        next: 下一次的时刻（写好的，带星期）。
+        remaining: 还剩几次（含下一次）；没有结束或数不过来时为 `None`。
+        end: 结束时刻（写好的）；没有时为 `None`。
+    """
+
+    id: int
+    content: str = field(repr=False)
+    rule: str
+    next: str
+    remaining: int | None
+    end: str | None
+
+
+def describe_active(
+    conn: sqlite3.Connection, user_id: int, timezone: ZoneInfo, now: int, limit: int | None = None
+) -> list[ActiveView]:
+    """这个用户当前有效的提醒写好的样子，按下一次的时刻排列，最多 `limit` 条。"""
+    views: list[ActiveView] = []
+    for reminder in active_reminders(conn, user_id)[:limit]:
+        if reminder.next is None:
+            continue
+        summary = summarize_schedule(
+            reminder.trigger,
+            timezone,
+            anchor=reminder.anchor_at,
+            now=min(now, reminder.next.at - 1),
+            resume=reminder.next,
+        )
+        end = reminder.trigger.end if isinstance(reminder.trigger, Interval | Calendar) else None
+        views.append(
+            ActiveView(
+                id=reminder.id,
+                content=reminder.content,
+                rule=rule_text(reminder.trigger, timezone, now),
+                next=moment_text(reminder.next.at, timezone, now),
+                remaining=None if summary is None else summary.remaining,
+                end=None if end is None else moment_text(resolve(end, timezone), timezone, now),
+            )
+        )
+    return views
+
+
+def count_unnotified(conn: sqlite3.Connection, user_id: int) -> int:
+    """还没告知的失败有几条提醒（同一条提醒的几种原因算一条，与失败通知的计法相同）。"""
+    return len(
+        {
+            ("reminder", r.reminder_id) if r.reminder_id is not None else ("row", r.id)
+            for r in pending_failures(conn, user_id)
+        }
     )
 
 

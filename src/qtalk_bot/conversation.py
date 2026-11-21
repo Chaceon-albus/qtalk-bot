@@ -147,13 +147,23 @@
 （纯文本，计进 `ReplyBudget`，发完要给回答留不足余量时不发）。它不算回答开始显示（不 `claim()`），插话照常可以重来；
 发送失败只记日志，这一轮照常继续。到点发提醒与回复授权互动也拿这个用户的锁（`user_lock()`），与他的轮次串行。
 
+**提醒的函数与确认按钮**（里程碑 8，构造时给了 `reminder_settings`）：所有对话模型的请求都带上 `reminder_tools.FUNCTIONS`
+（设置、列出、取消提醒），不依赖话题线与 `[memory]`，执行方是 `_ReminderTools`；系统提示词里带上这个用户的提醒资料
+（`_reminder_brief()`，开轮的事务里取）。设置与取消本身不改任何东西，只把这一项记进 `_Turn.pending`。
+- **一轮只出一条确认**（`confirmations.py`）：忘掉话题、设置提醒、取消提醒共用 `_Turn.pending`。同一种后到的：设置与
+  取消取代前一次，忘掉话题照旧只能是同一个话题；不同种类后到的被拒（`reminder_tools.slot_taken()`）。这一轮记账之后
+  `_offer()` 按它发一条 Markdown 加两个按钮的消息，令牌经 `confirmations.TokenRegistry` 登记（带种类，10 分钟，只能用
+  一次，只在内存里）。
+- 点按钮（`press_button()`）按令牌的种类分派：忘掉话题照旧；设置在用户的锁与一个事务里先复查授权、再
+  `reminders.create_reminder()`（重新校验条数、频率、是否还有剩下的触发），回复实际的下一次与还剩几次；取消不看授权，
+  回复取消了哪几条。已不能使用对话的用户点提醒的按钮不回复、不新建。
+
 **判断插话**（`judge()`）：在事务里复查授权、取出正在回答的消息与新消息的文字版（只有这个用户自己的），交给
 `routing.SteerJudge`；决策记录与用量挂在新消息里最后一条上，被取消时也照记。
 """
 
 import asyncio
 import logging
-import secrets
 import sqlite3
 import time
 from collections.abc import (
@@ -180,11 +190,38 @@ from math import inf
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
-from . import access, citations, drawing, faces, journal, memory_tools, profiles, texts, topics
+from . import (
+    access,
+    citations,
+    drawing,
+    faces,
+    journal,
+    memory_tools,
+    profiles,
+    reminder_tools,
+    reminders,
+    texts,
+    topics,
+)
 from .access import User
 from .citations import Source
 from .commands import day_start
-from .config import AttachmentSettings, ChatSettings, ImageGenerationSettings
+from .config import AttachmentSettings, ChatSettings, ImageGenerationSettings, ReminderSettings
+from .confirmations import (
+    TOKEN_SECONDS,
+    ButtonKind,
+    CancelItem,
+    Pending,
+    PendingCancel,
+    PendingForget,
+    PendingSet,
+    Refused,
+    Ticket,
+    TokenRegistry,
+    button_data,
+    kind_of,
+    parse_click,
+)
 from .context import (
     Built,
     RequestBuilder,
@@ -263,7 +300,7 @@ from .process import (
     Sleep,
     Timer,
 )
-from .prompt import Memory
+from .prompt import Memory, ReminderBrief, ReminderEntry, ReminderSent
 from .routing import (
     LATEST_CHARS,
     DecisionRecord,
@@ -276,6 +313,7 @@ from .routing import (
 )
 from .splitting import Cut, Piece, StreamSplitter
 from .storage import Database
+from .triggers import Once
 
 logger = logging.getLogger(__name__)
 
@@ -304,10 +342,16 @@ MIN_CALL_SECONDS = 60.0
 
 CHECKPOINT_RETRY_DELAYS = (0.5, 1.0, 2.0)
 """删掉话题后 WAL 检查点被别的读者挡住时，各次重试之前等的秒数；都失败就记警告，留给之后的检查点。"""
-FORGET_PREFIX = "forget:"
+FORGET_PREFIX = button_data(ButtonKind.FORGET_TOPIC, True, "")
 """「确认删除」按钮数据的前缀，后面是令牌。"""
-KEEP_PREFIX = "keep:"
+KEEP_PREFIX = button_data(ButtonKind.FORGET_TOPIC, False, "")
 """「取消」按钮数据的前缀，后面是令牌。"""
+BRIEF_REMINDERS = 20
+"""系统提示词的提醒资料里最多列几条有效的提醒。"""
+RECENT_SENT_SECONDS = 24 * 3600
+"""系统提示词的提醒资料里列最近这么久发出过的提醒。"""
+RECENT_SENT_SHOWN = 5
+"""最多列几条最近发出过的提醒。"""
 
 
 class SendError(Exception):
@@ -673,6 +717,7 @@ class _Begun:
         None  # 回复所挂的那条消息记进流水的时刻（`Conversation` 的墙上时钟）
     )
     profile: str = field(default="", repr=False)  # 问档案题时这个用户现有的档案，放进决策的输入
+    reminders: ReminderBrief | None = None  # 启用了提醒时系统提示词里的提醒资料
 
     @property
     def last_message_id(self) -> int:
@@ -737,13 +782,27 @@ class _Turn:
         self.images_delivered = 0  # 确认发给了用户的图
         self.images_uncertain = 0  # 说不准是否送达的图
         self.image_ref: str | None = None  # 第一张确认送达的图的引用索引
-        # `forget_topic` 要忘掉的话题（编号与标题）：这一轮记账之后发确认按钮（`Conversation._offer_forget()`）。
-        self.forget: tuple[int, str] | None = None
+        # 这一轮待确认的一项（忘掉话题、设置或取消提醒，`confirmations.py`）：记账之后发确认按钮（`Conversation._offer()`）。
+        self.pending: Pending | None = None
         self.profile_forgotten = False  # 这一轮调用过 `forget_profile_item`：不再排整份档案的重写
         self.ended = False  # 记账时这一轮记下了轮次边界（`journal.ends_turn()`）
         # 这一轮带上的全部用户消息：用户点了「确认删除」时随话题一并删掉。
         self.messages: tuple[int, ...] = ()
         self.control.on_cut(self.cut)
+
+    def accept(self, pending: Pending) -> None:
+        """接受（或取代）这一轮待确认的一项。第一次接受时为轮末的确认按钮预留一次被动回复（`ReplyBudget.reserve()`），
+        之后的「正在输入」、过程消息、改发纯文本等都把它算进去。"""
+        if self.pending is None:
+            self.channel.budget.reserve()
+        self.pending = pending
+
+    def drop_pending(self) -> Pending | None:
+        """作废这一轮待确认的一项（换备用模型重来、同一种后一次调用没通过、轮末要发它了），退回预留；返回作废的那一项。"""
+        pending, self.pending = self.pending, None
+        if pending is not None:
+            self.channel.budget.release()
+        return pending
 
     @property
     def images_shown(self) -> bool:
@@ -865,6 +924,7 @@ class Conversation:
         image_generator: ImageGenerator | None = None,
         image_generation: ImageGenerationSettings | None = None,
         reminders: FailureNotices | None = None,
+        reminder_settings: ReminderSettings | None = None,
         clock: Callable[[], float] = time.time,
         timer: Timer | None = None,
         sleep: Sleep = asyncio.sleep,
@@ -872,6 +932,8 @@ class Conversation:
         """`models` 按内部名字给出配置里的全部对话模型，`router` 决定每条消息用哪一个。
 
         `reminders` 不为空时（启用了 `[reminders]`），每轮真正开始时先发提醒的失败通知（见 `_respond()`）。
+        `reminder_settings` 不为空时（启用了 `[reminders]`），所有对话模型都有设置、列出、取消提醒的函数，系统提示词里
+        带上提醒资料。
 
         `fetcher` 为 `None` 时不下载附件（都按「没有下载」处理，只用文字版）；`describer` 为 `None` 时不给
         图片写描述、不给 PDF 写摘要；`summarizer` 为 `None` 时不给话题写标题与摘要（只在分话题时用到）；`steer` 为
@@ -894,6 +956,7 @@ class Conversation:
         self._image_generator = image_generator
         self._image_generation = image_generation
         self._reminders = reminders
+        self._reminder_settings = reminder_settings
         self._timezone = timezone
         self._clock = clock
         self._timer: Timer = timer or (lambda: asyncio.get_running_loop().time())
@@ -901,8 +964,8 @@ class Conversation:
         self._locks = _UserLocks()
         self._media_slots = asyncio.Semaphore(MULTIMODAL_REQUESTS)
         self._in_flight: set[asyncio.Future[None]] = set()
-        # 忘掉话题的确认按钮里的令牌 → 那次请求（只在内存里，重启就失效）。
-        self._forget_tokens: dict[str, _ForgetToken] = {}
+        # 确认按钮里的令牌 → 那次请求（只在内存里，重启就失效）。
+        self._tokens = TokenRegistry(self._timer)
         inputs = {modality for model in router.models for modality in model.inputs}
         wanted = {
             kind
@@ -1071,111 +1134,249 @@ class Conversation:
     async def press_button(
         self, openid: str, data: str, reply: Callable[[str], Awaitable[None]]
     ) -> None:
-        """用户点了忘掉话题的确认按钮（接线层只把 `FORGET_PREFIX`、`KEEP_PREFIX` 开头的交过来）。要回复用户时调用
-        `reply`（接线层的被动回复，自己处理发送失败）。
+        """用户点了确认按钮（接线层只把 `confirmations.BUTTON_PREFIXES` 开头的交过来）：忘掉话题，或设置、取消提醒。要
+        回复用户时调用 `reply`（接线层的被动回复，自己处理发送失败）。
 
         整次点击（含回复）都在这个用户的锁里，与他的轮次串行：正在写的流式回答结束之后才处理、才回复，免得互动的
-        回复插进去让平台提前结束它。按 openid 找不到用户时不处理。
+        回复插进去让平台提前结束它。按 openid 找不到用户时不处理。令牌见 `confirmations.TokenRegistry`：
 
-        - 令牌不存在或已过期（`FORGET_TOKEN_SECONDS`，或机器人重启过、已经点过）：请用户重新说一次。
+        - 令牌不存在、已过期（`TOKEN_SECONDS`）、已经点过、机器人重启过，或种类与按钮不符：请用户重新说一次（忘掉话题与
+          提醒各有文案）。
         - 点的人与令牌记下的用户不符：只记日志，不回复、不处理（令牌照旧有效）。
-        - 令牌只能用一次：点过任一按钮就作废。点「取消」什么都不删。
-        - 点「确认删除」：删掉这个话题，连同令牌记下的那一轮的用户消息（与回复），以及因此变空的话题
+        - 令牌只能用一次：点过任一按钮就作废。点「取消」「保留」什么都不改。
+        - 忘掉话题，点「确认删除」：删掉这个话题，连同令牌记下的那一轮的用户消息（与回复），以及因此变空的话题
           （`_erase_topics()`）。话题已经不在时照样删掉那一轮的消息。不看授权：这是用户自己的数据；档案清理的后台
           任务调用模型前照旧复查授权。
+        - 提醒（`_press_reminder()`）：已不能使用对话（未授权、停用、暂停）的用户点了不回复；点「确认」新建前在同一个
+          事务里复查授权，不通过不建；取消不看授权（删的是自己的数据），照样取消，只是不回复。
         由 `drain()` 等待。
         """
         async with self._tracking():
-            if data.startswith(FORGET_PREFIX):
-                confirmed, token = True, data.removeprefix(FORGET_PREFIX)
-            elif data.startswith(KEEP_PREFIX):
-                confirmed, token = False, data.removeprefix(KEEP_PREFIX)
-            else:
+            click = parse_click(data)
+            if click is None:
                 return
             user = await self._db.transaction(access.get_user_by_openid, openid)
             if user is None:
-                logger.info("不认识的人点了忘掉话题的按钮，不处理")
+                logger.info("不认识的人点了确认按钮，不处理")
                 return
             async with self._locks.hold(user.id):
-                self._prune_tokens()
-                found = self._forget_tokens.get(token)
-                if found is None:
+                taken = self._tokens.take(click, user, openid)
+                if taken is Refused.NOT_YOURS:
+                    logger.warning("用户 %s 点了不是发给他的确认按钮，不处理", user.label)
+                    return
+                if click.kind is not ButtonKind.FORGET_TOPIC:
+                    await self._press_reminder(user, click.kind, click.confirmed, taken, reply)
+                    return
+                if taken is Refused.EXPIRED:
                     logger.info("用户 %s 点的忘掉话题的按钮已经失效", user.label)
                     await reply(texts.forget_expired(FORGET_TOKEN_SECONDS // 60))
                     return
-                if found.user_id != user.id or not secrets.compare_digest(found.openid, openid):
-                    logger.warning(
-                        "用户 %s 点了不是发给他的忘掉话题的按钮（用户编号 %d），不处理",
-                        user.label,
-                        found.user_id,
-                    )
-                    return
-                del self._forget_tokens[token]  # 只能用一次
-                if not confirmed:
-                    logger.info("用户 %s 取消了忘掉话题 %d", user.label, found.topic_id)
+                pending = taken.pending
+                assert isinstance(pending, PendingForget)
+                if not click.confirmed:
+                    logger.info("用户 %s 取消了忘掉话题 %d", user.label, pending.topic_id)
                     await reply(texts.FORGET_CANCELLED)
                     return
                 existed = await self._erase_topics(
-                    user, (found.topic_id,), {found.topic_id: found.messages}
+                    user, (pending.topic_id,), {pending.topic_id: taken.messages}
                 )
                 await reply(
-                    texts.forget_done(found.topic_id) if existed else texts.FORGET_TOPIC_GONE
+                    texts.forget_done(pending.topic_id) if existed else texts.FORGET_TOPIC_GONE
                 )
 
-    def _prune_tokens(self) -> None:
-        now = self._timer()
-        for token, entry in list(self._forget_tokens.items()):
-            if entry.expires_at <= now:
-                del self._forget_tokens[token]
+    async def _press_reminder(
+        self,
+        user: User,
+        kind: ButtonKind,
+        confirmed: bool,
+        taken: Ticket | Refused,
+        reply: Callable[[str], Awaitable[None]],
+    ) -> None:
+        """点了设置或取消提醒的按钮（在这个用户的锁里）。规则见 `press_button()`。"""
+        settings = self._reminder_settings
+        cancelling = kind is ButtonKind.CANCEL_REMINDER
+        if isinstance(taken, Ticket) and confirmed and cancelling:
+            pending = taken.pending
+            assert isinstance(pending, PendingCancel)
+            ids = [item.reminder_id for item in pending.items]
+            cancelled, allowed = await self._db.transaction(self._confirm_cancel, user, ids)
+            logger.info("用户 %s 确认取消提醒，取消了 %d 条", user.label, len(cancelled))
+            if allowed:
+                names = {item.reminder_id: item.content for item in pending.items}
+                gone = [n for n in ids if n not in cancelled]
+                await reply(texts.reminder_cancelled([(n, names[n]) for n in cancelled], gone))
+            return
+        if isinstance(taken, Ticket) and confirmed and settings is not None:
+            pending = taken.pending
+            assert isinstance(pending, PendingSet)
+            outcome = await self._db.transaction(self._confirm_set, user, pending, settings)
+            if outcome is None:
+                logger.info("用户 %s 已不能使用对话，点了「确认」也不建提醒、不回复", user.label)
+                return
+            await reply(outcome)
+            return
+        if not await self._db.transaction(self._allowed, user):
+            logger.info("用户 %s 已不能使用对话，点了提醒的按钮不回复", user.label)
+            return
+        if not isinstance(taken, Ticket) or (settings is None and confirmed):
+            logger.info("用户 %s 点的提醒按钮已经失效", user.label)
+            await reply(texts.reminder_buttons_expired(TOKEN_SECONDS // 60))
+            return
+        logger.info("用户 %s 没有确认%s提醒", user.label, "取消" if cancelling else "设置")
+        await reply(texts.REMINDER_CANCEL_DECLINED if cancelling else texts.REMINDER_SET_DECLINED)
 
-    async def _offer_forget(self, turn: _Turn, forget: tuple[int, str]) -> None:
-        """这一轮记账之后，对这一轮回复挂的那条消息发一条带「确认删除」「取消」按钮的消息（不进流水）。
+    def _confirm_cancel(
+        self, conn: sqlite3.Connection, user: User, ids: Sequence[int]
+    ) -> tuple[list[int], bool]:
+        """确认取消：不看授权，取消这个用户仍然有效的那几条；同时告诉调用方回不回复（能不能使用对话）。"""
+        cancelled = reminders.cancel_reminders(conn, user.id, ids, int(self._clock()))
+        return cancelled, self._allowed(conn, user)
+
+    def _confirm_set(
+        self,
+        conn: sqlite3.Connection,
+        user: User,
+        pending: PendingSet,
+        settings: ReminderSettings,
+    ) -> str | None:
+        """确认新建：同一个事务里复查授权（不通过返回 `None`，不建、不回复），再新建（重新校验条数、频率、是否还有剩下的
+        触发）。返回给用户的回复。"""
+        current = access.get_user(conn, user.id)
+        if (
+            current is None
+            or not self._allowed(conn, user)
+            or reminders.pause_reason(conn, current, self._admin_openid) is not None
+        ):
+            return None  # 已不能使用对话，或提醒暂停中（如删了好友）：不建、不回复
+        now = int(self._clock())
+        timezone = self._timezone
+        result = reminders.create_reminder(
+            conn, user.id, pending.candidate, settings=settings, timezone=timezone, now=now
+        )
+        match result:
+            case reminders.Created(reminder=reminder, first=first, remaining=remaining):
+                push_off = reminders.get_user_state(conn, user.id).push is reminders.PushState.OFF
+                logger.info("用户 %s 确认设置提醒 #%d", user.label, reminder.id)
+                return texts.reminder_created(
+                    reminder_id=reminder.id,
+                    content=reminder.content,
+                    next_at=reminders.moment_text(first.at, timezone, now),
+                    remaining=None if isinstance(reminder.trigger, Once) else remaining,
+                    push_off=push_off,
+                )
+            case reminders.TooManyActive(active=active, limit=limit):
+                why, text = "有效条数到了上限", texts.reminder_too_many(active, limit)
+            case reminders.RateExceeded(period=period, start=start, count=count, limit=limit):
+                why = "超过频率上限"
+                text = texts.reminder_rate_exceeded(
+                    reminder_tools.period_text(period, start, timezone, now),
+                    count,
+                    limit,
+                    hourly=period is reminders.Period.HOUR,
+                )
+            case reminders.NothingLeft():
+                once = isinstance(pending.candidate.trigger, Once)
+                why = "时刻已过" if once else "没有剩下的触发"
+                text = texts.REMINDER_ONCE_PASSED if once else texts.REMINDER_NOTHING_LEFT
+            case reminders.TooDense():
+                why, text = "太密", texts.REMINDER_TOO_DENSE
+        logger.info("用户 %s 点了「确认」，提醒没有建（%s）", user.label, why)
+        return text
+
+    async def _offer(self, turn: _Turn, pending: Pending) -> None:
+        """这一轮记账之后，对这一轮回复挂的那条消息发一条带按钮的确认消息（不进流水）。
 
         先复查授权：停用了就不发（已经发出的有效按钮照设计仍可删本人的数据）。被插话重来、余量不够时不发；平台拒发而
-        余量还够发一条纯文字时，补一句「按钮没能发出来」（`texts.FORGET_BUTTONS_FAILED`），免得用户以为该有按钮。
-        发送结果说不准时只记日志（按钮可能已经到了）。"""
-        topic_id, title = forget
+        余量还够发一条纯文字时，补一句「按钮没能发出来」，免得用户以为该有按钮。发送结果说不准时只记日志（按钮可能
+        已经到了）。"""
         user = turn.user
+        kind = kind_of(pending)
         if turn.control.preempted:
             return
         if not await self._db.transaction(self._allowed, user):
-            logger.info("用户 %s 已不能使用对话，不发忘掉话题的确认按钮", user.label)
+            logger.info("用户 %s 已不能使用对话，不发确认按钮（%s）", user.label, kind.value)
             return
         if not turn.channel.budget.affords_last():
-            logger.info("用户 %s 这条消息的被动回复次数用完了，没发忘掉话题的确认按钮", user.label)
+            logger.info(
+                "用户 %s 这条消息的被动回复次数用完了，没发确认按钮（%s）", user.label, kind.value
+            )
             return
-        self._prune_tokens()
-        token = secrets.token_urlsafe(16)
-        self._forget_tokens[token] = _ForgetToken(
-            user_id=user.id,
-            openid=user.openid,
-            topic_id=topic_id,
-            title=title,
-            messages=turn.messages,
-            expires_at=self._timer() + FORGET_TOKEN_SECONDS,
-        )
+        minutes = TOKEN_SECONDS // 60
+        match pending:
+            case PendingForget(topic_id=topic_id, title=title):
+                markdown = texts.forget_prompt(topic_id, title, minutes)
+                labels = (
+                    (texts.FORGET_CONFIRM_LABEL, texts.FORGET_CONFIRMED_LABEL),
+                    (texts.FORGET_KEEP_LABEL, texts.FORGET_KEPT_LABEL),
+                )
+                failed = texts.FORGET_BUTTONS_FAILED
+            case PendingSet():
+                found = self._set_prompt(pending, minutes)
+                if found is None:
+                    # 回答写完之前时刻就已经过了（如几分钟后的一次性提醒）：按钮点了也建不成，不发，说明一句。
+                    logger.info(
+                        "用户 %s 要设的提醒在回答写完前已经没有触发时刻了，不发按钮", user.label
+                    )
+                    try:
+                        await turn.channel.send(texts.REMINDER_PASSED_BEFORE_BUTTONS)
+                    except SendError as exc:
+                        logger.warning("时刻已过的说明没能发给用户 %s：%s", user.label, exc)
+                    return
+                markdown = found
+                labels = (
+                    (texts.REMINDER_SET_CONFIRM_LABEL, texts.REMINDER_SET_CONFIRMED_LABEL),
+                    (texts.REMINDER_SET_DECLINE_LABEL, texts.REMINDER_SET_DECLINED_LABEL),
+                )
+                failed = texts.REMINDER_SET_BUTTONS_FAILED
+            case PendingCancel(items=items):
+                markdown = texts.reminder_cancel_prompt(
+                    [(item.reminder_id, item.content, item.next) for item in items], minutes
+                )
+                labels = (
+                    (texts.REMINDER_CANCEL_CONFIRM_LABEL, texts.REMINDER_CANCEL_CONFIRMED_LABEL),
+                    (texts.REMINDER_CANCEL_DECLINE_LABEL, texts.REMINDER_CANCEL_DECLINED_LABEL),
+                )
+                failed = texts.REMINDER_CANCEL_BUTTONS_FAILED
+        token = self._tokens.issue(user, pending, turn.messages)
+        (yes, yes_done), (no, no_done) = labels
         buttons = (
-            ChoiceButton(
-                texts.FORGET_CONFIRM_LABEL, FORGET_PREFIX + token, texts.FORGET_CONFIRMED_LABEL
-            ),
-            ChoiceButton(texts.FORGET_KEEP_LABEL, KEEP_PREFIX + token, texts.FORGET_KEPT_LABEL),
+            ChoiceButton(yes, button_data(kind, True, token), yes_done),
+            ChoiceButton(no, button_data(kind, False, token), no_done),
         )
-        minutes = FORGET_TOKEN_SECONDS // 60
         try:
-            await turn.channel.send_buttons(texts.forget_prompt(topic_id, title, minutes), buttons)
+            await turn.channel.send_buttons(markdown, buttons)
         except SendRejectedError as exc:
-            logger.warning("忘掉话题的确认按钮没能发给用户 %s：%s", user.label, exc)
-            del self._forget_tokens[token]
+            logger.warning("确认按钮（%s）没能发给用户 %s：%s", kind.value, user.label, exc)
+            self._tokens.withdraw(token)
             if turn.channel.budget.affords_last():
                 try:
-                    await turn.channel.send(texts.FORGET_BUTTONS_FAILED)
+                    await turn.channel.send(failed)
                 except SendError as again:
                     logger.warning("按钮没能发出的说明也没能发给用户 %s：%s", user.label, again)
             return
         except SendError as exc:
-            logger.warning("给用户 %s 发忘掉话题的确认按钮时不确定是否送达：%s", user.label, exc)
+            logger.warning(
+                "给用户 %s 发确认按钮（%s）时不确定是否送达：%s", user.label, kind.value, exc
+            )
             return
-        logger.info("给用户 %s 发了忘掉话题 %d 的确认按钮", user.label, topic_id)
+        logger.info("给用户 %s 发了确认按钮（%s）", user.label, kind.value)
+
+    def _set_prompt(self, pending: PendingSet, minutes: int) -> str | None:
+        """设置提醒的确认消息：按现在重新算接下来的几次（这一轮可能写了一阵）；已经一次都不剩时为 `None`。"""
+        candidate, now = pending.candidate, int(self._clock())
+        summary = reminders.summarize_schedule(
+            candidate.trigger, self._timezone, anchor=candidate.anchor, now=now
+        )
+        if summary is None:
+            return None
+        return texts.reminder_set_prompt(
+            content=candidate.content,
+            rule=summary.rule,
+            schedule=summary.text,
+            notes=summary.notes,
+            push_off=pending.push_off,
+            minutes=minutes,
+        )
 
     async def drain(self) -> None:
         """关停时调用：等所有在途的轮次结束（含被取消后的收尾与记账）。"""
@@ -1289,6 +1490,7 @@ class Conversation:
             announce=announce,
             max_size_mb=max_size_mb,
             drawing_possible=any(self._draws(model.image_generation) for model in models),
+            reminders=begun.reminders,
         )
 
         def open_process() -> ProcessStream | None:
@@ -1375,10 +1577,12 @@ class Conversation:
             raise cancelled
         if failure is not None:
             raise failure
-        if turn.forget is not None and turn.ended:
-            # 模型调用了 forget_topic：记账之后发一条带确认按钮的消息，用户点了「确认删除」才删（`press_button()`）。
-            # 只在这一轮记下了轮次边界时发：没有结束的一轮（什么都没送达）会被并进下一轮，确认后删不干净。
-            await self._offer_forget(turn, turn.forget)
+        pending = turn.drop_pending()  # 退回预留：要发就在 `_offer()` 里按 `affords_last()` 再查
+        if pending is not None and turn.ended:
+            # 模型调用了 forget_topic、set_reminder 或 cancel_reminder：记账之后发一条带确认按钮的消息，用户点了「确认」
+            # 才生效（`press_button()`）。只在这一轮记下了轮次边界时发：没有结束的一轮（什么都没送达）会被并进下一轮，
+            # 忘掉话题时确认后删不干净。
+            await self._offer(turn, pending)
         if outcome.delivery is not ReplyDelivery.WITHHELD:  # skipped 的也是 withheld
             self._schedule_descriptions(user, begun)
         if attributed is not None and self._summarizer is not None:
@@ -1626,6 +1830,45 @@ class Conversation:
             query,
             None if received_at is None else float(received_at),
             profile,
+            self._reminder_brief(conn, user, int(now)),
+        )
+
+    def _reminder_brief(
+        self, conn: sqlite3.Connection, user: User, now: int
+    ) -> ReminderBrief | None:
+        """系统提示词里的提醒资料（只取这个用户的）；没有启用提醒时为 `None`。"""
+        if self._reminder_settings is None:
+            return None
+        timezone = self._timezone
+        # 只取写进提示词的几项（编号、内容、规则、下一次），不算剩余次数这类用不上的；条数写死，不跟 `max_active` 走。
+        entries = tuple(
+            ReminderEntry(
+                id=r.id,
+                text=r.content,
+                rule=reminders.rule_text(r.trigger, timezone, now),
+                next=reminders.moment_text(r.next.at, timezone, now),
+            )
+            for r in reminders.next_reminders(conn, user.id, BRIEF_REMINDERS)
+            if r.next is not None
+        )
+        recent = reminders.recent_deliveries(
+            conn, user.id, now - RECENT_SENT_SECONDS, RECENT_SENT_SHOWN
+        )
+        state = reminders.get_user_state(conn, user.id)
+        return ReminderBrief(
+            reminders=entries,
+            recent=tuple(
+                ReminderSent(
+                    text=r.content,
+                    scheduled=reminders.moment_text(r.fire_at, timezone, now),
+                    delivered=r.status is reminders.SendStatus.SENT,
+                )
+                for r in recent
+            ),
+            push_switch=reminder_tools.push_label(state.push),
+            paused=reminder_tools.pause_label(
+                reminders.pause_reason(conn, user, self._admin_openid)
+            ),
         )
 
     def _topic_context(
@@ -1994,6 +2237,11 @@ class Conversation:
                     for function in recall.functions:
                         functions.append(function)
                         runners[function.name] = recall
+                if self._reminder_settings is not None:
+                    tools = _ReminderTools(self._reminder_deps(self._reminder_settings), turn)
+                    for function in reminder_tools.FUNCTIONS:
+                        functions.append(function)
+                        runners[function.name] = tools
                 if functions:
                     # 没有任何函数时请求与之前完全一样（不带 tools 与 tool_runner）。
                     request = replace(
@@ -2039,8 +2287,13 @@ class Conversation:
                 )
                 retry = False
             if retry:
-                # 还没有任何内容交给 QQ：丢掉排队的部分与 guard 里攒着的，换备用模型从头来。
+                # 还没有任何内容交给 QQ：丢掉排队的部分与 guard 里攒着的，换备用模型从头来。备用模型看不到这次调用里的
+                # 函数调用：这次登记的待确认项也丢掉，备用模型自己重新调用了才发按钮。
                 turn.outbox.discard()
+                if turn.drop_pending() is not None:
+                    logger.info(
+                        "用户 %s 这一轮换备用模型，丢掉主模型登记的待确认项", turn.user.label
+                    )
                 logger.warning(
                     "模型 %s 没能回复用户 %s（%s），改用备用模型 %s",
                     model.name,
@@ -2083,6 +2336,17 @@ class Conversation:
             allowed=self._allowed,
             timezone=self._timezone,
             summarizer=self._summarizer,
+            reminders=self._reminder_settings is not None,
+        )
+
+    def _reminder_deps(self, settings: ReminderSettings) -> _ReminderDeps:
+        return _ReminderDeps(
+            db=self._db,
+            allowed=self._allowed,
+            timezone=self._timezone,
+            settings=settings,
+            admin_openid=self._admin_openid,
+            clock=self._clock,
         )
 
     async def _erase_topics(
@@ -3008,19 +3272,6 @@ class _Tools:
         return await self._runners.get(call.name, self._fallback)(call)
 
 
-@dataclass(frozen=True, slots=True)
-class _ForgetToken:
-    """忘掉话题的确认按钮背后的请求：用户、他的 openid（点按钮的人要对得上）、话题、那一轮的用户消息（删除时一并
-    删掉）与到期时刻（`Conversation` 的单调时钟）。"""
-
-    user_id: int
-    openid: str = field(repr=False)
-    topic_id: int
-    title: str = field(repr=False)
-    messages: tuple[int, ...]
-    expires_at: float
-
-
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _RecallDeps:
     """`_Recall` 用到的 `Conversation` 的部分。`summarizer` 为空（没有 `[memory]`）时不提供 `forget_profile_item`。"""
@@ -3029,6 +3280,7 @@ class _RecallDeps:
     allowed: Callable[[sqlite3.Connection, User], bool]
     timezone: ZoneInfo
     summarizer: Summarizer | None
+    reminders: bool = False  # 启用了提醒：查看记忆、忘掉话题的结果里提一句提醒
 
 
 class _Recall:
@@ -3090,6 +3342,7 @@ class _Recall:
             logger.info("给用户 %s 查看记忆的参数不合法，交回说明", user.label)
             return memory_tools.bad_arguments(before)
         profile, listings, total = await deps.db.transaction(_memory_view, user.id, before)
+        active = await deps.db.transaction(reminders.count_active, user.id) if deps.reminders else 0
         more = len(listings) > memory_tools.VIEW_LIMIT
         listings = listings[: memory_tools.VIEW_LIMIT]
         logger.info(
@@ -3107,6 +3360,7 @@ class _Recall:
             more=more,
             timezone=deps.timezone,
             profile_tool=deps.summarizer is not None,
+            reminders=active,
         )
 
     async def _forget_topic(self, text: str) -> FunctionResult:
@@ -3120,17 +3374,27 @@ class _Recall:
         if topic is None:
             logger.info("给用户 %s 忘掉话题 %d：不是他的话题，不删", user.label, topic_id)
             return memory_tools.no_such_topic(topic_id)
-        if turn.forget is not None and turn.forget[0] != topic.id:
+        pending = turn.pending
+        if isinstance(pending, PendingForget) and pending.topic_id != topic.id:
             logger.info("用户 %s 这一轮已经要忘掉别的话题，不再安排第二个", user.label)
             return memory_tools.one_at_a_time()
-        if turn.forget is None and not turn.channel.budget.affords(1):
+        if pending is not None and not isinstance(pending, PendingForget):
+            logger.info("用户 %s 这一轮已有别的一项待确认，不安排忘掉话题", user.label)
+            return reminder_tools.slot_taken(pending)
+        if pending is None and not turn.channel.budget.affords(1):
             # 确认按钮要另发一条消息，还得给回答留余量。
             logger.info("用户 %s 这条消息的被动回复次数不够发确认按钮，不安排忘掉话题", user.label)
             return memory_tools.no_room_for_buttons()
-        turn.forget = (topic.id, topic.display_title)
+        turn.accept(PendingForget(topic.id, topic.display_title))
+        has_reminders = deps.reminders and bool(
+            await deps.db.transaction(reminders.count_active, user.id)
+        )
         logger.info("用户 %s 要忘掉话题 %d：这一轮结束后发确认按钮", user.label, topic.id)
         return memory_tools.buttons_coming(
-            topic.id, topic.display_title, profile_tool=deps.summarizer is not None
+            topic.id,
+            topic.display_title,
+            profile_tool=deps.summarizer is not None,
+            has_reminders=has_reminders,
         )
 
     async def _forget_item(self, summarizer: Summarizer, text: str) -> FunctionResult:
@@ -3155,6 +3419,199 @@ class _Recall:
                 return memory_tools.item_conflict()
             case ProfileForget.FAILED:
                 return memory_tools.item_failed()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ReminderDeps:
+    """`_ReminderTools` 用到的 `Conversation` 的部分。"""
+
+    db: Database
+    allowed: Callable[[sqlite3.Connection, User], bool]
+    timezone: ZoneInfo
+    settings: ReminderSettings
+    admin_openid: str
+    clock: Callable[[], float]
+
+
+class _ReminderTools:
+    """一次模型调用的提醒函数的执行方（`llm.ToolRunner`），函数说明、参数校验与结果文字在 `reminder_tools.py`。
+
+    - `set_reminder`：不建任何东西。规则合法、文字合法、准入检查通过（`reminders.check_admission()`）、这一轮没有别的
+      种类待确认、被动回复留得出发确认按钮的余量时，记进 `_Turn.pending`（同一轮里后一次取代前一次）；否则交回说明。
+      相对时间按调用这一刻换算（`anchor`）。
+    - `list_reminders`：只读这个用户的有效提醒、开关状态与还没告知的失败数。
+    - `cancel_reminder`：不取消任何东西。编号都是这个用户仍然有效的提醒时记进 `_Turn.pending`（同一轮里后一次取代
+      前一次）；有不是的（含别人的）一律按「不存在」交回，不泄露是否存在。
+    交回任何结果之前复查授权，不通过就停下这次模型调用（`_RevokedError`）。执行期间暂停这次调用的空闲时限。日志只记
+    用户、编号与结果的分类，不记提醒文字与参数原文。
+    """
+
+    def __init__(self, deps: _ReminderDeps, turn: _Turn) -> None:
+        self._deps = deps
+        self._turn = turn
+
+    async def __call__(self, call: FunctionCall) -> FunctionResult:
+        run = self._turn.run
+        deadlines = None if run is None else run.deadlines
+        with nullcontext() if deadlines is None else deadlines.paused():
+            result = await self._run(call)
+            deps = self._deps
+            if not await deps.db.transaction(deps.allowed, self._turn.user):
+                logger.info("用户 %s 已不能使用对话，停下这次模型调用", self._turn.user.label)
+                self._turn.outbox.stop()
+                raise _RevokedError
+            return result
+
+    async def _run(self, call: FunctionCall) -> FunctionResult:
+        match call.name:
+            case reminder_tools.SET_REMINDER_NAME:
+                return await self._set(call.arguments)
+            case reminder_tools.LIST_REMINDERS_NAME:
+                return await self._list()
+            case reminder_tools.CANCEL_REMINDER_NAME:
+                return await self._cancel(call.arguments)
+            case _:
+                logger.warning(
+                    "模型给用户 %s 调用了没有声明的函数，交回说明", self._turn.user.label
+                )
+                return drawing.unknown_function(call.name)
+
+    def _slot(self, kind: type[PendingSet | PendingCancel]) -> FunctionResult | None:
+        """这一轮待确认的一项能不能换成这一种：别的种类已经在了就拒绝；还没有时要留得出发按钮的余量。"""
+        turn = self._turn
+        pending = turn.pending
+        if pending is not None and not isinstance(pending, kind):
+            logger.info("用户 %s 这一轮已有别的一项待确认，不再安排", turn.user.label)
+            return reminder_tools.slot_taken(pending)
+        if pending is None and not turn.channel.budget.affords(1):
+            logger.info("用户 %s 这条消息的被动回复次数不够发确认按钮", turn.user.label)
+            return reminder_tools.no_room_for_buttons()
+        return None
+
+    def _failed(
+        self, result: FunctionResult, kind: type[PendingSet | PendingCancel]
+    ) -> FunctionResult:
+        """这次调用没通过：后一次调用取代前一次，失败也一样，所以同一轮里之前安排的同一种作废，结果里说明。"""
+        turn = self._turn
+        previous = turn.pending if isinstance(turn.pending, kind) else None
+        if previous is not None:
+            turn.drop_pending()
+            logger.info("用户 %s 这一轮之前安排的待确认项随这次失败的调用作废", turn.user.label)
+        return reminder_tools.dropped(result, previous)
+
+    async def _set(self, text: str) -> FunctionResult:
+        deps, turn = self._deps, self._turn
+        user = turn.user
+        if (refused := self._slot(PendingSet)) is not None:
+            return refused
+        now = int(deps.clock())
+        arguments = reminder_tools.parse_set(text, now=now, timezone=deps.timezone)
+        if isinstance(arguments, str):
+            logger.info("给用户 %s 设置提醒的参数不合法，交回说明", user.label)
+            return self._failed(reminder_tools.bad_arguments(arguments), PendingSet)
+        candidate = reminders.Candidate(
+            content=arguments.content, trigger=arguments.trigger, anchor=now
+        )
+        admission, push = await deps.db.transaction(self._admit, candidate, now)
+        if not isinstance(admission, reminders.Admitted):
+            logger.info(
+                "给用户 %s 设置的提醒没通过准入检查：%s", user.label, type(admission).__name__
+            )
+            return self._failed(
+                reminder_tools.rejected(
+                    admission, candidate.trigger, timezone=deps.timezone, now=now
+                ),
+                PendingSet,
+            )
+        summary = reminders.summarize_schedule(
+            candidate.trigger, deps.timezone, anchor=now, now=now
+        )
+        assert summary is not None  # 通过了准入检查就至少还有一次
+        replaced = isinstance(turn.pending, PendingSet)
+        push_off = push is reminders.PushState.OFF
+        turn.accept(PendingSet(candidate=candidate, summary=summary, push_off=push_off))
+        logger.info(
+            "用户 %s 要设置一条提醒%s：这一轮结束后发确认按钮",
+            user.label,
+            "（取代前一次）" if replaced else "",
+        )
+        return reminder_tools.set_pending(
+            summary, push_off=push_off, replaced=replaced, timezone=deps.timezone, now=now
+        )
+
+    def _admit(
+        self, conn: sqlite3.Connection, candidate: reminders.Candidate, now: int
+    ) -> tuple[reminders.Admission, reminders.PushState]:
+        deps = self._deps
+        user_id = self._turn.user.id
+        admission = reminders.check_admission(
+            conn, user_id, candidate, settings=deps.settings, timezone=deps.timezone, now=now
+        )
+        return admission, reminders.get_user_state(conn, user_id).push
+
+    async def _list(self) -> FunctionResult:
+        deps, user = self._deps, self._turn.user
+        now = int(deps.clock())
+        views, state, paused, unnotified = await deps.db.transaction(self._listing, now)
+        logger.info("给用户 %s 列出了 %d 条提醒", user.label, len(views))
+        return reminder_tools.listed(views, push=state.push, paused=paused, unnotified=unnotified)
+
+    def _listing(
+        self, conn: sqlite3.Connection, now: int
+    ) -> tuple[
+        list[reminders.ActiveView],
+        reminders.UserReminderState,
+        reminders.PauseReason | None,
+        int,
+    ]:
+        deps, user = self._deps, self._turn.user
+        return (
+            reminders.describe_active(conn, user.id, deps.timezone, now),
+            reminders.get_user_state(conn, user.id),
+            reminders.pause_reason(conn, user, deps.admin_openid),
+            reminders.count_unnotified(conn, user.id),
+        )
+
+    async def _cancel(self, text: str) -> FunctionResult:
+        deps, turn = self._deps, self._turn
+        user = turn.user
+        if (refused := self._slot(PendingCancel)) is not None:
+            return refused
+        ids = reminder_tools.parse_cancel(text)
+        if isinstance(ids, str):
+            logger.info("给用户 %s 取消提醒的参数不合法，交回说明", user.label)
+            return self._failed(reminder_tools.bad_arguments(ids), PendingCancel)
+        items, missing = await deps.db.transaction(self._lookup, ids, int(deps.clock()))
+        if missing:
+            logger.info(
+                "给用户 %s 取消提醒：有 %d 个编号不是他有效的提醒", user.label, len(missing)
+            )
+            return self._failed(reminder_tools.not_found(missing), PendingCancel)
+        replaced = isinstance(turn.pending, PendingCancel)
+        turn.accept(PendingCancel(tuple(items)))
+        logger.info("用户 %s 要取消 %d 条提醒：这一轮结束后发确认按钮", user.label, len(items))
+        return reminder_tools.cancel_pending(items, replaced=replaced)
+
+    def _lookup(
+        self, conn: sqlite3.Connection, ids: Sequence[int], now: int
+    ) -> tuple[list[CancelItem], list[int]]:
+        """这些编号里属于这个用户、仍然有效的（写好内容与下一次），与其余的（不存在、别人的、已经失效的）。"""
+        deps, user = self._deps, self._turn.user
+        items: list[CancelItem] = []
+        missing: list[int] = []
+        for reminder_id in ids:
+            found = reminders.get_reminder(conn, user.id, reminder_id)
+            if found is None or found.next is None:
+                missing.append(reminder_id)
+                continue
+            items.append(
+                CancelItem(
+                    reminder_id=found.id,
+                    content=found.content,
+                    next=reminders.moment_text(found.next.at, deps.timezone, now),
+                )
+            )
+        return items, missing
 
 
 def _memory_view(

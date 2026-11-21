@@ -101,14 +101,27 @@ class ReplyBudget:
     Attributes:
         typings: 「正在输入」的次数。
         replies: 被动回复的条数（普通消息、流式消息各算一条，一条流式消息不论几片都只算一条）。
+        reserved: 已经答应要发、还没发的被动回复（这一轮接受了一项待确认的事，轮末要发确认按钮）。之后的各项检查都
+            把它当作已用掉；要发那条时先退回预留（`release()`）再查 `affords_last()`。
     """
 
     typings: int = 0
     replies: int = 0
+    reserved: int = 0
+
+    def reserve(self) -> None:
+        self.reserved += 1
+
+    def release(self) -> None:
+        self.reserved = max(0, self.reserved - 1)
+
+    @property
+    def _used(self) -> int:
+        return self.replies + self.reserved
 
     def affords(self, extra: int = 1) -> bool:
         """再发 `extra` 条被动回复之后，是否还给回答留着 `ANSWER_RESERVE` 次。"""
-        replies = self.replies + extra + ANSWER_RESERVE
+        replies = self._used + extra + ANSWER_RESERVE
         return replies <= MAX_PASSIVE_REPLIES and replies + self.typings <= MAX_PASSIVE_SENDS
 
     def affords_typing(self, *, process: bool = False) -> bool:
@@ -116,7 +129,7 @@ class ReplyBudget:
         次（`process` 为真时再给过程消息留一次）。「正在输入」不算被动回复的条数，但算在 `MAX_PASSIVE_SENDS` 里。"""
         if self.typings >= MAX_TYPINGS:
             return False
-        replies = self.replies + ANSWER_RESERVE + (1 if process else 0)
+        replies = self._used + ANSWER_RESERVE + (1 if process else 0)
         return replies <= MAX_PASSIVE_REPLIES and replies + self.typings + 1 <= MAX_PASSIVE_SENDS
 
     def affords_process(self) -> bool:
@@ -125,13 +138,13 @@ class ReplyBudget:
 
     def affords_last(self) -> bool:
         """还能再发一条被动回复（不再给之后留余量）：一轮的回答都发完了，最后附上的一条（如忘掉话题的确认按钮）用。"""
-        replies = self.replies + 1
+        replies = self._used + 1
         return replies <= MAX_PASSIVE_REPLIES and replies + self.typings <= MAX_PASSIVE_SENDS
 
     def affords_continuation(self) -> bool:
         """回答已经开始显示，再开一条流式消息接着写（主动分条）之后，是否还给兜底留着 2 次：新的一条被拒时先改发
         纯文本，纯文本也被拒再发固定说明，两次都计数（评审修正）。"""
-        replies = self.replies + 3
+        replies = self._used + 3
         return replies <= MAX_PASSIVE_REPLIES and replies + self.typings <= MAX_PASSIVE_SENDS
 
 

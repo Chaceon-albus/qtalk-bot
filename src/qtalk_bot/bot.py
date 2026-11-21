@@ -1,6 +1,6 @@
 """接线层：把 pyqbot 的事件转成普通数据交给 `Gate`，再按结果回复或交给对话处理器。
 
-只注册单聊消息、加好友、删好友与互动（忘掉话题的确认按钮、资料卡的主动消息开关）的处理函数，群聊明确不做。这里尽量薄，
+只注册单聊消息、加好友、删好友与互动（忘掉话题与提醒的确认按钮、资料卡的主动消息开关）的处理函数，群聊明确不做。这里尽量薄，
 判断都在 `gate.py`、`conversation.py` 与 `reminders.py`。
 
 提醒（启用了 `[reminders]` 时）：到点的提醒经 `ProactiveSender` 以纯文本主动消息发出；切换主动消息开关的授权互动
@@ -40,9 +40,8 @@ from .access import User
 from .alerts import AlertGroup, Alerts, AlertSendError
 from .batching import Batcher
 from .chat import ChatHandler
+from .confirmations import BUTTON_PREFIXES
 from .conversation import (
-    FORGET_PREFIX,
-    KEEP_PREFIX,
     ChatInput,
     ChoiceButton,
     SendError,
@@ -107,8 +106,8 @@ def register(
     """在 `bot` 上注册单聊消息、加好友与（给了 `buttons` 或 `reminders` 时）互动的处理函数，给了 `reminders` 时还有
     删好友的。关停时要在关数据库之前等返回值的 `drain()`。
 
-    `hosts` 是下载白名单（`download_hosts()` 合并后的），形态日志按它决定记不记主机名。`buttons` 处理忘掉话题的
-    确认按钮（`conversation.Conversation.press_button()`）；`Bot` 默认先替我们回应按钮的互动（`auto_ack`），这里只管
+    `hosts` 是下载白名单（`download_hosts()` 合并后的），形态日志按它决定记不记主机名。`buttons` 处理确认按钮
+    （忘掉话题、设置与取消提醒，`conversation.Conversation.press_button()`）；`Bot` 默认先替我们回应按钮的互动（`auto_ack`），这里只管
     回复。`reminders` 处理主动消息开关与好友事件（见模块 docstring）。
     """
     handlers = Handlers(gate, chat, hosts=hosts, buttons=buttons, reminders=reminders)
@@ -765,7 +764,7 @@ class Handlers:
 
         - 切换资料卡的主动消息开关（`type` 18，`scope` 为 `c2c_push`）：交给 `reminders`，连同用这条互动被动回复的函数
           （由处理方在这个用户的锁里调用）。
-        - 点了回调按钮：只处理忘掉话题的确认按钮（`FORGET_PREFIX`、`KEEP_PREFIX` 开头），交给 `buttons`，连同一个经
+        - 点了回调按钮：只处理确认按钮（忘掉话题、设置与取消提醒，`confirmations.BUTTON_PREFIXES` 开头），交给 `buttons`，连同一个经
           `interaction.reply()` 回复用户的函数（发送失败只记日志）。互动已由 `Bot` 先回应（`auto_ack`）；回复由处理方
           在这个用户的锁里发，不插进正在写的流式回答。
         别的互动不理会。"""
@@ -787,7 +786,7 @@ class Handlers:
             data = interaction.button_data or ""
             if self._buttons is None:
                 return
-            if not data.startswith((FORGET_PREFIX, KEEP_PREFIX)):
+            if not data.startswith(BUTTON_PREFIXES):
                 return
 
             async def reply(text: str) -> None:

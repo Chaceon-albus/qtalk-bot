@@ -235,10 +235,11 @@ def viewed(
     more: bool,
     timezone: ZoneInfo,
     profile_tool: bool,
+    reminders: int = 0,
 ) -> FunctionResult:
     """`view_memory` 的结果：档案（没有时说明还没有）与这一页的话题（按开始的先后、最新开始的在前），写明共多少个、
     还有没有更早的、下一页该传的值。`before` 是这次的游标（0 是第一页），`more` 表示还有更早的话题，`total` 是这个
-    用户的话题总数，日期按 `timezone`。"""
+    用户的话题总数，日期按 `timezone`。`reminders` 是这个用户有效的提醒数（启用了提醒时），不为 0 时提一句。"""
     parts = [_view_notice(profile_tool)]
     if profile:
         parts.append(f"用户档案（JSON 的 profile 字段）：\n{profile_block(profile)}")
@@ -266,6 +267,11 @@ def viewed(
         parts.append("聊过的话题：还没有记录。")
     else:
         parts.append(f"聊过的话题共 {total} 个，没有编号小于 {before} 的话题了。")
+    if reminders:
+        parts.append(
+            f"另外，程序还为这个用户记着 {reminders} 条有效的提醒（提醒的内容也是程序保存的个人信息），可用 "
+            "list_reminders 查看。"
+        )
     return _ok("\n\n".join(parts))
 
 
@@ -280,18 +286,26 @@ def no_such_topic(topic_id: int) -> FunctionResult:
     )
 
 
-def buttons_coming(topic_id: int, title: str, *, profile_tool: bool) -> FunctionResult:
+def buttons_coming(
+    topic_id: int, title: str, *, profile_tool: bool, has_reminders: bool = False
+) -> FunctionResult:
     profile_note = (
         "用户档案是另外保存的：删掉话题后，其中与它有关的信息程序会尽量去掉，但不保证，用户在意时可以再让你去掉档案里"
         "的具体条目。"
         if profile_tool
         else ""
     )
+    reminder_note = (
+        "这个用户还有有效的提醒：提醒不属于话题，忘掉话题不会动它们；相关的提醒要等用户点完这次的按钮，之后再用 "
+        "cancel_reminder 取消。"
+        if has_reminders
+        else ""
+    )
     return _ok(
         f"还没有删除。这一轮回答结束后，程序会发一条带「确认删除」「取消」按钮的消息，问用户要不要忘掉话题 #{topic_id}"
         f"「{_shown(title)}」；用户点了「确认删除」才会删掉它的全部对话、图片与摘要，连同提出要求的这一轮对话，删除后"
         f"找不回来。请简短告诉用户：稍后会出现一条带按钮的消息，点「确认删除」才会删，按钮 {_MINUTES} 分钟内有效；"
-        f"没看到按钮的话再说一次。不要说已经删了。{profile_note}"
+        f"没看到按钮的话再说一次。不要说已经删了。{profile_note}{reminder_note}"
     )
 
 

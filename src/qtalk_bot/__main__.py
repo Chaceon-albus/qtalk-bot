@@ -282,6 +282,7 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                     image_generator=models.image_generator,
                     image_generation=image_generation,
                     reminders=reminder_service,
+                    reminder_settings=None if reminder_service is None else settings.reminders,
                 )
                 batcher = Batcher(conversation, settings.turns)
                 chat = QQChat(batcher)

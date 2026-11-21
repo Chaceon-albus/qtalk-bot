@@ -3,12 +3,13 @@
 全部是纯函数：时区（`ZoneInfo`）与「现在」（Unix 秒）都由调用方给，不读系统时钟。时刻在这里一律是 UTC 的 Unix 秒
 （整数，对齐到整分）；规则本身按本地钟点存（不带时区的 `datetime` 与 `time`），按配置的时区解释。
 
-三种规则（字段平铺一层，`kind` 是枚举，不适用的字段为 null，见 `parse_trigger()`）：
+三种规则（字段平铺一层，`kind` 是枚举，不适用的字段为 `None`，见 `parse_trigger()`；给模型的函数参数用约定的空值，由
+`reminder_tools.trigger_values()` 换成 `None`）：
 
 - **一次性** `once`：`at`（本地时刻）或 `delay_minutes`（相对调用时刻的分钟数，换算后向上取整到整分），两者填一个；
   至少在调用时刻的 `MIN_LEAD_SECONDS` 之后，最远 `MAX_AHEAD_DAYS` 天。
 - **固定间隔** `interval`：从 `start` 起每 `every` 个 `unit` 一次。第 k 次是「起点加 k 倍间隔」，不逐次累加：分钟、
-  小时按绝对时长算；天、周按本地的同一钟点算。`start` 为 null 时以调用时刻（向上取整到整分）为起点、第一次在一个
+  小时按绝对时长算；天、周按本地的同一钟点算。`start` 为空时以调用时刻（向上取整到整分）为起点、第一次在一个
   间隔之后；也可以用 `delay_minutes` 写相对的起点。`start` 可以已经过去（已过去的几次算用掉），离调用时刻前后都
   不超过 `MAX_AHEAD_DAYS` 天。
 - **日历式** `calendar`：一天里的若干时刻 `times`（至多 `MAX_TIMES` 个），加上 `weekdays`（`mon`…`sun`）、
@@ -67,7 +68,7 @@ TRIGGER_FIELDS: tuple[str, ...] = (
     "end",
     "count",
 )
-"""触发规则的全部字段（给模型的函数参数里平铺一层，不适用的填 null）。"""
+"""触发规则的全部字段（给模型的函数参数里平铺一层，不适用的填约定的空值，见 `reminder_tools.py`）。"""
 
 _ALLOWED = {
     TriggerKind.ONCE: frozenset({"at", "delay_minutes"}),
@@ -105,7 +106,7 @@ _UNIT_MINUTES = {
 
 LOCAL_FORMAT = "%Y-%m-%dT%H:%M"
 TIME_FORMAT = "%H:%M"
-_EXAMPLE = "形如 2026-11-21T08:00（配置时区的本地时间，精确到分钟，不带时区）"
+_EXAMPLE = "形如 2026-11-21T08:00（本地时间，精确到分钟，不带秒和时区）"
 
 
 class TriggerError(ValueError):
@@ -193,7 +194,7 @@ def resolve(local: datetime, timezone: ZoneInfo, *, latest: bool = False) -> int
 
 def parse_trigger(args: Mapping[str, object], *, now: int, timezone: ZoneInfo) -> Trigger:
     """把给模型的函数参数里的触发规则解析成 `Trigger`，并校验它在调用时刻 `now` 之后确实会触发。只读
-    `TRIGGER_FIELDS` 里的键，别的键不管；缺省的键当作 null。
+    `TRIGGER_FIELDS` 里的键，别的键不管；缺省的键与 `None` 都当作没填。
 
     Raises:
         TriggerError: 规则不合法，或若干年内一次都不会触发。
@@ -201,7 +202,10 @@ def parse_trigger(args: Mapping[str, object], *, now: int, timezone: ZoneInfo) -
     kind = _kind(args.get("kind"))
     for name in TRIGGER_FIELDS[1:]:
         if name not in _ALLOWED[kind] and args.get(name) is not None:
-            raise TriggerError(name, f"kind 为 {kind.value} 时应为 null")
+            raise TriggerError(
+                name,
+                f"kind 为 {kind.value} 时不用这个字段，填它的空值（字符串填空串，整数填 0，列表填空列表，unit 填 none）",
+            )
     match kind:
         case TriggerKind.ONCE:
             trigger: Trigger = _parse_once(args, now, timezone)
@@ -229,16 +233,23 @@ def _parse_once(args: Mapping[str, object], now: int, timezone: ZoneInfo) -> Onc
             "at", "at 与 delay_minutes 要填一个：绝对时刻填 at，「几分钟后」填 delay_minutes"
         )
     if at is not None and delay is not None:
-        raise TriggerError("delay_minutes", "at 与 delay_minutes 只能填一个，另一个填 null")
+        raise TriggerError("delay_minutes", "at 与 delay_minutes 只能填一个")
     if delay is not None:
         minutes = _integer("delay_minutes", delay, MIN_LEAD_SECONDS // 60, MAX_DELAY_MINUTES)
         return Once(local_of(ceil_minute(now + minutes * 60), timezone))
     local = _parse_local("at", at)
     moment = resolve(local, timezone)
     if moment <= now:
-        raise TriggerError("at", "这个时刻已经过去了，请换一个将来的时刻")
+        raise TriggerError(
+            "at",
+            "这个时刻已经过去了。用户没说清是哪一天、上午还是下午时先问清楚，不要自己改成别的时刻",
+        )
     if moment < now + MIN_LEAD_SECONDS:
-        raise TriggerError("at", f"至少要在 {MIN_LEAD_SECONDS // 60} 分钟之后")
+        raise TriggerError(
+            "at",
+            f"太近了：至少要在 {MIN_LEAD_SECONDS // 60} 分钟之后（确认按钮要等回答结束才出现，用户来不及点）。"
+            "请如实告诉用户",
+        )
     if moment > now + MAX_AHEAD_DAYS * 86400:
         raise TriggerError("at", "最远只能设到一年之内")
     return Once(local_of(moment, timezone))  # 落在夏令时跳过的那段里时，存顺延后的时刻
@@ -253,7 +264,7 @@ def _parse_interval(args: Mapping[str, object], now: int, timezone: ZoneInfo) ->
         raise TriggerError("every", "间隔最长一年")
     start_value, delay = args.get("start"), args.get("delay_minutes")
     if start_value is not None and delay is not None:
-        raise TriggerError("delay_minutes", "start 与 delay_minutes 只能填一个，另一个填 null")
+        raise TriggerError("delay_minutes", "start 与 delay_minutes 只能填一个")
     if start_value is not None:
         start = _parse_local("start", start_value)
         moment = resolve(start, timezone)
@@ -299,7 +310,7 @@ def _parse_calendar(args: Mapping[str, object]) -> Calendar:
     if (raw := args.get("months")) is not None:
         months = tuple(sorted({_integer("months", item, 1, 12) for item in _list("months", raw)}))
     if weekdays is not None and monthdays is not None:
-        raise TriggerError("monthdays", "weekdays 与 monthdays 只能填一个，另一个填 null")
+        raise TriggerError("monthdays", "weekdays 与 monthdays 只能填一个")
     end, count = _end_and_count(args)
     return Calendar(
         times=times, weekdays=weekdays, monthdays=monthdays, months=months, end=end, count=count
@@ -318,7 +329,10 @@ def _check_fires(trigger: Trigger, now: int, timezone: ZoneInfo) -> None:
         return
     match trigger:
         case Once():  # 解析时已经保证在将来
-            raise TriggerError("at", "这个时刻已经过去了，请换一个将来的时刻")
+            raise TriggerError(
+                "at",
+                "这个时刻已经过去了。用户没说清是哪一天、上午还是下午时先问清楚，不要自己改成别的时刻",
+            )
         case Interval() | Calendar() if (
             trigger.end is not None and resolve(trigger.end, timezone, latest=True) <= now
         ):
@@ -328,7 +342,10 @@ def _check_fires(trigger: Trigger, now: int, timezone: ZoneInfo) -> None:
         ) < resolve(trigger.start, timezone):
             raise TriggerError("end", "结束时刻早于第一次提醒")
         case Interval():
-            raise TriggerError("start", "按这个起始时刻、次数与结束时刻，所有的提醒都已经过去了")
+            raise TriggerError(
+                "start",
+                "按这个起始时刻与次数，所有的提醒都已经过去了：start 改成将来的第一次，或调整 count",
+            )
         case Calendar() if trigger.end is not None:
             raise TriggerError("end", "结束时刻早于第一次提醒")
         case Calendar():
@@ -349,7 +366,8 @@ def _parse_local(field: str, value: object) -> datetime:
             raise TriggerError(field, f"不是有效的日期或时刻，{_EXAMPLE}") from None
     if _ZONED.fullmatch(text):
         raise TriggerError(
-            field, f"不要带时区（Z 或 +08:00 这类偏移），写配置时区的本地时间，{_EXAMPLE}"
+            field,
+            f"不要带时区（Z 或 +08:00 这类偏移），写本地时间（时区同系统提示里的当前时间），{_EXAMPLE}",
         )
     if _WITH_SECONDS.fullmatch(text):
         raise TriggerError(field, f"不要带秒，精确到分钟，{_EXAMPLE}")
@@ -397,7 +415,7 @@ def _unit(value: object) -> IntervalUnit:
 
 def _list(field: str, value: object) -> list[object]:
     if not isinstance(value, list) or not value:
-        raise TriggerError(field, "应为非空的列表；不限时填 null")
+        raise TriggerError(field, "应为非空的列表")
     return cast(list[object], value)
 
 

@@ -689,11 +689,16 @@ MAX_FAILURE_LINES = 10
 """失败通知最多列几行，其余写「另有 n 条」。"""
 
 
-def reminder_moment(moment: datetime, now: datetime) -> str:
-    """「11 月 23 日（周一）08:00」；与 `now` 不在同一年时前面加年份。两个都是本地时刻。"""
+def reminder_date(moment: datetime, now: datetime) -> str:
+    """「11 月 23 日（周一）」；与 `now` 不在同一年时前面加年份。两个都是本地时刻。"""
     year = "" if moment.year == now.year else f"{moment.year} 年 "
     weekday = WEEKDAY_NAMES[moment.weekday()]
-    return f"{year}{moment.month} 月 {moment.day} 日（{weekday}）{moment:%H:%M}"
+    return f"{year}{moment.month} 月 {moment.day} 日（{weekday}）"
+
+
+def reminder_moment(moment: datetime, now: datetime) -> str:
+    """「11 月 23 日（周一）08:00」；与 `now` 不在同一年时前面加年份。两个都是本地时刻。"""
+    return f"{reminder_date(moment, now)}{moment:%H:%M}"
 
 
 def reminder_rule(trigger: Trigger, now: datetime) -> str:
@@ -836,3 +841,106 @@ def reminder_failures_brief(count: int, reasons: Sequence[str], *, push_off: boo
     """失败通知的简版：完整的那条被平台拒发时改发，不带提醒文字。"""
     text = f"有 {count} 条提醒没能按时发出（{'、'.join(reasons)}），具体内容这次没能显示出来。"
     return f"{text}\n{REMINDER_PUSH_HINT}" if push_off else text
+
+
+# ---- 提醒的确认按钮（里程碑 8） ----
+#
+# 确认消息用 Markdown 发，提醒文字与程序写的规则、时刻都先经 `escape_markdown()`；点按钮之后的回复是纯文本。
+
+REMINDER_SET_CONFIRM_LABEL = "确认"
+REMINDER_SET_CONFIRMED_LABEL = "已确认"
+REMINDER_SET_DECLINE_LABEL = "取消"
+REMINDER_SET_DECLINED_LABEL = "已取消"
+REMINDER_CANCEL_CONFIRM_LABEL = "确认取消"
+REMINDER_CANCEL_CONFIRMED_LABEL = "已取消提醒"
+REMINDER_CANCEL_DECLINE_LABEL = "保留"
+REMINDER_CANCEL_DECLINED_LABEL = "已保留"
+
+REMINDER_PUSH_OFF_NOTE = "你现在没开「允许主动发送」，到点发不出去。可以在机器人的资料卡里打开它。"
+"""已知开关关着时，确认消息与点「确认」后的回复里加的一句。"""
+
+
+def reminder_set_prompt(
+    *,
+    content: str,
+    rule: str,
+    schedule: str,
+    notes: Sequence[str],
+    push_off: bool,
+    minutes: int,
+) -> str:
+    """设置提醒的确认消息（Markdown）。`schedule` 是「接下来：……」那一句（`reminder_schedule()`）。"""
+    items = [f"内容：{escape_markdown(content)}", f"规则：{escape_markdown(rule)}"]
+    items.append(escape_markdown(schedule))
+    items.extend(escape_markdown(note) for note in notes)
+    if push_off:
+        items.append(escape_markdown(REMINDER_PUSH_OFF_NOTE))
+    listed = "\n".join(f"- {item}" for item in items)
+    return f"要设这条提醒吗？\n\n{listed}\n\n按钮 {minutes} 分钟内有效。"
+
+
+def reminder_cancel_prompt(items: Sequence[tuple[int, str, str | None]], minutes: int) -> str:
+    """取消提醒的确认消息（Markdown）。`items` 是（编号，提醒文字，下一次的时刻；没有时为 `None`）。"""
+    lines = [
+        f"- #{reminder_id} {escape_markdown(content)}"
+        + ("" if next_at is None else f"（下一次：{escape_markdown(next_at)}）")
+        for reminder_id, content, next_at in items
+    ]
+    count = "这条" if len(items) == 1 else f"这 {len(items)} 条"
+    return f"要取消{count}提醒吗？\n\n" + "\n".join(lines) + f"\n\n按钮 {minutes} 分钟内有效。"
+
+
+REMINDER_PASSED_BEFORE_BUTTONS = (
+    "要设的提醒时刻在回答写完之前就已经过了，没有设。需要的话请重新说一次时间。"
+)
+"""轮末要发设置提醒的确认按钮时，提醒已经一次都不剩了（如几分钟后的一次性提醒）：不发按钮，改发这一句。"""
+REMINDER_SET_BUTTONS_FAILED = "确认按钮没能发出来，提醒还没有设。需要的话请再跟我说一次。"
+REMINDER_CANCEL_BUTTONS_FAILED = "确认按钮没能发出来，提醒还没有取消。需要的话请再跟我说一次。"
+
+
+def reminder_buttons_expired(minutes: int) -> str:
+    """点的提醒按钮已经失效（过期、点过，或机器人重启过）。"""
+    return f"这个按钮已经失效了（超过 {minutes} 分钟，或已经点过）。还需要的话，请再跟我说一次。"
+
+
+REMINDER_SET_DECLINED = "好的，这条提醒不设了。"
+REMINDER_CANCEL_DECLINED = "好的，不取消了，提醒照旧。"
+
+
+def reminder_created(
+    *, reminder_id: int, content: str, next_at: str, remaining: int | None, push_off: bool
+) -> str:
+    """点了「确认」、建好之后的回复：实际的下一次时刻，有限次数时写还剩几次。"""
+    text = f"好的，提醒 #{reminder_id} 设好了：{_one_line(content)}。下一次是 {next_at}"
+    text += "。" if remaining is None else f"，还剩 {remaining} 次。"
+    return f"{text}\n{REMINDER_PUSH_OFF_NOTE}" if push_off else text
+
+
+REMINDER_ONCE_PASSED = "这个时刻已经过去了，提醒没有设。需要的话请再跟我说一次。"
+REMINDER_NOTHING_LEFT = "按这个规则，之后已经没有要提醒的了，所以没有设。需要的话请再跟我说一次。"
+REMINDER_TOO_DENSE = "这条提醒太密了，没有设。可以把间隔放宽一些再跟我说。"
+
+
+def reminder_too_many(active: int, limit: int) -> str:
+    return f"你已经有 {active} 条提醒，到了上限 {limit} 条，这条没有设。可以先取消不需要的提醒，再跟我说一次。"
+
+
+def reminder_rate_exceeded(when: str, count: int, limit: int, *, hourly: bool) -> str:
+    """`when` 是「11 月 23 日（周一）08:00 开始的这一个小时」或「11 月 23 日（周一）这一天」。"""
+    unit = "小时" if hourly else "天"
+    return (
+        f"设了这条的话，{when}里你会收到 {count} 条提醒，超过每{unit}最多 {limit} 条的上限，所以没有设。"
+        "可以把间隔放宽一些，或先取消别的提醒。"
+    )
+
+
+def reminder_cancelled(cancelled: Sequence[tuple[int, str]], gone: Sequence[int]) -> str:
+    """点了「确认取消」之后的回复：取消了哪几条，已经不在（发完或早已取消）的照实说。"""
+    parts: list[str] = []
+    if cancelled:
+        listed = "、".join(f"#{n} {_one_line(content)}" for n, content in cancelled)
+        parts.append(f"好的，取消了：{listed}。")
+    if gone:
+        listed = "、".join(f"#{n}" for n in gone)
+        parts.append(f"{listed} 已经不在了（发完了或之前已经取消），不用再取消。")
+    return "".join(parts)

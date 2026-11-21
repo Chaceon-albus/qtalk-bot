@@ -95,8 +95,8 @@ def test_once_delay_is_rounded_up_to_the_minute() -> None:
         ({"at": "2026-11-31T08:00"}, "at", "不是有效的日期"),
         ({"at": "明天早上"}, "at", "格式不对"),
         ({"at": 20261121}, "at", "应为字符串"),
-        ({"at": "2026-11-21T08:00", "every": 5}, "every", "应为 null"),
-        ({"at": "2026-11-21T08:00", "count": 2}, "count", "应为 null"),
+        ({"at": "2026-11-21T08:00", "every": 5}, "every", "不用这个字段"),
+        ({"at": "2026-11-21T08:00", "count": 2}, "count", "不用这个字段"),
     ],
 )
 def test_once_errors_name_the_field_without_echoing_the_value(

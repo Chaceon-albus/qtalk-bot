@@ -2815,6 +2815,8 @@ class _FakeInteraction:
     [
         ("forget:t", "已经忘掉话题 #1 了。", True, True),
         ("keep:t", None, True, False),  # 处理方不回复时不回
+        ("remind:t", "好的，提醒 #1 设好了", True, True),  # 提醒的确认按钮也交过去
+        ("keepremind:t", None, True, False),
         ("like", "不该出现", False, False),  # 别的按钮不理会
         (None, "不该出现", False, False),  # 资料卡开关等别的互动
     ],

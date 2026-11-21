@@ -77,7 +77,7 @@ from .media import (
     image_label,
     marker,
 )
-from .prompt import Memory, ReferableImage, image_reference, system_prompt
+from .prompt import Memory, ReferableImage, ReminderBrief, image_reference, system_prompt
 
 MAX_REFERABLE_IMAGES = 10
 """系统提示词里「可以引用的图片」最多列几张（从新到旧）。"""
@@ -390,6 +390,7 @@ class RequestBuilder:
         max_size_mb: int = 20,
         memory: Memory | None = None,
         drawing_possible: bool = True,
+        reminders: ReminderBrief | None = None,
     ) -> None:
         self._store = store
         self._media_dir = media_dir  # 这个用户的附件目录名
@@ -406,6 +407,7 @@ class RequestBuilder:
         # 整个部署里有没有模型能画图：不能画图的请求据此选系统提示词里的说明（`prompt.NO_DRAWING` 或
         # `prompt.NO_DRAWING_AT_ALL`）。
         self._drawing_possible = drawing_possible
+        self._reminders = reminders  # 启用了提醒时系统提示词里的提醒资料
 
     def set_context(self, history: Sequence[HistoryEntry], memory: Memory | None) -> None:
         """换上选完话题之后才组装出的历史与记忆（分话题时，决策之后调用，组装请求之前）。"""
@@ -464,6 +466,7 @@ class RequestBuilder:
                 if referable_images
                 else None,
                 drawing_possible=self._drawing_possible,
+                reminders=self._reminders,
             ),
             messages=tuple(messages),
             max_output_tokens=self._max_output_tokens,
