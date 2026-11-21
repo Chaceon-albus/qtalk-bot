@@ -247,6 +247,7 @@ class FakeChannel:
         self.image_failure: SendError | None = None
         self.buttons: list[tuple[ChoiceButton, ...]] = []  # 发出的按钮消息里的按钮
         self.buttons_failure: SendError | None = None
+        self.markdown_failure: SendError | None = None
         self.image_ref: str | None = None
 
     def open_process(self) -> FakeProcess:
@@ -327,6 +328,13 @@ class FakeChannel:
         self.log.append(("image", mime_type))
         self.images.append(data)
         return self.image_ref
+
+    async def send_markdown(self, markdown: str) -> None:
+        """发 Markdown（程序直接发的提醒列表）：记成（`markdown`，正文）。`markdown_failure` 不为空时抛出它。"""
+        await asyncio.sleep(0)
+        if self.markdown_failure is not None:
+            raise self.markdown_failure
+        self.log.append(("markdown", markdown))
 
     async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
         """发 Markdown 加按钮：记成（`buttons`，Markdown），按钮记进 `buttons`。`buttons_failure` 不为空时抛出它。"""

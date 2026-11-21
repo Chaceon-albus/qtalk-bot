@@ -9,7 +9,7 @@ Markdown 里的动态内容（备注、名字）一律先经 `escape_markdown()`
 
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -639,12 +639,20 @@ FORGET_KEEP_LABEL = "取消"
 FORGET_KEPT_LABEL = "已取消"
 
 
-def forget_prompt(topic_id: int, title: str, minutes: int) -> str:
-    """带确认按钮的那条消息（Markdown）；标题来自用户的对话，经 `escape_markdown()`。`minutes` 是按钮的有效期。"""
-    return (
+FORGET_KEEPS_REMINDERS = "相关的提醒不会一起删。"
+
+
+def forget_prompt(topic_id: int, title: str, minutes: int, *, reminders: bool = False) -> str:
+    """带确认按钮的那条消息（Markdown）；标题来自用户的对话，经 `escape_markdown()`。`minutes` 是按钮的有效期。
+    `reminders` 为真（启用了提醒、这个用户有有效的提醒）时另起一段说提醒不会一起删：这一轮模型不写文字，只能写在
+    卡片上。"""
+    head = (
         f"要忘掉话题 #{topic_id}「{escape_markdown(title)}」吗？这个话题里的全部对话、图片与摘要，连同刚才提出要求的"
-        f"这一轮对话，都会删掉，找不回来。按钮 {minutes} 分钟内有效。"
+        "这一轮对话，都会删掉，找不回来。"
     )
+    if reminders:
+        return f"{head}\n\n{FORGET_KEEPS_REMINDERS}\n\n按钮 {minutes} 分钟内有效。"
+    return f"{head}按钮 {minutes} 分钟内有效。"
 
 
 def forget_expired(minutes: int) -> str:
@@ -679,14 +687,13 @@ _UNIT_NAMES = {
 }
 _MONTH_DAYS = (31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)  # 2 月按闰年算
 
-REMINDER_REASON_PUSH_OFF = "未开启主动消息"
-REMINDER_REASON_LATE = "没能按时发出"
+REMINDER_REASON_LATE = "机器人当时没在运行或太忙"
 REMINDER_REASON_SEND_ERROR = "发送出错"
 REMINDER_REASON_RATE_LIMITED = "超过频率上限"
 REMINDER_REASON_MAYBE_LOST = "可能没送到"
 
-REMINDER_PUSH_HINT = "可以在机器人的资料卡里打开「允许主动发送」。"
-"""失败原因里有「未开启主动消息」时，失败通知最后加的一句。"""
+REMINDER_RETRY_HINT = "还需要的话，可以让我重新设。"
+"""失败通知末尾的一句。"""
 
 MAX_FAILURE_LINES = 10
 """失败通知最多列几行，其余写「另有 n 条」。"""
@@ -802,17 +809,33 @@ def reminder_late(seconds: int) -> str:
     return f"晚了 {format_duration(seconds)}"
 
 
-def reminder_message(items: Sequence[tuple[str, int | None]], sent_at: str) -> str:
-    """到点发出的提醒（纯文本）。`items` 是同一分钟到期、合并在一条里的（提醒文字，迟到的秒数），不注明迟到时为
-    `None`；`sent_at` 是发出的时刻（配置时区的 HH:MM），写在最后一行。不用括号：迟到的在那一条末尾写「· 晚了 N 分钟」。"""
+REMINDER_LAST_NOTE = "最后一次"
+"""有限次数的提醒发最后一次时，那一条末尾的说明。"""
 
-    def late_note(late: int | None) -> str:
-        return "" if late is None else f" · {reminder_late(late)}"
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MessageItem:
+    """到点发出的提醒里的一条：提醒文字、迟到的秒数（不注明迟到时为 `None`）、是不是有限次数的最后一次。"""
+
+    content: str = field(repr=False)
+    late: int | None = None
+    last: bool = False
+
+
+def reminder_message(items: Sequence[MessageItem], sent_at: str) -> str:
+    """到点发出的提醒（纯文本）。`items` 是同一分钟到期、合并在一条里的；`sent_at` 是发出的时刻（配置时区的 HH:MM），
+    写在最后一行。不用括号：迟到的在那一条末尾写「 · 晚了 N 分钟」，最后一次的写「 · 最后一次」，都有时两段都写。"""
+
+    def notes(item: MessageItem) -> str:
+        parts = [] if item.late is None else [reminder_late(item.late)]
+        if item.last:
+            parts.append(REMINDER_LAST_NOTE)
+        return "".join(f" · {part}" for part in parts)
 
     if len(items) == 1:
-        ((content, late),) = items
-        return f"提醒：{content}{late_note(late)}\n{sent_at}"
-    lines = [f"- {_one_line(content)}{late_note(late)}" for content, late in items]
+        (item,) = items
+        return f"提醒：{item.content}{notes(item)}\n{sent_at}"
+    lines = [f"- {_one_line(item.content)}{notes(item)}" for item in items]
     return "提醒：\n" + "\n".join(lines) + f"\n{sent_at}"
 
 
@@ -845,25 +868,23 @@ def _failure_line(line: FailureLine) -> str:
     return f"- {_one_line(line.content)}\n    {detail}"
 
 
-def reminder_failures(
-    lines: Sequence[FailureLine], reasons: Sequence[str], *, push_off: bool
-) -> str:
+def reminder_failures(lines: Sequence[FailureLine], reasons: Sequence[str]) -> str:
     """失败通知（纯文本，不编号、不用括号）：有几条提醒没能按时发出、粗分的原因；每条一行内容、下一行缩进写详情，至多
-    列 `MAX_FAILURE_LINES` 条。`push_off` 为真（原因里
-    有「未开启主动消息」）时最后加一句怎么打开。"""
+    列 `MAX_FAILURE_LINES` 条；最后一句说可以重新设。"""
     parts = [f"有 {len(lines)} 条提醒没能按时发出，原因是{'、'.join(reasons)}："]
     parts.extend(_failure_line(line) for line in lines[:MAX_FAILURE_LINES])
     if len(lines) > MAX_FAILURE_LINES:
         parts.append(f"另有 {len(lines) - MAX_FAILURE_LINES} 条。")
-    if push_off:
-        parts.append(REMINDER_PUSH_HINT)
+    parts.append(REMINDER_RETRY_HINT)
     return "\n".join(parts)
 
 
-def reminder_failures_brief(count: int, reasons: Sequence[str], *, push_off: bool) -> str:
+def reminder_failures_brief(count: int, reasons: Sequence[str]) -> str:
     """失败通知的简版：完整的那条被平台拒发时改发，不带提醒文字。"""
-    text = f"有 {count} 条提醒没能按时发出，原因是{'、'.join(reasons)}。具体内容这次没能显示出来。"
-    return f"{text}\n{REMINDER_PUSH_HINT}" if push_off else text
+    return (
+        f"有 {count} 条提醒没能按时发出，原因是{'、'.join(reasons)}。具体内容这次没能显示出来。"
+        f"\n{REMINDER_RETRY_HINT}"
+    )
 
 
 # ---- 提醒的确认按钮（里程碑 8） ----
@@ -893,9 +914,11 @@ def reminder_set_prompt(
     notes: Sequence[str],
     single: bool,
     minutes: int,
+    replacing: str | None = None,
 ) -> str:
     """设置提醒的确认消息（Markdown）：提醒文字是列表项，下面缩进的子条目写规则与接下来的几次（只有一次时只写时间），
-    跳过的月份与闰年的说明也各写一条。`schedule` 是 `reminder_schedule()` 的结果。"""
+    跳过的月份与闰年的说明也各写一条。`schedule` 是 `reminder_schedule()` 的结果。修改提醒时 `replacing` 是要被替换的
+    那条的文字：标题改成「要把这条提醒改成下面这样吗？」，最后一个子条目写「**替换**：原来的文字」。"""
     lines = [f"- {escape_markdown(_one_line(content))}"]
     if single:
         lines.append(_sub("时间", escape_markdown(schedule)))
@@ -903,29 +926,46 @@ def reminder_set_prompt(
         lines.append(_sub("规则", escape_markdown(rule)))
         lines.append(_sub("接下来", escape_markdown(schedule)))
     lines.extend(_sub("说明", escape_markdown(note)) for note in notes)
+    if replacing is not None:
+        lines.append(_sub("替换", escape_markdown(_one_line(replacing))))
     body = "\n".join(lines)
-    return f"要设这条提醒吗？\n\n{body}\n\n按钮 {minutes} 分钟内有效。"
+    title = "要设这条提醒吗？" if replacing is None else "要把这条提醒改成下面这样吗？"
+    return f"{title}\n\n{body}\n\n按钮 {minutes} 分钟内有效。"
 
 
-def reminder_cancel_prompt(items: Sequence[tuple[str, str | None]], minutes: int) -> str:
-    """取消提醒的确认消息（Markdown）。`items` 是（提醒文字，下次的时刻；没有时为 `None`）；不写编号。"""
+def reminder_cancel_prompt(
+    items: Sequence[tuple[str, str | None, str | None]], minutes: int
+) -> str:
+    """取消提醒的确认消息（Markdown）。`items` 是（提醒文字，规则，下次的时刻）：一次性的规则为 `None`，写「**时间**」；
+    周期性的写「**规则**」与「**下次**」，与设置卡片、列表一致。不写编号。"""
     lines: list[str] = []
-    for content, next_at in items:
+    for content, rule, next_at in items:
         lines.append(f"- {escape_markdown(_one_line(content))}")
+        if rule is not None:
+            lines.append(_sub("规则", escape_markdown(rule)))
         if next_at is not None:
-            lines.append(_sub("下次", escape_markdown(next_at)))
+            lines.append(_sub("时间" if rule is None else "下次", escape_markdown(next_at)))
     count = "这条" if len(items) == 1 else f"这 {len(items)} 条"
     return f"要取消{count}提醒吗？\n\n" + "\n".join(lines) + f"\n\n按钮 {minutes} 分钟内有效。"
 
 
-REMINDER_PASSED_BEFORE_BUTTONS = (
-    "要设的提醒时刻在回答写完之前就已经过了，没有设。需要的话请重新说一次时间。"
-)
+REMINDER_PASSED_BEFORE_BUTTONS = "要设的提醒时刻已经过了，没有设。需要的话请重新说一次时间。"
 """轮末要发设置提醒的确认按钮时，提醒已经一次都不剩了（如几分钟后的一次性提醒）：不发按钮，改发这一句。"""
 REMINDER_SET_BUTTONS_FAILED = "确认按钮没能发出来，提醒还没有设。需要的话请再跟我说一次。"
 REMINDER_CANCEL_BUTTONS_FAILED = "确认按钮没能发出来，提醒还没有取消。需要的话请再跟我说一次。"
 
 
+REMINDER_PRESSED_CREATED = "这个按钮已经点过了，提醒已经设好。"
+REMINDER_PRESSED_REPLACED = "这个按钮已经点过了，提醒已经改好。"
+REMINDER_PRESSED_CANCELLED = "这个按钮已经点过了，提醒已经取消。"
+REMINDER_PRESSED = "这个按钮已经点过了。"
+"""再点已经点过的提醒按钮（10 分钟内）时的回复：按上次点的结果说。"""
+CARD_MAYBE_LOST = "确认卡片可能没发出来。没看到的话，请再跟我说一次。"
+"""只发卡片、没有回答文字的一轮里，确认卡片（提醒或忘掉话题）发送结果不明时补发的一句。"""
+REMINDER_LIST_FAILED = "提醒列表没能发出来。需要的话请再跟我说一次。"
+"""程序直接发的提醒列表被平台拒发时补发的一句。"""
+REMINDER_LIST_MAYBE_LOST = "提醒列表可能没发出来。没看到的话，请再跟我说一次。"
+"""只发列表、没有回答文字的一轮里，列表发送结果不明时补发的一句。"""
 REMINDER_BUTTONS_EXPIRED = "这个按钮已经失效了。还需要的话，请再跟我说一次。"
 """点的提醒按钮已经失效（过期、点过，或机器人重启过）。"""
 
@@ -934,15 +974,22 @@ REMINDER_SET_DECLINED = "好的，这条提醒不设了。"
 REMINDER_CANCEL_DECLINED = "好的，不取消了，提醒照旧。"
 
 
-def reminder_created(*, next_at: str, remaining: int | None, once: bool = False) -> str:
+REMINDER_REPLACED_GONE = "原来那条已经不在了。"
+
+
+def reminder_created(
+    *, next_at: str, remaining: int | None, once: bool = False, replaced: bool = False
+) -> str:
     """点了「确认」、建好之后的回复：只写下次的时刻（不重复提醒的内容，那是到点才发的话）。一次性的、或只剩一次的写
-    「我会在……提醒你」；还有好几次的写还剩几次；一直重复的不写次数。"""
+    「我会在……提醒你」；还有好几次的写还剩几次；一直重复的不写次数。修改提醒、替换了原来那条时（`replaced`）开头写
+    「改好了」。"""
     at = _lead(next_at)
+    done = "改好了" if replaced else "设置好了"
     if once or remaining == 1:
-        return f"设置好了，我会在{at} 提醒你。"
+        return f"{done}，我会在{at} 提醒你。"
     if remaining is None:
-        return f"设置好了，下次在{at} 提醒你。"
-    return f"设置好了，下次在{at} 提醒你，还剩 {remaining} 次。"
+        return f"{done}，下次在{at} 提醒你。"
+    return f"{done}，下次在{at} 提醒你，还剩 {remaining} 次。"
 
 
 REMINDER_ONCE_PASSED = "这个时刻已经过去了，提醒没有设。需要的话请再跟我说一次。"

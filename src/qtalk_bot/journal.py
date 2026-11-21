@@ -72,6 +72,9 @@ class ReplyDelivery(StrEnum):
     # 没有送达任何文字回答（模型只画了图没写字，或文字回答没能送达、说明也没能确认送达），但这一轮画的图至少有
     # 一张已确认发给用户：图记成这条回复的附件，这一轮照样结束；结局记的是真实的情况
     IMAGES = "images"
+    # 模型没写回答文字，这一轮只发确认卡片（设置、修改、取消提醒或忘掉话题）与提醒列表（里程碑 8）：content 是程序
+    # 写的确认送达的那些的方括号说明（`Conversation._settle_extras()`），模型下一轮看历史时据此知道那一轮发了什么
+    CARD = "card"
 
 
 class UsagePurpose(StrEnum):

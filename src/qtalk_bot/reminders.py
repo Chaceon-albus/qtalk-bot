@@ -20,8 +20,9 @@ Unix 秒，由调用方传入。所有查询都带 `user_id`。
 - 运行时按配置时区的整点小时与自然日兜底：这个人已经发出（含在途与结果不明）的提醒消息数到了上限，就记失败（超过
   频率上限）。
 - 到点不管记下的开关状态一律去发（用户 2026-11-20 决定：实测关掉「允许主动发送」之后提醒照样送到）。发成功就把
-  开关记成「开」（`reminder_state.record_proven_on()`）。被平台拒发时，开关记着「关」的记「未开启主动消息」，否则记
-  「发送出错」；结果不明（超时等）不重试，记「可能没送到」。
+  开关记成「开」（`reminder_state.record_proven_on()`）。被平台拒发时一律记「发送出错」（不再据开关断定是「未开启
+  主动消息」，用户 2026-11-20 定；库里旧的那种行显示时按「发送出错」处理）；结果不明（超时等）不重试，记「可能没送到」。
+- 有限次数（count 或 end）的提醒发最后一次时，那一条末尾注明「最后一次」。
 - 停用、删了好友、没有授权的用户（`pause_reason()`）：不发，跳过的不补，也不进失败记录；期间已过时刻的一次性提醒
   作废。从暂停变回可发时，在记下恢复的同一个事务里把已经过去、还没处理的次数静默推进（恢复时推进，`reminder_state.py`）。
   管理员 `/pause` 期间照发（第一版到点不调用模型）。
@@ -114,7 +115,8 @@ class ReminderStatus(StrEnum):
 
 
 class FailureReason(StrEnum):
-    """提醒没能按时发出的粗分原因；值存进失败表。"""
+    """提醒没能按时发出的粗分原因；值存进失败表。`PUSH_OFF` 不再记（被平台拒发一律记 `SEND_ERROR`，用户 2026-11-20
+    定），只为认出库里已有的旧行：显示时按「发送出错」处理（`shown`）。"""
 
     PUSH_OFF = "push_off"
     LATE = "late"
@@ -123,12 +125,16 @@ class FailureReason(StrEnum):
     MAYBE_LOST = "maybe_lost"
 
     @property
+    def shown(self) -> FailureReason:
+        """显示时归入的原因：旧的 `PUSH_OFF` 行按 `SEND_ERROR` 处理。"""
+        return FailureReason.SEND_ERROR if self is FailureReason.PUSH_OFF else self
+
+    @property
     def label(self) -> str:
-        return _REASON_LABELS[self]
+        return _REASON_LABELS[self.shown]
 
 
 _REASON_LABELS = {
-    FailureReason.PUSH_OFF: texts.REMINDER_REASON_PUSH_OFF,
     FailureReason.LATE: texts.REMINDER_REASON_LATE,
     FailureReason.SEND_ERROR: texts.REMINDER_REASON_SEND_ERROR,
     FailureReason.RATE_LIMITED: texts.REMINDER_REASON_RATE_LIMITED,
@@ -308,11 +314,13 @@ type Rejection = TooManyActive | RateExceeded | NothingLeft | TooDense
 
 @dataclass(frozen=True, slots=True)
 class Created:
-    """建好了。`first` 是下一次；`remaining` 是日程上还剩几次（含 `first`），没有结束或数不过来时为 `None`。"""
+    """建好了。`first` 是下一次；`remaining` 是日程上还剩几次（含 `first`），没有结束或数不过来时为 `None`；`replaced`
+    是同时取消了要被替换的那条（修改提醒时；那条已经不在了、或不是修改时为假）。"""
 
     reminder: Reminder
     first: Occurrence
     remaining: int | None
+    replaced: bool = False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -332,14 +340,16 @@ def check_admission(
     settings: ReminderSettings,
     timezone: ZoneInfo,
     now: int,
+    replaces: int | None = None,
 ) -> Admission:
     """新建之前的准入检查（不看授权，由调用方另查）：有效条数、`now` 之后还有没有、频率上限的模拟
     （`check_rates()`，计入这个人在当前小时与今天已经发出的提醒消息，以及已经到期、还在宽限内、还没发出的那一批：
-    它们马上会合成一条发出，算在当前时段里）。"""
-    active = count_active(conn, user_id)
+    它们马上会合成一条发出，算在当前时段里）。修改提醒时 `replaces` 是要被替换的那条的编号：条数与频率都先扣掉它
+    （不是这个人有效的提醒时没有可扣的）。"""
+    reminders = [r for r in active_reminders(conn, user_id) if r.id != replaces]
+    active = len(reminders)
     if active >= settings.max_active:
         return TooManyActive(active, settings.max_active)
-    reminders = active_reminders(conn, user_id)
     existing = [Schedule(trigger=r.trigger, anchor=r.anchor_at, resume=r.next) for r in reminders]
     hour, day = hour_start(now, timezone), day_start(now, timezone)
     pending = 1 if any(_dispatchable(r, settings, timezone, now) for r in reminders) else 0
@@ -503,14 +513,25 @@ def create_reminder(
     settings: ReminderSettings,
     timezone: ZoneInfo,
     now: int,
+    replaces: int | None = None,
 ) -> Created | Rejection:
     """准入检查通过就新建（同一个事务里）。不看授权：调用方（点「确认」时）在同一个事务里先用
-    `access.chat_allowed()` 复查。确认之前已经过去的几次算用掉，不发、也不进失败记录。"""
+    `access.chat_allowed()` 复查。确认之前已经过去的几次算用掉，不发、也不进失败记录。
+
+    修改提醒时 `replaces` 是要被替换的那条：准入检查扣掉它，通过了才取消它、再新建，都在这个事务里；没通过时两条都
+    不动。它已经不在了（发完、已取消，或不是这个人的）时照样新建，`Created.replaced` 为假。"""
     admission = check_admission(
-        conn, user_id, candidate, settings=settings, timezone=timezone, now=now
+        conn,
+        user_id,
+        candidate,
+        settings=settings,
+        timezone=timezone,
+        now=now,
+        replaces=replaces,
     )
     if not isinstance(admission, Admitted):
         return admission
+    replaced = replaces is not None and bool(cancel_reminders(conn, user_id, (replaces,), now))
     first = admission.first
     row = conn.execute(
         "INSERT INTO reminders (user_id, action, content, trigger, timezone, anchor_at, next_index,"  # noqa: S608  只拼列名常量
@@ -529,7 +550,7 @@ def create_reminder(
     ).fetchone()
     final = final_occurrence(candidate.trigger, timezone, anchor=candidate.anchor)
     remaining = None if final is None else final.index - first.index + 1
-    return Created(_reminder(row), first, remaining)
+    return Created(_reminder(row), first, remaining, replaced)
 
 
 def cancel_reminders(
@@ -546,6 +567,13 @@ def cancel_reminders(
         if cursor.rowcount == 1:
             cancelled.append(reminder_id)
     return cancelled
+
+
+def _finite(trigger: Trigger) -> bool:
+    """有限次数的周期性提醒（有 count 或 end）；一次性的不算（不标「最后一次」）。"""
+    return isinstance(trigger, Interval | Calendar) and (
+        trigger.count is not None or trigger.end is not None
+    )
 
 
 def _advance(
@@ -671,7 +699,10 @@ def describe_active(
 ) -> list[ActiveView]:
     """这个用户当前有效的提醒写好的样子，按下一次的时刻排列，最多 `limit` 条。"""
     views: list[ActiveView] = []
-    for reminder in active_reminders(conn, user_id)[:limit]:
+    found = (
+        active_reminders(conn, user_id) if limit is None else next_reminders(conn, user_id, limit)
+    )
+    for reminder in found:
         if reminder.next is None:
             continue
         summary = summarize_schedule(
@@ -898,9 +929,10 @@ class FailureNotice:
 
 
 def compose_notice(
-    records: Sequence[FailureRecord], *, push_off: bool, timezone: ZoneInfo, now: int
+    records: Sequence[FailureRecord], *, timezone: ZoneInfo, now: int
 ) -> FailureNotice | None:
-    """把还没告知的失败写成一条通知：同一条提醒（不论原因）合并成一行，按最早的原定时刻排列。没有失败时为 `None`。"""
+    """把还没告知的失败写成一条通知：同一条提醒（不论原因）合并成一行，按最早的原定时刻排列；原因按显示的归类合并
+    （`FailureReason.shown`）。没有失败时为 `None`。"""
     if not records:
         return None
     groups: dict[tuple[str, int], list[FailureRecord]] = {}
@@ -917,7 +949,8 @@ def compose_notice(
         latest = max(group, key=lambda r: r.id)
         totals: dict[FailureReason, int] = {}
         for record in group:
-            totals[record.reason] = totals.get(record.reason, 0) + record.times
+            reason = record.reason.shown
+            totals[reason] = totals.get(reason, 0) + record.times
         reasons = sorted(totals.items(), key=lambda item: (-item[1], _REASON_ORDER[item[0]]))
         once = sum(totals.values()) == 1
         lines.append(
@@ -928,10 +961,11 @@ def compose_notice(
                 reasons=tuple((reason.label, times) for reason, times in reasons),
             )
         )
-    labels = [r.label for r in sorted({r.reason for r in records}, key=_REASON_ORDER.__getitem__)]
+    shown = sorted({r.reason.shown for r in records}, key=_REASON_ORDER.__getitem__)
+    labels = [reason.label for reason in shown]
     return FailureNotice(
-        text=texts.reminder_failures(lines, labels, push_off=push_off),
-        brief=texts.reminder_failures_brief(len(lines), labels, push_off=push_off),
+        text=texts.reminder_failures(lines, labels),
+        brief=texts.reminder_failures_brief(len(lines), labels),
         count=len(lines),
         marks=tuple((r.id, r.times) for r in records),
     )
@@ -940,13 +974,8 @@ def compose_notice(
 def take_notice(
     conn: sqlite3.Connection, user_id: int, *, timezone: ZoneInfo, now: int
 ) -> FailureNotice | None:
-    """这个用户还没告知的失败写成的通知；已知开关关着时加一句怎么打开。"""
-    records = pending_failures(conn, user_id)
-    if not records:
-        return None
-    # 「怎么打开开关」那句只在原因里有「未开启主动消息」时才加。
-    push_off = any(record.reason is FailureReason.PUSH_OFF for record in records)
-    return compose_notice(records, push_off=push_off, timezone=timezone, now=now)
+    """这个用户还没告知的失败写成的通知。"""
+    return compose_notice(pending_failures(conn, user_id), timezone=timezone, now=now)
 
 
 # ---- 清理 ----
@@ -1055,7 +1084,7 @@ class ReminderService:
     ) -> None:
         """用户在资料卡切换了「允许主动发送」：记下状态（停用的也记）。`at` 是授权互动的平台时间：比上一次授权互动更早
         （晚到的旧事件）时不改状态、也不回复。打开、有还没告知的失败、提醒没有暂停时，在他的锁里用 `reply`（这条授权
-        互动的被动回复）发失败通知，不加「请打开开关」那句。不认识的 openid 忽略。"""
+        互动的被动回复）发失败通知。开关的状态只有这一个用途。不认识的 openid 忽略。"""
         user = await self._db.transaction(access.get_user_by_openid, openid)
         if user is None:
             logger.info("不认识的人切换了主动消息开关，忽略")
@@ -1086,9 +1115,7 @@ class ReminderService:
         current = access.get_user(conn, user.id)
         if current is None or pause_reason(conn, current, self._admin_openid) is not None:
             return None
-        return compose_notice(
-            pending_failures(conn, user.id), push_off=False, timezone=self._timezone, now=now
-        )
+        return compose_notice(pending_failures(conn, user.id), timezone=self._timezone, now=now)
 
     async def friend_changed(self, openid: str, *, present: bool, at: int | None) -> None:
         """用户删了好友（`present` 为假）或重新加了好友：删好友期间提醒按停用处理（暂停，跳过的不补），重新加好友后照常
@@ -1159,6 +1186,7 @@ class _Item:
     rule: str
     fire_at: int
     late: int
+    last: bool = False  # 有限次数（count 或 end）的提醒的最后一次
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1387,6 +1415,7 @@ class ReminderScheduler:
                         rule=rule,
                         fire_at=caught.latest.at,
                         late=late,
+                        last=caught.following is None and _finite(reminder.trigger),
                     )
                 )
             _advance(conn, reminder.id, caught.following, now)
@@ -1414,7 +1443,11 @@ class ReminderScheduler:
         )
         text = texts.reminder_message(
             [
-                (item.content, item.late if item.late >= LATE_NOTE_SECONDS else None)
+                texts.MessageItem(
+                    content=item.content,
+                    late=item.late if item.late >= LATE_NOTE_SECONDS else None,
+                    last=item.last,
+                )
                 for item in items
             ],
             f"{local_of(now, self._timezone):%H:%M}",
@@ -1459,18 +1492,13 @@ class ReminderScheduler:
         user_id: int = conn.execute(
             "SELECT user_id FROM reminder_sends WHERE id = ?", (plan.send_id,)
         ).fetchone()[0]
-        state = get_user_state(conn, user_id)
         match delivery:
             case Delivery.SENT:
                 # 发送成功证明开关是「开」，更早的授权互动之后不再改状态（`record_proven_on()`）。
                 record_proven_on(conn, user_id, now)
             case Delivery.NOT_SENT:
-                reason = (
-                    FailureReason.PUSH_OFF
-                    if state.push is PushState.OFF
-                    else FailureReason.SEND_ERROR
-                )
-                self._fail_items(conn, user_id, plan.items, reason, now)
+                # 开关关着也记「发送出错」：开关的状态不一定准，不据此断定原因（用户 2026-11-20 定）。
+                self._fail_items(conn, user_id, plan.items, FailureReason.SEND_ERROR, now)
             case Delivery.UNKNOWN:
                 self._fail_items(conn, user_id, plan.items, FailureReason.MAYBE_LOST, now)
 

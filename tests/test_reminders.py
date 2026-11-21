@@ -487,14 +487,22 @@ def test_summary_notes_skipped_months_and_leap_years() -> None:
 
 
 def test_merged_message_texts() -> None:
-    # 发出的时刻写在最后一行；迟到的不用括号，在那一条末尾写「· 晚了 N 分钟」。
-    assert texts.reminder_message([("吃药", None)], "20:52") == "提醒：吃药\n20:52"
-    assert texts.reminder_message([("吃药", 12 * 60)], "20:52") == (
+    from qtalk_bot.texts import MessageItem
+
+    # 发出的时刻写在最后一行；迟到的不用括号，在那一条末尾写「 · 晚了 N 分钟」，最后一次写「 · 最后一次」。
+    assert texts.reminder_message([MessageItem(content="吃药")], "20:52") == "提醒：吃药\n20:52"
+    assert texts.reminder_message([MessageItem(content="吃药", late=12 * 60)], "20:52") == (
         "提醒：吃药 · 晚了 12 分钟\n20:52"
     )
-    assert texts.reminder_message([("吃药\n两片", None), ("喝水", 3700)], "20:52") == (
-        "提醒：\n- 吃药 两片\n- 喝水 · 晚了 1 小时 1 分钟\n20:52"
+    assert texts.reminder_message(
+        [MessageItem(content="吃药\n两片"), MessageItem(content="喝水", late=3700)], "20:52"
+    ) == ("提醒：\n- 吃药 两片\n- 喝水 · 晚了 1 小时 1 分钟\n20:52")
+    assert texts.reminder_message([MessageItem(content="吃药", last=True)], "20:52") == (
+        "提醒：吃药 · 最后一次\n20:52"
     )
+    assert texts.reminder_message(
+        [MessageItem(content="吃药", late=600, last=True), MessageItem(content="喝水")], "20:52"
+    ) == ("提醒：\n- 吃药 · 晚了 10 分钟 · 最后一次\n- 喝水\n20:52")
 
 
 # ---- 到点发送 ----
@@ -727,27 +735,43 @@ async def test_reminders_are_sent_even_when_the_switch_is_off(db: Database) -> N
         await run_at(scheduler, clock, at(moment))
 
     assert len(sender.sent) == 3  # 每一条都去发
-    # 被拒时开关记着「关」，原因写「未开启主动消息」；通知末尾加怎么打开。
-    assert summary(await failures(db, alice)) == [(FailureReason.PUSH_OFF, 3)]
+    # 被拒时开关记着「关」也一律记「发送出错」，通知里不提开关（用户 2026-11-20 定）。
+    assert summary(await failures(db, alice)) == [(FailureReason.SEND_ERROR, 3)]
     replies = Replies()
     await ReminderService(db, admin_openid=ADMIN, timezone=TZ).notify_in_turn(alice, replies)
-    assert replies.texts[0].endswith(texts.REMINDER_PUSH_HINT)
+    assert "原因是发送出错" in replies.texts[0]
+    assert "主动" not in replies.texts[0]
+    assert replies.texts[0].endswith(texts.REMINDER_RETRY_HINT)
     # 发成功就记回「开」。
     await run_at(scheduler, clock, at("2026-11-21T16:00"))
     assert len(sender.sent) == 4
     assert (await db.transaction(get_user_state, alice.id)).push is PushState.ON
 
 
-async def test_push_hint_only_when_a_reason_is_push_off(db: Database) -> None:
+async def test_old_push_off_rows_are_shown_as_send_errors(db: Database) -> None:
+    # 库里旧的「未开启主动消息」行：显示时按「发送出错」处理，同一条提醒的两种合成一种。
     alice = await invited(db, ALICE, "小王")
-    await db.transaction(record_push, alice.id, PushState.OFF, T0)
-    await db.transaction(fail, alice, None, FailureReason.SEND_ERROR, T0)
+    created = await add(db, alice, "喝水", kind="calendar", times=["16:00"])
+    rid = created.reminder.id
+
+    def plant(conn: sqlite3.Connection) -> None:
+        fail(conn, alice, rid, FailureReason.PUSH_OFF, T0, content="喝水")
+        fail(conn, alice, rid, FailureReason.SEND_ERROR, T0 + 86400, content="喝水")
+        fail(conn, alice, None, FailureReason.PUSH_OFF, T0 + 60, content="旧的")
+
+    await db.transaction(plant)
     replies = Replies()
 
     await ReminderService(db, admin_openid=ADMIN, timezone=TZ).notify_in_turn(alice, replies)
 
     (text,) = replies.texts
-    assert texts.REMINDER_PUSH_HINT not in text  # 开关记着「关」，但原因不是它
+    assert text.split("\n")[0] == "有 2 条提醒没能按时发出，原因是发送出错："
+    assert "- 喝水\n    每 10 分钟一次，错过 2 次，发送出错\n" in text
+    assert "- 旧的\n    原定 11 月 20 日 星期五 15:31，发送出错\n" in text
+    assert "未开启" not in text
+    assert "主动" not in text
+    assert FailureReason.PUSH_OFF.label == texts.REMINDER_REASON_SEND_ERROR
+    assert await failures(db, alice) == []  # 照样标为已告知
 
 
 def enable(conn: sqlite3.Connection, user: User, now: int) -> None:
@@ -961,15 +985,16 @@ async def test_failures_merge_per_reminder_reason_until_notified(db: Database) -
         (FailureReason.LATE, 3, T0, T0 + 600),
         (FailureReason.PUSH_OFF, 1, T0 + 60, T0 + 60),
     ]
-    notice = compose_notice(records, push_off=False, timezone=TZ, now=T0)
+    notice = compose_notice(records, timezone=TZ, now=T0)
     assert notice is not None
     assert notice.text == (
-        "有 1 条提醒没能按时发出，原因是未开启主动消息、没能按时发出：\n"
-        "- 吃药\n    每 10 分钟一次，错过 4 次：没能按时发出 3 次、未开启主动消息 1 次"
+        "有 1 条提醒没能按时发出，原因是机器人当时没在运行或太忙、发送出错：\n"
+        "- 吃药\n    每 10 分钟一次，错过 4 次：机器人当时没在运行或太忙 3 次、发送出错 1 次\n"
+        + texts.REMINDER_RETRY_HINT
     )
 
 
-def test_notice_lists_at_most_ten_lines_and_the_switch_hint() -> None:
+def test_notice_lists_at_most_ten_lines_and_the_retry_hint() -> None:
     records = [
         FailureRecord(
             id=n,
@@ -984,20 +1009,21 @@ def test_notice_lists_at_most_ten_lines_and_the_switch_hint() -> None:
         for n in range(1, 13)
     ]
 
-    notice = compose_notice(records, push_off=True, timezone=TZ, now=T0)
+    notice = compose_notice(records, timezone=TZ, now=T0)
 
     assert notice is not None
     lines = notice.text.split("\n")
     # 不编号、不用括号：内容一行，详情缩进在下一行。
-    assert lines[0] == "有 12 条提醒没能按时发出，原因是未开启主动消息："
+    assert lines[0] == "有 12 条提醒没能按时发出，原因是发送出错："
     assert lines[1] == "- 第 1 条"
-    assert lines[2] == "    原定今天 15:31，未开启主动消息"
+    assert lines[2] == "    原定今天 15:31，发送出错"
     assert lines[19] == "- 第 10 条"
     assert lines[21] == "另有 2 条。"
-    assert lines[22] == texts.REMINDER_PUSH_HINT
+    assert lines[22] == texts.REMINDER_RETRY_HINT
+    assert len(lines) == 23
     assert notice.brief == (
-        "有 12 条提醒没能按时发出，原因是未开启主动消息。具体内容这次没能显示出来。\n"
-        + texts.REMINDER_PUSH_HINT
+        "有 12 条提醒没能按时发出，原因是发送出错。具体内容这次没能显示出来。\n"
+        + texts.REMINDER_RETRY_HINT
     )
     assert "第 1 条" not in notice.brief
 
@@ -1089,7 +1115,7 @@ async def test_turning_the_switch_on_replies_with_the_notice(db: Database) -> No
     (text,) = replies.texts
     assert "爱丽丝的提醒" in text
     assert "鲍勃" not in text
-    assert texts.REMINDER_PUSH_HINT not in text  # 打开时不加「请打开开关」
+    assert "主动" not in text
     assert await failures(db, alice) == []
     state = await db.transaction(get_user_state, alice.id)
     assert (state.push, state.push_updated_at) == (PushState.ON, T0)
@@ -1468,7 +1494,7 @@ async def test_purge_keeps_reminders_with_unnotified_failures(db: Database) -> N
 
     await db.transaction(purge_reminders, now, 3)
     kept = [row["id"] for row in await db.fetch_all("SELECT id FROM reminders")]
-    notice = compose_notice(await failures(db, alice), push_off=False, timezone=TZ, now=now)
+    notice = compose_notice(await failures(db, alice), timezone=TZ, now=now)
 
     assert kept == [rid]
     assert notice is not None
@@ -1732,3 +1758,141 @@ async def test_failure_copies_keep_absolute_dates(db: Database) -> None:
 
     (failure,) = await failures(db, alice)
     assert failure.rule == "每 10 分钟一次，从 11 月 20 日 星期五 16:00 起，最多 10 次"
+
+
+# ---- 修改提醒（替换）与最后一次的标记 ----
+
+
+async def replace(
+    db: Database,
+    user: User,
+    content: str,
+    replaces: int,
+    *,
+    settings: ReminderSettings | None = None,
+    **fields: object,
+) -> object:
+    trigger = parse_trigger(fields, now=T0, timezone=TZ)
+    return await db.transaction(
+        create_reminder,
+        user.id,
+        Candidate(content=content, trigger=trigger, anchor=T0),
+        settings=ReminderSettings() if settings is None else settings,
+        timezone=TZ,
+        now=T0,
+        replaces=replaces,
+    )
+
+
+async def contents(db: Database, user: User) -> list[str]:
+    return [r.content for r in await db.transaction(active_reminders, user.id)]
+
+
+async def test_replacing_cancels_the_old_one_and_creates_the_new_one(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    old = await add(db, alice, "旧的", kind="calendar", times=["08:00"])
+
+    result = await replace(db, alice, "新的", old.reminder.id, kind="calendar", times=["09:00"])
+
+    assert isinstance(result, Created)
+    assert result.replaced
+    assert await contents(db, alice) == ["新的"]
+    gone = await db.transaction(get_reminder, alice.id, old.reminder.id)
+    assert gone is not None
+    assert gone.status is ReminderStatus.CANCELLED
+
+
+async def test_a_rejected_replacement_leaves_both_unchanged(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    old = await add(db, alice, "旧的", kind="calendar", times=["08:00"])
+    settings = ReminderSettings(hourly_limit=5)
+
+    result = await replace(
+        db,
+        alice,
+        "刷屏",
+        old.reminder.id,
+        settings=settings,
+        kind="interval",
+        every=1,
+        unit="minutes",
+    )
+
+    assert isinstance(result, RateExceeded)
+    assert await contents(db, alice) == ["旧的"]  # 旧的没有被取消，新的也没建
+    kept = await db.transaction(get_reminder, alice.id, old.reminder.id)
+    assert kept is not None
+    assert kept.status is ReminderStatus.ACTIVE
+
+
+async def test_admission_leaves_out_the_replaced_one(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    # 条数：到了上限时新设不行，替换可以。
+    full = ReminderSettings(max_active=1)
+    old = await add(db, alice, "旧的", kind="calendar", times=["08:00"])
+    assert await try_add(db, alice, "新的", settings=full, kind="calendar", times=["09:00"]) == (
+        TooManyActive(1, 1)
+    )
+    first = await replace(
+        db, alice, "新的", old.reminder.id, settings=full, kind="calendar", times=["09:00"]
+    )
+    assert isinstance(first, Created)
+    # 频率：新旧两条叠加才超的，替换时不再计入旧的。
+    rated = ReminderSettings(daily_limit=3)
+    three = ["10:00", "11:00", "12:00"]
+    added = await try_add(db, alice, "频率", settings=rated, kind="calendar", times=three)
+    assert isinstance(added, RateExceeded)
+    swapped = await replace(
+        db, alice, "频率", first.reminder.id, settings=rated, kind="calendar", times=three
+    )
+    assert isinstance(swapped, Created)
+    assert await contents(db, alice) == ["频率"]
+
+
+async def test_replacing_one_that_is_gone_still_creates(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    bob = await invited(db, BOB, "小李")
+    old = await add(db, alice, "旧的", kind="calendar", times=["08:00"])
+    await db.transaction(cancel_reminders, alice.id, [old.reminder.id], T0)
+    bobs = await add(db, bob, "鲍勃的", kind="calendar", times=["08:00"])
+
+    gone = await replace(db, alice, "新的", old.reminder.id, kind="calendar", times=["09:00"])
+    others = await replace(db, alice, "又一条", bobs.reminder.id, kind="calendar", times=["10:00"])
+
+    assert isinstance(gone, Created)
+    assert not gone.replaced
+    assert isinstance(others, Created)
+    assert not others.replaced  # 别人的提醒不动
+    assert await contents(db, alice) == ["新的", "又一条"]
+    assert await contents(db, bob) == ["鲍勃的"]
+
+
+async def test_the_last_time_of_a_finite_reminder_is_marked(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    await add(db, alice, "喝水", kind="calendar", times=["16:00", "17:00"], count=2)
+    await add(db, alice, "一次", kind="once", at="2026-11-20T17:00")
+    await add(
+        db,
+        alice,
+        "截止",
+        kind="interval",
+        every=1,
+        unit="hours",
+        start="2026-11-20T16:00",
+        end="2026-11-20T17:00",
+    )
+    await add(db, alice, "一直", kind="calendar", times=["17:00"])
+    sender, clock = Sender(), Clock(T0)
+    scheduler = make_scheduler(db, sender, clock)
+
+    await run_at(scheduler, clock, at("2026-11-20T16:00"))
+    await run_at(scheduler, clock, at("2026-11-20T17:05"))  # 晚了 5 分钟，仍在宽限内
+
+    assert [text for _, text in sender.sent] == [
+        "提醒：\n- 喝水\n- 截止\n16:00",
+        # 合并的各自判断；一次性的不标；迟到与最后一次都有时两段都写。
+        (
+            "提醒：\n- 喝水 · 晚了 5 分钟 · 最后一次\n- 一次 · 晚了 5 分钟\n"
+            "- 截止 · 晚了 5 分钟 · 最后一次\n- 一直 · 晚了 5 分钟\n17:05"
+        ),
+    ]

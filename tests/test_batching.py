@@ -198,6 +198,9 @@ class Channel:
     async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
         self.sent.append(f"[按钮] {markdown}")
 
+    async def send_markdown(self, markdown: str) -> None:
+        self.sent.append(f"[Markdown] {markdown}")
+
     def open_process(self) -> ReplyStream:
         raise AssertionError("这里的替身不发过程消息")
 

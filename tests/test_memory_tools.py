@@ -546,7 +546,10 @@ async def test_forget_topic_never_deletes_by_itself_and_sends_buttons(
     (result,) = model.results
     assert not result.is_error
     assert "还没有删除" in text_parts(result)
-    assert await contents(db, alice) == [*before, "把那个话题忘掉", "请点按钮确认"]
+    *kept, asked, replied = await contents(db, alice)
+    assert (kept, asked) == (before, "把那个话题忘掉")
+    # 回答文字之后另起一行，记下确认送达的卡片。
+    assert replied.startswith(f"请点按钮确认\n[发了忘掉话题的确认卡片：话题 #{first}「")
     assert await topic_ids(db, alice) == [first, second, max(await topic_ids(db, alice))]
     (buttons,) = channel.buttons
     assert [(b.label, b.visited_label) for b in buttons] == [

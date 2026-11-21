@@ -2785,6 +2785,15 @@ async def test_reply_channel_sends_markdown_with_one_row_of_callback_buttons() -
     ]
 
 
+async def test_reply_channel_sends_plain_markdown_without_buttons() -> None:
+    message = _FakeButtonMessage()
+    channel = bot_module._QQReplyChannel(cast(pyqbot.C2CMessage, message))  # pyright: ignore[reportPrivateUsage]  测接线层的通道本身
+
+    await channel.send_markdown("你现在有 1 条提醒：\n\n- 喝水")
+
+    assert message.replies == [{"markdown": "你现在有 1 条提醒：\n\n- 喝水"}]
+
+
 class _FakeInteraction:
     def __init__(
         self,

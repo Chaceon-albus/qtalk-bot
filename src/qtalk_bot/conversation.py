@@ -149,14 +149,28 @@
 
 **提醒的函数与确认按钮**（里程碑 8，构造时给了 `reminder_settings`）：所有对话模型的请求都带上 `reminder_tools.FUNCTIONS`
 （设置、列出、取消提醒），不依赖话题线与 `[memory]`，执行方是 `_ReminderTools`；系统提示词里带上这个用户的提醒资料
-（`_reminder_brief()`，开轮的事务里取）。设置与取消本身不改任何东西，只把这一项记进 `_Turn.pending`。
+（`_reminder_brief()`，开轮的事务里取）。设置（含修改）与取消本身不改任何东西，只把这一项记进 `_Turn.pending`；列出
+提醒只把渲染好的列表记进 `_Turn.listing`，由 `_send_listing()` 直接发给用户（在确认卡片之前；同一轮里多次调用只发
+最后一次的），模型只拿到 JSON 资料。
+- **列表与卡片的时机**（`_send_extras()`）：回答结束之后、记账之前发。在回答之后：同一用户还在写的流式消息会被另一条
+  回复提前结束（errata 40034019）。在记账之前：流水按实际送达的写（`_settle_extras()`），确认送达的列表与卡片各记一句
+  程序写的方括号说明，另起一行接在回答文字后面；被拒、没发、送达不明的不记。只在这一轮会结束时发（同 `_record()` 的
+  判断），没有结束的一轮会被并进下一轮。
+- **预留**：接受列表或待确认的一项时各为它预留一次被动回复（`ReplyBudget.reserve()`）；正文的兜底（改发纯文本、固定
+  说明）发完要给预留留不出余量时不发（`_fallback_room()`），宁可不发正文的说明，也照样发已经答应的列表与卡片。
 - **一轮只出一条确认**（`confirmations.py`）：忘掉话题、设置提醒、取消提醒共用 `_Turn.pending`。同一种后到的：设置与
-  取消取代前一次，忘掉话题照旧只能是同一个话题；不同种类后到的被拒（`reminder_tools.slot_taken()`）。这一轮记账之后
+  取消取代前一次，忘掉话题照旧只能是同一个话题；不同种类后到的被拒（`reminder_tools.slot_taken()`）。回答结束之后
   `_offer()` 按它发一条 Markdown 加两个按钮的消息，令牌经 `confirmations.TokenRegistry` 登记（带种类，10 分钟，只能用
   一次，只在内存里）。
 - 点按钮（`press_button()`）按令牌的种类分派：忘掉话题照旧；设置在用户的锁与一个事务里先复查授权、再
-  `reminders.create_reminder()`（重新校验条数、频率、是否还有剩下的触发），回复实际的下一次与还剩几次；取消不看授权，
-  回复取消了哪几条。已不能使用对话的用户点提醒的按钮不回复、不新建。
+  `reminders.create_reminder()`（重新校验条数、频率、是否还有剩下的触发；修改时先取消要被替换的那条，原子完成），
+  回复实际的下一次与还剩几次；取消不看授权，回复取消了哪几条。已不能使用对话的用户点提醒的按钮不回复、不新建。用过的
+  提醒按钮 10 分钟内再点，按上次的结果回复（`TokenRegistry.remember()`）。
+- **只发卡片、列表的一轮**：设置、修改、取消提醒，忘掉话题，或列出提醒时模型照提示不写回答文字（正常结束、只有空白，
+  结局 `empty`），而这一轮有待确认的一项或要发的列表（`_Turn.silent_card()`）：不算失败，不换备用模型，不发回答也不发
+  失败说明，接着发列表与卡片。流水里只记确认送达的那些的方括号说明（送达状态 `card`）；一项都没送达时不写内容，
+  补发的说明（「没能发出来」等）确认送达了按 `failed` 记（同其它固定说明，这一轮结束），否则按 `notice_lost`（消息
+  留给下一轮）。第一条发出之前（`claim()` 之前）这一轮还没显示任何东西，被插话重来时照常重来（`_restart()`）。
 
 **判断插话**（`judge()`）：在事务里复查授权、取出正在回答的消息与新消息的文字版（只有这个用户自己的），交给
 `routing.SteerJudge`；决策记录与用量挂在新消息里最后一条上，被取消时也照记。
@@ -212,13 +226,17 @@ from .confirmations import (
     TOKEN_SECONDS,
     ButtonKind,
     CancelItem,
+    Click,
     Pending,
     PendingCancel,
     PendingForget,
     PendingSet,
+    Pressed,
     Refused,
+    Replaced,
     Ticket,
     TokenRegistry,
+    Used,
     button_data,
     kind_of,
     parse_click,
@@ -493,6 +511,10 @@ class ReplyChannel(Protocol):
 
         准备工作（如上传）做完、真正发起回复的请求之前调用一次 `replying()`：从那时起被取消的，平台可能已经
         接受了这条回复，调用方按送达说不准处理。"""
+        ...
+
+    async def send_markdown(self, markdown: str) -> None:
+        """发一条 Markdown 的普通消息（如程序直接发的提醒列表），算一次被动回复。它不是回答，引用索引不存，不返回。"""
         ...
 
     async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
@@ -783,13 +805,36 @@ class _Turn:
         self.images_delivered = 0  # 确认发给了用户的图
         self.images_uncertain = 0  # 说不准是否送达的图
         self.image_ref: str | None = None  # 第一张确认送达的图的引用索引
-        # 这一轮待确认的一项（忘掉话题、设置或取消提醒，`confirmations.py`）：记账之后发确认按钮（`Conversation._offer()`）。
+        # 这一轮待确认的一项（忘掉话题、设置或取消提醒，`confirmations.py`）：回答结束之后发确认按钮（`Conversation._offer()`）。
         self.pending: Pending | None = None
+        # 这一轮要由程序直接发给用户的提醒列表（`list_reminders`，只留最后一次的）：回答结束之后、确认卡片之前发。
+        self.listing: reminder_tools.Listing | None = None
+        # 列表或卡片没发成时补发的说明确认送达了（`Conversation._extra_notice()`）。
+        self.extra_noticed = False
+        # 正文的兜底为了给列表或卡片留着预留而没发（`Conversation._fallback_room()`）：之后照样发列表与卡片。
+        self.kept_room = False
         self.profile_forgotten = False  # 这一轮调用过 `forget_profile_item`：不再排整份档案的重写
-        self.ended = False  # 记账时这一轮记下了轮次边界（`journal.ends_turn()`）
         # 这一轮带上的全部用户消息：用户点了「确认删除」时随话题一并删掉。
         self.messages: tuple[int, ...] = ()
         self.control.on_cut(self.cut)
+
+    def silent_card(self, ending: Ending) -> bool:
+        """模型照提示没写回答文字（正常结束，结局 `empty`），而这一轮有待确认的一项（设置、修改、取消提醒或忘掉话题）
+        或要发的提醒列表：这一轮不算失败，不换备用模型，只发卡片与列表。"""
+        return ending is Ending.EMPTY and (self.pending is not None or self.listing is not None)
+
+    def accept_listing(self, listing: reminder_tools.Listing) -> None:
+        """记下（或取代）这一轮要发的提醒列表；第一次时为它预留一次被动回复（同 `accept()`）。"""
+        if self.listing is None:
+            self.channel.budget.reserve()
+        self.listing = listing
+
+    def drop_listing(self) -> reminder_tools.Listing | None:
+        """作废这一轮要发的提醒列表（换备用模型重来、轮末要发它了），退回预留；返回作废的那一份。"""
+        listing, self.listing = self.listing, None
+        if listing is not None:
+            self.channel.budget.release()
+        return listing
 
     def accept(self, pending: Pending) -> None:
         """接受（或取代）这一轮待确认的一项。第一次接受时为轮末的确认按钮预留一次被动回复（`ReplyBudget.reserve()`），
@@ -1142,7 +1187,7 @@ class Conversation:
         回复插进去让平台提前结束它。按 openid 找不到用户时不处理。令牌见 `confirmations.TokenRegistry`：
 
         - 令牌不存在、已过期（`TOKEN_SECONDS`）、已经点过、机器人重启过，或种类与按钮不符：请用户重新说一次（忘掉话题与
-          提醒各有文案）。
+          提醒各有文案）。提醒的按钮点过之后 10 分钟内本人再点，按上次的结果回复（设好了、改好了、取消了，或只说点过了）。
         - 点的人与令牌记下的用户不符：只记日志，不回复、不处理（令牌照旧有效）。
         - 令牌只能用一次：点过任一按钮就作废。点「取消」「保留」什么都不改。
         - 忘掉话题，点「确认删除」：删掉这个话题，连同令牌记下的那一轮的用户消息（与回复），以及因此变空的话题
@@ -1166,9 +1211,9 @@ class Conversation:
                     logger.warning("用户 %s 点了不是发给他的确认按钮，不处理", user.label)
                     return
                 if click.kind is not ButtonKind.FORGET_TOPIC:
-                    await self._press_reminder(user, click.kind, click.confirmed, taken, reply)
+                    await self._press_reminder(user, click, taken, reply)
                     return
-                if taken is Refused.EXPIRED:
+                if not isinstance(taken, Ticket):  # 过期，或（忘掉话题不记）用过
                     logger.info("用户 %s 点的忘掉话题的按钮已经失效", user.label)
                     await reply(texts.forget_expired(FORGET_TOKEN_SECONDS // 60))
                     return
@@ -1188,36 +1233,56 @@ class Conversation:
     async def _press_reminder(
         self,
         user: User,
-        kind: ButtonKind,
-        confirmed: bool,
-        taken: Ticket | Refused,
+        click: Click,
+        taken: Ticket | Used | Refused,
         reply: Callable[[str], Awaitable[None]],
     ) -> None:
-        """点了设置或取消提醒的按钮（在这个用户的锁里）。规则见 `press_button()`。"""
+        """点了设置或取消提醒的按钮（在这个用户的锁里）。规则见 `press_button()`。用过的令牌记下这次点的结果
+        （`TokenRegistry.remember()`），10 分钟内再点时按结果回复，免得用户以为没设成又设一遍。"""
         settings = self._reminder_settings
-        cancelling = kind is ButtonKind.CANCEL_REMINDER
-        if isinstance(taken, Ticket) and confirmed and cancelling:
+        cancelling = click.kind is ButtonKind.CANCEL_REMINDER
+        if isinstance(taken, Ticket) and click.confirmed and cancelling:
             pending = taken.pending
             assert isinstance(pending, PendingCancel)
             ids = [item.reminder_id for item in pending.items]
             cancelled, allowed = await self._db.transaction(self._confirm_cancel, user, ids)
+            # 再点时按实际的结果回复：一条都没取消（都已经不在了）的只说点过了。
+            self._tokens.remember(
+                click.token, taken, Pressed.CANCELLED if cancelled else Pressed.OTHER
+            )
             logger.info("用户 %s 确认取消提醒，取消了 %d 条", user.label, len(cancelled))
             if allowed:
                 await reply(texts.reminder_cancelled(len(cancelled), len(ids) - len(cancelled)))
             return
-        if isinstance(taken, Ticket) and confirmed and settings is not None:
+        if isinstance(taken, Ticket) and click.confirmed and settings is not None:
             pending = taken.pending
             assert isinstance(pending, PendingSet)
             outcome = await self._db.transaction(self._confirm_set, user, pending, settings)
             if outcome is None:
+                self._tokens.remember(click.token, taken, Pressed.OTHER)
                 logger.info("用户 %s 已不能使用对话，点了「确认」也不建提醒、不回复", user.label)
                 return
-            await reply(outcome)
+            text, pressed = outcome
+            self._tokens.remember(click.token, taken, pressed)
+            await reply(text)
             return
+        if isinstance(taken, Ticket):
+            self._tokens.remember(click.token, taken, Pressed.OTHER)
         if not await self._db.transaction(self._allowed, user):
             logger.info("用户 %s 已不能使用对话，点了提醒的按钮不回复", user.label)
             return
-        if not isinstance(taken, Ticket) or (settings is None and confirmed):
+        if isinstance(taken, Used):
+            logger.info("用户 %s 又点了一次已经点过的提醒按钮", user.label)
+            await reply(
+                {
+                    Pressed.CREATED: texts.REMINDER_PRESSED_CREATED,
+                    Pressed.REPLACED: texts.REMINDER_PRESSED_REPLACED,
+                    Pressed.CANCELLED: texts.REMINDER_PRESSED_CANCELLED,
+                    Pressed.OTHER: texts.REMINDER_PRESSED,
+                }[taken.pressed]
+            )
+            return
+        if not isinstance(taken, Ticket) or (settings is None and click.confirmed):
             logger.info("用户 %s 点的提醒按钮已经失效", user.label)
             await reply(texts.REMINDER_BUTTONS_EXPIRED)
             return
@@ -1237,9 +1302,10 @@ class Conversation:
         user: User,
         pending: PendingSet,
         settings: ReminderSettings,
-    ) -> str | None:
+    ) -> tuple[str, Pressed] | None:
         """确认新建：同一个事务里复查授权（不通过返回 `None`，不建、不回复），再新建（重新校验条数、频率、是否还有剩下的
-        触发）。返回给用户的回复。"""
+        触发）。修改提醒时先取消要被替换的那条再新建，原子完成（`reminders.create_reminder()`；没建成时两条都不动）。
+        返回给用户的回复与这次点的结果（`Pressed`，再点时据此回复）。"""
         current = access.get_user(conn, user.id)
         if (
             current is None
@@ -1249,19 +1315,36 @@ class Conversation:
             return None  # 已不能使用对话，或提醒暂停中（如删了好友）：不建、不回复
         now = int(self._clock())
         timezone = self._timezone
+        replaces = None if pending.replaces is None else pending.replaces.reminder_id
         result = reminders.create_reminder(
-            conn, user.id, pending.candidate, settings=settings, timezone=timezone, now=now
+            conn,
+            user.id,
+            pending.candidate,
+            settings=settings,
+            timezone=timezone,
+            now=now,
+            replaces=replaces,
         )
         match result:
-            case reminders.Created(reminder=reminder, first=first, remaining=remaining):
-                logger.info("用户 %s 确认设置提醒 #%d", user.label, reminder.id)
-                return texts.reminder_created(
+            case reminders.Created(
+                reminder=reminder, first=first, remaining=remaining, replaced=replaced
+            ):
+                logger.info(
+                    "用户 %s 确认%s提醒 #%d",
+                    user.label,
+                    "修改" if replaces is not None else "设置",
+                    reminder.id,
+                )
+                text = texts.reminder_created(
                     next_at=reminders.moment_text(first.at, timezone, now),
                     remaining=remaining,
-                    once=isinstance(
-                        reminder.trigger, Once
-                    ),  # 一次性的 remaining 是 1，不写「还剩 1 次」
+                    once=isinstance(reminder.trigger, Once),  # 一次性的不写「还剩 1 次」
+                    replaced=replaced,
                 )
+                if replaces is not None and not replaced:
+                    # 要被替换的那条在确认之前已经发完或取消了：照样新建，说一句。
+                    text = f"{texts.REMINDER_REPLACED_GONE}{text}"
+                return text, Pressed.REPLACED if replaced else Pressed.CREATED
             case reminders.TooManyActive(active=active, limit=limit):
                 why, text = "有效条数到了上限", texts.reminder_too_many(active, limit)
             case reminders.RateExceeded(period=period, start=start, count=count, limit=limit):
@@ -1279,30 +1362,72 @@ class Conversation:
             case reminders.TooDense():
                 why, text = "太密", texts.REMINDER_TOO_DENSE
         logger.info("用户 %s 点了「确认」，提醒没有建（%s）", user.label, why)
-        return text
+        return text, Pressed.OTHER
 
-    async def _offer(self, turn: _Turn, pending: Pending) -> None:
-        """这一轮记账之后，对这一轮回复挂的那条消息发一条带按钮的确认消息（不进流水）。
+    async def _send_extras(self, turn: _Turn, *, silent: bool) -> list[str]:
+        """这一轮回答结束之后、记账之前，发这一轮要发的提醒列表与确认卡片（先列表后卡片），返回确认送达的那些的方括号
+        说明（按发出的先后），由调用方写进流水。补发的说明（「没能发出来」等）确认送达时记进 `turn.extra_noticed`。
+
+        在记账之前发，流水才能按实际的结果写；第一条发出之前（`claim()` 之前）这一轮还没有显示任何东西，被插话
+        重来时照常重来（`_TurnChannel` 的 `claim()` 不成功时抛出 `CancelledError`，这里在开始时也查一次）。退回预留：
+        列表先退、先发，确认卡片的预留留到发它之前才退，列表的兜底说明不会占掉卡片的那一次。"""
+        if turn.control.preempted:
+            raise asyncio.CancelledError
+        notes: list[str] = []
+        listing = turn.drop_listing()
+        if listing is not None and await self._send_listing(turn, listing, silent=silent):
+            notes.append(listing.note)
+        pending = turn.drop_pending()
+        if pending is not None and await self._offer(turn, pending, silent=silent):
+            notes.append(self._card_note(pending))
+        return notes
+
+    def _card_note(self, pending: Pending) -> str:
+        match pending:
+            case PendingForget(topic_id=topic_id, title=title):
+                return memory_tools.card_note(topic_id, title)
+            case PendingSet() | PendingCancel():
+                return reminder_tools.card_note(
+                    pending, timezone=self._timezone, now=int(self._clock())
+                )
+
+    async def _extra_notice(self, turn: _Turn, text: str) -> None:
+        """列表或卡片没发成时补一句说明（余量还够时）；确认送达就记进 `turn.extra_noticed`。"""
+        if not turn.channel.budget.affords_last():
+            return
+        try:
+            await turn.channel.send(text)
+        except SendError as exc:
+            logger.warning("列表或卡片没能发出的说明也没能发给用户 %s：%s", turn.user.label, exc)
+            return
+        turn.extra_noticed = True
+
+    async def _offer(self, turn: _Turn, pending: Pending, *, silent: bool = False) -> bool:
+        """这一轮回答结束之后，对这一轮回复挂的那条消息发一条带按钮的确认消息；返回是否确认送达。
 
         先复查授权：停用了就不发（已经发出的有效按钮照设计仍可删本人的数据）。被插话重来、余量不够时不发；平台拒发而
         余量还够发一条纯文字时，补一句「按钮没能发出来」，免得用户以为该有按钮。发送结果说不准时只记日志（按钮可能
-        已经到了）。"""
+        已经到了，令牌照旧有效，但不算送达）；只是这一轮没有回答文字（`silent`）时，余量还够就补一句「卡片可能没发
+        出来」，免得用户什么都没看到。"""
         user = turn.user
         kind = kind_of(pending)
         if turn.control.preempted:
-            return
+            return False
         if not await self._db.transaction(self._allowed, user):
             logger.info("用户 %s 已不能使用对话，不发确认按钮（%s）", user.label, kind.value)
-            return
+            return False
         if not turn.channel.budget.affords_last():
             logger.info(
                 "用户 %s 这条消息的被动回复次数用完了，没发确认按钮（%s）", user.label, kind.value
             )
-            return
+            return False
         minutes = TOKEN_SECONDS // 60
         match pending:
             case PendingForget(topic_id=topic_id, title=title):
-                markdown = texts.forget_prompt(topic_id, title, minutes)
+                keeps = self._reminder_settings is not None and bool(
+                    await self._db.transaction(reminders.count_active, user.id)
+                )
+                markdown = texts.forget_prompt(topic_id, title, minutes, reminders=keeps)
                 labels = (
                     (texts.FORGET_CONFIRM_LABEL, texts.FORGET_CONFIRMED_LABEL),
                     (texts.FORGET_KEEP_LABEL, texts.FORGET_KEPT_LABEL),
@@ -1315,11 +1440,8 @@ class Conversation:
                     logger.info(
                         "用户 %s 要设的提醒在回答写完前已经没有触发时刻了，不发按钮", user.label
                     )
-                    try:
-                        await turn.channel.send(texts.REMINDER_PASSED_BEFORE_BUTTONS)
-                    except SendError as exc:
-                        logger.warning("时刻已过的说明没能发给用户 %s：%s", user.label, exc)
-                    return
+                    await self._extra_notice(turn, texts.REMINDER_PASSED_BEFORE_BUTTONS)
+                    return False
                 markdown = found
                 labels = (
                     (texts.REMINDER_SET_CONFIRM_LABEL, texts.REMINDER_SET_CONFIRMED_LABEL),
@@ -1328,7 +1450,7 @@ class Conversation:
                 failed = texts.REMINDER_SET_BUTTONS_FAILED
             case PendingCancel(items=items):
                 markdown = texts.reminder_cancel_prompt(
-                    [(item.content, item.next) for item in items], minutes
+                    [(item.content, item.rule, item.next) for item in items], minutes
                 )
                 labels = (
                     (texts.REMINDER_CANCEL_CONFIRM_LABEL, texts.REMINDER_CANCEL_CONFIRMED_LABEL),
@@ -1346,18 +1468,50 @@ class Conversation:
         except SendRejectedError as exc:
             logger.warning("确认按钮（%s）没能发给用户 %s：%s", kind.value, user.label, exc)
             self._tokens.withdraw(token)
-            if turn.channel.budget.affords_last():
-                try:
-                    await turn.channel.send(failed)
-                except SendError as again:
-                    logger.warning("按钮没能发出的说明也没能发给用户 %s：%s", user.label, again)
-            return
+            await self._extra_notice(turn, failed)
+            return False
         except SendError as exc:
             logger.warning(
                 "给用户 %s 发确认按钮（%s）时不确定是否送达：%s", user.label, kind.value, exc
             )
-            return
+            if silent:
+                await self._extra_notice(turn, texts.CARD_MAYBE_LOST)
+            return False
+        except asyncio.CancelledError:
+            self._tokens.withdraw(token)  # 被插话重来（`claim()` 不成功）：按钮没有发出
+            raise
         logger.info("给用户 %s 发了确认按钮（%s）", user.label, kind.value)
+        return True
+
+    async def _send_listing(
+        self, turn: _Turn, listing: reminder_tools.Listing, *, silent: bool
+    ) -> bool:
+        """这一轮回答结束之后，把 `list_reminders` 的列表（Markdown）作为一条消息发给用户；返回是否确认送达。
+
+        授权、插话、余量的检查同 `_offer()`。被平台拒发时余量还够就补一句「列表没能发出来」；发送结果说不准时只记日志，
+        只是这一轮没有回答文字（`silent`）时补一句「列表可能没发出来」。"""
+        user = turn.user
+        if turn.control.preempted:
+            return False
+        if not await self._db.transaction(self._allowed, user):
+            logger.info("用户 %s 已不能使用对话，不发提醒列表", user.label)
+            return False
+        if not turn.channel.budget.affords_last():
+            logger.info("用户 %s 这条消息的被动回复次数用完了，没发提醒列表", user.label)
+            return False
+        try:
+            await turn.channel.send_markdown(listing.markdown)
+        except SendRejectedError as exc:
+            logger.warning("提醒列表没能发给用户 %s：%s", user.label, exc)
+            await self._extra_notice(turn, texts.REMINDER_LIST_FAILED)
+            return False
+        except SendError as exc:
+            logger.warning("给用户 %s 发提醒列表时不确定是否送达：%s", user.label, exc)
+            if silent:
+                await self._extra_notice(turn, texts.REMINDER_LIST_MAYBE_LOST)
+            return False
+        logger.info("给用户 %s 发了提醒列表", user.label)
+        return True
 
     def _set_prompt(self, pending: PendingSet, minutes: int) -> str | None:
         """设置提醒的确认消息：按现在重新算接下来的几次（这一轮可能写了一阵）；已经一次都不剩时为 `None`。"""
@@ -1374,6 +1528,7 @@ class Conversation:
             notes=summary.notes,
             single=isinstance(candidate.trigger, Once),
             minutes=minutes,
+            replacing=None if pending.replaces is None else pending.replaces.content,
         )
 
     async def drain(self) -> None:
@@ -1524,10 +1679,9 @@ class Conversation:
         except asyncio.CancelledError as exc:
             if control.preempted:
                 # 插话重来：回答什么都没交给 QQ，不写回复行，消息留给重新开始的那一轮；决策与用量照记。过程
-                # 消息写上收尾的一行后结束，全文留给重来的那一轮存档。忘掉话题的确认按钮不发。
+                # 消息写上收尾的一行后结束，全文留给重来的那一轮存档。列表与确认卡片不发。
                 await self._wind_down(turn, quiet=True, note=texts.PROCESS_RESTART)
-                control.earlier.append(turn.process)
-                await asyncio.shield(self._record_preempted(turn, begun.last_message_id))
+                await self._restart(turn, begun)
                 raise
             cancelled = exc
             outcome = await self._wind_down(turn)
@@ -1552,9 +1706,34 @@ class Conversation:
         if cancelled is None and failure is None:
             try:
                 await self._close_process(turn)
-            except asyncio.CancelledError as exc:  # 回答已经有了结局，照它记账
+            except asyncio.CancelledError as exc:
                 turn.process.cancel()
-                cancelled = exc
+                if control.preempted:
+                    # 还什么都没显示（如只发卡片的一轮，卡片还没发）就被插话重来：同上，不写回复行。
+                    await self._restart(turn, begun)
+                    raise
+                cancelled = exc  # 回答已经有了结局，照它记账
+        if turn.listing is not None or turn.pending is not None:
+            # 列表与确认卡片在回答结束之后、记账之前发，流水按实际送达的写。只在这一轮会结束时发（用户实际收到了
+            # 东西，`journal.ends_turn()`；只发卡片、列表的一轮；或正文的兜底为了留着预留没发）：没有结束的一轮
+            # （什么都没送达）会被并进下一轮，忘掉话题时确认后删不干净。
+            notes: list[str] = []
+            if cancelled is None and failure is None and self._sends_extras(turn, outcome):
+                try:
+                    notes = await self._send_extras(
+                        turn, silent=outcome.delivery is ReplyDelivery.CARD
+                    )
+                except asyncio.CancelledError as exc:
+                    if control.preempted:
+                        # 第一条还没发出就被插话重来：这一轮什么都没显示，照常重来，不写回复行。
+                        await self._restart(turn, begun)
+                        raise
+                    cancelled = exc
+            turn.drop_listing()  # 没发的退回预留
+            turn.drop_pending()
+            outcome = self._settle_extras(turn, outcome, notes, cancelled=cancelled is not None)
+        elif outcome.delivery is ReplyDelivery.CARD:  # 不会发生：只发卡片的一轮总有要发的
+            outcome = _Outcome("", ReplyDelivery.NOTICE_LOST)
         # 正常结束与被取消共用这一次记账；shield 让写入不随取消撤掉（数据库线程正忙、事务还没执行时，
         # 直接 await 被取消会把它撤掉），即使这里再次被取消，事务也照常完成，且只写一次。
         turn_messages = [
@@ -1575,12 +1754,6 @@ class Conversation:
             raise cancelled
         if failure is not None:
             raise failure
-        pending = turn.drop_pending()  # 退回预留：要发就在 `_offer()` 里按 `affords_last()` 再查
-        if pending is not None and turn.ended:
-            # 模型调用了 forget_topic、set_reminder 或 cancel_reminder：记账之后发一条带确认按钮的消息，用户点了「确认」
-            # 才生效（`press_button()`）。只在这一轮记下了轮次边界时发：没有结束的一轮（什么都没送达）会被并进下一轮，
-            # 忘掉话题时确认后删不干净。
-            await self._offer(turn, pending)
         if outcome.delivery is not ReplyDelivery.WITHHELD:  # skipped 的也是 withheld
             self._schedule_descriptions(user, begun)
         if attributed is not None and self._summarizer is not None:
@@ -1667,7 +1840,6 @@ class Conversation:
             outcome = _Outcome("", ReplyDelivery.NOTICED)
         # 实际以原件交给模型的附件：这一轮结束了（用户实际收到了东西，`journal.ends_turn()`）时，以最后一次
         # 调用（换了备用模型时是备用模型，被取消时是被打断的那次）的请求为准；没有结束这一轮的都不算。
-        turn.ended = journal.ends_turn(outcome.content, outcome.delivery)
         given = (
             turn.attempts[-1].given
             if turn.attempts and journal.ends_turn(outcome.content, outcome.delivery)
@@ -1708,6 +1880,14 @@ class Conversation:
             turn.process.chunks,
         )
         return attributed
+
+    async def _restart(self, turn: _Turn, begun: _Begun) -> None:
+        """被插话重来（还什么都没显示）的收尾：列表与卡片不发、退回预留（重来的那一轮用同一条消息的余量），过程消息
+        留给重来的那一轮存档，不写回复行，消息仍是待回复的；决策与用量照记。"""
+        turn.drop_listing()
+        turn.drop_pending()
+        turn.control.earlier.append(turn.process)
+        await asyncio.shield(self._record_preempted(turn, begun.last_message_id))
 
     async def _record_preempted(self, turn: _Turn, message_id: int) -> None:
         await self._db.transaction(
@@ -1838,16 +2018,16 @@ class Conversation:
         if self._reminder_settings is None:
             return None
         timezone = self._timezone
-        # 只取写进提示词的几项（编号、内容、规则、下一次），不算剩余次数这类用不上的；条数写死，不跟 `max_active` 走。
+        # 编号、内容、规则、下一次与还剩几次（修改带次数上限的提醒时，count 照它填）；条数写死，不跟 `max_active` 走。
         entries = tuple(
             ReminderEntry(
-                id=r.id,
-                text=r.content,
-                rule=reminders.rule_text(r.trigger, timezone, now),
-                next=reminders.moment_text(r.next.at, timezone, now),
+                id=view.id,
+                text=view.content,
+                rule=view.rule,
+                next=view.next,
+                remaining=reminder_tools.remaining_value(view),
             )
-            for r in reminders.next_reminders(conn, user.id, BRIEF_REMINDERS)
-            if r.next is not None
+            for view in reminders.describe_active(conn, user.id, timezone, now, BRIEF_REMINDERS)
         )
         recent = reminders.recent_deliveries(
             conn, user.id, now - RECENT_SENT_SECONDS, RECENT_SENT_SHOWN
@@ -2270,6 +2450,7 @@ class Conversation:
                 not attempt.has_answer
                 and not turn.outbox.handed
                 and not turn.images_shown
+                and not turn.silent_card(attempt.ending)
                 and index + 1 < len(models)
             )
             if retry and (left := self._time_left(turn)) is not None and left < MIN_CALL_SECONDS:
@@ -2289,6 +2470,10 @@ class Conversation:
                 if turn.drop_pending() is not None:
                     logger.info(
                         "用户 %s 这一轮换备用模型，丢掉主模型登记的待确认项", turn.user.label
+                    )
+                if turn.drop_listing() is not None:
+                    logger.info(
+                        "用户 %s 这一轮换备用模型，丢掉主模型要发的提醒列表", turn.user.label
                     )
                 logger.warning(
                     "模型 %s 没能回复用户 %s（%s），改用备用模型 %s",
@@ -2653,7 +2838,12 @@ class Conversation:
                 if turn.images_delivered and last.ending is Ending.EMPTY:
                     logger.info("模型只给用户 %s 发了图、没有写文字，不发失败说明", user.label)
                     return _Outcome("", ReplyDelivery.IMAGES, turn.image_ref)
-                sent = await _send_notice(channel, texts.MODEL_FAILED, user)
+                if turn.silent_card(last.ending):
+                    # 设置、修改、取消提醒，忘掉话题，或列出提醒时模型照提示不写回答文字：不发回答也不发失败说明，
+                    # 之后直接发列表与确认卡片（`_send_extras()`）。还没有内容：流水按实际送达的写（`_settle_extras()`）。
+                    logger.info("用户 %s 这一轮只发卡片或列表，没有回答文字", user.label)
+                    return _Outcome("", ReplyDelivery.CARD)
+                sent = await self._fallback(turn, texts.MODEL_FAILED)
                 return _Outcome("", ReplyDelivery.FAILED if sent else ReplyDelivery.NOTICE_LOST)
             if outbox.unclosed:
                 return outbox.outcome(ReplyDelivery.UNCLOSED)
@@ -2666,7 +2856,7 @@ class Conversation:
         if isinstance(outbox.error, SendUncertainError):
             return outbox.outcome(ReplyDelivery.UNCERTAIN)
         # 流式回复被平台拒绝：全文改用纯文本再发一次。
-        if last.text.strip():
+        if last.text.strip() and self._fallback_room(turn):
             answer = last.text + citations.plain_section(last.sources)
             plain = answer if notice is None else f"{answer}\n\n{notice}"
             try:
@@ -2679,9 +2869,57 @@ class Conversation:
             else:
                 logger.info("用户 %s 的流式回复被平台拒绝，已改发纯文本", user.label)
                 return _Outcome(answer, ReplyDelivery.PLAIN, ref_idx)
-        sent = await _send_notice(channel, texts.REPLY_REJECTED, user)
+        sent = await self._fallback(turn, texts.REPLY_REJECTED)
         delivery = ReplyDelivery.REJECTED if sent else ReplyDelivery.NOTICE_LOST
         return outbox.outcome(delivery)
+
+    def _sends_extras(self, turn: _Turn, outcome: _Outcome) -> bool:
+        """回答结束之后发不发列表与卡片：只发卡片、列表的一轮；正文的兜底为了留预留没发；或这一轮会结束（用户实际
+        收到了东西，同 `_record()` 里的判断：回答或固定说明、图、附件的说明）。"""
+        return (
+            outcome.delivery is ReplyDelivery.CARD
+            or turn.kept_room
+            or journal.ends_turn(outcome.content, outcome.delivery)
+            or turn.images_delivered > 0
+            or bool(turn.sent_notices)
+        )
+
+    def _fallback_room(self, turn: _Turn) -> bool:
+        """正文的兜底（改发纯文本、固定说明）还发不发：这一轮答应了要发列表或卡片（有预留）时，发完要给它们留着预留，
+        余量不够就不发，记下 `turn.kept_room`（之后照样发列表与卡片）。没有预留时照旧发。"""
+        budget = turn.channel.budget
+        if budget.reserved == 0 or budget.affords_last():
+            return True
+        logger.info(
+            "用户 %s 这条消息的被动回复次数要留给列表或卡片，不再发正文的兜底", turn.user.label
+        )
+        turn.kept_room = True
+        return False
+
+    async def _fallback(self, turn: _Turn, text: str) -> bool:
+        """发正文的固定说明（余量规则见 `_fallback_room()`），返回是否确认送达。"""
+        if not self._fallback_room(turn):
+            return False
+        return await _send_notice(turn.channel, text, turn.user)
+
+    def _settle_extras(
+        self, turn: _Turn, outcome: _Outcome, notes: Sequence[str], *, cancelled: bool
+    ) -> _Outcome:
+        """按列表与卡片实际送达的结果定下这一轮记进流水的回复：确认送达的那些的方括号说明另起一行接在回答文字后面
+        （只发卡片、列表的一轮就只有它们）。只发卡片、列表的一轮一项都没送达时不算回复：补发的说明确认送达了按
+        `failed`（同其它固定说明），否则按 `notice_lost`，被取消（关停）时按 `cancelled`，都不写内容。"""
+        if outcome.delivery is not ReplyDelivery.CARD:
+            if not notes:
+                return outcome
+            joined = "\n".join(part for part in (outcome.content, *notes) if part)
+            return replace(outcome, content=joined)
+        if notes:
+            return _Outcome("\n".join(notes), ReplyDelivery.CARD)
+        if cancelled:
+            return _Outcome("", ReplyDelivery.CANCELLED)
+        return _Outcome(
+            "", ReplyDelivery.FAILED if turn.extra_noticed else ReplyDelivery.NOTICE_LOST
+        )
 
     async def _close_process(self, turn: _Turn) -> None:
         """一轮正常结束：结束过程消息（回答开始时已经结束的就等它发完），最多等 `GRACE_SECONDS`。"""
@@ -2965,6 +3203,11 @@ class _TurnChannel:
         self._claim()
         self.budget.replies += 1
         return await self._channel.send_image(data, mime_type, replying)
+
+    async def send_markdown(self, markdown: str) -> None:
+        self._claim()
+        self.budget.replies += 1
+        await self._channel.send_markdown(markdown)
 
     async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
         self._claim()
@@ -3445,7 +3688,10 @@ class _ReminderTools:
     - `set_reminder`：不建任何东西。规则合法、文字合法、准入检查通过（`reminders.check_admission()`）、这一轮没有别的
       种类待确认、被动回复留得出发确认按钮的余量时，记进 `_Turn.pending`（同一轮里后一次取代前一次）；否则交回说明。
       相对时间按调用这一刻换算（`anchor`）。
-    - `list_reminders`：只读这个用户的有效提醒、开关状态与还没告知的失败数。
+    - `list_reminders`：只读这个用户的有效提醒、暂停状态与还没告知的失败数，把渲染好的列表记进 `_Turn.listing`（同一轮
+      里后一次取代前一次；第一次要留得出发列表的余量），交回 JSON 资料。
+    - `set_reminder` 填了 `replaces`（修改）：只认这个用户仍然有效的提醒，有不是的（含别人的）按「不存在」交回；准入
+      检查扣掉它再算。
     - `cancel_reminder`：不取消任何东西。编号都是这个用户仍然有效的提醒时记进 `_Turn.pending`（同一轮里后一次取代
       前一次）；有不是的（含别人的）一律按「不存在」交回，不泄露是否存在。
     交回任何结果之前复查授权，不通过就停下这次模型调用（`_RevokedError`）。执行期间暂停这次调用的空闲时限。日志只记
@@ -3519,14 +3765,24 @@ class _ReminderTools:
         candidate = reminders.Candidate(
             content=arguments.content, trigger=arguments.trigger, anchor=now
         )
-        admission = await deps.db.transaction(self._admit, candidate, now)
+        replaces = arguments.replaces
+        checked = await deps.db.transaction(self._admit, candidate, now, replaces)
+        if checked is None:
+            assert replaces is not None
+            logger.info("给用户 %s 修改提醒：要被替换的编号不是他有效的提醒", user.label)
+            return self._failed(reminder_tools.replace_not_found(replaces), PendingSet)
+        admission, replaced_item = checked
         if not isinstance(admission, reminders.Admitted):
             logger.info(
                 "给用户 %s 设置的提醒没通过准入检查：%s", user.label, type(admission).__name__
             )
             return self._failed(
                 reminder_tools.rejected(
-                    admission, candidate.trigger, timezone=deps.timezone, now=now
+                    admission,
+                    candidate.trigger,
+                    timezone=deps.timezone,
+                    now=now,
+                    replacing=replaces is not None,
                 ),
                 PendingSet,
             )
@@ -3538,36 +3794,79 @@ class _ReminderTools:
         if (refused := self._slot(PendingSet)) is not None:
             return refused
         replaced = isinstance(turn.pending, PendingSet)
-        turn.accept(PendingSet(candidate=candidate, summary=summary))
+        turn.accept(PendingSet(candidate=candidate, summary=summary, replaces=replaced_item))
         logger.info(
-            "用户 %s 要设置一条提醒%s：这一轮结束后发确认按钮",
+            "用户 %s 要%s一条提醒%s：这一轮结束后发确认按钮",
             user.label,
+            "修改" if replaced_item is not None else "设置",
             "（取代前一次）" if replaced else "",
         )
         return reminder_tools.set_pending(
-            summary, replaced=replaced, timezone=deps.timezone, now=now
-        )
-
-    def _admit(
-        self, conn: sqlite3.Connection, candidate: reminders.Candidate, now: int
-    ) -> reminders.Admission:
-        deps = self._deps
-        return reminders.check_admission(
-            conn,
-            self._turn.user.id,
-            candidate,
-            settings=deps.settings,
+            summary,
+            replaced=replaced,
+            replaces=replaced_item,
             timezone=deps.timezone,
             now=now,
         )
 
-    async def _list(self) -> FunctionResult:
+    def _admit(
+        self,
+        conn: sqlite3.Connection,
+        candidate: reminders.Candidate,
+        now: int,
+        replaces: int | None,
+    ) -> tuple[reminders.Admission, Replaced | None] | None:
+        """准入检查；修改时先认要被替换的那条（只认这个用户仍然有效的，别人的同样按不存在，返回 `None`），条数与频率
+        扣掉它再算。"""
         deps, user = self._deps, self._turn.user
+        replaced: Replaced | None = None
+        if replaces is not None:
+            found = reminders.get_reminder(conn, user.id, replaces)
+            if found is None or found.next is None:
+                return None
+            replaced = Replaced(reminder_id=found.id, content=found.content)
+        admission = reminders.check_admission(
+            conn,
+            user.id,
+            candidate,
+            settings=deps.settings,
+            timezone=deps.timezone,
+            now=now,
+            replaces=replaces,
+        )
+        return admission, replaced
+
+    def _list_room(self) -> FunctionResult | None:
+        """还没有要发的列表时，要留得出发列表的余量（同 `_slot()`：调用开始时查一次，记下之前在同一步里再查一次）。"""
+        turn = self._turn
+        if turn.listing is None and not turn.channel.budget.affords(1):
+            logger.info("用户 %s 这条消息的被动回复次数不够发提醒列表", turn.user.label)
+            return reminder_tools.no_room_for_list()
+        return None
+
+    async def _list(self) -> FunctionResult:
+        deps, turn = self._deps, self._turn
+        user = turn.user
+        if (refused := self._list_room()) is not None:
+            return refused
         now = int(deps.clock())
         views, paused, unnotified = await deps.db.transaction(self._listing, now)
         waiting = deps.waiting(user.id)
-        logger.info("给用户 %s 列出了 %d 条提醒、%d 条待确认", user.label, len(views), len(waiting))
-        return reminder_tools.listed(views, waiting=waiting, paused=paused, unnotified=unnotified)
+        if (refused := self._list_room()) is not None:
+            return refused
+        replaced = turn.listing is not None
+        turn.accept_listing(
+            reminder_tools.listing(views, waiting=waiting, paused=paused, unnotified=unnotified)
+        )
+        logger.info(
+            "用户 %s 要看提醒：%d 条提醒、%d 条待确认，这一轮结束后发列表",
+            user.label,
+            len(views),
+            len(waiting),
+        )
+        return reminder_tools.listed(
+            views, waiting=waiting, paused=paused, unnotified=unnotified, replaced=replaced
+        )
 
     def _listing(
         self, conn: sqlite3.Connection, now: int
@@ -3618,6 +3917,9 @@ class _ReminderTools:
                     reminder_id=found.id,
                     content=found.content,
                     next=reminders.moment_text(found.next.at, deps.timezone, now),
+                    rule=None
+                    if isinstance(found.trigger, Once)
+                    else reminders.rule_text(found.trigger, deps.timezone, now),
                 )
             )
         return items, missing

@@ -631,6 +631,9 @@ class _QQReplyChannel:
         sent = await _guarded(self._message.reply(media=photo))
         return None if sent.ext_info is None else _ref_value(sent.ext_info.ref_idx)
 
+    async def send_markdown(self, markdown: str) -> None:
+        await _guarded(self._message.reply(markdown=markdown))
+
     async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
         """Markdown 加一行回调按钮（键盘只能随 Markdown 发，pyqbot guide 第 3 节；单聊实测可发，errata「键盘」）。"""
         keyboard = pyqbot.Keyboard.from_rows(
