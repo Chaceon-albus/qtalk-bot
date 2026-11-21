@@ -55,7 +55,7 @@ class UserReminderState:
         push: 主动消息开关。
         push_updated_at: 最近一次改开关状态的时刻（我们的时钟）。
         push_event_at: 最近一次授权互动的平台时间；更早的授权互动（晚到的旧事件）不再改开关。
-        push_trial_day: 开关为「关」时最近一次试发的本地日期。
+        push_trial_day: 第 17 版的列，已不再使用：到点不管开关一律去发（用户 2026-11-20 决定），不再「每天试发一次」。
         friend_removed: 删了好友。
         friend_updated_at: 最近一次好友事件的平台时间。
         paused_since: 提醒从什么时候起暂停；没有暂停时为 `None`。
@@ -108,7 +108,8 @@ def record_push(
     *,
     event_at: int | None = None,
 ) -> bool:
-    """记下主动消息开关的状态。改成「开」时清掉今天试发过的记录。
+    """记下主动消息开关的状态。开关只用来写失败原因（被拒时是「未开启主动消息」还是「发送出错」）与打开时当场回复失败
+    通知，不拦发送。
 
     `event_at` 是授权互动的平台时间（来自授权互动时给）：比已知状态的时刻更早（晚到的旧事件）时不改，返回 `False`。
     「已知状态的时刻」（`push_event_at`）是上一次授权互动的平台时间，或发送成功所证明的「开」的时刻减去
@@ -119,8 +120,7 @@ def record_push(
         " VALUES (?, ?, ?, ?)"
         " ON CONFLICT (user_id) DO UPDATE SET push = excluded.push,"
         " push_updated_at = excluded.push_updated_at,"
-        " push_event_at = coalesce(excluded.push_event_at, push_event_at),"
-        " push_trial_day = CASE WHEN excluded.push = 'off' THEN push_trial_day END"
+        " push_event_at = coalesce(excluded.push_event_at, push_event_at)"
         " WHERE excluded.push_event_at IS NULL OR push_event_at IS NULL"
         " OR push_event_at <= excluded.push_event_at",
         (user_id, state.value, now, event_at),
@@ -136,18 +136,8 @@ def record_proven_on(conn: sqlite3.Connection, user_id: int, now: int) -> None:
         "INSERT INTO reminder_user_state (user_id, push, push_updated_at, push_event_at)"
         " VALUES (?, 'on', ?, ?)"
         " ON CONFLICT (user_id) DO UPDATE SET push = 'on', push_updated_at = excluded.push_updated_at,"
-        " push_trial_day = NULL,"
         " push_event_at = max(coalesce(push_event_at, excluded.push_event_at), excluded.push_event_at)",
         (user_id, now, watermark),
-    )
-
-
-def record_trial(conn: sqlite3.Connection, user_id: int, day: str) -> None:
-    """记下开关为「关」时今天已经试发过（`day` 是本地日期）。"""
-    conn.execute(
-        "INSERT INTO reminder_user_state (user_id, push_trial_day) VALUES (?, ?)"
-        " ON CONFLICT (user_id) DO UPDATE SET push_trial_day = excluded.push_trial_day",
-        (user_id, day),
     )
 
 

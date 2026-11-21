@@ -666,7 +666,11 @@ def forget_done(topic_id: int) -> str:
 #
 # 到点发出的提醒、失败通知都用纯文本发（不做 Markdown 转义）；提醒文字是用户的原话，放进列表时压成一行。
 
-WEEKDAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+WEEKDAY_NAMES = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+"""日期里的星期（用户 2026-11-20 定：「星期几」的叫法）。"""
+_WEEKDAY_SHORT = "一二三四五六日"
+"""规则里「每周一、三、五」的写法。"""
+_RELATIVE_DAYS = ("今天", "明天", "后天")
 _UNIT_NAMES = {
     IntervalUnit.MINUTES: "分钟",
     IntervalUnit.HOURS: "小时",
@@ -681,45 +685,60 @@ REMINDER_REASON_SEND_ERROR = "发送出错"
 REMINDER_REASON_RATE_LIMITED = "超过频率上限"
 REMINDER_REASON_MAYBE_LOST = "可能没送到"
 
-REMINDER_PUSH_HINT = (
-    "你现在没有开启「允许主动发送」，提醒到点发不出去。可以在机器人的资料卡里打开「允许主动发送」。"
-)
-"""已知用户关着主动消息的开关时，失败通知最后加的一句。"""
+REMINDER_PUSH_HINT = "可以在机器人的资料卡里打开「允许主动发送」。"
+"""失败原因里有「未开启主动消息」时，失败通知最后加的一句。"""
 
 MAX_FAILURE_LINES = 10
 """失败通知最多列几行，其余写「另有 n 条」。"""
 
 
-def reminder_date(moment: datetime, now: datetime) -> str:
-    """「11 月 23 日（周一）」；与 `now` 不在同一年时前面加年份。两个都是本地时刻。"""
+def reminder_date(moment: datetime, now: datetime, *, relative: bool = True) -> str:
+    """日期的写法（用户 2026-11-20 定）：按自然日算，今天、明天、后天直接写「今天」「明天」「后天」；更远的写
+    「11 月 26 日 星期四」；与 `now` 不在同一年时前面加年份，如「2027 年 1 月 5 日 星期二」。两个都是本地时刻。
+    `relative` 为假时不用「今天」这类说法：存起来之后再显示的副本（如失败记录里的规则）用它，免得过了一天就说错。"""
+    if relative and 0 <= (days := (moment.date() - now.date()).days) < len(_RELATIVE_DAYS):
+        return _RELATIVE_DAYS[days]
     year = "" if moment.year == now.year else f"{moment.year} 年 "
     weekday = WEEKDAY_NAMES[moment.weekday()]
-    return f"{year}{moment.month} 月 {moment.day} 日（{weekday}）"
+    return f"{year}{moment.month} 月 {moment.day} 日 {weekday}"
 
 
-def reminder_moment(moment: datetime, now: datetime) -> str:
-    """「11 月 23 日（周一）08:00」；与 `now` 不在同一年时前面加年份。两个都是本地时刻。"""
-    return f"{reminder_date(moment, now)}{moment:%H:%M}"
+def _lead(date: str) -> str:
+    """接在汉字后面的日期：以数字开头（「11 月 26 日」）时前面空一格，「明天」这类不空。"""
+    return f" {date}" if date[:1].isdigit() else date
 
 
-def reminder_rule(trigger: Trigger, now: datetime, timezone: ZoneInfo) -> str:
-    """触发规则的中文描述，如「每周一、周三 08:00，最多 10 次」。`now` 是本地时刻，只用来决定写不写年份。以绝对时刻为准
-    的（由相对时间换算出的一次性时刻与间隔起点）按 `timezone`（现在配置的时区）换算显示，与「下一次」一致。"""
+def is_relative_day(text: str) -> bool:
+    """`reminder_date()` 的结果是不是「今天」「明天」「后天」。"""
+    return text in _RELATIVE_DAYS
+
+
+def reminder_moment(moment: datetime, now: datetime, *, relative: bool = True) -> str:
+    """「明天 08:00」「11 月 26 日 星期四 08:00」，规则见 `reminder_date()`。"""
+    return f"{reminder_date(moment, now, relative=relative)} {moment:%H:%M}"
+
+
+def reminder_rule(
+    trigger: Trigger, now: datetime, timezone: ZoneInfo, *, relative: bool = True
+) -> str:
+    """触发规则的中文描述，如「每周一、三 08:00，最多 10 次」。`now` 是本地时刻，用来决定写「今天」「明天」与年份；
+    `relative` 见 `reminder_date()`。以绝对时刻为准的（由相对时间换算出的一次性时刻与间隔起点）按 `timezone`（现在
+    配置的时区）换算显示，与「下次」一致。"""
     match trigger:
         case Once(at=at, moment=moment):
             shown = at if moment is None else local_of(moment, timezone)
-            return f"一次：{reminder_moment(shown, now)}"
+            return f"一次：{reminder_moment(shown, now, relative=relative)}"
         case Interval():
             unit = _UNIT_NAMES[trigger.unit]
             every = f"每{unit}" if trigger.every == 1 else f"每 {trigger.every} {unit}"
             start = (
                 trigger.start if trigger.start_at is None else local_of(trigger.start_at, timezone)
             )
-            rule = f"{every}一次，从 {reminder_moment(start, now)} 起"
+            rule = f"{every}一次，从{_lead(reminder_moment(start, now, relative=relative))} 起"
         case Calendar():
             rule = f"{_calendar_days(trigger)} {'、'.join(f'{t:%H:%M}' for t in trigger.times)}"
     if trigger.end is not None:
-        rule += f"，到 {reminder_moment(trigger.end, now)} 为止"
+        rule += f"，到{_lead(reminder_moment(trigger.end, now, relative=relative))} 为止"
     if trigger.count is not None:
         rule += f"，最多 {trigger.count} 次"
     return rule
@@ -728,7 +747,7 @@ def reminder_rule(trigger: Trigger, now: datetime, timezone: ZoneInfo) -> str:
 def _calendar_days(trigger: Calendar) -> str:
     months = None if trigger.months is None else "、".join(f"{m} 月" for m in trigger.months)
     if trigger.weekdays is not None:
-        weekdays = "每" + "、".join(WEEKDAY_NAMES[day] for day in trigger.weekdays)
+        weekdays = "每周" + "、".join(_WEEKDAY_SHORT[day] for day in trigger.weekdays)
         return weekdays if months is None else f"每年 {months}的{weekdays}"
     if trigger.monthdays is not None:
         days = "、".join("最后一天" if d == LAST_DAY else f"{d} 日" for d in trigger.monthdays)
@@ -750,7 +769,7 @@ def reminder_rule_notes(trigger: Trigger) -> list[str]:
         lacking = [m for m in months if _MONTH_DAYS[m - 1] < day]
         if lacking:
             names = "、".join(f"{m} 月" for m in lacking)
-            notes.append(f"没有 {day} 日的月份（{names}）跳过。")
+            notes.append(f"没有 {day} 日的月份跳过：{names}。")
         if day == 29 and 2 in months:
             notes.append("2 月 29 日只在闰年有，平年的 2 月跳过。")
     return notes
@@ -759,7 +778,7 @@ def reminder_rule_notes(trigger: Trigger) -> list[str]:
 def reminder_schedule(
     upcoming: Sequence[str], *, more: bool, total: int | None, last: str | None, until: str | None
 ) -> str:
-    """接下来的几次（已写好的时刻，至多 3 个）与总次数，如「接下来：A、B、C……共 10 次，最后一次是 X」。
+    """接下来的几次（已写好的时刻，至多 3 个）与总次数，如「A、B、C……共 10 次，最后一次是 X」。
 
     `more` 表示列出的之后还有；`total` 与 `last` 是日程上的总次数与最后一次（不知道时为 `None`）；`until` 是不知道
     总数、但有结束时刻时的结束时刻。只有一次时只写那个时刻。
@@ -769,10 +788,10 @@ def reminder_schedule(
         return listed
     joint = "……" if more else "，"
     if total is not None and last is not None:
-        return f"接下来：{listed}{joint}共 {total} 次，最后一次是 {last}"
+        return f"{listed}{joint}共 {total} 次，最后一次是{_lead(last)}"
     if until is not None:
-        return f"接下来：{listed}{joint}之后一直重复，到 {until} 为止"
-    return f"接下来：{listed}{joint}之后一直重复，直到取消"
+        return f"{listed}{joint}之后一直重复，到{_lead(until)} 为止"
+    return f"{listed}{joint}之后一直重复，直到取消"
 
 
 def _one_line(text: str) -> str:
@@ -783,18 +802,18 @@ def reminder_late(seconds: int) -> str:
     return f"晚了 {format_duration(seconds)}"
 
 
-def reminder_message(items: Sequence[tuple[str, int | None]]) -> str:
+def reminder_message(items: Sequence[tuple[str, int | None]], sent_at: str) -> str:
     """到点发出的提醒（纯文本）。`items` 是同一分钟到期、合并在一条里的（提醒文字，迟到的秒数），不注明迟到时为
-    `None`。"""
+    `None`；`sent_at` 是发出的时刻（配置时区的 HH:MM），写在最后一行。不用括号：迟到的在那一条末尾写「· 晚了 N 分钟」。"""
+
+    def late_note(late: int | None) -> str:
+        return "" if late is None else f" · {reminder_late(late)}"
+
     if len(items) == 1:
         ((content, late),) = items
-        head = "提醒：" if late is None else f"提醒（{reminder_late(late)}）："
-        return head + content
-    lines = [
-        f"{number}. {_one_line(content)}" + ("" if late is None else f"（{reminder_late(late)}）")
-        for number, (content, late) in enumerate(items, 1)
-    ]
-    return "提醒：\n" + "\n".join(lines)
+        return f"提醒：{content}{late_note(late)}\n{sent_at}"
+    lines = [f"- {_one_line(content)}{late_note(late)}" for content, late in items]
+    return "提醒：\n" + "\n".join(lines) + f"\n{sent_at}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -817,25 +836,23 @@ class FailureLine:
 def _failure_line(line: FailureLine) -> str:
     total = sum(times for _, times in line.reasons)
     if line.when is not None and total == 1:
-        detail = f"原定 {line.when}，{line.reasons[0][0]}"
+        detail = f"原定{_lead(line.when)}，{line.reasons[0][0]}"
     elif len(line.reasons) == 1:
         detail = f"{line.rule}，错过 {total} 次，{line.reasons[0][0]}"
     else:
         reasons = "、".join(f"{reason} {times} 次" for reason, times in line.reasons)
         detail = f"{line.rule}，错过 {total} 次：{reasons}"
-    return f"{_one_line(line.content)}（{detail}）"
+    return f"- {_one_line(line.content)}\n    {detail}"
 
 
 def reminder_failures(
     lines: Sequence[FailureLine], reasons: Sequence[str], *, push_off: bool
 ) -> str:
-    """失败通知（纯文本）：有几条提醒没能按时发出、粗分的原因，至多列 `MAX_FAILURE_LINES` 行。`push_off` 为真（已知
-    用户关着主动消息的开关）时最后加一句怎么打开。"""
-    parts = [f"有 {len(lines)} 条提醒没能按时发出（{'、'.join(reasons)}）："]
-    parts.extend(
-        f"{number}. {_failure_line(line)}"
-        for number, line in enumerate(lines[:MAX_FAILURE_LINES], 1)
-    )
+    """失败通知（纯文本，不编号、不用括号）：有几条提醒没能按时发出、粗分的原因；每条一行内容、下一行缩进写详情，至多
+    列 `MAX_FAILURE_LINES` 条。`push_off` 为真（原因里
+    有「未开启主动消息」）时最后加一句怎么打开。"""
+    parts = [f"有 {len(lines)} 条提醒没能按时发出，原因是{'、'.join(reasons)}："]
+    parts.extend(_failure_line(line) for line in lines[:MAX_FAILURE_LINES])
     if len(lines) > MAX_FAILURE_LINES:
         parts.append(f"另有 {len(lines) - MAX_FAILURE_LINES} 条。")
     if push_off:
@@ -845,7 +862,7 @@ def reminder_failures(
 
 def reminder_failures_brief(count: int, reasons: Sequence[str], *, push_off: bool) -> str:
     """失败通知的简版：完整的那条被平台拒发时改发，不带提醒文字。"""
-    text = f"有 {count} 条提醒没能按时发出（{'、'.join(reasons)}），具体内容这次没能显示出来。"
+    text = f"有 {count} 条提醒没能按时发出，原因是{'、'.join(reasons)}。具体内容这次没能显示出来。"
     return f"{text}\n{REMINDER_PUSH_HINT}" if push_off else text
 
 
@@ -862,8 +879,10 @@ REMINDER_CANCEL_CONFIRMED_LABEL = "已取消提醒"
 REMINDER_CANCEL_DECLINE_LABEL = "保留"
 REMINDER_CANCEL_DECLINED_LABEL = "已保留"
 
-REMINDER_PUSH_OFF_NOTE = "你现在没开「允许主动发送」，到点发不出去。可以在机器人的资料卡里打开它。"
-"""已知开关关着时，确认消息与点「确认」后的回复里加的一句。"""
+
+def _sub(label: str, value: str) -> str:
+    """卡片与列表里缩进 4 个空格的子条目，标签加粗；`value` 已转义。"""
+    return f"    - **{label}**：{value}"
 
 
 def reminder_set_prompt(
@@ -872,26 +891,29 @@ def reminder_set_prompt(
     rule: str,
     schedule: str,
     notes: Sequence[str],
-    push_off: bool,
+    single: bool,
     minutes: int,
 ) -> str:
-    """设置提醒的确认消息（Markdown）。`schedule` 是「接下来：……」那一句（`reminder_schedule()`）。"""
-    items = [f"内容：{escape_markdown(content)}", f"规则：{escape_markdown(rule)}"]
-    items.append(escape_markdown(schedule))
-    items.extend(escape_markdown(note) for note in notes)
-    if push_off:
-        items.append(escape_markdown(REMINDER_PUSH_OFF_NOTE))
-    listed = "\n".join(f"- {item}" for item in items)
-    return f"要设这条提醒吗？\n\n{listed}\n\n按钮 {minutes} 分钟内有效。"
+    """设置提醒的确认消息（Markdown）：提醒文字是列表项，下面缩进的子条目写规则与接下来的几次（只有一次时只写时间），
+    跳过的月份与闰年的说明也各写一条。`schedule` 是 `reminder_schedule()` 的结果。"""
+    lines = [f"- {escape_markdown(_one_line(content))}"]
+    if single:
+        lines.append(_sub("时间", escape_markdown(schedule)))
+    else:
+        lines.append(_sub("规则", escape_markdown(rule)))
+        lines.append(_sub("接下来", escape_markdown(schedule)))
+    lines.extend(_sub("说明", escape_markdown(note)) for note in notes)
+    body = "\n".join(lines)
+    return f"要设这条提醒吗？\n\n{body}\n\n按钮 {minutes} 分钟内有效。"
 
 
-def reminder_cancel_prompt(items: Sequence[tuple[int, str, str | None]], minutes: int) -> str:
-    """取消提醒的确认消息（Markdown）。`items` 是（编号，提醒文字，下一次的时刻；没有时为 `None`）。"""
-    lines = [
-        f"- #{reminder_id} {escape_markdown(content)}"
-        + ("" if next_at is None else f"（下一次：{escape_markdown(next_at)}）")
-        for reminder_id, content, next_at in items
-    ]
+def reminder_cancel_prompt(items: Sequence[tuple[str, str | None]], minutes: int) -> str:
+    """取消提醒的确认消息（Markdown）。`items` 是（提醒文字，下次的时刻；没有时为 `None`）；不写编号。"""
+    lines: list[str] = []
+    for content, next_at in items:
+        lines.append(f"- {escape_markdown(_one_line(content))}")
+        if next_at is not None:
+            lines.append(_sub("下次", escape_markdown(next_at)))
     count = "这条" if len(items) == 1 else f"这 {len(items)} 条"
     return f"要取消{count}提醒吗？\n\n" + "\n".join(lines) + f"\n\n按钮 {minutes} 分钟内有效。"
 
@@ -904,22 +926,23 @@ REMINDER_SET_BUTTONS_FAILED = "确认按钮没能发出来，提醒还没有设�
 REMINDER_CANCEL_BUTTONS_FAILED = "确认按钮没能发出来，提醒还没有取消。需要的话请再跟我说一次。"
 
 
-def reminder_buttons_expired(minutes: int) -> str:
-    """点的提醒按钮已经失效（过期、点过，或机器人重启过）。"""
-    return f"这个按钮已经失效了（超过 {minutes} 分钟，或已经点过）。还需要的话，请再跟我说一次。"
+REMINDER_BUTTONS_EXPIRED = "这个按钮已经失效了。还需要的话，请再跟我说一次。"
+"""点的提醒按钮已经失效（过期、点过，或机器人重启过）。"""
 
 
 REMINDER_SET_DECLINED = "好的，这条提醒不设了。"
 REMINDER_CANCEL_DECLINED = "好的，不取消了，提醒照旧。"
 
 
-def reminder_created(
-    *, reminder_id: int, content: str, next_at: str, remaining: int | None, push_off: bool
-) -> str:
-    """点了「确认」、建好之后的回复：实际的下一次时刻，有限次数时写还剩几次。"""
-    text = f"好的，提醒 #{reminder_id} 设好了：{_one_line(content)}。下一次是 {next_at}"
-    text += "。" if remaining is None else f"，还剩 {remaining} 次。"
-    return f"{text}\n{REMINDER_PUSH_OFF_NOTE}" if push_off else text
+def reminder_created(*, next_at: str, remaining: int | None, once: bool = False) -> str:
+    """点了「确认」、建好之后的回复：只写下次的时刻（不重复提醒的内容，那是到点才发的话）。一次性的、或只剩一次的写
+    「我会在……提醒你」；还有好几次的写还剩几次；一直重复的不写次数。"""
+    at = _lead(next_at)
+    if once or remaining == 1:
+        return f"设置好了，我会在{at} 提醒你。"
+    if remaining is None:
+        return f"设置好了，下次在{at} 提醒你。"
+    return f"设置好了，下次在{at} 提醒你，还剩 {remaining} 次。"
 
 
 REMINDER_ONCE_PASSED = "这个时刻已经过去了，提醒没有设。需要的话请再跟我说一次。"
@@ -932,7 +955,7 @@ def reminder_too_many(active: int, limit: int) -> str:
 
 
 def reminder_rate_exceeded(when: str, count: int, limit: int, *, hourly: bool) -> str:
-    """`when` 是「11 月 23 日（周一）08:00 开始的这一个小时」或「11 月 23 日（周一）这一天」。"""
+    """`when` 是「明天 08:00 开始的这一个小时」「明天」或「11 月 26 日 星期四这一天」（`reminder_tools.period_text()`）。"""
     unit = "小时" if hourly else "天"
     return (
         f"设了这条的话，{when}里你会收到 {count} 条提醒，超过每{unit}最多 {limit} 条的上限，所以没有设。"
@@ -940,13 +963,9 @@ def reminder_rate_exceeded(when: str, count: int, limit: int, *, hourly: bool) -
     )
 
 
-def reminder_cancelled(cancelled: Sequence[tuple[int, str]], gone: Sequence[int]) -> str:
-    """点了「确认取消」之后的回复：取消了哪几条，已经不在（发完或早已取消）的照实说。"""
-    parts: list[str] = []
-    if cancelled:
-        listed = "、".join(f"#{n} {_one_line(content)}" for n, content in cancelled)
-        parts.append(f"好的，取消了：{listed}。")
-    if gone:
-        listed = "、".join(f"#{n}" for n in gone)
-        parts.append(f"{listed} 已经不在了（发完了或之前已经取消），不用再取消。")
-    return "".join(parts)
+def reminder_cancelled(cancelled: int, gone: int) -> str:
+    """点了「确认取消」之后的回复：取消了几条，已经不在（发完或早已取消）的有几条；不列内容与编号。"""
+    if cancelled == 0:
+        return f"有 {gone} 条已经不在了，不用再取消。"
+    text = "好的，取消了。" if cancelled == 1 else f"好的，取消了 {cancelled} 条。"
+    return f"{text}有 {gone} 条已经不在了。" if gone else text

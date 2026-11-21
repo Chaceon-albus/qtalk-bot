@@ -19,9 +19,9 @@ Unix 秒，由调用方传入。所有查询都带 `user_id`。
   一次，其余记失败。「现在」在派发的事务里取，宽限、配额与 started_at 都按实际开始发送的时刻算。
 - 运行时按配置时区的整点小时与自然日兜底：这个人已经发出（含在途与结果不明）的提醒消息数到了上限，就记失败（超过
   频率上限）。
-- 已知开关为「关」时每天只试发第一条，其余记失败（未开启主动消息）；发成功就改回「开」（开关未知时发成功也记成
-  「开」）。被平台拒发时，开关为「关」记「未开启主动消息」，否则记「发送出错」；结果不明（超时等）不重试，记
-  「可能没送到」。
+- 到点不管记下的开关状态一律去发（用户 2026-11-20 决定：实测关掉「允许主动发送」之后提醒照样送到）。发成功就把
+  开关记成「开」（`reminder_state.record_proven_on()`）。被平台拒发时，开关记着「关」的记「未开启主动消息」，否则记
+  「发送出错」；结果不明（超时等）不重试，记「可能没送到」。
 - 停用、删了好友、没有授权的用户（`pause_reason()`）：不发，跳过的不补，也不进失败记录；期间已过时刻的一次性提醒
   作废。从暂停变回可发时，在记下恢复的同一个事务里把已经过去、还没处理的次数静默推进（恢复时推进，`reminder_state.py`）。
   管理员 `/pause` 期间照发（第一版到点不调用模型）。
@@ -57,7 +57,6 @@ from .reminder_state import (
     record_friend,
     record_proven_on,
     record_push,
-    record_trial,
     sync_pause,
 )
 from .storage import Database
@@ -65,6 +64,7 @@ from .triggers import (
     Calendar,
     Interval,
     Occurrence,
+    Once,
     Steps,
     TooManyStepsError,
     Trigger,
@@ -568,13 +568,13 @@ def _advance(
 # ---- 渲染 ----
 
 
-def rule_text(trigger: Trigger, timezone: ZoneInfo, now: int) -> str:
-    """规则的中文描述（不在今年的日期写上年份）。"""
-    return texts.reminder_rule(trigger, local_of(now, timezone), timezone)
+def rule_text(trigger: Trigger, timezone: ZoneInfo, now: int, *, relative: bool = True) -> str:
+    """规则的中文描述（日期的写法见 `texts.reminder_date()`；存起来之后再显示的副本传 `relative=False`）。"""
+    return texts.reminder_rule(trigger, local_of(now, timezone), timezone, relative=relative)
 
 
 def moment_text(moment: int, timezone: ZoneInfo, now: int) -> str:
-    """一个时刻的写法，带星期，如「11 月 23 日（周一）08:00」。"""
+    """一个时刻的写法，如「明天 08:00」「11 月 26 日 星期四 08:00」（`texts.reminder_moment()`）。"""
     return texts.reminder_moment(local_of(moment, timezone), local_of(now, timezone))
 
 
@@ -654,6 +654,7 @@ class ActiveView:
         next: 下一次的时刻（写好的，带星期）。
         remaining: 还剩几次（含下一次）；没有结束或数不过来时为 `None`。
         end: 结束时刻（写好的）；没有时为 `None`。
+        once: 是一次性的提醒（列表里不写规则，只写下次）。
     """
 
     id: int
@@ -662,6 +663,7 @@ class ActiveView:
     next: str
     remaining: int | None
     end: str | None
+    once: bool = False
 
 
 def describe_active(
@@ -687,6 +689,7 @@ def describe_active(
                 rule=rule_text(reminder.trigger, timezone, now),
                 next=moment_text(reminder.next.at, timezone, now),
                 remaining=None if summary is None else summary.remaining,
+                once=isinstance(reminder.trigger, Once),
                 end=None if end is None else moment_text(resolve(end, timezone), timezone, now),
             )
         )
@@ -941,7 +944,8 @@ def take_notice(
     records = pending_failures(conn, user_id)
     if not records:
         return None
-    push_off = get_user_state(conn, user_id).push is PushState.OFF
+    # 「怎么打开开关」那句只在原因里有「未开启主动消息」时才加。
+    push_off = any(record.reason is FailureReason.PUSH_OFF for record in records)
     return compose_notice(records, push_off=push_off, timezone=timezone, now=now)
 
 
@@ -1294,7 +1298,8 @@ class ReminderScheduler:
     # ---- 事务里：同步，在数据库线程里执行 ----
 
     def _rule(self, trigger: Trigger, now: int) -> str:
-        return rule_text(trigger, self._timezone, now)
+        # 存进失败记录与发出记录的副本：之后才显示，不用「今天」「明天」。
+        return rule_text(trigger, self._timezone, now, relative=False)
 
     def _plan(self, conn: sqlite3.Connection, user_id: int) -> _Plan | None:
         # 「现在」在事务里取：宽限、配额与 started_at 都按实际开始处理（开始发送）的时刻算，不按排队之前的。
@@ -1338,7 +1343,6 @@ class ReminderScheduler:
             return None
         grace = self._settings.grace_minutes * 60
         this_minute = now - now % 60
-        state = get_user_state(conn, user_id)
         items: list[_Item] = []
         for reminder in due:
             assert reminder.next is not None
@@ -1395,17 +1399,6 @@ class ReminderScheduler:
             self._fail_items(conn, user_id, items, FailureReason.RATE_LIMITED, now)
             logger.warning("用户 %s 的提醒超过了频率上限，%d 条记为失败", user.label, len(items))
             return None
-        if state.push is PushState.OFF:
-            today = local_day(now, self._timezone)
-            if state.push_trial_day == today:
-                self._fail_items(conn, user_id, items, FailureReason.PUSH_OFF, now)
-                logger.info(
-                    "用户 %s 关着主动消息、今天已经试发过，%d 条提醒记为失败",
-                    user.label,
-                    len(items),
-                )
-                return None
-            record_trial(conn, user_id, today)
         send_id: int = conn.execute(
             "INSERT INTO reminder_sends (user_id, status, started_at) VALUES (?, 'sending', ?)"
             " RETURNING id",
@@ -1423,7 +1416,8 @@ class ReminderScheduler:
             [
                 (item.content, item.late if item.late >= LATE_NOTE_SECONDS else None)
                 for item in items
-            ]
+            ],
+            f"{local_of(now, self._timezone):%H:%M}",
         )
         return _Plan(
             send_id=send_id, openid=user.openid, label=user.label, text=text, items=tuple(items)

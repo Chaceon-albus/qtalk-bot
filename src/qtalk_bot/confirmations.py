@@ -75,11 +75,10 @@ class PendingForget:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PendingSet:
-    """要新建的提醒：调用时的规则与渲染结果，`push_off` 是当时已知开关关着。"""
+    """要新建的提醒：调用时的规则与渲染结果。"""
 
     candidate: Candidate
     summary: ScheduleSummary = field(repr=False)
-    push_off: bool
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -168,6 +167,11 @@ class TokenRegistry:
             return Refused.NOT_YOURS
         del self._tickets[click.token]
         return ticket
+
+    def waiting(self, user_id: int, kind: ButtonKind) -> list[Ticket]:
+        """这个用户还没用掉、没过期的这一种令牌，按登记的先后。"""
+        self._prune()
+        return [t for t in self._tickets.values() if t.user_id == user_id and t.kind is kind]
 
     def __len__(self) -> int:
         return len(self._tickets)

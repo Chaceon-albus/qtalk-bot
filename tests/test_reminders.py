@@ -454,35 +454,32 @@ def summarize(now: int = T0, **fields: object) -> str:
 
 def test_summaries_of_the_three_kinds() -> None:
     assert summarize(kind="once", at="2026-11-23T08:00") == (
-        "一次：11 月 23 日（周一）08:00 | 11 月 23 日（周一）08:00"
+        "一次：11 月 23 日 星期一 08:00 | 11 月 23 日 星期一 08:00"
     )
     assert summarize(
         kind="interval", every=10, unit="minutes", start="2026-11-21T10:00", end="2026-11-21T11:00"
     ) == (
-        "每 10 分钟一次，从 11 月 21 日（周六）10:00 起，到 11 月 21 日（周六）11:00 为止"
-        " | 接下来：11 月 21 日（周六）10:00、11 月 21 日（周六）10:10、11 月 21 日（周六）10:20……"
-        "共 7 次，最后一次是 11 月 21 日（周六）11:00"
+        "每 10 分钟一次，从明天 10:00 起，到明天 11:00 为止"
+        " | 明天 10:00、明天 10:10、明天 10:20……共 7 次，最后一次是明天 11:00"
     )
     assert summarize(kind="calendar", times=["08:00"], weekdays=["mon", "wed"]) == (
-        "每周一、周三 08:00 | 接下来：11 月 23 日（周一）08:00、11 月 25 日（周三）08:00、"
-        "11 月 30 日（周一）08:00……之后一直重复，直到取消"
+        "每周一、三 08:00 | 11 月 23 日 星期一 08:00、11 月 25 日 星期三 08:00、"
+        "11 月 30 日 星期一 08:00……之后一直重复，直到取消"
     )
 
 
 def test_summary_with_fewer_than_three_has_no_ellipsis() -> None:
     assert summarize(kind="interval", every=1, unit="days", start="2026-11-21T09:00", count=2) == (
-        "每天一次，从 11 月 21 日（周六）09:00 起，最多 2 次"
-        " | 接下来：11 月 21 日（周六）09:00、11 月 22 日（周日）09:00，共 2 次，"
-        "最后一次是 11 月 22 日（周日）09:00"
+        "每天一次，从明天 09:00 起，最多 2 次 | 明天 09:00、后天 09:00，共 2 次，最后一次是后天 09:00"
     )
 
 
 def test_summary_notes_skipped_months_and_leap_years() -> None:
     assert summarize(kind="calendar", times=["09:00"], monthdays=[31]).endswith(
-        "没有 31 日的月份（2 月、4 月、6 月、9 月、11 月）跳过。"
+        "没有 31 日的月份跳过：2 月、4 月、6 月、9 月、11 月。"
     )
     leap = summarize(kind="calendar", times=["09:00"], months=[2], monthdays=[29])
-    assert leap.startswith("每年 2 月 29 日 09:00 | 接下来：2028 年 2 月 29 日（周二）09:00")
+    assert leap.startswith("每年 2 月 29 日 09:00 | 2028 年 2 月 29 日 星期二 09:00")
     assert leap.endswith("2 月 29 日只在闰年有，平年的 2 月跳过。")
     assert summarize(kind="calendar", times=["09:00"], monthdays=[1, -1]).startswith(
         "每月 1 日、最后一天 09:00"
@@ -490,10 +487,13 @@ def test_summary_notes_skipped_months_and_leap_years() -> None:
 
 
 def test_merged_message_texts() -> None:
-    assert texts.reminder_message([("吃药", None)]) == "提醒：吃药"
-    assert texts.reminder_message([("吃药", 12 * 60)]) == "提醒（晚了 12 分钟）：吃药"
-    assert texts.reminder_message([("吃药\n两片", None), ("喝水", 3700)]) == (
-        "提醒：\n1. 吃药 两片\n2. 喝水（晚了 1 小时 1 分钟）"
+    # 发出的时刻写在最后一行；迟到的不用括号，在那一条末尾写「· 晚了 N 分钟」。
+    assert texts.reminder_message([("吃药", None)], "20:52") == "提醒：吃药\n20:52"
+    assert texts.reminder_message([("吃药", 12 * 60)], "20:52") == (
+        "提醒：吃药 · 晚了 12 分钟\n20:52"
+    )
+    assert texts.reminder_message([("吃药\n两片", None), ("喝水", 3700)], "20:52") == (
+        "提醒：\n- 吃药 两片\n- 喝水 · 晚了 1 小时 1 分钟\n20:52"
     )
 
 
@@ -511,7 +511,7 @@ async def test_due_reminder_is_sent_once_as_plain_text(db: Database) -> None:
     await run_at(scheduler, clock, at("2026-11-20T16:00") + 1)
     await run_at(scheduler, clock, at("2026-11-20T16:01") + 1)
 
-    assert sender.sent == [(ALICE, "提醒：吃药")]
+    assert sender.sent == [(ALICE, "提醒：吃药\n16:00")]
     done = await db.transaction(get_reminder, alice.id, created.reminder.id)
     assert done is not None
     assert done.status is ReminderStatus.FINISHED
@@ -534,8 +534,8 @@ async def test_same_minute_reminders_are_merged_and_users_kept_apart(db: Databas
     await run_at(make_scheduler(db, sender, clock), clock, at("2026-11-20T16:00") + 1)
 
     assert sorted(sender.sent) == [
-        (ALICE, "提醒：\n1. 吃药\n2. 喝水"),
-        (BOB, "提醒：鲍勃的秘密"),
+        (ALICE, "提醒：\n- 吃药\n- 喝水\n16:00"),
+        (BOB, "提醒：鲍勃的秘密\n16:00"),
     ]
 
 
@@ -548,7 +548,7 @@ async def test_periodic_reminder_moves_to_the_next_time(db: Database) -> None:
     await run_at(scheduler, clock, at("2026-11-20T16:00") + 1)
     await run_at(scheduler, clock, at("2026-11-20T20:00") + 1)
 
-    assert [text for _, text in sender.sent] == ["提醒：喝水", "提醒：喝水"]
+    assert [text for _, text in sender.sent] == ["提醒：喝水\n16:00", "提醒：喝水\n20:00"]
     current = await db.transaction(get_reminder, alice.id, created.reminder.id)
     assert current is not None
     assert current.next == Occurrence(2, at("2026-11-21T16:00"))
@@ -563,7 +563,7 @@ async def test_late_within_grace_is_sent_with_a_note(db: Database) -> None:
     await run_at(make_scheduler(db, sender, clock), clock, at("2026-11-20T16:10") + 5)
 
     # 晚了 10 分钟的注明；晚了 1 分钟的不注明（不到 2 分钟）。
-    assert sender.sent == [(ALICE, "提醒：\n1. 吃药（晚了 10 分钟）\n2. 喝水")]
+    assert sender.sent == [(ALICE, "提醒：\n- 吃药 · 晚了 10 分钟\n- 喝水\n16:10")]
 
 
 async def test_too_late_is_recorded_not_sent(db: Database) -> None:
@@ -581,7 +581,7 @@ async def test_too_late_is_recorded_not_sent(db: Database) -> None:
         at("2026-11-20T16:00"),
     )
     assert failure.content == "吃药"
-    assert failure.rule == "一次：11 月 20 日（周五）16:00"
+    assert failure.rule == "一次：11 月 20 日 星期五 16:00"
 
 
 async def test_missed_periodic_only_sends_the_latest(db: Database) -> None:
@@ -600,7 +600,7 @@ async def test_missed_periodic_only_sends_the_latest(db: Database) -> None:
 
     await run_at(make_scheduler(db, sender, clock), clock, at("2026-11-20T17:05"))
 
-    assert sender.sent == [(ALICE, "提醒（晚了 5 分钟）：喝水")]
+    assert sender.sent == [(ALICE, "提醒：喝水 · 晚了 5 分钟\n17:05")]
     assert summary(await failures(db, alice)) == [(FailureReason.LATE, 6)]
     current = await db.transaction(get_reminder, alice.id, created.reminder.id)
     assert current is not None
@@ -698,7 +698,7 @@ async def test_runtime_rate_limit_is_a_backstop(db: Database) -> None:
     await run_at(scheduler, clock, at("2026-11-20T16:00"))
     await run_at(scheduler, clock, at("2026-11-20T16:10"))
 
-    assert [text for _, text in sender.sent] == ["提醒：一"]
+    assert [text for _, text in sender.sent] == ["提醒：一\n16:00"]
     assert summary(await failures(db, alice)) == [(FailureReason.RATE_LIMITED, 1)]
 
 
@@ -715,23 +715,39 @@ async def test_rejected_sends_do_not_count_toward_the_limit(db: Database) -> Non
     assert len(sender.sent) == 2
 
 
-async def test_push_off_tries_only_the_first_each_day(db: Database) -> None:
+async def test_reminders_are_sent_even_when_the_switch_is_off(db: Database) -> None:
+    # 实测关掉「允许主动发送」之后提醒照样送到：到点不管开关一律去发（用户 2026-11-20 决定）。
     alice = await invited(db, ALICE, "小王")
     await add(db, alice, "喝水", kind="calendar", times=["16:00", "17:00", "18:00"])
     await db.transaction(record_push, alice.id, PushState.OFF, T0)
-    sender, clock = Sender(Delivery.NOT_SENT), Clock(T0)
+    sender, clock = Sender(Delivery.NOT_SENT, Delivery.NOT_SENT, Delivery.NOT_SENT), Clock(T0)
     scheduler = make_scheduler(db, sender, clock)
 
     for moment in ("2026-11-20T16:00", "2026-11-20T17:00", "2026-11-20T18:00"):
         await run_at(scheduler, clock, at(moment))
 
-    assert len(sender.sent) == 1  # 每天只试第一条
+    assert len(sender.sent) == 3  # 每一条都去发
+    # 被拒时开关记着「关」，原因写「未开启主动消息」；通知末尾加怎么打开。
     assert summary(await failures(db, alice)) == [(FailureReason.PUSH_OFF, 3)]
-    # 第二天再试一次，发成功就改回「开」，之后照常发。
+    replies = Replies()
+    await ReminderService(db, admin_openid=ADMIN, timezone=TZ).notify_in_turn(alice, replies)
+    assert replies.texts[0].endswith(texts.REMINDER_PUSH_HINT)
+    # 发成功就记回「开」。
     await run_at(scheduler, clock, at("2026-11-21T16:00"))
-    await run_at(scheduler, clock, at("2026-11-21T17:00"))
-    assert len(sender.sent) == 3
+    assert len(sender.sent) == 4
     assert (await db.transaction(get_user_state, alice.id)).push is PushState.ON
+
+
+async def test_push_hint_only_when_a_reason_is_push_off(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    await db.transaction(record_push, alice.id, PushState.OFF, T0)
+    await db.transaction(fail, alice, None, FailureReason.SEND_ERROR, T0)
+    replies = Replies()
+
+    await ReminderService(db, admin_openid=ADMIN, timezone=TZ).notify_in_turn(alice, replies)
+
+    (text,) = replies.texts
+    assert texts.REMINDER_PUSH_HINT not in text  # 开关记着「关」，但原因不是它
 
 
 def enable(conn: sqlite3.Connection, user: User, now: int) -> None:
@@ -765,7 +781,7 @@ async def test_paused_users_get_nothing_and_once_reminders_expire(db: Database) 
     await run_at(scheduler, clock, at("2026-11-21T16:30"))
     assert sender.sent == []
     await run_at(scheduler, clock, at("2026-11-22T16:00"))
-    assert sender.sent == [(ALICE, "提醒：每天")]
+    assert sender.sent == [(ALICE, "提醒：每天\n16:00")]
     current = await db.transaction(get_reminder, alice.id, daily.reminder.id)
     assert current is not None
     assert current.next == Occurrence(3, at("2026-11-23T16:00"))
@@ -783,7 +799,7 @@ async def test_removed_friend_is_paused_until_added_again(db: Database) -> None:
     await service.friend_changed(ALICE, present=True, at=T0 + 3600)
     await run_at(scheduler, clock, at("2026-11-21T16:00"))
 
-    assert sender.sent == [(ALICE, "提醒：每天")]
+    assert sender.sent == [(ALICE, "提醒：每天\n16:00")]
     assert await failures(db, alice) == []
 
 
@@ -795,7 +811,7 @@ async def test_reminders_are_sent_while_the_service_is_paused(db: Database) -> N
 
     await run_at(make_scheduler(db, sender, clock), clock, at("2026-11-20T16:00"))
 
-    assert sender.sent == [(ALICE, "提醒：吃药")]
+    assert sender.sent == [(ALICE, "提醒：吃药\n16:00")]
 
 
 async def test_pause_reasons(db: Database) -> None:
@@ -848,7 +864,7 @@ async def test_sending_waits_for_the_users_lock(db: Database) -> None:
         clock.now += 180
     await asyncio.wait_for(scheduler.settle(), HANG_GUARD)
 
-    assert sender.sent == [(ALICE, "提醒（晚了 3 分钟）：吃药")]
+    assert sender.sent == [(ALICE, "提醒：吃药 · 晚了 3 分钟\n16:03")]
 
 
 async def test_timezone_change_recomputes_the_next_time(db: Database) -> None:
@@ -900,7 +916,7 @@ async def test_run_checks_every_minute_with_an_injected_clock(db: Database) -> N
         running.cancel()
         await asyncio.gather(running, return_exceptions=True)
 
-    assert sender.sent == [(ALICE, "提醒：吃药")]
+    assert sender.sent == [(ALICE, "提醒：吃药\n16:00")]
 
 
 # ---- 失败表与失败通知 ----
@@ -948,8 +964,8 @@ async def test_failures_merge_per_reminder_reason_until_notified(db: Database) -
     notice = compose_notice(records, push_off=False, timezone=TZ, now=T0)
     assert notice is not None
     assert notice.text == (
-        "有 1 条提醒没能按时发出（未开启主动消息、没能按时发出）：\n"
-        "1. 吃药（每 10 分钟一次，错过 4 次：没能按时发出 3 次、未开启主动消息 1 次）"
+        "有 1 条提醒没能按时发出，原因是未开启主动消息、没能按时发出：\n"
+        "- 吃药\n    每 10 分钟一次，错过 4 次：没能按时发出 3 次、未开启主动消息 1 次"
     )
 
 
@@ -972,13 +988,15 @@ def test_notice_lists_at_most_ten_lines_and_the_switch_hint() -> None:
 
     assert notice is not None
     lines = notice.text.split("\n")
-    assert lines[0] == "有 12 条提醒没能按时发出（未开启主动消息）："
-    assert lines[1] == "1. 第 1 条（原定 11 月 20 日（周五）15:31，未开启主动消息）"
-    assert lines[10].startswith("10. 第 10 条")
-    assert lines[11] == "另有 2 条。"
-    assert lines[12] == texts.REMINDER_PUSH_HINT
+    # 不编号、不用括号：内容一行，详情缩进在下一行。
+    assert lines[0] == "有 12 条提醒没能按时发出，原因是未开启主动消息："
+    assert lines[1] == "- 第 1 条"
+    assert lines[2] == "    原定今天 15:31，未开启主动消息"
+    assert lines[19] == "- 第 10 条"
+    assert lines[21] == "另有 2 条。"
+    assert lines[22] == texts.REMINDER_PUSH_HINT
     assert notice.brief == (
-        "有 12 条提醒没能按时发出（未开启主动消息），具体内容这次没能显示出来。\n"
+        "有 12 条提醒没能按时发出，原因是未开启主动消息。具体内容这次没能显示出来。\n"
         + texts.REMINDER_PUSH_HINT
     )
     assert "第 1 条" not in notice.brief
@@ -1231,7 +1249,7 @@ async def test_zero_grace_still_sends_what_is_due_this_minute(db: Database) -> N
     await run_at(scheduler, clock, at("2026-11-20T16:00") + 1)
     await run_at(scheduler, clock, at("2026-11-20T16:11") + 5)  # 16:10 那分钟没检查到
 
-    assert sender.sent == [(ALICE, "提醒：按时")]
+    assert sender.sent == [(ALICE, "提醒：按时\n16:00")]
     assert summary(await failures(db, alice)) == [(FailureReason.LATE, 1)]
 
 
@@ -1316,7 +1334,7 @@ async def test_timezone_change_keeps_due_occurrences_for_the_normal_flow(db: Dat
     await scheduler.tick()
     await asyncio.wait_for(scheduler.settle(), HANG_GUARD)
 
-    assert sender.sent == [(ALICE, "提醒（晚了 10 分钟）：吃药")]
+    assert sender.sent == [(ALICE, "提醒：吃药 · 晚了 10 分钟\n16:10")]
 
 
 async def test_runtime_hour_bucket_uses_real_timezone_boundaries(db: Database) -> None:
@@ -1637,8 +1655,10 @@ def test_rule_of_relative_reminders_uses_the_current_timezone() -> None:
     once = parse_trigger({"kind": "once", "delay_minutes": 30}, now=T0, timezone=TZ)
     interval = parse_trigger({"kind": "interval", "every": 1, "unit": "hours"}, now=T0, timezone=TZ)
 
-    assert rule_text(once, tokyo, T0) == "一次：11 月 20 日（周五）17:00"
-    assert rule_text(interval, tokyo, T0) == "每小时一次，从 11 月 20 日（周五）17:30 起"
+    assert rule_text(once, tokyo, T0) == "一次：今天 17:00"
+    assert rule_text(interval, tokyo, T0) == "每小时一次，从今天 17:30 起"
+    # 存起来的副本不用「今天」「明天」。
+    assert rule_text(once, tokyo, T0, relative=False) == "一次：11 月 20 日 星期五 17:00"
 
 
 def test_admission_stops_early_on_the_new_schedule_alone() -> None:
@@ -1659,3 +1679,56 @@ def test_admission_stops_early_on_the_new_schedule_alone() -> None:
     )
 
     assert result == RateExceeded(Period.HOUR, at("2026-11-20T15:00"), 29, 20)
+
+
+def test_dates_use_today_tomorrow_and_full_weekday_names() -> None:
+    now = datetime(2026, 12, 30, 21, 0)
+
+    def moment(*parts: int) -> str:
+        return texts.reminder_moment(datetime(*parts), now)  # pyright: ignore[reportArgumentType]
+
+    assert moment(2026, 12, 30, 20, 52) == "今天 20:52"
+    assert moment(2026, 12, 31, 8, 0) == "明天 08:00"
+    assert moment(2027, 1, 1, 22, 0) == "后天 22:00"  # 跨年也按自然日算
+    assert moment(2027, 1, 5, 9, 0) == "2027 年 1 月 5 日 星期二 09:00"
+    assert moment(2026, 12, 27, 9, 0) == "12 月 27 日 星期日 09:00"  # 过去的不写「前天」
+    assert texts.reminder_moment(datetime(2026, 12, 1, 8, 0), datetime(2026, 11, 29, 23, 0)) == (
+        "后天 08:00"  # 跨月
+    )
+    assert texts.reminder_moment(datetime(2026, 12, 2, 8, 0), datetime(2026, 11, 29, 23, 0)) == (
+        "12 月 2 日 星期三 08:00"
+    )
+    assert texts.reminder_date(datetime(2026, 12, 31, 8, 0), now) == "明天"
+    assert texts.reminder_date(datetime(2026, 12, 31, 8, 0), now, relative=False) == (
+        "12 月 31 日 星期四"
+    )
+
+
+def test_period_text_uses_the_same_date_style() -> None:
+    from qtalk_bot.reminder_tools import period_text
+
+    assert period_text(Period.HOUR, at("2026-11-21T08:00"), TZ, T0) == (
+        "明天 08:00 开始的这一个小时"
+    )
+    assert period_text(Period.DAY, at("2026-11-21T00:00"), TZ, T0) == "明天"
+    assert period_text(Period.DAY, at("2026-11-26T00:00"), TZ, T0) == "11 月 26 日 星期四这一天"
+
+
+async def test_failure_copies_keep_absolute_dates(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    await add(
+        db,
+        alice,
+        "吃药",
+        kind="interval",
+        every=10,
+        unit="minutes",
+        start="2026-11-20T16:00",
+        count=10,
+    )
+    sender, clock = Sender(), Clock(T0)
+
+    await run_at(make_scheduler(db, sender, clock), clock, at("2026-11-20T17:05"))
+
+    (failure,) = await failures(db, alice)
+    assert failure.rule == "每 10 分钟一次，从 11 月 20 日 星期五 16:00 起，最多 10 次"

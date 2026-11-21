@@ -1203,9 +1203,7 @@ class Conversation:
             cancelled, allowed = await self._db.transaction(self._confirm_cancel, user, ids)
             logger.info("用户 %s 确认取消提醒，取消了 %d 条", user.label, len(cancelled))
             if allowed:
-                names = {item.reminder_id: item.content for item in pending.items}
-                gone = [n for n in ids if n not in cancelled]
-                await reply(texts.reminder_cancelled([(n, names[n]) for n in cancelled], gone))
+                await reply(texts.reminder_cancelled(len(cancelled), len(ids) - len(cancelled)))
             return
         if isinstance(taken, Ticket) and confirmed and settings is not None:
             pending = taken.pending
@@ -1221,7 +1219,7 @@ class Conversation:
             return
         if not isinstance(taken, Ticket) or (settings is None and confirmed):
             logger.info("用户 %s 点的提醒按钮已经失效", user.label)
-            await reply(texts.reminder_buttons_expired(TOKEN_SECONDS // 60))
+            await reply(texts.REMINDER_BUTTONS_EXPIRED)
             return
         logger.info("用户 %s 没有确认%s提醒", user.label, "取消" if cancelling else "设置")
         await reply(texts.REMINDER_CANCEL_DECLINED if cancelling else texts.REMINDER_SET_DECLINED)
@@ -1256,17 +1254,13 @@ class Conversation:
         )
         match result:
             case reminders.Created(reminder=reminder, first=first, remaining=remaining):
-                push_off = (
-                    reminder_state.get_user_state(conn, user.id).push
-                    is reminder_state.PushState.OFF
-                )
                 logger.info("用户 %s 确认设置提醒 #%d", user.label, reminder.id)
                 return texts.reminder_created(
-                    reminder_id=reminder.id,
-                    content=reminder.content,
                     next_at=reminders.moment_text(first.at, timezone, now),
-                    remaining=None if isinstance(reminder.trigger, Once) else remaining,
-                    push_off=push_off,
+                    remaining=remaining,
+                    once=isinstance(
+                        reminder.trigger, Once
+                    ),  # 一次性的 remaining 是 1，不写「还剩 1 次」
                 )
             case reminders.TooManyActive(active=active, limit=limit):
                 why, text = "有效条数到了上限", texts.reminder_too_many(active, limit)
@@ -1334,7 +1328,7 @@ class Conversation:
                 failed = texts.REMINDER_SET_BUTTONS_FAILED
             case PendingCancel(items=items):
                 markdown = texts.reminder_cancel_prompt(
-                    [(item.reminder_id, item.content, item.next) for item in items], minutes
+                    [(item.content, item.next) for item in items], minutes
                 )
                 labels = (
                     (texts.REMINDER_CANCEL_CONFIRM_LABEL, texts.REMINDER_CANCEL_CONFIRMED_LABEL),
@@ -1378,7 +1372,7 @@ class Conversation:
             rule=summary.rule,
             schedule=summary.text,
             notes=summary.notes,
-            push_off=pending.push_off,
+            single=isinstance(candidate.trigger, Once),
             minutes=minutes,
         )
 
@@ -1858,7 +1852,6 @@ class Conversation:
         recent = reminders.recent_deliveries(
             conn, user.id, now - RECENT_SENT_SECONDS, RECENT_SENT_SHOWN
         )
-        state = reminder_state.get_user_state(conn, user.id)
         return ReminderBrief(
             reminders=entries,
             recent=tuple(
@@ -1869,7 +1862,6 @@ class Conversation:
                 )
                 for r in recent
             ),
-            push_switch=reminder_tools.push_label(state.push),
             paused=reminder_tools.pause_label(
                 reminder_state.pause_reason(conn, user, self._admin_openid)
             ),
@@ -2351,7 +2343,16 @@ class Conversation:
             settings=settings,
             admin_openid=self._admin_openid,
             clock=self._clock,
+            waiting=self._waiting_sets,
         )
+
+    def _waiting_sets(self, user_id: int) -> list[str]:
+        """这个用户还没点确认的设置提醒的内容（只在内存里的令牌：设置类、未过期、未使用、属于他的）。"""
+        return [
+            ticket.pending.candidate.content
+            for ticket in self._tokens.waiting(user_id, ButtonKind.SET_REMINDER)
+            if isinstance(ticket.pending, PendingSet)
+        ]
 
     async def _erase_topics(
         self,
@@ -3435,6 +3436,7 @@ class _ReminderDeps:
     settings: ReminderSettings
     admin_openid: str
     clock: Callable[[], float]
+    waiting: Callable[[int], list[str]]  # 这个用户还没点确认的设置提醒（令牌未过期、未使用）的内容
 
 
 class _ReminderTools:
@@ -3517,7 +3519,7 @@ class _ReminderTools:
         candidate = reminders.Candidate(
             content=arguments.content, trigger=arguments.trigger, anchor=now
         )
-        admission, push = await deps.db.transaction(self._admit, candidate, now)
+        admission = await deps.db.transaction(self._admit, candidate, now)
         if not isinstance(admission, reminders.Admitted):
             logger.info(
                 "给用户 %s 设置的提醒没通过准入检查：%s", user.label, type(admission).__name__
@@ -3536,46 +3538,43 @@ class _ReminderTools:
         if (refused := self._slot(PendingSet)) is not None:
             return refused
         replaced = isinstance(turn.pending, PendingSet)
-        push_off = push is reminder_state.PushState.OFF
-        turn.accept(PendingSet(candidate=candidate, summary=summary, push_off=push_off))
+        turn.accept(PendingSet(candidate=candidate, summary=summary))
         logger.info(
             "用户 %s 要设置一条提醒%s：这一轮结束后发确认按钮",
             user.label,
             "（取代前一次）" if replaced else "",
         )
         return reminder_tools.set_pending(
-            summary, push_off=push_off, replaced=replaced, timezone=deps.timezone, now=now
+            summary, replaced=replaced, timezone=deps.timezone, now=now
         )
 
     def _admit(
         self, conn: sqlite3.Connection, candidate: reminders.Candidate, now: int
-    ) -> tuple[reminders.Admission, reminder_state.PushState]:
+    ) -> reminders.Admission:
         deps = self._deps
-        user_id = self._turn.user.id
-        admission = reminders.check_admission(
-            conn, user_id, candidate, settings=deps.settings, timezone=deps.timezone, now=now
+        return reminders.check_admission(
+            conn,
+            self._turn.user.id,
+            candidate,
+            settings=deps.settings,
+            timezone=deps.timezone,
+            now=now,
         )
-        return admission, reminder_state.get_user_state(conn, user_id).push
 
     async def _list(self) -> FunctionResult:
         deps, user = self._deps, self._turn.user
         now = int(deps.clock())
-        views, state, paused, unnotified = await deps.db.transaction(self._listing, now)
-        logger.info("给用户 %s 列出了 %d 条提醒", user.label, len(views))
-        return reminder_tools.listed(views, push=state.push, paused=paused, unnotified=unnotified)
+        views, paused, unnotified = await deps.db.transaction(self._listing, now)
+        waiting = deps.waiting(user.id)
+        logger.info("给用户 %s 列出了 %d 条提醒、%d 条待确认", user.label, len(views), len(waiting))
+        return reminder_tools.listed(views, waiting=waiting, paused=paused, unnotified=unnotified)
 
     def _listing(
         self, conn: sqlite3.Connection, now: int
-    ) -> tuple[
-        list[reminders.ActiveView],
-        reminder_state.UserReminderState,
-        reminder_state.PauseReason | None,
-        int,
-    ]:
+    ) -> tuple[list[reminders.ActiveView], reminder_state.PauseReason | None, int]:
         deps, user = self._deps, self._turn.user
         return (
             reminders.describe_active(conn, user.id, deps.timezone, now),
-            reminder_state.get_user_state(conn, user.id),
             reminder_state.pause_reason(conn, user, deps.admin_openid),
             reminders.count_unnotified(conn, user.id),
         )

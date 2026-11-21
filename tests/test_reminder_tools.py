@@ -63,9 +63,9 @@ from qtalk_bot.routing import Router
 from qtalk_bot.storage import DATABASE_FILENAME, Database
 from qtalk_bot.triggers import TRIGGER_FIELDS, parse_trigger
 
-# START 是上海时间 2027-01-15 16:00（周五）。
+# START 是上海时间 2027-01-15 16:00 星期五。
 MINUTES = TOKEN_SECONDS // 60
-EXPIRED = texts.reminder_buttons_expired(MINUTES)
+EXPIRED = texts.REMINDER_BUTTONS_EXPIRED
 
 
 @pytest.fixture
@@ -275,27 +275,28 @@ async def test_set_reminder_creates_nothing_until_confirmed(db: Database, tmp_pa
     error, text = result(model)
     assert not error
     assert "还没有设好" in text
-    assert "1 月 16 日（周六）08:00" in text
+    assert "明天 08:00" in text
     assert "后一次调用会取代前一次" in text
     assert await stored(db, alice) == []
     (pair,) = channel.buttons
     assert [(b.label, b.visited_label) for b in pair] == [("确认", "已确认"), ("取消", "已取消")]
     markdown = markdown_of(channel)
-    assert markdown == texts.reminder_set_prompt(
-        content="该吃*降压药*了",
-        rule="一次：1 月 16 日（周六）08:00",
-        schedule="1 月 16 日（周六）08:00",
-        notes=(),
-        push_off=False,
-        minutes=MINUTES,
+    # 卡片：提醒文字是列表项，下面缩进的子条目，标签加粗；不写编号与括号。
+    assert markdown == (
+        "要设这条提醒吗？\n\n- 该吃\\*降压药\\*了\n    - **时间**：明天 08:00\n\n"
+        f"按钮 {MINUTES} 分钟内有效。"
     )
-    assert "该吃\\*降压药\\*了" in markdown  # 提醒文字经过 escape_markdown()
+    # 模型只用一句话说明要设的提醒，不解释按钮。
+    assert "只用一句话简短说明要设的提醒" in text
+    assert "分钟内有效" not in text
+    assert "没看到按钮" not in text
     assert channel.log[-1][0] == "buttons"
     assert channel.budget.replies == 2
 
     reply = await press(chat, ALICE, buttons(channel)[0])
 
-    assert reply == "好的，提醒 #1 设好了：该吃*降压药*了。下一次是 1 月 16 日（周六）08:00。"
+    # 不带提醒的内容（那是到点才发的话），也不带编号。
+    assert reply == "设置好了，我会在明天 08:00 提醒你。"
     assert await stored(db, alice) == [(1, "该吃*降压药*了")]
     assert await press(chat, ALICE, buttons(channel)[0]) == EXPIRED  # 只能用一次
 
@@ -315,11 +316,14 @@ async def test_periodic_confirmation_shows_the_count_and_notes(
     reply = await press(chat, ALICE, buttons(channel)[0])
 
     markdown = markdown_of(channel)
-    assert "每月 31 日 09:00，最多 3 次" in markdown
-    assert "共 3 次，最后一次是 5 月 31 日（周一）09:00" in markdown
-    assert "没有 31 日的月份" in markdown
+    assert markdown.startswith(
+        "要设这条提醒吗？\n\n- 交房租\n    - **规则**：每月 31 日 09:00，最多 3 次\n"
+    )
+    assert "    - **接下来**：1 月 31 日 星期日 09:00、3 月 31 日" in markdown
+    assert "共 3 次，最后一次是 5 月 31 日 星期一 09:00" in markdown
+    assert "\n    - **说明**：没有 31 日的月份跳过：2 月、4 月、6 月、9 月、11 月。" in markdown
     assert f"按钮 {MINUTES} 分钟内有效" in markdown
-    assert reply == "好的，提醒 #1 设好了：交房租。下一次是 1 月 31 日（周日）09:00，还剩 3 次。"
+    assert reply == "设置好了，下次在 1 月 31 日 星期日 09:00 提醒你，还剩 3 次。"
 
 
 async def test_a_later_set_replaces_the_earlier_one_in_the_same_turn(
@@ -464,11 +468,12 @@ async def test_rate_limit_error_says_when(db: Database, tmp_path: Path) -> None:
 
     error, text = result(model)
     assert error
-    assert "1 月 15 日（周五）16:00 开始的这一个小时里这个用户会收到 59 条提醒消息" in text
+    assert "今天 16:00 开始的这一个小时里这个用户会收到 59 条提醒消息" in text
     assert "每小时最多 20 条" in text
 
 
-async def test_push_off_is_mentioned(db: Database, tmp_path: Path) -> None:
+async def test_no_push_warnings_anywhere(db: Database, tmp_path: Path) -> None:
+    # 到点不管开关一律去发：结果、卡片、回复与系统提示词里都不再警告「到点发不出去」。
     alice = await invited(db, ALICE, "小王")
     await db.transaction(record_push, alice.id, PushState.OFF, START)
     model = QueueModel()
@@ -478,11 +483,10 @@ async def test_push_off_is_mentioned(db: Database, tmp_path: Path) -> None:
     channel = await say(chat, alice, "明早提醒我")
     reply = await press(chat, ALICE, buttons(channel)[0])
 
-    assert "没有开启「允许主动发送」" in result(model)[1]
-    assert "允许主动发送" in markdown_of(channel)
-    assert reply is not None
-    assert reply.endswith(texts.REMINDER_PUSH_OFF_NOTE)
-    assert 'push_switch": "关"' in system_of(model.requests[0])
+    assert "允许主动发送" not in result(model)[1]
+    assert "允许主动发送" not in markdown_of(channel)
+    assert reply == "设置好了，我会在明天 08:00 提醒你。"
+    assert "push_switch" not in system_of(model.requests[0])
 
 
 # ---- list_reminders ----
@@ -515,22 +519,30 @@ async def test_list_shows_only_the_users_own_reminders(db: Database, tmp_path: P
 
     error, text = result(model)
     assert not error
-    assert "1. #12 内容" in text
     assert "鲍勃" not in text
+    # 程序渲染好的列表：不写编号，标签加粗，子条目缩进 4 个空格。
+    assert (
+        "渲染好的列表：\n\n- 喝水\n"
+        "    - **规则**：每小时一次，从今天 17:00 起，最多 3 次\n"
+        "    - **下次**：今天 17:00\n"
+        "    - **剩余**：3 次\n\nJSON："
+    ) in text
+    assert "逐行照抄" in text
+    assert f"#{mine}" not in text
     data = json.loads(text[text.index("{") :])
     assert data == {
         "reminders": [
             {
                 "id": mine,
                 "text": "喝水",
-                "rule": "每小时一次，从 1 月 15 日（周五）17:00 起，最多 3 次",
-                "next": "1 月 15 日（周五）17:00",
+                "rule": "每小时一次，从今天 17:00 起，最多 3 次",
+                "next": "今天 17:00",
                 "remaining": 3,
                 "end": None,
             }
         ],
+        "waiting_confirmation": [],
         "paused": None,
-        "push_switch": "未知（按开处理）",
         "unnotified_failures": 1,
     }
     system = system_of(model.requests[0])
@@ -564,14 +576,15 @@ async def test_cancel_only_takes_the_users_active_reminders(db: Database, tmp_pa
     channel = await say(chat, alice, "取消喝水")
     assert "还没有取消" in result(model)[1]
     markdown = markdown_of(channel)
-    assert markdown == texts.reminder_cancel_prompt(
-        [(mine, "喝水", "1 月 16 日（周六）08:00")], MINUTES
+    assert markdown == (
+        f"要取消这条提醒吗？\n\n- 喝水\n    - **下次**：明天 08:00\n\n按钮 {MINUTES} 分钟内有效。"
     )
+    assert "只用一句话简短说明要取消哪条" in result(model)[1]
     yes, _ = buttons(channel)
     assert yes.startswith("unremind:")
     assert [b.label for b in channel.buttons[-1]] == ["确认取消", "保留"]
 
-    assert await press(chat, ALICE, yes) == f"好的，取消了：#{mine} 喝水。"
+    assert await press(chat, ALICE, yes) == "好的，取消了。"
     assert await stored(db, alice) == []
     assert await stored(db, bob) == [(theirs, "鲍勃的秘密")]
 
@@ -592,10 +605,9 @@ async def test_cancel_reports_reminders_already_gone(db: Database, tmp_path: Pat
 
     reply = await press(chat, ALICE, buttons(channel)[0])
 
-    assert (
-        reply
-        == f"好的，取消了：#{first} 一。#{second} 已经不在了（发完了或之前已经取消），不用再取消。"
-    )
+    assert reply == "好的，取消了。有 1 条已经不在了。"  # 只说条数，不列内容与编号
+    assert texts.reminder_cancelled(2, 0) == "好的，取消了 2 条。"
+    assert texts.reminder_cancelled(0, 2) == "有 2 条已经不在了，不用再取消。"
 
 
 # ---- 按钮 ----
@@ -711,7 +723,7 @@ async def test_periodic_with_nothing_left_or_fewer_left(db: Database, tmp_path: 
 
     assert await press(chat, ALICE, buttons(gone)[0]) == texts.REMINDER_NOTHING_LEFT
     assert await press(chat, ALICE, buttons(fewer)[0]) == (
-        "好的，提醒 #1 设好了：喝水。下一次是 1 月 15 日（周五）16:07，还剩 2 次。"
+        "设置好了，下次在今天 16:07 提醒你，还剩 2 次。"
     )
 
 
@@ -793,13 +805,8 @@ async def test_prompt_lists_reminders_and_recent_sends_of_this_user(
     system = system_of(model.requests[0])
     block = json.loads(system.split("提醒资料：\n", 1)[1].split("\n", 1)[0])
     assert block == {
-        "reminders": [
-            {"id": rid, "text": "喝水", "rule": "每天 08:00", "next": "1 月 16 日（周六）08:00"}
-        ],
-        "recently_sent": [
-            {"text": "吃药", "scheduled": "1 月 15 日（周五）15:00", "delivery": "已发出"}
-        ],
-        "push_switch": "未知（按开处理）",
+        "reminders": [{"id": rid, "text": "喝水", "rule": "每天 08:00", "next": "明天 08:00"}],
+        "recently_sent": [{"text": "吃药", "scheduled": "今天 15:00", "delivery": "已发出"}],
         "paused": None,
     }
     assert "鲍勃" not in system
@@ -882,7 +889,7 @@ async def test_empty_values_mean_not_filled(db: Database, tmp_path: Path) -> Non
 
     error, text = result(model)
     assert not error, text
-    assert "1 月 15 日（周五）16:30" in text
+    assert "今天 16:30" in text
     assert "共 2 次" in text
     assert len(channel.buttons) == 1
 
@@ -1130,3 +1137,122 @@ async def test_budget_is_checked_again_right_before_accepting(
     assert "发不了确认按钮" in text
     assert channel.budget.reserved == 0
     assert channel.buttons == []
+
+
+# ---- 第一次 QQ 实测后的修改 ----
+
+
+async def test_list_shows_waiting_confirmations_of_this_user_only(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    bob = await invited(db, BOB, "小李")
+    model = QueueModel()
+    timer = [1000.0]
+    chat = reminder_chat(db, tmp_path, model, timer=timer)
+    await ask_set(chat, model, alice, once(text="该吃药了"))
+    await ask_set(chat, model, bob, once(text="鲍勃的秘密"))
+    model.then(LIST, *answer("好"))
+
+    await say(chat, alice, "我有哪些提醒")
+
+    text = result(model)[1]
+    assert "渲染好的列表：\n\n待确认，点了卡片上的「确认」才生效：\n\n- 该吃药了\n\nJSON：" in text
+    assert '"waiting_confirmation": ["该吃药了"]' in text
+    assert "鲍勃" not in text
+    # 过期的不再列出。
+    timer[0] += TOKEN_SECONDS + 1
+    model.then(LIST, *answer("好"))
+    await say(chat, alice, "我有哪些提醒")
+    assert "待确认" not in result(model)[1].split("JSON：")[0]
+    assert "现在没有提醒。" in result(model)[1]
+
+
+def test_render_list_formats() -> None:
+    from qtalk_bot.reminder_state import PauseReason
+    from qtalk_bot.reminder_tools import render_list
+    from qtalk_bot.reminders import ActiveView
+
+    views = [
+        ActiveView(
+            id=3,
+            content="交报告",
+            rule="一次：…",
+            next="明天 08:00",
+            remaining=1,
+            end=None,
+            once=True,
+        ),
+        ActiveView(
+            id=4,
+            content="打卡",
+            rule="每天 09:00",
+            next="明天 09:00",
+            remaining=None,
+            end="2033 年 1 月 1 日 星期六 00:00",
+        ),
+        ActiveView(
+            id=5,
+            content="喝水",
+            rule="每天 10:00",
+            next="明天 10:00",
+            remaining=None,
+            end=None,
+        ),
+    ]
+
+    rendered = render_list(views, waiting=(), paused=PauseReason.FRIEND_REMOVED)
+
+    assert rendered == (
+        "你删除了好友，提醒暂停中，到点不会发。\n\n"
+        "- 交报告\n    - **时间**：明天 08:00\n"
+        "- 打卡\n    - **规则**：每天 09:00\n    - **下次**：明天 09:00\n"
+        "    - **剩余**：未算出\n    - **结束**：2033 年 1 月 1 日 星期六 00:00\n"
+        "- 喝水\n    - **规则**：每天 10:00\n    - **下次**：明天 10:00\n"
+        "    - **剩余**：一直重复"
+    )
+    assert "#" not in rendered
+    disabled = render_list(views[:1], waiting=["喝水"], paused=PauseReason.DISABLED)
+    assert disabled.startswith("你的使用权限被停用了，提醒暂停中，到点不会发。\n\n")
+    assert disabled.endswith("待确认，点了卡片上的「确认」才生效：\n\n- 喝水")
+    assert "（" not in disabled.replace(" 星期六", "")
+
+
+def test_button_texts_after_the_live_test() -> None:
+    assert texts.REMINDER_BUTTONS_EXPIRED == "这个按钮已经失效了。还需要的话，请再跟我说一次。"
+    assert texts.reminder_created(next_at="明天 08:00", remaining=None, once=True) == (
+        "设置好了，我会在明天 08:00 提醒你。"
+    )
+    assert (
+        texts.reminder_created(next_at="明天 08:00", remaining=1)
+        == "设置好了，我会在明天 08:00 提醒你。"
+    )
+    assert (
+        texts.reminder_created(next_at="明天 08:00", remaining=None)
+        == "设置好了，下次在明天 08:00 提醒你。"
+    )
+    assert texts.reminder_created(next_at="明天 08:00", remaining=3) == (
+        "设置好了，下次在明天 08:00 提醒你，还剩 3 次。"
+    )
+    # 用户可见的文字一律写「下次」，不写「下一次」。
+    assert "下一次" not in texts.reminder_cancel_prompt([("喝水", "X")], MINUTES)
+    assert "下一次" not in texts.reminder_created(next_at="明天 08:00", remaining=2)
+
+
+def test_prompts_do_not_ask_the_model_to_explain_buttons() -> None:
+    from qtalk_bot.memory_tools import FORGET_TOPIC, buttons_coming
+    from qtalk_bot.prompt import REMINDER_GUIDE
+
+    forget_result = text_parts(buttons_coming(3, "甲", profile_tool=False))
+    for text in (
+        REMINDER_GUIDE,
+        SET_REMINDER.description,
+        CANCEL_REMINDER.description,
+        FORGET_TOPIC.description,
+        forget_result,
+    ):
+        assert "分钟内有效" not in text
+        assert "没看到按钮的话再说一次" not in text
+        assert "解释按钮" in text
+    assert "1. #12" not in LIST_REMINDERS.description
+    assert "不要写给用户" in CANCEL_REMINDER.description
