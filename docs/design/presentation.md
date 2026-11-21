@@ -135,7 +135,8 @@
 | 多租户的云存储与内容平台：`sitecorecloud.io`、`amazonaws.com`、`ctfassets.net` | 3 | 1 | 不放：任何人都能在这些后缀下开一块地方并看到访问记录 |
 | 拿不准或太零散：`qcloudimg.com`、`reutersconnect.com`、`wisc.edu`、`nipr.ac.jp`、`geog.com.cn`、`unsplash.com`、`staticflickr.com`、`futurecdn.net`，以及品牌官网 `apple.com`、`apple.com.cn`、`byd.com` | 7 | 4 | 默认不放，需要时由配置追加 |
 
-- **建议的默认白名单**是前两行的 14 个后缀：覆盖 108 张里的 93 张（86%），`gpt-6.2-sol` 80%，`gemini-4-hydrogen` 92%。只放 `wikimedia.org` 的话分别是 53% 与 83%。判断「只有站点自己能看到请求」是按各站的性质推断的，没有逐个核实。
+- **名单在审阅中**：用户提出 `gov.cn` 整个后缀直接放行（2026-11-20，取代单列的 `stats.gov.cn`、`cnsa.gov.cn`），并要再补一些合适的图站一起审阅，定下来之后写在这里。
+- **最初建议的默认白名单**是前两行的 14 个后缀：覆盖 108 张里的 93 张（86%），`gpt-6.2-sol` 80%，`gemini-4-hydrogen` 92%。只放 `wikimedia.org` 的话分别是 53% 与 83%。判断「只有站点自己能看到请求」是按各站的性质推断的，没有逐个核实。
 - **两家的习惯不同**：`gpt-6.2-sol` 更常用原始出处（数据图表一类完全不用维基，中国题材会用故宫、国家统计局、国家航天局的站）；`gemini-4-hydrogen` 几乎全靠维基。新浪、搜狐、百度、知乎这类国内的内容站一张也没有出现。
 - **维基的原图地址会被限流，缩略图地址不会**：`upload.wikimedia.org` 上的 46 张里有 26 张原图（全部来自 `gemini-4-hydrogen`）在两遍检查里都是 HTTP 429；`thumb.wikimedia.org` 的 29 张从没被限流。把这 26 张的地址改写成 960px 的缩略图地址后全部下载成功（15 KB 到 418 KB）。改写规则：`upload.wikimedia.org/wikipedia/<项目>/<a>/<ab>/<文件名>` → `thumb.wikimedia.org/wikipedia/<项目>/thumb/<a>/<ab>/<文件名>/960px-<文件名>`，SVG 再加 `.png`；缩略图不能比原图宽，960 不行时要退到更小的宽度（这次没有遇到）。
 - **对实现的影响**：
