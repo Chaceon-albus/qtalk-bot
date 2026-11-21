@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import contextlib
 import itertools
 import json
 import logging
@@ -2784,12 +2785,28 @@ async def test_reply_channel_sends_markdown_with_one_row_of_callback_buttons() -
 
 
 class _FakeInteraction:
-    def __init__(self, data: str | None, openid: str | None = ALICE) -> None:
+    def __init__(
+        self,
+        data: str | None,
+        openid: str | None = ALICE,
+        *,
+        kind: pyqbot.InteractionType = pyqbot.InteractionType.INLINE_KEYBOARD,
+        authorize: pyqbot.InteractionAuthorizeData | None = None,
+        failure: pyqbot.QQBotError | None = None,
+    ) -> None:
         self.button_data = data
         self.user_openid = openid
+        self.type = kind
+        self.data = pyqbot.InteractionData(
+            type=kind,
+            resolved=pyqbot.InteractionResolved(button_data=data, authorize_data=authorize),
+        )
+        self.failure = failure
         self.replies: list[str] = []
 
     async def reply(self, text: str) -> None:
+        if self.failure is not None:
+            raise self.failure
         self.replies.append(text)
 
 
@@ -2821,3 +2838,199 @@ async def test_interactions_go_to_the_button_handler(
     if called:
         assert calls == [(ALICE, data)]
     assert interaction.replies == ([answer] if replied else [])
+
+
+# ---- 提醒：主动消息开关与好友事件 ----
+
+
+class _RecordingReminders:
+    """`ReminderEvents` 的替身：记下收到的事件；切换开关时用给的函数回复 `answer`。"""
+
+    def __init__(self, answer: str | None = None) -> None:
+        self.answer = answer
+        self.switches: list[tuple[str, bool]] = []
+        self.friends: list[tuple[str, bool, int | None]] = []
+        self.deliveries: list[Delivery] = []
+
+    async def push_switched(
+        self, openid: str, *, on: bool, reply: Callable[[str], Awaitable[Delivery]]
+    ) -> None:
+        self.switches.append((openid, on))
+        if self.answer is not None:
+            self.deliveries.append(await reply(self.answer))
+
+    async def friend_changed(self, openid: str, *, present: bool, at: int | None) -> None:
+        self.friends.append((openid, present, at))
+
+
+def _authorize(switch: bool, scope: str = "c2c_push") -> pyqbot.InteractionAuthorizeData:
+    return pyqbot.InteractionAuthorizeData(
+        opt_scene=pyqbot.AuthorizeOptScene.SETTING,
+        scope=pyqbot.AuthorizeScope(scope),
+        switch=switch,
+    )
+
+
+@pytest.mark.parametrize("switch", [True, False])
+async def test_push_switch_interaction_goes_to_reminders_with_a_reply(switch: bool) -> None:
+    reminders = _RecordingReminders(answer="有 1 条提醒没能按时发出")
+    handlers = Handlers(cast(Gate, None), cast(ChatHandler, None), reminders=reminders)
+    interaction = _FakeInteraction(
+        None, kind=pyqbot.InteractionType.USER_AUTHORIZE, authorize=_authorize(switch)
+    )
+
+    await handlers.on_interaction(cast(pyqbot.Interaction, interaction))
+
+    assert reminders.switches == [(ALICE, switch)]
+    assert interaction.replies == ["有 1 条提醒没能按时发出"]
+    assert reminders.deliveries == [Delivery.SENT]
+
+
+@pytest.mark.parametrize(
+    ("failure", "delivery"),
+    [
+        (api_error(400, 40034006), Delivery.NOT_SENT),
+        (api_error(500, None, outcome_unknown=True), Delivery.UNKNOWN),
+    ],
+)
+async def test_push_switch_reply_reports_the_delivery(
+    failure: pyqbot.QQBotError, delivery: Delivery
+) -> None:
+    reminders = _RecordingReminders(answer="通知")
+    handlers = Handlers(cast(Gate, None), cast(ChatHandler, None), reminders=reminders)
+    interaction = _FakeInteraction(
+        None,
+        kind=pyqbot.InteractionType.USER_AUTHORIZE,
+        authorize=_authorize(True),
+        failure=failure,
+    )
+
+    await handlers.on_interaction(cast(pyqbot.Interaction, interaction))
+
+    assert reminders.deliveries == [delivery]
+
+
+async def test_group_push_switch_and_buttons_do_not_reach_reminders() -> None:
+    reminders = _RecordingReminders(answer="不该出现")
+    handlers = Handlers(cast(Gate, None), cast(ChatHandler, None), reminders=reminders)
+    group = _FakeInteraction(
+        None, kind=pyqbot.InteractionType.USER_AUTHORIZE, authorize=_authorize(True, "group_push")
+    )
+    button = _FakeInteraction("forget:t")  # 没有按钮的处理方：不理会
+
+    await handlers.on_interaction(cast(pyqbot.Interaction, group))
+    await handlers.on_interaction(cast(pyqbot.Interaction, button))
+
+    assert reminders.switches == []
+    assert group.replies == button.replies == []
+
+
+async def test_push_switch_without_reminders_is_ignored() -> None:
+    calls: list[str] = []
+
+    async def buttons(openid: str, button: str, reply: Callable[[str], Awaitable[None]]) -> None:
+        calls.append(button)
+
+    handlers = Handlers(cast(Gate, None), cast(ChatHandler, None), buttons=buttons)
+    interaction = _FakeInteraction(
+        None, kind=pyqbot.InteractionType.USER_AUTHORIZE, authorize=_authorize(True)
+    )
+
+    await handlers.on_interaction(cast(pyqbot.Interaction, interaction))
+
+    assert calls == []
+    assert interaction.replies == []
+
+
+def friend_del(openid: str, event_id: str) -> Payload:
+    return {
+        "op": 0,
+        "id": event_id,
+        "t": "FRIEND_DEL",
+        "d": {"author": {"union_openid": ""}, "openid": openid, "timestamp": 1794861000},
+    }
+
+
+async def test_friend_events_reach_reminders_and_gate_still_greets(db: Database) -> None:
+    await add_invite(db)
+    reminders = _RecordingReminders()
+    welcomed, removed = asyncio.Event(), asyncio.Event()
+    platform = Platform(
+        [
+            friend_add(ALICE, CODE, "FRIEND_ADD:1"),
+            friend_del(ALICE, "FRIEND_DEL:1"),
+            friend_add(ALICE, "", "FRIEND_ADD:2"),
+        ],
+        hold={1: welcomed, 2: removed},
+    )
+    codes = itertools.count(1)
+
+    async def until(done: Callable[[], bool]) -> None:
+        while not done():
+            platform.changed.clear()
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(0.05):
+                    await platform.changed.wait()
+
+    async with asyncio.timeout(HANG_GUARD), bot_on(platform) as bot:
+        gate = CountingGate(
+            db,
+            admin_openid=ADMIN,
+            timezone=ZoneInfo("Asia/Shanghai"),
+            invites=InviteSettings(),
+            share_link=ShareLinks(bot),
+            bot_name=BOT_NAME,
+            new_code=lambda: f"{next(codes):032x}",
+        )
+        gate.changed = platform.changed
+        gate.settled = []
+        register(bot, gate, RecordingChat(), reminders=reminders)
+        running = asyncio.create_task(bot.start())
+        await until(lambda: bool(gate.settled))  # 欢迎语发完、记下已欢迎之后再删好友
+        welcomed.set()
+        await until(lambda: len(reminders.friends) >= 2)
+        removed.set()
+        await until(lambda: len(platform.sent) >= 2 and len(reminders.friends) >= 3)
+        await asyncio.sleep(SETTLE)
+        await bot.close()
+        await running
+
+    assert reminders.friends == [
+        (ALICE, True, 1794861114),
+        (ALICE, False, 1794861000),
+        (ALICE, True, 1794861114),
+    ]
+    # 加好友的回复照旧由 Gate 决定：先是欢迎语，重新加好友时是「欢迎回来」；删好友不回复。
+    assert [text_of(body) for body in platform.sent] == [
+        texts.welcome("小王"),
+        texts.welcome_back("小王"),
+    ]
+
+
+async def test_proactive_sender_sends_plain_text_without_reply_to(db: Database) -> None:
+    platform = Platform([])
+    async with bot_on(platform) as bot:
+        send = bot_module.ProactiveSender(bot)
+        assert await send(ALICE, "提醒：吃药") is Delivery.SENT
+
+    (sent,) = platform.sent
+    assert sent["content"] == "提醒：吃药"
+    assert "msg_id" not in sent
+    assert "event_id" not in sent
+    assert sent["path"] == f"/v2/users/{ALICE}/messages"
+
+
+@pytest.mark.parametrize(
+    ("respond", "delivery"),
+    [
+        (reject, Delivery.NOT_SENT),
+        (server_error, Delivery.UNKNOWN),
+    ],
+)
+async def test_proactive_sender_classifies_failures(
+    respond: Callable[[Payload], httpx2.Response], delivery: Delivery
+) -> None:
+    platform = Platform([], respond=respond)
+    async with bot_on(platform) as bot:
+        send = bot_module.ProactiveSender(bot)
+        assert await send(ALICE, "提醒：吃药") is delivery

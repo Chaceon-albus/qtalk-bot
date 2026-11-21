@@ -142,6 +142,11 @@
   尽量从档案里去掉只来自那段聊天的信息（`Summarizer.schedule_profile_forget()`），被删了一部分的话题排一次摘要重写。
   删除不看授权（用户自己的数据）；档案清理的后台任务调用模型前照旧复查授权。
 
+**提醒的失败通知**（里程碑 8，构造时给了 `reminders`）：`_respond()` 复查授权、取出这一轮的消息之后（在这个用户的锁里，
+发「正在输入」与附件说明之前），交给 `FailureNotices.notify_in_turn()`：有还没告知的失败就用这条消息的被动回复先发一条
+（纯文本，计进 `ReplyBudget`，发完要给回答留不足余量时不发）。它不算回答开始显示（不 `claim()`），插话照常可以重来；
+发送失败只记日志，这一轮照常继续。到点发提醒与回复授权互动也拿这个用户的锁（`user_lock()`），与他的轮次串行。
+
 **判断插话**（`judge()`）：在事务里复查授权、取出正在回答的消息与新消息的文字版（只有这个用户自己的），交给
 `routing.SteerJudge`；决策记录与用量挂在新消息里最后一条上，被取消时也照记。
 """
@@ -191,6 +196,7 @@ from .context import (
     plan_turn,
 )
 from .describe import Describer
+from .gate import Delivery
 from .imagegen import GeneratedImage as ImageResult
 from .imagegen import ImageGenerator
 from .journal import (
@@ -306,6 +312,14 @@ KEEP_PREFIX = "keep:"
 
 class SendError(Exception):
     """回复没能发出。文案已脱敏（不含 openid 与正文）。"""
+
+
+class FailureNotices(Protocol):
+    """提醒的失败通知（`reminders.ReminderService` 符合它）：真正开始一轮对话时，在这个用户的锁里先发一条。"""
+
+    async def notify_in_turn(
+        self, user: User, send: Callable[[str], Awaitable[Delivery]]
+    ) -> None: ...
 
 
 class SendRejectedError(SendError):
@@ -850,11 +864,14 @@ class Conversation:
         steer: SteerJudge | None = None,
         image_generator: ImageGenerator | None = None,
         image_generation: ImageGenerationSettings | None = None,
+        reminders: FailureNotices | None = None,
         clock: Callable[[], float] = time.time,
         timer: Timer | None = None,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
         """`models` 按内部名字给出配置里的全部对话模型，`router` 决定每条消息用哪一个。
+
+        `reminders` 不为空时（启用了 `[reminders]`），每轮真正开始时先发提醒的失败通知（见 `_respond()`）。
 
         `fetcher` 为 `None` 时不下载附件（都按「没有下载」处理，只用文字版）；`describer` 为 `None` 时不给
         图片写描述、不给 PDF 写摘要；`summarizer` 为 `None` 时不给话题写标题与摘要（只在分话题时用到）；`steer` 为
@@ -876,6 +893,7 @@ class Conversation:
         self._steer = SteerJudge() if steer is None else steer
         self._image_generator = image_generator
         self._image_generation = image_generation
+        self._reminders = reminders
         self._timezone = timezone
         self._clock = clock
         self._timer: Timer = timer or (lambda: asyncio.get_running_loop().time())
@@ -905,6 +923,11 @@ class Conversation:
                 AttachmentKind.VOICE
             )  # 决策接口收音频：没有对话模型能听，也要存下原声交给决策
         self._wanted = frozenset(wanted)  # 用得上原件、要下载的种类
+
+    def user_lock(self, user_id: int) -> AbstractAsyncContextManager[None]:
+        """这个用户的串行锁（轮次、按钮的点击都在它里面）。到点发提醒、回复授权互动也拿它（`reminders.py`），与他的
+        轮次串行，免得打断正在写的流式回答。不可重入：持有它的流程里不能再拿。"""
+        return self._locks.hold(user_id)
 
     async def receive(
         self, user: User, message: ChatInput, channel: ReplyChannel
@@ -1219,6 +1242,7 @@ class Conversation:
     async def _respond(
         self, user: User, messages: Sequence[int], channel: ReplyChannel, control: TurnControl
     ) -> None:
+        raw = channel
         channel = _TurnChannel(channel, control)
         begun = await self._db.transaction(self._begin, user, messages)
         if begun is None:
@@ -1227,6 +1251,10 @@ class Conversation:
         if not begun.current:
             logger.info("用户 %s 没有待回复的消息", user.label)
             return
+        if self._reminders is not None:
+            # 提醒的失败通知：过了 Gate、复查授权通过、在这个用户的锁里、发「正在输入」之前，用这条消息的被动回复先发。
+            # 它不算回答开始显示（不 claim），插话照常可以重来；重来的那一轮里已经告知过的不再发。
+            await self._reminders.notify_in_turn(user, _notice_sender(raw))
         control.begin([entry.message_id for entry in begun.current if entry.message_id is not None])
         models = self._router.models
         max_size_mb = self._attachments.max_size_mb
@@ -3164,6 +3192,24 @@ async def _try_send(channel: ReplyChannel, text: str, user: User) -> _SendResult
         logger.warning("向用户 %s 发固定说明时不确定是否送达：%s", user.label, exc)
         return _SendResult.UNKNOWN
     return _SendResult.DELIVERED
+
+
+def _notice_sender(channel: ReplyChannel) -> Callable[[str], Awaitable[Delivery]]:
+    """失败通知的发送函数：被动回复这条消息、计数；发完要给回答留不足 `ANSWER_RESERVE` 次时不发（当作没发出）。"""
+
+    async def send(text: str) -> Delivery:
+        if not channel.budget.affords(1):
+            return Delivery.NOT_SENT
+        channel.budget.replies += 1
+        try:
+            await channel.send(text)
+        except SendRejectedError:
+            return Delivery.NOT_SENT
+        except SendError:
+            return Delivery.UNKNOWN
+        return Delivery.SENT
+
+    return send
 
 
 async def _send_notice(channel: ReplyChannel, text: str, user: User) -> bool:

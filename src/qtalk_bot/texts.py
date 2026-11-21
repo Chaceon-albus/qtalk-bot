@@ -10,8 +10,10 @@ Markdown 里的动态内容（备注、名字）一律先经 `escape_markdown()`
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 
 from .journal import UsagePurpose, UsageSummary, UsageTotals
+from .triggers import LAST_DAY, Calendar, Interval, IntervalUnit, Once, Trigger
 
 ADMIN_NAME = "管理员"
 """管理员在用户表里的名字。"""
@@ -657,3 +659,180 @@ FORGET_BUTTONS_FAILED = "确认按钮没能发出来，什么都没有删。还�
 def forget_done(topic_id: int) -> str:
     """点了「确认删除」、删完之后的回复（不重复标题）。"""
     return f"已经忘掉话题 #{topic_id} 了，刚才提出要求的那一轮对话也一起删掉了。"
+
+
+# ---- 提醒（里程碑 8） ----
+#
+# 到点发出的提醒、失败通知都用纯文本发（不做 Markdown 转义）；提醒文字是用户的原话，放进列表时压成一行。
+
+WEEKDAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+_UNIT_NAMES = {
+    IntervalUnit.MINUTES: "分钟",
+    IntervalUnit.HOURS: "小时",
+    IntervalUnit.DAYS: "天",
+    IntervalUnit.WEEKS: "周",
+}
+_MONTH_DAYS = (31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)  # 2 月按闰年算
+
+REMINDER_REASON_PUSH_OFF = "未开启主动消息"
+REMINDER_REASON_LATE = "没能按时发出"
+REMINDER_REASON_SEND_ERROR = "发送出错"
+REMINDER_REASON_RATE_LIMITED = "超过频率上限"
+REMINDER_REASON_MAYBE_LOST = "可能没送到"
+
+REMINDER_PUSH_HINT = (
+    "你现在没有开启「允许主动发送」，提醒到点发不出去。可以在机器人的资料卡里打开「允许主动发送」。"
+)
+"""已知用户关着主动消息的开关时，失败通知最后加的一句。"""
+
+MAX_FAILURE_LINES = 10
+"""失败通知最多列几行，其余写「另有 n 条」。"""
+
+
+def reminder_moment(moment: datetime, now: datetime) -> str:
+    """「11 月 23 日（周一）08:00」；与 `now` 不在同一年时前面加年份。两个都是本地时刻。"""
+    year = "" if moment.year == now.year else f"{moment.year} 年 "
+    weekday = WEEKDAY_NAMES[moment.weekday()]
+    return f"{year}{moment.month} 月 {moment.day} 日（{weekday}）{moment:%H:%M}"
+
+
+def reminder_rule(trigger: Trigger, now: datetime) -> str:
+    """触发规则的中文描述，如「每周一、周三 08:00，最多 10 次」。`now` 是本地时刻，只用来决定写不写年份。"""
+    match trigger:
+        case Once(at=at):
+            return f"一次：{reminder_moment(at, now)}"
+        case Interval():
+            unit = _UNIT_NAMES[trigger.unit]
+            every = f"每{unit}" if trigger.every == 1 else f"每 {trigger.every} {unit}"
+            rule = f"{every}一次，从 {reminder_moment(trigger.start, now)} 起"
+        case Calendar():
+            rule = f"{_calendar_days(trigger)} {'、'.join(f'{t:%H:%M}' for t in trigger.times)}"
+    if trigger.end is not None:
+        rule += f"，到 {reminder_moment(trigger.end, now)} 为止"
+    if trigger.count is not None:
+        rule += f"，最多 {trigger.count} 次"
+    return rule
+
+
+def _calendar_days(trigger: Calendar) -> str:
+    months = None if trigger.months is None else "、".join(f"{m} 月" for m in trigger.months)
+    if trigger.weekdays is not None:
+        weekdays = "每" + "、".join(WEEKDAY_NAMES[day] for day in trigger.weekdays)
+        return weekdays if months is None else f"每年 {months}的{weekdays}"
+    if trigger.monthdays is not None:
+        days = "、".join("最后一天" if d == LAST_DAY else f"{d} 日" for d in trigger.monthdays)
+        if trigger.months is None:
+            return f"每月 {days}"
+        if len(trigger.months) == 1:
+            return f"每年 {months} {days}"
+        return f"每年 {months}的 {days}"
+    return "每天" if months is None else f"每年 {months}的每天"
+
+
+def reminder_rule_notes(trigger: Trigger) -> list[str]:
+    """规则里有跳过的月份、只在闰年有的日期时，各写一句说明。"""
+    if not isinstance(trigger, Calendar) or trigger.monthdays is None:
+        return []
+    months = trigger.months or tuple(range(1, 13))
+    notes: list[str] = []
+    for day in (d for d in trigger.monthdays if d > 28):
+        lacking = [m for m in months if _MONTH_DAYS[m - 1] < day]
+        if lacking:
+            names = "、".join(f"{m} 月" for m in lacking)
+            notes.append(f"没有 {day} 日的月份（{names}）跳过。")
+        if day == 29 and 2 in months:
+            notes.append("2 月 29 日只在闰年有，平年的 2 月跳过。")
+    return notes
+
+
+def reminder_schedule(
+    upcoming: Sequence[str], *, more: bool, total: int | None, last: str | None, until: str | None
+) -> str:
+    """接下来的几次（已写好的时刻，至多 3 个）与总次数，如「接下来：A、B、C……共 10 次，最后一次是 X」。
+
+    `more` 表示列出的之后还有；`total` 与 `last` 是日程上的总次数与最后一次（不知道时为 `None`）；`until` 是不知道
+    总数、但有结束时刻时的结束时刻。只有一次时只写那个时刻。
+    """
+    listed = "、".join(upcoming)
+    if total is not None and total <= 1:
+        return listed
+    joint = "……" if more else "，"
+    if total is not None and last is not None:
+        return f"接下来：{listed}{joint}共 {total} 次，最后一次是 {last}"
+    if until is not None:
+        return f"接下来：{listed}{joint}之后一直重复，到 {until} 为止"
+    return f"接下来：{listed}{joint}之后一直重复，直到取消"
+
+
+def _one_line(text: str) -> str:
+    return " ".join(text.split())
+
+
+def reminder_late(seconds: int) -> str:
+    return f"晚了 {format_duration(seconds)}"
+
+
+def reminder_message(items: Sequence[tuple[str, int | None]]) -> str:
+    """到点发出的提醒（纯文本）。`items` 是同一分钟到期、合并在一条里的（提醒文字，迟到的秒数），不注明迟到时为
+    `None`。"""
+    if len(items) == 1:
+        ((content, late),) = items
+        head = "提醒：" if late is None else f"提醒（{reminder_late(late)}）："
+        return head + content
+    lines = [
+        f"{number}. {_one_line(content)}" + ("" if late is None else f"（{reminder_late(late)}）")
+        for number, (content, late) in enumerate(items, 1)
+    ]
+    return "提醒：\n" + "\n".join(lines)
+
+
+@dataclass(frozen=True, slots=True)
+class FailureLine:
+    """失败通知里的一行：同一条提醒的各次失败合在一起。
+
+    Attributes:
+        content: 提醒文字的副本。
+        rule: 规则描述的副本。
+        when: 只错过一次时那一次的原定时刻（已写好）；错过多次时为 `None`。
+        reasons: （原因，次数），按次数从多到少。
+    """
+
+    content: str
+    rule: str
+    when: str | None
+    reasons: tuple[tuple[str, int], ...]
+
+
+def _failure_line(line: FailureLine) -> str:
+    total = sum(times for _, times in line.reasons)
+    if line.when is not None and total == 1:
+        detail = f"原定 {line.when}，{line.reasons[0][0]}"
+    elif len(line.reasons) == 1:
+        detail = f"{line.rule}，错过 {total} 次，{line.reasons[0][0]}"
+    else:
+        reasons = "、".join(f"{reason} {times} 次" for reason, times in line.reasons)
+        detail = f"{line.rule}，错过 {total} 次：{reasons}"
+    return f"{_one_line(line.content)}（{detail}）"
+
+
+def reminder_failures(
+    lines: Sequence[FailureLine], reasons: Sequence[str], *, push_off: bool
+) -> str:
+    """失败通知（纯文本）：有几条提醒没能按时发出、粗分的原因，至多列 `MAX_FAILURE_LINES` 行。`push_off` 为真（已知
+    用户关着主动消息的开关）时最后加一句怎么打开。"""
+    parts = [f"有 {len(lines)} 条提醒没能按时发出（{'、'.join(reasons)}）："]
+    parts.extend(
+        f"{number}. {_failure_line(line)}"
+        for number, line in enumerate(lines[:MAX_FAILURE_LINES], 1)
+    )
+    if len(lines) > MAX_FAILURE_LINES:
+        parts.append(f"另有 {len(lines) - MAX_FAILURE_LINES} 条。")
+    if push_off:
+        parts.append(REMINDER_PUSH_HINT)
+    return "\n".join(parts)
+
+
+def reminder_failures_brief(count: int, reasons: Sequence[str], *, push_off: bool) -> str:
+    """失败通知的简版：完整的那条被平台拒发时改发，不带提醒文字。"""
+    text = f"有 {count} 条提醒没能按时发出（{'、'.join(reasons)}），具体内容这次没能显示出来。"
+    return f"{text}\n{REMINDER_PUSH_HINT}" if push_off else text

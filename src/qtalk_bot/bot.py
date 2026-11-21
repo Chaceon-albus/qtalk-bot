@@ -1,6 +1,12 @@
 """接线层：把 pyqbot 的事件转成普通数据交给 `Gate`，再按结果回复或交给对话处理器。
 
-只注册单聊消息、加好友与按钮互动（忘掉话题的确认按钮）的处理函数，群聊明确不做。这里尽量薄，判断都在 `gate.py` 与 `conversation.py`。
+只注册单聊消息、加好友、删好友与互动（忘掉话题的确认按钮、资料卡的主动消息开关）的处理函数，群聊明确不做。这里尽量薄，
+判断都在 `gate.py`、`conversation.py` 与 `reminders.py`。
+
+提醒（启用了 `[reminders]` 时）：到点的提醒经 `ProactiveSender` 以纯文本主动消息发出；切换主动消息开关的授权互动
+（`type` 18、`scope` 为 `c2c_push`，开关状态在 `authorize_data.switch`，pyqbot `docs/errata.md`「单聊主动消息开关」）
+交给 `ReminderEvents.push_switched()`，连同用这条互动被动回复的函数；删好友、加好友（`FRIEND_DEL`、`FRIEND_ADD`，
+errata「好友事件」实测都会推送）交给 `ReminderEvents.friend_changed()`，加好友的回复照旧由 Gate 决定。
 
 日志不记 openid 与消息正文。pyqbot 的异常文案里可能带 openid（请求路径），所以这里只记异常类型、
 `err_code` 与 `trace_id`。
@@ -79,6 +85,16 @@ type ButtonHandler = Callable[[str, str, Callable[[str], Awaitable[None]]], Awai
 `conversation.Conversation.press_button()`）。"""
 
 
+class ReminderEvents(Protocol):
+    """提醒关心的平台事件（`reminders.ReminderService` 符合它）。"""
+
+    async def push_switched(
+        self, openid: str, *, on: bool, reply: Callable[[str], Awaitable[Delivery]]
+    ) -> None: ...
+
+    async def friend_changed(self, openid: str, *, present: bool, at: int | None) -> None: ...
+
+
 def register(
     bot: pyqbot.Bot,
     gate: Gate,
@@ -86,17 +102,21 @@ def register(
     *,
     hosts: Sequence[str] = PLATFORM_HOSTS,
     buttons: ButtonHandler | None = None,
+    reminders: ReminderEvents | None = None,
 ) -> Handlers:
-    """在 `bot` 上注册单聊消息、加好友与（给了 `buttons` 时）互动的处理函数。关停时要在关数据库之前等返回值的
-    `drain()`。
+    """在 `bot` 上注册单聊消息、加好友与（给了 `buttons` 或 `reminders` 时）互动的处理函数，给了 `reminders` 时还有
+    删好友的。关停时要在关数据库之前等返回值的 `drain()`。
 
     `hosts` 是下载白名单（`download_hosts()` 合并后的），形态日志按它决定记不记主机名。`buttons` 处理忘掉话题的
-    确认按钮（`conversation.Conversation.press_button()`）；`Bot` 默认先替我们回应互动（`auto_ack`），这里只管回复。
+    确认按钮（`conversation.Conversation.press_button()`）；`Bot` 默认先替我们回应按钮的互动（`auto_ack`），这里只管
+    回复。`reminders` 处理主动消息开关与好友事件（见模块 docstring）。
     """
-    handlers = Handlers(gate, chat, hosts=hosts, buttons=buttons)
+    handlers = Handlers(gate, chat, hosts=hosts, buttons=buttons, reminders=reminders)
     bot.on_c2c_message(handlers.on_c2c_message)
     bot.on_friend_add(handlers.on_friend_add)
-    if buttons is not None:
+    if reminders is not None:
+        bot.on_friend_del(handlers.on_friend_del)
+    if buttons is not None or reminders is not None:
         bot.on_interaction(handlers.on_interaction)
     return handlers
 
@@ -360,6 +380,42 @@ class AdminAlertSender:
             raise AlertSendError(_describe(exc)) from None
         except RuntimeError as exc:  # 客户端已关闭
             raise AlertSendError(type(exc).__name__) from None
+
+
+class ProactiveSender:
+    """以纯文本主动消息发给用户（`client.users.send_message()`，不带 `reply_to`），符合 `reminders.ProactiveSend`。
+    不抛异常：平台明确拒绝是 `NOT_SENT`，说不准是 `UNKNOWN`（按 `is_rejection()` 分）。时限由调用方控制。"""
+
+    def __init__(self, client: pyqbot.Client) -> None:
+        self._client = client
+
+    async def __call__(self, openid: str, text: str) -> Delivery:
+        try:
+            await self._client.users.send_message(openid, text)
+        except pyqbot.QQBotError as exc:
+            logger.warning("主动消息没能确认发出：%s", _describe(exc))
+            return Delivery.NOT_SENT if is_rejection(exc) else Delivery.UNKNOWN
+        except (RuntimeError, ValueError) as exc:  # 客户端已关闭，或内容不合法（没有发请求）
+            logger.warning("主动消息没能发出：%s", type(exc).__name__)
+            return Delivery.NOT_SENT
+        return Delivery.SENT
+
+
+def _interaction_reply(interaction: pyqbot.Interaction) -> Callable[[str], Awaitable[Delivery]]:
+    """用这条互动被动回复纯文本，结果分法同 `ProactiveSender`。"""
+
+    async def reply(text: str) -> Delivery:
+        try:
+            await interaction.reply(text)
+        except pyqbot.QQBotError as exc:
+            logger.warning("回复互动没能确认发出：%s", _describe(exc))
+            return Delivery.NOT_SENT if is_rejection(exc) else Delivery.UNKNOWN
+        except (RuntimeError, ValueError) as exc:
+            logger.warning("回复互动没能发出：%s", type(exc).__name__)
+            return Delivery.NOT_SENT
+        return Delivery.SENT
+
+    return reply
 
 
 class QQDownloader:
@@ -640,7 +696,7 @@ class _KeyedLock:
 
 
 class Handlers:
-    """前台的处理函数（单聊消息、加好友、按钮的互动）。
+    """前台的处理函数（单聊消息、加好友、删好友、互动：按钮与主动消息开关）。
 
     每次处理从 Gate 的决定开始，到对话处理器把放行的消息写进流水（或回复链收尾）为止，都由这里跟踪，关停时
     `drain()` 在关数据库之前等它们。pyqbot 关闭时只等处理函数 5 秒：数据库的队列堵着时，受保护的 Gate 事务
@@ -655,11 +711,13 @@ class Handlers:
         *,
         hosts: Sequence[str] = PLATFORM_HOSTS,
         buttons: ButtonHandler | None = None,
+        reminders: ReminderEvents | None = None,
     ) -> None:
         self._gate = gate
         self._chat = chat
         self._hosts = tuple(hosts)
         self._buttons = buttons
+        self._reminders = reminders
         # 同一个人的回复链成组发出：管理员连发两条 /invite 时，两组「状态 + 邀请」不会交叉，免得把
         # 不带备注的邀请转发错人。只锁回复链的发送，对话处理器不在锁里。
         self._reply_locks = _KeyedLock()
@@ -690,14 +748,44 @@ class Handlers:
         async with self._tracking():
             await self._on_friend_add(event)
 
-    async def on_interaction(self, interaction: pyqbot.Interaction) -> None:
-        """点了回调按钮：只处理忘掉话题的确认按钮（`FORGET_PREFIX`、`KEEP_PREFIX` 开头），交给 `buttons`，连同一个经
-        `interaction.reply()` 回复用户的函数（发送失败只记日志）。互动已由 `Bot` 先回应（`auto_ack`）；回复由处理方在
-        这个用户的锁里发，不插进正在写的流式回答。别的互动（资料卡的开关等）不理会。"""
+    async def on_friend_del(self, event: pyqbot.FriendDel) -> None:
+        """删了好友：交给 `reminders`（提醒按停用处理），不回复。"""
         async with self._tracking():
-            data = interaction.button_data or ""
+            if self._reminders is None:
+                return
+            try:
+                await self._reminders.friend_changed(
+                    event.openid, present=False, at=event.timestamp
+                )
+            except Exception as exc:  # noqa: BLE001  只记类型
+                logger.warning("记下删好友对提醒的影响时出错：%s", type(exc).__name__)
+
+    async def on_interaction(self, interaction: pyqbot.Interaction) -> None:
+        """互动：
+
+        - 切换资料卡的主动消息开关（`type` 18，`scope` 为 `c2c_push`）：交给 `reminders`，连同用这条互动被动回复的函数
+          （由处理方在这个用户的锁里调用）。
+        - 点了回调按钮：只处理忘掉话题的确认按钮（`FORGET_PREFIX`、`KEEP_PREFIX` 开头），交给 `buttons`，连同一个经
+          `interaction.reply()` 回复用户的函数（发送失败只记日志）。互动已由 `Bot` 先回应（`auto_ack`）；回复由处理方
+          在这个用户的锁里发，不插进正在写的流式回答。
+        别的互动不理会。"""
+        async with self._tracking():
             openid = interaction.user_openid
-            if self._buttons is None or openid is None:
+            if openid is None:
+                return
+            if interaction.type == pyqbot.InteractionType.USER_AUTHORIZE:
+                authorize = interaction.data.resolved.authorize_data
+                if (
+                    self._reminders is not None
+                    and authorize is not None
+                    and authorize.scope == pyqbot.AuthorizeScope.C2C_PUSH
+                ):
+                    await self._reminders.push_switched(
+                        openid, on=authorize.switch, reply=_interaction_reply(interaction)
+                    )
+                return
+            data = interaction.button_data or ""
+            if self._buttons is None:
                 return
             if not data.startswith((FORGET_PREFIX, KEEP_PREFIX)):
                 return
@@ -753,6 +841,12 @@ class Handlers:
                 pass
 
     async def _on_friend_add(self, event: pyqbot.FriendAdd) -> None:
+        if self._reminders is not None:
+            # 重新加好友后提醒照常接着发；回复（欢迎语、欢迎回来）照旧由 Gate 决定。记不下来也不挡住回复。
+            try:
+                await self._reminders.friend_changed(event.openid, present=True, at=event.timestamp)
+            except Exception as exc:  # noqa: BLE001  只记类型
+                logger.warning("记下加好友对提醒的影响时出错：%s", type(exc).__name__)
         added = FriendAdded(
             openid=event.openid, event_id=event.event_id, scene_param=event.scene_param
         )

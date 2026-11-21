@@ -5,10 +5,11 @@
 创建对话模型、决策模型、写图片描述的模型与出图的图片模型（成败经 `model_watch.ModelWatch` 统计、告警）、构造
 `pyqbot.Bot`、注册处理函数（经 `batching.Batcher` 交给对话）并运行。
 
-运行期间的后台任务：定期清理过期的附件；写心跳文件供 `python -m qtalk_bot.health` 检查（`health.Heartbeat`，启动时
-先删掉旧的，心跳里带着 QQ 网关的状态）；定时备份（`maintenance.BackupScheduler`）；查磁盘余量
-（`maintenance.DiskWatch`）；看网关断没断（`gateway_watch.GatewayWatch`）。后三者与模型的告警都经 `alerts.Alerts` 发给
-管理员。
+运行期间的后台任务：定期清理过期的附件（并清理过期的提醒数据，`reminders.reminder_cleanup()`）；写心跳文件供
+`python -m qtalk_bot.health` 检查（`health.Heartbeat`，启动时先删掉旧的，心跳里带着 QQ 网关的状态）；定时备份
+（`maintenance.BackupScheduler`）；查磁盘余量（`maintenance.DiskWatch`）；看网关断没断（`gateway_watch.GatewayWatch`）；
+启用了 `[reminders]` 时到点发提醒（`reminders.ReminderScheduler`，经 `bot.ProactiveSender` 发主动消息，与对话共用每用户
+的锁 `Conversation.user_lock()`）。备份、磁盘、网关与模型的告警都经 `alerts.Alerts` 发给管理员。
 
 退出时按 `_shut_down()` 的顺序先停收事件、等前台与对话收尾，再停后台的任务，最后关闭模型的客户端与数据库。配置
 或数据库有误（含迁移前的备份失败）、连不上平台时打印原因并以非零状态退出，不打印 traceback。
@@ -20,6 +21,7 @@ import logging
 import signal
 import sys
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +32,7 @@ from .batching import Batcher
 from .bot import (
     AdminAlertSender,
     Handlers,
+    ProactiveSender,
     QQChat,
     QQDownloader,
     ShareLinks,
@@ -66,6 +69,7 @@ from .maintenance import (
 from .media import Fetcher, MediaStore, relocate_user_dirs, run_cleanup
 from .memory import Summarizer
 from .model_watch import ModelWatch
+from .reminders import ReminderScheduler, ReminderService, UserLocks, reminder_cleanup
 from .routing import Router, SteerJudge
 from .storage import DATABASE_FILENAME, Database, StorageError
 
@@ -183,6 +187,15 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
         handlers: Handlers | None = None
         cleanup: asyncio.Task[None] | None = None
         maintenance: list[Background] = []
+        reminder_service: ReminderService | None = None
+        fallback_locks = UserLocks()
+
+        def user_lock(user_id: int) -> AbstractAsyncContextManager[None]:
+            # 提醒与对话共用每用户的锁；注入了别的对话处理器（没有 Conversation）时用自己的。
+            if conversation is None:
+                return fallback_locks.hold(user_id)
+            return conversation.user_lock(user_id)
+
         # 从这里起无论怎样结束（取名字时被取消、后面准备失败、正常停止），都经 `_shut_down()` 关闭 Bot 的
         # HTTP 连接并等后台收尾。
         try:
@@ -218,6 +231,13 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                 dir_taken=store.dir_taken,
             )
             await gate.prepare()
+            if settings.reminders.enabled:
+                reminder_service = ReminderService(
+                    db,
+                    admin_openid=secrets.admin_openid,
+                    timezone=settings.timezone,
+                    lock=user_lock,
+                )
             if settings.describe is not None and models.describer is not None:
                 describer = Describer(
                     db,
@@ -261,17 +281,39 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                     steer=SteerJudge(settings.decisions, models.decider),
                     image_generator=models.image_generator,
                     image_generation=image_generation,
+                    reminders=reminder_service,
                 )
                 batcher = Batcher(conversation, settings.turns)
                 chat = QQChat(batcher)
+            if reminder_service is not None:
+                # 在 Conversation 建好之后才开始：之前开始的话，最初几次会拿到另一套锁。
+                reminders = ReminderScheduler(
+                    db,
+                    send=ProactiveSender(bot),
+                    settings=settings.reminders,
+                    timezone=settings.timezone,
+                    admin_openid=secrets.admin_openid,
+                    lock=user_lock,
+                )
+                maintenance.append(
+                    Background("提醒", asyncio.create_task(reminders.run()), reminders.stop)
+                )
             handlers = register(
                 bot,
                 gate,
                 chat,
                 hosts=hosts,
                 buttons=None if conversation is None else conversation.press_button,
+                reminders=reminder_service,
             )
-            cleanup = asyncio.create_task(run_cleanup(db, store, settings.attachments))
+            cleanup = asyncio.create_task(
+                run_cleanup(
+                    db,
+                    store,
+                    settings.attachments,
+                    also=(reminder_cleanup(db, settings.reminders),),
+                )
+            )
             logger.info("机器人启动")
             await bot.start()
         except BaseException:
@@ -305,7 +347,8 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
 
 @dataclass(frozen=True, slots=True)
 class Background:
-    """一个维护任务（心跳、定时备份、磁盘检查、网关检查）：`stop` 是可选的同步停止请求，关停时先于取消任务调用。"""
+    """一个维护任务（心跳、定时备份、磁盘检查、网关检查、到点发提醒）：`stop` 是可选的同步停止请求，关停时先于取消任务
+    调用。"""
 
     name: str
     task: asyncio.Task[None]
@@ -338,13 +381,14 @@ async def _shut_down(
     *,
     maintenance: Sequence[Background] = (),
 ) -> bool:
-    """按顺序关停，返回期间是否又被取消过。`maintenance` 是维护任务：心跳、定时备份、磁盘检查、网关检查。
+    """按顺序关停，返回期间是否又被取消过。`maintenance` 是维护任务：心跳、定时备份、磁盘检查、网关检查、到点发提醒。
 
     顺序：
     0. 停掉 `maintenance`（同步）：先发各自的停止请求（定时备份借此通知正在复制的备份在下一步之前放弃、删掉临时
        文件），再取消任务。放在最前面：数据库只有一个线程，正在做的备份会让排在后面的 Gate 事务与流水写入一直等，
        耗掉第 6 步的时限，已经放行的消息就可能丢掉。心跳与网关检查也在这里停：之后 `Bot.stop()` 把网关切到
-       `STOPPED`，不该再写进心跳或拿来告警。等它们退出放在第 8 步。
+       `STOPPED`，不该再写进心跳或拿来告警。到点发提醒也在这里停（不再派出新的发送，取消在途的；被取消的发送按
+       「可能没送到」记下）：它经 QQ 的 HTTP 客户端发主动消息，要在第 5 步关闭客户端之前停下。等它们退出放在第 8 步。
     1. `Batcher.stop()`（同步）：放弃等待中的附件、防抖的计时与正在进行的插话判断（消息已在流水里，重启后是
        待回复的），取消正在回答的轮次（对话自己在后台收尾记账），之后到达的消息只收下、不再回答。放在
        `Bot.stop()` 之前：否则等处理函数的那几秒里，刚收下的消息还会开新的一轮（发「正在输入」、调用决策），

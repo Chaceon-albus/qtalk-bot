@@ -629,6 +629,101 @@ def _v16_media_dirs(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+_V17_REMINDERS = """
+-- 提醒（里程碑 8，见 reminders.py 与 triggers.py）。编号都是 AUTOINCREMENT（删除后不复用：列表与取消只认编号），
+-- 所有表随用户删除级联删掉。时刻一律是 UTC 的 Unix 秒。
+--
+-- reminders：一条提醒。action 区分「到点发一句话」（message，content 是要发的话）与以后的「到点执行一个请求」
+-- （request，content 是请求）。trigger 是触发规则（triggers.dump_trigger() 的 JSON，按本地钟点存），timezone 是算
+-- next_fire_at 时用的时区名，启动时发现配置的时区变了就重算。anchor_at 是建提醒时的调用时刻（日历式的日程从它之后
+-- 算起）。next_index 与 next_fire_at 是日程上的下一次（第几次，从 0 起；何时）；不再触发时两者都为空，status 不再是
+-- active，ended_at 是发完（finished）或取消（cancelled）的时刻，清理按它删。
+CREATE TABLE reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    action TEXT NOT NULL DEFAULT 'message' CHECK (action IN ('message', 'request')),
+    content TEXT NOT NULL,
+    trigger TEXT NOT NULL,
+    timezone TEXT NOT NULL,
+    anchor_at INTEGER NOT NULL,
+    next_index INTEGER CHECK (next_index >= 0),
+    next_fire_at INTEGER,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'finished', 'cancelled')),
+    created_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    CHECK ((status = 'active') = (next_fire_at IS NOT NULL)),
+    CHECK ((next_fire_at IS NULL) = (next_index IS NULL)),
+    CHECK ((status = 'active') = (ended_at IS NULL))
+) STRICT;
+CREATE INDEX reminders_due ON reminders (next_fire_at) WHERE status = 'active';
+CREATE INDEX reminders_by_user ON reminders (user_id, status);
+CREATE INDEX reminders_ended ON reminders (ended_at) WHERE ended_at IS NOT NULL;
+
+-- 没能按时发出的提醒：按「提醒 × 原因 × 未告知」合并成一行（times 是次数，first_at、last_at 是其中最早、最晚的原定
+-- 时刻），不会无限增长。content 与 rule 是提醒文字与规则描述的副本：提醒取消、清理之后也还能列出。notified_at 为空即
+-- 还没告知用户；告知后不再合并新的失败（新的另起一行）。reason 的取值见 reminders.FailureReason。
+CREATE TABLE reminder_failures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    reminder_id INTEGER REFERENCES reminders (id) ON DELETE SET NULL,
+    reason TEXT NOT NULL
+        CHECK (reason IN ('push_off', 'late', 'send_error', 'rate_limited', 'maybe_lost')),
+    content TEXT NOT NULL,
+    rule TEXT NOT NULL,
+    times INTEGER NOT NULL CHECK (times >= 1),
+    first_at INTEGER NOT NULL,
+    last_at INTEGER NOT NULL CHECK (last_at >= first_at),
+    notified_at INTEGER,
+    updated_at INTEGER NOT NULL
+) STRICT;
+CREATE UNIQUE INDEX reminder_failures_open ON reminder_failures (reminder_id, reason)
+    WHERE notified_at IS NULL;
+CREATE INDEX reminder_failures_by_user ON reminder_failures (user_id, notified_at);
+CREATE INDEX reminder_failures_by_reminder ON reminder_failures (reminder_id);
+CREATE INDEX reminder_failures_notified ON reminder_failures (notified_at)
+    WHERE notified_at IS NOT NULL;
+
+-- 每个用户的主动消息开关与好友状态（没有行时按默认值：开关未知、仍是好友）。push 是资料卡上「允许主动发送」的开关，
+-- 来自授权互动（未知按开处理），push_updated_at 是最近一次改它的时刻；push_trial_day 是开关为「关」时最近一次试发
+-- 提醒的本地日期（YYYY-MM-DD），每天只试一次。friend_removed 为 1 即用户删了好友，提醒按停用处理；
+-- friend_updated_at 是最近一次好友事件的时刻（平台的时间），晚到的旧事件不覆盖新的。
+CREATE TABLE reminder_user_state (
+    user_id INTEGER PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
+    push TEXT NOT NULL DEFAULT 'unknown' CHECK (push IN ('unknown', 'on', 'off')),
+    push_updated_at INTEGER,
+    push_trial_day TEXT,
+    friend_removed INTEGER NOT NULL DEFAULT 0 CHECK (friend_removed IN (0, 1)),
+    friend_updated_at INTEGER
+) STRICT;
+
+-- 发出的提醒消息（同一分钟到期的合并成一条）：运行时的频率上限按它计数，系统提示词里「最近发出过的提醒」也取自它。
+-- 先记成 sending 再发，发完改成 sent（确认送达）、rejected（平台明确拒绝）或 unknown（结果不明）；重启时还是
+-- sending 的按 unknown 处理。started_at 是开始发送的时刻。
+CREATE TABLE reminder_sends (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('sending', 'sent', 'rejected', 'unknown')),
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER
+) STRICT;
+CREATE INDEX reminder_sends_by_user ON reminder_sends (user_id, started_at);
+CREATE INDEX reminder_sends_in_flight ON reminder_sends (status) WHERE status = 'sending';
+CREATE INDEX reminder_sends_by_time ON reminder_sends (started_at);
+
+-- 一条提醒消息里的各条提醒：fire_at 是原定时刻；content 与 rule 是副本（记失败、列「最近发出过的」时用）。
+CREATE TABLE reminder_send_items (
+    send_id INTEGER NOT NULL REFERENCES reminder_sends (id) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    reminder_id INTEGER REFERENCES reminders (id) ON DELETE SET NULL,
+    content TEXT NOT NULL,
+    rule TEXT NOT NULL,
+    fire_at INTEGER NOT NULL,
+    PRIMARY KEY (send_id, position)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX reminder_send_items_by_reminder ON reminder_send_items (reminder_id);
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     _V1_ACCESS,
     _V2_CHAT,
@@ -646,6 +741,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     _V14_AUTOINCREMENT,
     _V15_PROFILE_VERSIONS,
     _v16_media_dirs,
+    _V17_REMINDERS,
 )
 """本程序的迁移列表。业务表由各里程碑在末尾追加，已发布的不能修改。"""
 

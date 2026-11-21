@@ -18,6 +18,7 @@ from qtalk_bot.config import (
     Provider,
     ProvidersSettings,
     QQSettings,
+    ReminderSettings,
     Secrets,
     Settings,
     TopicSettings,
@@ -66,6 +67,7 @@ def test_example_config_is_valid_and_spells_out_the_defaults() -> None:
     assert example.turns == TurnSettings()
     assert example.backup == BackupSettings()
     assert example.alerts == AlertSettings()
+    assert example.reminders == ReminderSettings()
     # [describe] 的模型没有默认值，其余各项要与默认值一致。
     assert example.describe == DescribeSettings(provider=Provider.OPENAI, model="gpt-6-luna")
     # [memory] 同理；reasoning 默认不传。

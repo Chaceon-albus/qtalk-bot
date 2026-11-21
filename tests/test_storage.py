@@ -827,7 +827,7 @@ async def test_version_16_gives_users_random_dirs_and_strips_attachment_prefixes
         ).fetchall()
     conn.close()
 
-    async with await Database.open(db_path) as db:
+    async with await Database.open(db_path, migrations=MIGRATIONS[:16]) as db:
         users = await db.transaction(access.list_users)
         rows = await db.fetch_all(
             "SELECT user_id, path, status FROM attachments ORDER BY user_id, position"
@@ -852,7 +852,7 @@ async def test_version_16_gives_users_random_dirs_and_strips_attachment_prefixes
                 ("../" + "a" * 29,),
             )
 
-    assert user_version(db_path) == len(MIGRATIONS) == 16
+    assert user_version(db_path) == 16
     assert [tuple(row) for row in copied] == [tuple(row) for row in users_before]
     dirs = [user.media_dir for user in users]
     assert all(media.valid_media_dir(d) for d in dirs)
@@ -932,3 +932,31 @@ async def test_version_16_refuses_paths_outside_the_users_own_directory(
     assert paths_after == paths_before
     assert "users_new" not in table_names(db_path)
     assert "media_relocations" not in table_names(db_path)
+
+
+async def test_version_17_adds_the_reminder_tables(db_path: Path) -> None:
+    from qtalk_bot import access
+
+    async with await Database.open(db_path, migrations=MIGRATIONS[:16]) as old:
+        await old.transaction(access.ensure_user, "FAKE-OPENID-A", "小王", 0)
+    before = _schema(db_path)
+
+    async with await Database.open(db_path) as db:
+        assert await db.fetch_all("PRAGMA foreign_key_check") == []
+        users = await db.transaction(access.list_users)
+
+    assert user_version(db_path) == len(MIGRATIONS) == 17
+    assert [user.name for user in users] == ["小王"]
+    after = _schema(db_path)
+    for name, sql in before.items():
+        assert after[name] == sql, name  # 已有的表原样不动
+    added = set(after) - set(before)
+    assert {
+        "reminders",
+        "reminder_failures",
+        "reminder_user_state",
+        "reminder_sends",
+        "reminder_send_items",
+    } <= added
+    assert "AUTOINCREMENT" in after["reminders"]
+    assert "ON DELETE CASCADE" in after["reminders"]

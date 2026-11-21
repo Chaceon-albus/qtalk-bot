@@ -1443,8 +1443,12 @@ async def run_cleanup(
     *,
     clock: Callable[[], float] = time.time,
     interval: float = CLEANUP_INTERVAL_SECONDS,
+    also: Sequence[Callable[[int], Awaitable[None]]] = (),
 ) -> None:
-    """启动时清理一次，之后每隔 `interval` 秒一次，直到被取消。出错只记日志。"""
+    """启动时清理一次，之后每隔 `interval` 秒一次，直到被取消。出错只记日志。
+
+    `also` 是并进来的其它清理（如过期的提醒数据，`reminders.reminder_cleanup()`），每次在附件之后依次调用，参数是
+    当前时刻；各自出错只记日志，不影响别的。"""
     while True:
         now = int(clock())
         cutoff = now - settings.retention_days * 24 * 3600
@@ -1455,4 +1459,9 @@ async def run_cleanup(
         else:
             if removed:
                 logger.info("清理了 %d 个过期的附件文件", removed)
+        for step in also:
+            try:
+                await step(now)
+            except Exception as exc:  # noqa: BLE001  同上
+                logger.warning("定期清理出错：%s", type(exc).__name__)
         await asyncio.sleep(interval)

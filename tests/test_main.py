@@ -5,7 +5,7 @@ import dataclasses
 import logging
 import signal
 import sqlite3
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
@@ -1150,9 +1150,15 @@ def test_startup_moves_legacy_attachment_dirs_before_cleanup_and_serving(
     seen: list[str] = []
     real_cleanup = entry.run_cleanup
 
-    async def cleanup(db: Database, store: MediaStore, settings: AttachmentSettings) -> None:
+    async def cleanup(
+        db: Database,
+        store: MediaStore,
+        settings: AttachmentSettings,
+        *,
+        also: Sequence[Callable[[int], Awaitable[None]]] = (),
+    ) -> None:
         seen.append(f"清理：旧目录{'还在' if legacy.exists() else '已搬走'}")
-        await real_cleanup(db, store, settings)
+        await real_cleanup(db, store, settings, also=also)
 
     async def start(self: pyqbot.Bot) -> None:
         seen.append(f"开始收消息：旧目录{'还在' if legacy.exists() else '已搬走'}")

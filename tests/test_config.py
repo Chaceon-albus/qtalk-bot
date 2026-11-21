@@ -26,6 +26,7 @@ from qtalk_bot.config import (
     ProviderSettings,
     ProvidersSettings,
     QQSettings,
+    ReminderSettings,
     Secrets,
     Settings,
     TopicSettings,
@@ -222,9 +223,9 @@ def test_invalid_value_is_not_echoed(tmp_path: Path) -> None:
 
 
 def test_unknown_keys_and_tables_are_reported(tmp_path: Path) -> None:
-    text = 'timezne = "UTC"\n[reminders]\nenabled = true\n'
+    text = 'timezne = "UTC"\n[reminder]\nenabled = true\n'
     error = config_error(write_config(tmp_path, text))
-    assert error.problems == ("timezne：未知的键", "reminders：未知的键")
+    assert error.problems == ("timezne：未知的键", "reminder：未知的键")
 
 
 def test_secret_in_config_file_is_rejected_without_echoing_value(tmp_path: Path) -> None:
@@ -1650,3 +1651,55 @@ def test_backup_and_alerts_problems_are_reported_together(tmp_path: Path) -> Non
     problems = config_error(write_config(tmp_path, text)).problems
     assert "backup.keep：应为正整数" in problems
     assert "alerts.model_failures：应为正整数" in problems
+
+
+# ---- [reminders]（里程碑 8）----
+
+
+def test_reminders_default_when_omitted(tmp_path: Path) -> None:
+    settings = load_settings(write_config(tmp_path, ""))
+    assert settings.reminders == ReminderSettings(
+        enabled=True,
+        max_active=20,
+        hourly_limit=20,
+        daily_limit=50,
+        grace_minutes=30,
+        retention_days=3,
+    )
+
+
+def test_reminders_values_are_read(tmp_path: Path) -> None:
+    text = (
+        "[reminders]\nenabled = false\nmax_active = 5\nhourly_limit = 3\ndaily_limit = 10\n"
+        "grace_minutes = 0\nretention_days = 7\n"
+    )
+    settings = load_settings(write_config(tmp_path, text))
+    assert settings.reminders == ReminderSettings(
+        enabled=False,
+        max_active=5,
+        hourly_limit=3,
+        daily_limit=10,
+        grace_minutes=0,
+        retention_days=7,
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ("[reminders]\nenabled = 1\n", "reminders.enabled：应为布尔值，实际是整数"),
+        ("[reminders]\nmax_active = 0\n", "reminders.max_active：应为正整数"),
+        ("[reminders]\nhourly_limit = 61\n", "reminders.hourly_limit：不能大于 60"),
+        ("[reminders]\ndaily_limit = 1441\n", "reminders.daily_limit：不能大于 1440"),
+        (
+            "[reminders]\nhourly_limit = 30\ndaily_limit = 20\n",
+            "reminders.hourly_limit：不能大于 daily_limit",
+        ),
+        ("[reminders]\ngrace_minutes = -1\n", "reminders.grace_minutes：不能小于 0"),
+        ("[reminders]\nretention_days = 0\n", "reminders.retention_days：应为正整数"),
+        ("[reminders]\nlimit = 1\n", "reminders.limit：未知的键"),
+        ("reminders = true\n", "reminders：应为表，实际是布尔值"),
+    ],
+)
+def test_reminders_problems(tmp_path: Path, text: str, problem: str) -> None:
+    assert problem in config_error(write_config(tmp_path, text)).problems

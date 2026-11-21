@@ -138,6 +138,16 @@ DEFAULT_ALERT_DISK_FREE_MIN_MB = 1024
 MAX_ALERT_DISK_FREE_MIN_MB = 1024 * 1024  # 1 TiB
 DEFAULT_ALERT_GATEWAY_DOWN_MINUTES = 10
 MAX_ALERT_GATEWAY_DOWN_MINUTES = 24 * 60
+DEFAULT_REMINDER_MAX_ACTIVE = 20
+MAX_REMINDER_MAX_ACTIVE = 1000
+DEFAULT_REMINDER_HOURLY_LIMIT = 20
+MAX_REMINDER_HOURLY_LIMIT = 60  # 同一分钟的合并成一条，一小时最多 60 条
+DEFAULT_REMINDER_DAILY_LIMIT = 50
+MAX_REMINDER_DAILY_LIMIT = 24 * 60
+DEFAULT_REMINDER_GRACE_MINUTES = 30
+MAX_REMINDER_GRACE_MINUTES = 24 * 60
+DEFAULT_REMINDER_RETENTION_DAYS = 3
+MAX_REMINDER_RETENTION_DAYS = 365
 
 type GeminiImageSize = Literal["512", "1K", "2K", "4K"]
 """Gemini 出图的分辨率（Interactions API `response_format.image_size` 的取值）。"""
@@ -534,6 +544,28 @@ class AlertSettings:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ReminderSettings:
+    """`[reminders]` 表：提醒（里程碑 8，见 `reminders.py`）。
+
+    Attributes:
+        enabled: 是否启用提醒：到点发送、失败通知。关掉时到点的提醒不发，重新打开后，期间错过的按「没能按时
+            发出」记失败。
+        max_active: 每人同时有效的提醒最多几条。
+        hourly_limit: 每人每个整点小时（配置的时区）最多收到几条提醒消息，同一分钟到期的合并成一条计。
+        daily_limit: 每人每个自然日（配置的时区）最多收到几条提醒消息，计法同上。
+        grace_minutes: 停机等原因晚了这么多分钟以内的照发（注明晚了多久），更晚的不发、记失败。
+        retention_days: 发完或取消的提醒、已告知的失败记录过这么多天删掉。
+    """
+
+    enabled: bool = True
+    max_active: int = DEFAULT_REMINDER_MAX_ACTIVE
+    hourly_limit: int = DEFAULT_REMINDER_HOURLY_LIMIT
+    daily_limit: int = DEFAULT_REMINDER_DAILY_LIMIT
+    grace_minutes: int = DEFAULT_REMINDER_GRACE_MINUTES
+    retention_days: int = DEFAULT_REMINDER_RETENTION_DAYS
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Settings:
     """来自 TOML 配置文件的静态设置。`models` 已经校验过：非空、恰好一个默认、名字不重复、备用引用有效；
     `decisions` 不为空且模型多于一个时，每个模型都有 `description`。"""
@@ -554,6 +586,7 @@ class Settings:
     image_generation: ImageGenerationSettings | None = None
     backup: BackupSettings = BackupSettings()
     alerts: AlertSettings = AlertSettings()
+    reminders: ReminderSettings = ReminderSettings()
 
     @property
     def default_model(self) -> ModelSettings:
@@ -818,6 +851,8 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
     backup = None if backup_table is None else _parse_backup(backup_table)
     alerts_table = table.table("alerts")
     alerts = None if alerts_table is None else _parse_alerts(alerts_table)
+    reminders_table = table.table("reminders")
+    reminders = None if reminders_table is None else _parse_reminders(reminders_table)
     table.finish()
     if decisions is not None and models is not None and len(models) > MAX_OPTIONS:
         # 每个模型是选模型那道选择题的一个选项，两家接口都最多 255 个。
@@ -845,6 +880,7 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         or not image_ok
         or backup is None
         or alerts is None
+        or reminders is None
     ):
         return None
     return Settings(
@@ -864,6 +900,47 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         image_generation=image_generation,
         backup=backup,
         alerts=alerts,
+        reminders=reminders,
+    )
+
+
+def _parse_reminders(table: _Table) -> ReminderSettings | None:
+    enabled = table.boolean("enabled", True)
+    max_active = _positive_int(
+        table, "max_active", DEFAULT_REMINDER_MAX_ACTIVE, MAX_REMINDER_MAX_ACTIVE
+    )
+    hourly = _positive_int(
+        table, "hourly_limit", DEFAULT_REMINDER_HOURLY_LIMIT, MAX_REMINDER_HOURLY_LIMIT
+    )
+    daily = _positive_int(
+        table, "daily_limit", DEFAULT_REMINDER_DAILY_LIMIT, MAX_REMINDER_DAILY_LIMIT
+    )
+    grace = _bounded_int(
+        table, "grace_minutes", DEFAULT_REMINDER_GRACE_MINUTES, 0, MAX_REMINDER_GRACE_MINUTES
+    )
+    retention = _positive_int(
+        table, "retention_days", DEFAULT_REMINDER_RETENTION_DAYS, MAX_REMINDER_RETENTION_DAYS
+    )
+    table.finish()
+    if hourly is not None and daily is not None and hourly > daily:
+        table.problem("hourly_limit", "不能大于 daily_limit")
+        return None
+    if (
+        enabled is None
+        or max_active is None
+        or hourly is None
+        or daily is None
+        or grace is None
+        or retention is None
+    ):
+        return None
+    return ReminderSettings(
+        enabled=enabled,
+        max_active=max_active,
+        hourly_limit=hourly,
+        daily_limit=daily,
+        grace_minutes=grace,
+        retention_days=retention,
     )
 
 
