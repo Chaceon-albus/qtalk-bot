@@ -644,7 +644,7 @@ FORGET_KEEPS_REMINDERS = "相关的提醒不会一起删。"
 
 def forget_prompt(topic_id: int, title: str, minutes: int, *, reminders: bool = False) -> str:
     """带确认按钮的那条消息（Markdown）；标题来自用户的对话，经 `escape_markdown()`。`minutes` 是按钮的有效期。
-    `reminders` 为真（启用了提醒、这个用户有有效的提醒）时另起一段说提醒不会一起删：这一轮模型不写文字，只能写在
+    `reminders` 为真（这个用户在库里有有效的提醒，不论 `[reminders]` 开没开）时另起一段说提醒不会一起删：这一轮模型不写文字，只能写在
     卡片上。"""
     head = (
         f"要忘掉话题 #{topic_id}「{escape_markdown(title)}」吗？这个话题里的全部对话、图片与摘要，连同刚才提出要求的"
@@ -974,7 +974,10 @@ REMINDER_SET_DECLINED = "好的，这条提醒不设了。"
 REMINDER_CANCEL_DECLINED = "好的，不取消了，提醒照旧。"
 
 
-REMINDER_REPLACED_GONE = "原来那条已经不在了。"
+REMINDER_REPLACED_GONE = (
+    "原来那条提醒已经不在了，可能已经改过或发完，这次没有改动。需要的话请再跟我说一次。"
+)
+"""点了修改卡片的「确认」时，要被替换的那条已经不是有效的提醒：什么都不改。"""
 
 
 def reminder_created(

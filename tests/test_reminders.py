@@ -39,6 +39,7 @@ from qtalk_bot.reminders import (
     ReminderService,
     ReminderStatus,
     ReminderTextError,
+    ReplacedGone,
     SendStatus,
     TooManyActive,
     UserLocks,
@@ -1849,7 +1850,7 @@ async def test_admission_leaves_out_the_replaced_one(db: Database) -> None:
     assert await contents(db, alice) == ["频率"]
 
 
-async def test_replacing_one_that_is_gone_still_creates(db: Database) -> None:
+async def test_replacing_one_that_is_gone_changes_nothing(db: Database) -> None:
     alice = await invited(db, ALICE, "小王")
     bob = await invited(db, BOB, "小李")
     old = await add(db, alice, "旧的", kind="calendar", times=["08:00"])
@@ -1859,11 +1860,10 @@ async def test_replacing_one_that_is_gone_still_creates(db: Database) -> None:
     gone = await replace(db, alice, "新的", old.reminder.id, kind="calendar", times=["09:00"])
     others = await replace(db, alice, "又一条", bobs.reminder.id, kind="calendar", times=["10:00"])
 
-    assert isinstance(gone, Created)
-    assert not gone.replaced
-    assert isinstance(others, Created)
-    assert not others.replaced  # 别人的提醒不动
-    assert await contents(db, alice) == ["新的", "又一条"]
+    # 已经不是有效的提醒（取消、发完、被另一张修改卡片替换过），或不是自己的：什么都不改，不当成新建。
+    assert gone == ReplacedGone()
+    assert others == ReplacedGone()
+    assert await contents(db, alice) == []
     assert await contents(db, bob) == ["鲍勃的"]
 
 
@@ -1896,3 +1896,42 @@ async def test_the_last_time_of_a_finite_reminder_is_marked(db: Database) -> Non
             "- 截止 · 晚了 5 分钟 · 最后一次\n- 一直 · 晚了 5 分钟\n17:05"
         ),
     ]
+
+
+async def test_quick_remaining_for_the_prompt(db: Database) -> None:
+    from qtalk_bot.reminders import describe_active, quick_remaining
+
+    alice = await invited(db, ALICE, "小王")
+    counted = await add(db, alice, "次数", kind="calendar", times=["16:00"], count=5)
+    short = await add(db, alice, "截止", kind="calendar", times=["16:00"], end="2026-11-25T23:59")
+    long = await add(  # 三百多次，多过便宜算法肯数的
+        db, alice, "很长", kind="calendar", times=["16:00"], end="2027-10-01T00:00"
+    )
+    both = await add(
+        db, alice, "都有", kind="calendar", times=["16:00"], count=2, end="2027-10-01T00:00"
+    )
+    endless = await add(db, alice, "一直", kind="calendar", times=["16:00"])
+    once = await add(db, alice, "一次", kind="once", at="2026-11-21T08:00")
+
+    def quick(created: Created) -> int | None:
+        return quick_remaining(created.reminder, TZ)
+
+    assert quick(counted) == 5  # 次数减去下一次的编号，直接相减
+    assert quick(short) == 6  # 20 日到 25 日
+    assert quick(long) is None  # 数不完：「未算出」
+    assert quick(both) == 2
+    assert quick(endless) is None  # 「一直重复」
+    assert quick(once) == 1
+    # 用户主动要看的列表照旧精确地数。
+    exact = {
+        v.content: v.remaining for v in await db.transaction(describe_active, alice.id, TZ, T0)
+    }
+    rough = {
+        v.content: v.remaining
+        for v in await db.transaction(describe_active, alice.id, TZ, T0, exact=False)
+    }
+    assert exact["很长"] == 315
+    assert rough["很长"] is None
+    assert {k: v for k, v in exact.items() if k != "很长"} == {
+        k: v for k, v in rough.items() if k != "很长"
+    }

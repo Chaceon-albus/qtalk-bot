@@ -154,8 +154,9 @@
 最后一次的），模型只拿到 JSON 资料。
 - **列表与卡片的时机**（`_send_extras()`）：回答结束之后、记账之前发。在回答之后：同一用户还在写的流式消息会被另一条
   回复提前结束（errata 40034019）。在记账之前：流水按实际送达的写（`_settle_extras()`），确认送达的列表与卡片各记一句
-  程序写的方括号说明，另起一行接在回答文字后面；被拒、没发、送达不明的不记。只在这一轮会结束时发（同 `_record()` 的
-  判断），没有结束的一轮会被并进下一轮。
+  程序写的方括号说明，另起一行接在回答文字后面；被拒、没发、送达不明的不记。送达结果逐项记在 turn 上
+  （`_Turn.extra_notes`、`_Turn.extra_noticed`），中途关停或出错时照样按已经送达的记账（出错的记完账再抛出）。只在
+  这一轮会结束时发（同 `_record()` 的判断），没有结束的一轮会被并进下一轮。
 - **预留**：接受列表或待确认的一项时各为它预留一次被动回复（`ReplyBudget.reserve()`）；正文的兜底（改发纯文本、固定
   说明）发完要给预留留不出余量时不发（`_fallback_room()`），宁可不发正文的说明，也照样发已经答应的列表与卡片。
 - **一轮只出一条确认**（`confirmations.py`）：忘掉话题、设置提醒、取消提醒共用 `_Turn.pending`。同一种后到的：设置与
@@ -809,6 +810,8 @@ class _Turn:
         self.pending: Pending | None = None
         # 这一轮要由程序直接发给用户的提醒列表（`list_reminders`，只留最后一次的）：回答结束之后、确认卡片之前发。
         self.listing: reminder_tools.Listing | None = None
+        # 确认送达的列表与卡片的方括号说明，按发出的先后（`Conversation._send_extras()`）。
+        self.extra_notes: list[str] = []
         # 列表或卡片没发成时补发的说明确认送达了（`Conversation._extra_notice()`）。
         self.extra_noticed = False
         # 正文的兜底为了给列表或卡片留着预留而没发（`Conversation._fallback_room()`）：之后照样发列表与卡片。
@@ -1341,9 +1344,6 @@ class Conversation:
                     once=isinstance(reminder.trigger, Once),  # 一次性的不写「还剩 1 次」
                     replaced=replaced,
                 )
-                if replaces is not None and not replaced:
-                    # 要被替换的那条在确认之前已经发完或取消了：照样新建，说一句。
-                    text = f"{texts.REMINDER_REPLACED_GONE}{text}"
                 return text, Pressed.REPLACED if replaced else Pressed.CREATED
             case reminders.TooManyActive(active=active, limit=limit):
                 why, text = "有效条数到了上限", texts.reminder_too_many(active, limit)
@@ -1361,26 +1361,28 @@ class Conversation:
                 text = texts.REMINDER_ONCE_PASSED if once else texts.REMINDER_NOTHING_LEFT
             case reminders.TooDense():
                 why, text = "太密", texts.REMINDER_TOO_DENSE
+            case reminders.ReplacedGone():
+                # 要被替换的那条已经不在了（如另一张修改卡片先确认了）：什么都不改，不当成新建。
+                why, text = "要被替换的那条已经不在了", texts.REMINDER_REPLACED_GONE
         logger.info("用户 %s 点了「确认」，提醒没有建（%s）", user.label, why)
         return text, Pressed.OTHER
 
-    async def _send_extras(self, turn: _Turn, *, silent: bool) -> list[str]:
-        """这一轮回答结束之后、记账之前，发这一轮要发的提醒列表与确认卡片（先列表后卡片），返回确认送达的那些的方括号
-        说明（按发出的先后），由调用方写进流水。补发的说明（「没能发出来」等）确认送达时记进 `turn.extra_noticed`。
+    async def _send_extras(self, turn: _Turn, *, silent: bool) -> None:
+        """这一轮回答结束之后、记账之前，发这一轮要发的提醒列表与确认卡片（先列表后卡片）。每确认送达一项就把它的方括号
+        说明记进 `turn.extra_notes`（按发出的先后），补发的说明（「没能发出来」等）确认送达时记下 `turn.extra_noticed`：
+        逐项记在 turn 上，中途被取消（关停）或出错时，调用方照样按已经送达的记账。
 
         在记账之前发，流水才能按实际的结果写；第一条发出之前（`claim()` 之前）这一轮还没有显示任何东西，被插话
         重来时照常重来（`_TurnChannel` 的 `claim()` 不成功时抛出 `CancelledError`，这里在开始时也查一次）。退回预留：
         列表先退、先发，确认卡片的预留留到发它之前才退，列表的兜底说明不会占掉卡片的那一次。"""
         if turn.control.preempted:
             raise asyncio.CancelledError
-        notes: list[str] = []
         listing = turn.drop_listing()
         if listing is not None and await self._send_listing(turn, listing, silent=silent):
-            notes.append(listing.note)
+            turn.extra_notes.append(listing.note)
         pending = turn.drop_pending()
         if pending is not None and await self._offer(turn, pending, silent=silent):
-            notes.append(self._card_note(pending))
-        return notes
+            turn.extra_notes.append(self._card_note(pending))
 
     def _card_note(self, pending: Pending) -> str:
         match pending:
@@ -1413,7 +1415,10 @@ class Conversation:
         kind = kind_of(pending)
         if turn.control.preempted:
             return False
-        if not await self._db.transaction(self._allowed, user):
+        # 忘掉话题的卡片要写明相关的提醒不会一起删：有效提醒的条数与授权在同一个事务里取，发卡片用的是最新的授权。
+        # 只看库里有没有有效提醒，不看 `[reminders]` 开没开：关掉时提醒仍在库里，重新打开后会接着发。
+        allowed, active = await self._db.transaction(self._allowed_with_reminders, user)
+        if not allowed:
             logger.info("用户 %s 已不能使用对话，不发确认按钮（%s）", user.label, kind.value)
             return False
         if not turn.channel.budget.affords_last():
@@ -1424,10 +1429,7 @@ class Conversation:
         minutes = TOKEN_SECONDS // 60
         match pending:
             case PendingForget(topic_id=topic_id, title=title):
-                keeps = self._reminder_settings is not None and bool(
-                    await self._db.transaction(reminders.count_active, user.id)
-                )
-                markdown = texts.forget_prompt(topic_id, title, minutes, reminders=keeps)
+                markdown = texts.forget_prompt(topic_id, title, minutes, reminders=active > 0)
                 labels = (
                     (texts.FORGET_CONFIRM_LABEL, texts.FORGET_CONFIRMED_LABEL),
                     (texts.FORGET_KEEP_LABEL, texts.FORGET_KEPT_LABEL),
@@ -1717,21 +1719,24 @@ class Conversation:
             # 列表与确认卡片在回答结束之后、记账之前发，流水按实际送达的写。只在这一轮会结束时发（用户实际收到了
             # 东西，`journal.ends_turn()`；只发卡片、列表的一轮；或正文的兜底为了留着预留没发）：没有结束的一轮
             # （什么都没送达）会被并进下一轮，忘掉话题时确认后删不干净。
-            notes: list[str] = []
             if cancelled is None and failure is None and self._sends_extras(turn, outcome):
                 try:
-                    notes = await self._send_extras(
-                        turn, silent=outcome.delivery is ReplyDelivery.CARD
-                    )
+                    await self._send_extras(turn, silent=outcome.delivery is ReplyDelivery.CARD)
                 except asyncio.CancelledError as exc:
-                    if control.preempted:
+                    if control.preempted and not control.displayed:
                         # 第一条还没发出就被插话重来：这一轮什么都没显示，照常重来，不写回复行。
                         await self._restart(turn, begun)
                         raise
-                    cancelled = exc
+                    cancelled = exc  # 关停：按已经送达的记账
+                except Exception as exc:  # noqa: BLE001  记账之后原样抛出
+                    # 意外的异常（如复查授权时数据库出错）：同上，按已经送达的记账（正文、决策、用量）再抛出。
+                    logger.warning(
+                        "给用户 %s 发列表或卡片时出错：%s", user.label, type(exc).__name__
+                    )
+                    failure = exc
             turn.drop_listing()  # 没发的退回预留
             turn.drop_pending()
-            outcome = self._settle_extras(turn, outcome, notes, cancelled=cancelled is not None)
+            outcome = self._settle_extras(turn, outcome, cancelled=cancelled is not None)
         elif outcome.delivery is ReplyDelivery.CARD:  # 不会发生：只发卡片的一轮总有要发的
             outcome = _Outcome("", ReplyDelivery.NOTICE_LOST)
         # 正常结束与被取消共用这一次记账；shield 让写入不随取消撤掉（数据库线程正忙、事务还没执行时，
@@ -1906,6 +1911,11 @@ class Conversation:
     def _allowed(self, conn: sqlite3.Connection, user: User) -> bool:
         return access.chat_allowed(conn, user.id, self._admin_openid)
 
+    def _allowed_with_reminders(self, conn: sqlite3.Connection, user: User) -> tuple[bool, int]:
+        """授权与这个用户有效提醒的条数（同一个事务里；先数条数、再复查授权）。"""
+        active = reminders.count_active(conn, user.id)
+        return self._allowed(conn, user), active
+
     def _record_message(
         self,
         conn: sqlite3.Connection,
@@ -2019,6 +2029,7 @@ class Conversation:
             return None
         timezone = self._timezone
         # 编号、内容、规则、下一次与还剩几次（修改带次数上限的提醒时，count 照它填）；条数写死，不跟 `max_active` 走。
+        # 每轮开轮都要算，剩余次数用便宜的算法（`reminders.quick_remaining()`），不逐次枚举长期的日历提醒。
         entries = tuple(
             ReminderEntry(
                 id=view.id,
@@ -2027,7 +2038,9 @@ class Conversation:
                 next=view.next,
                 remaining=reminder_tools.remaining_value(view),
             )
-            for view in reminders.describe_active(conn, user.id, timezone, now, BRIEF_REMINDERS)
+            for view in reminders.describe_active(
+                conn, user.id, timezone, now, BRIEF_REMINDERS, exact=False
+            )
         )
         recent = reminders.recent_deliveries(
             conn, user.id, now - RECENT_SENT_SECONDS, RECENT_SENT_SHOWN
@@ -2902,24 +2915,26 @@ class Conversation:
             return False
         return await _send_notice(turn.channel, text, turn.user)
 
-    def _settle_extras(
-        self, turn: _Turn, outcome: _Outcome, notes: Sequence[str], *, cancelled: bool
-    ) -> _Outcome:
-        """按列表与卡片实际送达的结果定下这一轮记进流水的回复：确认送达的那些的方括号说明另起一行接在回答文字后面
-        （只发卡片、列表的一轮就只有它们）。只发卡片、列表的一轮一项都没送达时不算回复：补发的说明确认送达了按
-        `failed`（同其它固定说明），否则按 `notice_lost`，被取消（关停）时按 `cancelled`，都不写内容。"""
-        if outcome.delivery is not ReplyDelivery.CARD:
-            if not notes:
-                return outcome
+    def _settle_extras(self, turn: _Turn, outcome: _Outcome, *, cancelled: bool) -> _Outcome:
+        """按列表与卡片实际送达的结果（`turn.extra_notes`、`turn.extra_noticed`，中途被取消或出错时是已经送达的那些）
+        定下这一轮记进流水的回复：确认送达的那些的方括号说明另起一行接在回答文字后面（只发卡片、列表的一轮就只有
+        它们）。一项都没送达、回答本身也没有结束这一轮时（只发卡片、列表的一轮，或正文没送达的混合请求），补发的说明
+        确认送达了按 `failed`（同其它固定说明，这一轮结束），不写内容；什么都没送达时只发卡片、列表的一轮按
+        `notice_lost`，被取消（关停）时按 `cancelled`，混合请求照原来的结局。"""
+        notes = turn.extra_notes
+        if notes:
+            if outcome.delivery is ReplyDelivery.CARD:
+                return _Outcome("\n".join(notes), ReplyDelivery.CARD)
             joined = "\n".join(part for part in (outcome.content, *notes) if part)
             return replace(outcome, content=joined)
-        if notes:
-            return _Outcome("\n".join(notes), ReplyDelivery.CARD)
-        if cancelled:
-            return _Outcome("", ReplyDelivery.CANCELLED)
-        return _Outcome(
-            "", ReplyDelivery.FAILED if turn.extra_noticed else ReplyDelivery.NOTICE_LOST
-        )
+        silent = outcome.delivery is ReplyDelivery.CARD
+        if turn.extra_noticed and (
+            silent or not journal.ends_turn(outcome.content, outcome.delivery)
+        ):
+            return _Outcome("", ReplyDelivery.FAILED)
+        if not silent:
+            return outcome
+        return _Outcome("", ReplyDelivery.CANCELLED if cancelled else ReplyDelivery.NOTICE_LOST)
 
     async def _close_process(self, turn: _Turn) -> None:
         """一轮正常结束：结束过程消息（回答开始时已经结束的就等它发完），最多等 `GRACE_SECONDS`。"""

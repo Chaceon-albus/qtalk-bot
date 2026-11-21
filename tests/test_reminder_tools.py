@@ -8,7 +8,7 @@
 import asyncio
 import json
 import sqlite3
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from typing import cast
 
@@ -24,7 +24,7 @@ from tests.test_conversation import (
     FakeDownloader,
     invited,
 )
-from tests.test_conversation_images import Call, text_parts
+from tests.test_conversation_images import Call, Step, text_parts
 from tests.test_conversation_topics import Picker, say
 from tests.test_memory_tools import QueueModel, answer, forget, names, view
 
@@ -39,7 +39,7 @@ from qtalk_bot.config import (
     TopicSettings,
 )
 from qtalk_bot.confirmations import BUTTON_PREFIXES, TOKEN_SECONDS, ButtonKind, parse_click
-from qtalk_bot.conversation import Conversation
+from qtalk_bot.conversation import ChoiceButton, Conversation
 from qtalk_bot.llm import ChatRequest, FunctionResult, Provider, Usage
 from qtalk_bot.media import Fetcher, MediaStore
 from qtalk_bot.memory_tools import FORGET_TOPIC_NAME, VIEW_MEMORY_NAME
@@ -1442,7 +1442,7 @@ def test_cancel_card_labels_match_the_set_card() -> None:
 # ---- Fable 的用户视角审阅与用户拍板之后 ----
 
 
-async def silent(chat: Conversation, model: QueueModel, user: User, *calls: Call) -> FakeChannel:
+async def silent(chat: Conversation, model: QueueModel, user: User, *calls: Step) -> FakeChannel:
     """模型照提示只调用函数、不写回答文字的一轮。"""
     from tests.test_conversation import DONE
 
@@ -1587,8 +1587,30 @@ async def test_replacing_one_that_is_gone_by_the_time_of_confirming(
 
     reply = await press(chat, ALICE, buttons(channel)[0])
 
-    assert reply == "原来那条已经不在了。设置好了，下次在明天 09:00 提醒你。"
-    assert [content for _, content in await stored(db, alice)] == ["新的"]
+    assert reply == (
+        "原来那条提醒已经不在了，可能已经改过或发完，这次没有改动。需要的话请再跟我说一次。"
+    )
+    assert await stored(db, alice) == []  # 不当成新建
+    assert await press(chat, ALICE, buttons(channel)[0]) == texts.REMINDER_PRESSED
+
+
+async def test_two_replacement_cards_for_one_reminder_apply_only_once(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    old = await plant(db, alice, "旧的", kind="calendar", times=["08:00"])
+    model = QueueModel()
+    chat = reminder_chat(db, tmp_path, model)
+    first = await ask_set(
+        chat, model, alice, set_call("改成九点", kind="calendar", times=["09:00"], replaces=old)
+    )
+    second = await ask_set(
+        chat, model, alice, set_call("改成十点", kind="calendar", times=["10:00"], replaces=old)
+    )
+
+    assert await press(chat, ALICE, buttons(first)[0]) == "改好了，下次在明天 09:00 提醒你。"
+    assert await press(chat, ALICE, buttons(second)[0]) == texts.REMINDER_REPLACED_GONE
+    assert [content for _, content in await stored(db, alice)] == ["改成九点"]
 
 
 async def test_a_replacement_that_fails_on_confirming_changes_nothing(
@@ -1966,3 +1988,207 @@ def cancel_pending_result() -> FunctionResult:
     return cancel_pending(
         [CancelItem(reminder_id=1, content="喝水", next="明天 08:00")], replaced=False
     )
+
+
+# ---- 第三轮评审：关停、异常、混合请求、旧的替换卡片、间隔的剩余次数、忘掉话题的卡片 ----
+
+
+class GatedButtons(FakeChannel):
+    """发按钮时卡住（等 `gate`），用来在发卡片的中途关停。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.waiting = asyncio.Event()
+
+    async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
+        self.waiting.set()
+        await self.gate.wait()
+        await super().send_buttons(markdown, buttons)
+
+
+async def shut_down_while_sending_the_card(
+    chat: Conversation, user: User, channel: GatedButtons
+) -> None:
+    from tests.test_conversation import HANG_GUARD
+
+    from qtalk_bot.conversation import ChatInput
+
+    task = asyncio.create_task(
+        chat.handle(user, [ChatInput(message_id="qq-x", text="列一下再取消")], channel)
+    )
+    async with asyncio.timeout(HANG_GUARD):
+        await channel.waiting.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    async with asyncio.timeout(HANG_GUARD):
+        await chat.drain()
+
+
+async def test_shutdown_keeps_what_was_already_delivered(db: Database, tmp_path: Path) -> None:
+    from qtalk_bot.conversation import SendRejectedError
+
+    alice = await invited(db, ALICE, "小王")
+    mine = await plant(db, alice, "吃药", kind="calendar", times=["08:00"])
+    model = QueueModel()
+    chat = reminder_chat(db, tmp_path, model)
+
+    # 列表已经送达，发卡片时关停：照样记列表，这一轮结束。
+    channel = GatedButtons()
+    model.then(LIST, cancel_call(mine), Usage(1, 1), DONE)
+    await shut_down_while_sending_the_card(chat, alice, channel)
+    assert listing_of(channel).startswith("你现在有 1 条提醒")
+    assert await last_reply(db) == ("[发了提醒列表：1 条提醒]", "card")
+    assert channel.budget.reserved == 0
+
+    # 第一项送达的是「列表没能发出来」：按 failed 记，不被 cancelled 盖掉。
+    noticed = GatedButtons()
+    noticed.markdown_failure = SendRejectedError("拒绝")
+    model.then(LIST, cancel_call(mine), Usage(1, 1), DONE)
+    await shut_down_while_sending_the_card(chat, alice, noticed)
+    assert noticed.sent == [texts.REMINDER_LIST_FAILED]
+    assert await last_reply(db) == ("", "failed")
+
+
+async def test_unexpected_errors_while_sending_still_record_the_turn(
+    db: Database, tmp_path: Path
+) -> None:
+    class Broken(FakeChannel):
+        async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
+            raise ValueError("意外")
+
+    alice = await invited(db, ALICE, "小王")
+    mine = await plant(db, alice, "吃药", kind="calendar", times=["08:00"])
+    model = QueueModel()
+    chat = reminder_chat(db, tmp_path, model)
+    channel = Broken()
+    model.then(LIST, cancel_call(mine), *answer("另外，今天天气不错"))
+
+    with pytest.raises(ValueError, match="意外"):
+        await say(chat, alice, "列一下再取消", channel=channel)
+
+    # 已经送达的正文与列表、用量都记下了，没发的卡片退回预留。
+    assert await last_reply(db) == ("另外，今天天气不错\n[发了提醒列表：1 条提醒]", "streamed")
+    assert [r[0] for r in await db.fetch_all("SELECT input_tokens FROM usage")] == [12]
+    assert channel.budget.reserved == 0
+
+
+async def test_only_the_card_notice_delivered_ends_a_mixed_turn(
+    db: Database, tmp_path: Path
+) -> None:
+    from qtalk_bot.conversation import SendRejectedError
+    from qtalk_bot.process import MAX_PASSIVE_REPLIES
+
+    alice = await invited(db, ALICE, "小王")
+    model = QueueModel()
+    clock = [float(START)]
+    chat = reminder_chat(db, tmp_path, model, clock=clock)
+    crowded = FakeChannel(
+        stream_failure=lambda _: SendRejectedError("拒绝"),
+        send_failure=lambda text: SendRejectedError("拒绝") if "天气" in text else None,
+    )
+    crowded.budget.replies = MAX_PASSIVE_REPLIES - 3
+
+    async def slow() -> None:
+        clock[0] += 600
+
+    model.then(set_call(kind="once", delay_minutes=2), slow, *answer("另外，今天天气不错"))
+
+    await say(chat, alice, "两分钟后提醒我，顺便聊聊天气", channel=crowded)
+
+    # 正文没送达、卡片也没发，只有「时刻已经过了」送达：同只发卡片的一轮，按 failed 结束这一轮。
+    assert crowded.sent[-1] == texts.REMINDER_PASSED_BEFORE_BUTTONS
+    assert await last_reply(db) == ("", "failed")
+
+
+async def test_replacing_an_interval_keeps_the_remaining_times(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    eleven = float(START - 5 * 3600)  # 今天 11:00
+    trigger = parse_trigger(
+        {"kind": "interval", "every": 2, "unit": "hours", "start": "2027-01-15T08:00", "count": 5},
+        now=int(eleven),
+        timezone=SHANGHAI,
+    )
+    created = await db.transaction(
+        create_reminder,
+        alice.id,
+        Candidate(content="喝水", trigger=trigger, anchor=int(eleven) - 4 * 3600),
+        settings=ReminderSettings(),
+        timezone=SHANGHAI,
+        now=int(eleven),
+    )
+    assert isinstance(created, Created)
+    old = created.reminder.id
+    model = QueueModel()
+    chat = reminder_chat(db, tmp_path, model, clock=[eleven])
+
+    # 照 replaces 的说明：不改时间时 start 填下次时刻（资料里的 next），count 填 remaining。
+    channel = await ask_set(
+        chat,
+        model,
+        alice,
+        set_call(
+            "喝温水",
+            kind="interval",
+            every=2,
+            unit="hours",
+            start="2027-01-15T12:00",
+            count=3,
+            replaces=old,
+        ),
+    )
+    block = json.loads(system_of(model.requests[-1]).split("提醒资料：\n", 1)[1].split("\n", 1)[0])
+    assert (block["reminders"][0]["next"], block["reminders"][0]["remaining"]) == ("今天 12:00", 3)
+    assert "start 填它的下次时刻" in str(SET_REMINDER.parameters)
+    assert "    - **接下来**：今天 12:00、今天 14:00、今天 16:00，共 3 次" in markdown_of(channel)
+
+    reply = await press(chat, ALICE, buttons(channel)[0])
+
+    assert reply == "改好了，下次在今天 12:00 提醒你，还剩 3 次。"
+
+
+async def test_forget_card_uses_fresh_authorization(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from qtalk_bot import reminders
+
+    alice = await invited(db, ALICE, "小王")
+    model = QueueModel()
+    chat = reminder_chat(db, tmp_path, model, topics_on=True)
+    await say(chat, alice, "甲话题")
+    (topic_id,) = [int(r["id"]) for r in await db.fetch_all("SELECT id FROM topics")]
+    armed: list[bool] = []
+    original = reminders.count_active
+
+    def count_then_disable(conn: sqlite3.Connection, user_id: int) -> int:
+        # 发卡片前数有效提醒的那一刻，管理员停用了这个用户。
+        if armed:
+            access.set_user_status(conn, user_id, UserStatus.DISABLED)
+        return original(conn, user_id)
+
+    async def arm() -> None:
+        armed.append(True)
+
+    monkeypatch.setattr(reminders, "count_active", count_then_disable)
+
+    channel = await silent(chat, model, alice, forget(topic_id), arm)
+
+    assert channel.buttons == []
+
+
+async def test_forget_card_mentions_reminders_even_when_reminders_are_off(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    await plant(db, alice, "喝水", kind="calendar", times=["08:00"])
+    model = QueueModel()
+    chat = reminder_chat(db, tmp_path, model, topics_on=True, enabled=False)
+    await say(chat, alice, "甲话题")
+    (topic_id,) = [int(r["id"]) for r in await db.fetch_all("SELECT id FROM topics")]
+
+    channel = await silent(chat, model, alice, forget(topic_id))
+
+    assert texts.FORGET_KEEPS_REMINDERS in markdown_of(channel)

@@ -304,18 +304,23 @@ class NothingLeft:
 
 
 @dataclass(frozen=True, slots=True)
+class ReplacedGone:
+    """修改提醒时，要被替换的那条已经不是有效的提醒（已经被别的修改替换、取消或发完）：什么都不改。"""
+
+
+@dataclass(frozen=True, slots=True)
 class TooDense:
     """模拟时要列举的触发时刻太多（超过 `MAX_ADMISSION_ITERATIONS`），按太密拒绝。"""
 
 
 type Admission = Admitted | TooManyActive | RateExceeded | NothingLeft | TooDense
-type Rejection = TooManyActive | RateExceeded | NothingLeft | TooDense
+type Rejection = TooManyActive | RateExceeded | NothingLeft | TooDense | ReplacedGone
 
 
 @dataclass(frozen=True, slots=True)
 class Created:
     """建好了。`first` 是下一次；`remaining` 是日程上还剩几次（含 `first`），没有结束或数不过来时为 `None`；`replaced`
-    是同时取消了要被替换的那条（修改提醒时；那条已经不在了、或不是修改时为假）。"""
+    是同时取消了要被替换的那条（修改提醒时为真）。"""
 
     reminder: Reminder
     first: Occurrence
@@ -519,7 +524,12 @@ def create_reminder(
     `access.chat_allowed()` 复查。确认之前已经过去的几次算用掉，不发、也不进失败记录。
 
     修改提醒时 `replaces` 是要被替换的那条：准入检查扣掉它，通过了才取消它、再新建，都在这个事务里；没通过时两条都
-    不动。它已经不在了（发完、已取消，或不是这个人的）时照样新建，`Created.replaced` 为假。"""
+    不动。它已经不是这个人有效的提醒（被另一张修改卡片替换过、已取消或发完）时什么都不改，返回 `ReplacedGone`：
+    同一条提醒的两张修改卡片不会都生效。"""
+    if replaces is not None:
+        target = get_reminder(conn, user_id, replaces)
+        if target is None or target.status is not ReminderStatus.ACTIVE or target.next is None:
+            return ReplacedGone()
     admission = check_admission(
         conn,
         user_id,
@@ -695,9 +705,18 @@ class ActiveView:
 
 
 def describe_active(
-    conn: sqlite3.Connection, user_id: int, timezone: ZoneInfo, now: int, limit: int | None = None
+    conn: sqlite3.Connection,
+    user_id: int,
+    timezone: ZoneInfo,
+    now: int,
+    limit: int | None = None,
+    *,
+    exact: bool = True,
 ) -> list[ActiveView]:
-    """这个用户当前有效的提醒写好的样子，按下一次的时刻排列，最多 `limit` 条。"""
+    """这个用户当前有效的提醒写好的样子，按下一次的时刻排列，最多 `limit` 条。
+
+    `exact` 为真（`list_reminders`，用户主动要看）时剩余次数按日程精确地数（`summarize_schedule()`，长期的日历提醒
+    要逐次枚举到结束）；为假（每轮开轮时系统提示词里的提醒资料）时用便宜的算法（`quick_remaining()`）。"""
     views: list[ActiveView] = []
     found = (
         active_reminders(conn, user_id) if limit is None else next_reminders(conn, user_id, limit)
@@ -705,13 +724,17 @@ def describe_active(
     for reminder in found:
         if reminder.next is None:
             continue
-        summary = summarize_schedule(
-            reminder.trigger,
-            timezone,
-            anchor=reminder.anchor_at,
-            now=min(now, reminder.next.at - 1),
-            resume=reminder.next,
-        )
+        if exact:
+            summary = summarize_schedule(
+                reminder.trigger,
+                timezone,
+                anchor=reminder.anchor_at,
+                now=min(now, reminder.next.at - 1),
+                resume=reminder.next,
+            )
+            remaining = None if summary is None else summary.remaining
+        else:
+            remaining = quick_remaining(reminder, timezone)
         end = reminder.trigger.end if isinstance(reminder.trigger, Interval | Calendar) else None
         views.append(
             ActiveView(
@@ -719,12 +742,50 @@ def describe_active(
                 content=reminder.content,
                 rule=rule_text(reminder.trigger, timezone, now),
                 next=moment_text(reminder.next.at, timezone, now),
-                remaining=None if summary is None else summary.remaining,
+                remaining=remaining,
                 once=isinstance(reminder.trigger, Once),
                 end=None if end is None else moment_text(resolve(end, timezone), timezone, now),
             )
         )
     return views
+
+
+QUICK_REMAINING_STEPS = 200
+"""`quick_remaining()` 对只有结束时刻的提醒最多往后数几次，超过就当作没算出。"""
+_QUICK_STEP_LIMIT = 5000  # 往后数时算触发时刻的步数上限（含被跳过的日子）
+
+
+def quick_remaining(reminder: Reminder, timezone: ZoneInfo) -> int | None:
+    """有效提醒还剩几次（含下一次）的便宜算法，给每轮开轮时的提醒资料：有次数上限的直接用次数减去下一次的编号；只有
+    结束时刻的从下一次往后数，至多 `QUICK_REMAINING_STEPS` 次，数不完就是 `None`（「未算出」）；没有结束的是 `None`
+    （「一直重复」）。两者都有时取先到的那个。"""
+    trigger, following = reminder.trigger, reminder.next
+    if following is None:
+        return 0
+    if isinstance(trigger, Once):
+        return 1
+    by_count = None if trigger.count is None else max(0, trigger.count - following.index)
+    if trigger.end is None:
+        return by_count
+    cap = QUICK_REMAINING_STEPS if by_count is None else by_count
+    counted = 0
+    try:
+        for _ in upcoming(
+            trigger,
+            timezone,
+            anchor=reminder.anchor_at,
+            after=following.at - 1,
+            resume=following,
+            steps=Steps(_QUICK_STEP_LIMIT),
+        ):
+            counted += 1
+            if counted > cap:
+                break
+    except TooManyStepsError:
+        return None
+    if counted <= cap:
+        return counted
+    return by_count  # 次数先到（有次数上限时），或数不完（只有结束时刻时为 `None`）
 
 
 def count_unnotified(conn: sqlite3.Connection, user_id: int) -> int:
