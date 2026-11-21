@@ -21,8 +21,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-FORMAT_GUIDE = """回复会显示在 QQ 聊天里，QQ 按 Markdown 渲染：
-- 可以用标题、粗体与斜体、有序与无序列表、引用、代码块、表格，以及 LaTeX 公式（行内用 $...$，独立成行用 $$...$$）。
+FORMAT_GUIDE = """回复会显示在 QQ 聊天里，QQ 按 Markdown 渲染。下面这些都能正常显示，用不用、用哪些由你决定：
+- 标题、粗体、斜体、删除线、分割线。
+- 有序与无序列表，可以嵌套（子项缩进 4 个空格；列表前面是普通文字时先空一行）；任务列表（`- [ ]`、`- [x]`）。
+- 引用、行内代码与代码块、表格（可以设对齐）、脚注。
+- LaTeX 公式（行内用 $...$，独立成行用 $$...$$）。
 - HTML 标签不会生效，不要使用。
 - 链接必须写完整的 http:// 或 https:// 地址；不要写相对路径、页内锚点等不是网址的链接目标。
 - 不要用 `![](…)` 插入图片，图片只能由画图函数发出。"""
