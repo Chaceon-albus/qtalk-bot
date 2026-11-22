@@ -263,11 +263,11 @@
 
 ## 存储
 
-表在迁移 V17、V18 里建，所有表随用户删除级联删掉，时刻一律是 UTC 的 Unix 秒。
+提醒有下面几张表，所有表随用户删除级联删掉，时刻一律是 UTC 的 Unix 秒。
 
 - **`reminders`**：`action`（`message`，留了 `request`）、`content`、`trigger`（JSON，按本地钟点存；由相对时间派生的一次性时刻与起点另存 UTC 秒 `at_utc`、`start_utc`）、`timezone`、`anchor_at`（建提醒时的调用时刻）、`next_index` 与 `next_fire_at`（日程上的下一次）、`status`（`active`、`finished`、`cancelled`）、`ended_at`。编号 `AUTOINCREMENT`。
-- **`reminder_failures`**：按「提醒 × 原因 × 未告知」合并成一行（唯一部分索引加 UPSERT），存提醒文字与规则描述的副本、次数、第一次与最后一次的原定时刻、告知时刻。`reason` 的取值有 `push_off`、`late`、`send_error`、`rate_limited`、`maybe_lost`；`push_off` 不再记，库里已有的旧行显示时按「发送出错」处理。
-- **`reminder_user_state`**：开关三值、更新时刻与最近一次授权互动的平台时间（`push_event_at`），删好友状态与平台时间，暂停的开始（`paused_since`，派发时据此认出「已经恢复」）与最近一次暂停的起止（`pause_started`、`pause_ended`，只当记录）。V17 的 `push_trial_day` 已不再使用。
+- **`reminder_failures`**：按「提醒 × 原因 × 未告知」合并成一行（唯一部分索引加 UPSERT），存提醒文字与规则描述的副本、次数、第一次与最后一次的原定时刻、告知时刻。`reason` 的取值有 `late`、`send_error`、`rate_limited`、`maybe_lost`。
+- **`reminder_user_state`**：开关三值、更新时刻与最近一次授权互动的平台时间（`push_event_at`），删好友状态与平台时间，暂停的开始（`paused_since`，派发时据此认出「已经恢复」，恢复时清掉）。
 - **`reminder_sends`** 与 **`reminder_send_items`**：一条合并后的消息（`sending`、`sent`、`rejected`、`unknown`）及其中各条提醒（原定时刻、文字与规则的副本）。运行时的频率计数、「最近发出过的提醒」都取自这里。
 - **清理**：并进定期清理。`retention_days` 天前发完或取消的提醒（还有没告知的失败引用它的留着）、已告知的失败记录删掉；发出记录至少留 2 天（频率上限按自然日计数，系统提示词要最近 24 小时的）。
 - **备份**：提醒的表同样进备份，保留期同样算在[已接受的边界](open-questions.md#已知的薄弱处)里。

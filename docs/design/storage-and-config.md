@@ -20,8 +20,8 @@ SQLite 存储在 `src/qtalk_bot/storage.py`。
 
 - 标准库 `sqlite3`，数据库文件是 `data_dir` 下的 `qtalk.db`。只有一个连接，所有访问都在一个专用线程里执行，对外是 async 接口。
 - 多条语句要原子执行时用 `db.transaction(fn)`：`fn` 是同步函数，在数据库线程里整体执行，中间没有 `await`。
-- 表结构由有序的迁移列表维护，版本记在 `PRAGMA user_version`。已发布的迁移只能在末尾追加；迁移不得自行提交或回滚事务；版本高于程序已知的数据库拒绝打开。
-- **迁移合并回 V1（已定，还没做）**：开发阶段没有别人在用，不必一路往上加版本。[发送记录](conversation.md#发送记录)（V19）已经做完，本地库升到最新之后，把现有的迁移（V1–V19）合并成一个新的 V1；只为升级旧库存在的代码与不再使用的列一起删掉（包括 V19 搬旧回复行引用索引的那一句；合并时 `messages.msg_idx` 写明只是用户消息的引用索引），如 V16 搬用户目录与 `media_relocations` 表、清理时认数字目录、提醒表里不再使用的 `push_trial_day`、`pause_started`、`pause_ended`，以及旧失败原因 `push_off` 的兼容。本地库先备份，再用一次性脚本把数据搬进新的 V1 库。合并之后「已发布的迁移只能在末尾追加」从新的 V1 重新算起。VPS 还没部署，没有别的库要管。
+- 表结构由有序的迁移列表维护，版本记在 `PRAGMA user_version`。第 1 项（`storage.py` 的 `_V1`）是全部表的初始结构（开发阶段合并过一次迁移，合并前的库没有升级路径）。已发布的迁移只能在末尾追加，从这个 V1 算起；迁移不得自行提交或回滚事务；版本高于程序已知的数据库拒绝打开（合并前的库与备份版本号都大于 1，因此打不开）。
+- 表的列与约束以 `storage.py` 里的建表语句与注释为准，各设计文件只讲用法：`invites`、`users`、`refusals`、`service_state`、`processed_events` 见[「接入与授权」](access.md)；`messages` 见[「流水与送达状态」](conversation.md#流水与送达状态)，`usage` 见[「用量」](conversation.md#用量)，`sends` 见[「发送记录」](conversation.md#发送记录)，`decisions` 见[「选模型」的「记录」](model-routing.md#记录)；`attachments` 见[「附件」](attachments.md#表与配置)；`topics`、`topic_messages`、`profiles` 见[「记忆」](memory.md)；`reminders`、`reminder_failures`、`reminder_user_state`、`reminder_sends`、`reminder_send_items` 见[「提醒事项」的「存储」](reminders.md#存储)。
 - 迁移前备份：`Database.open(before_migration=...)` 在打开已有的库、要升级表结构时，先在数据库线程里调用钩子 `BeforeMigration`（拿到连接、真实路径、旧版本与放弃信号），钩子可以用 `backup_connection()` 把库备份到别处；钩子失败就不迁移。新建的空库不调用。存储层不知道备份放在哪里、留几份，这些见[「部署」的「备份」](deployment.md#备份)。
 - WAL 模式，`synchronous=NORMAL`：断电时可能丢最后几个事务，但不会损坏数据库。连接打开 `secure_delete`，理由见[「记忆」](memory.md#删干净)。
 - 新建的数据库和备份文件权限是 `0600`。数据目录在启动时收紧（`__main__.private_data_dir()`）：不存在时以 `0700` 新建，已有的去掉组与其他人的权限；收紧失败（例如 docker 挂进来的目录属于别的账户）只记警告、照常启动。

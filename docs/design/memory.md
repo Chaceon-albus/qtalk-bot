@@ -46,7 +46,7 @@ Decisions 只能选、不能写。新话题的标题、话题摘要和档案更�
 
 - **只在配置了 `[decisions]` 时启用。** 不配就不分话题，上下文是最近 `[chat].history_turns` 轮。`Router(..., topics=settings.topics)`，没有 `[decisions]` 或没有决策模型时 `Router.topics` 为空，`Conversation` 据此判断是否分话题，不另设开关。启用后即使只有一个模型，也会为话题题调用决策。
 - 模块：`topics.py` 是话题表与归属的数据层（候选、按引用定位、建行与归属、`set_summary()`）；话题里各轮的原文由 `journal.topic_history()` 取；选话题在 `routing.py`（`TopicQuery`、`choose_topic()`），与选模型同一个 `Selection`；合并历史在 `context.merge_history()`，记忆一段在 `prompt.Memory`；后台写标题与摘要在 `memory.py`。
-- 表（迁移 V9）：`messages.ref_msg_idx`（被引用消息的引用索引，按 `(user_id, msg_idx)` 建了索引）；`topics`（`provisional_title`、`title`、`summary`、`summarized_through`、`created_at`、`active_at`、`last_message_id`）与 `topic_messages`（消息 → 话题，带 `user_id`）；机器人各条气泡的引用索引在发送记录 `sends`（迁移 V19，按 `(user_id, ref_idx)` 建了索引）。「最近活跃」按 `last_message_id`（归进来的最后一轮的回复编号）排序，不按时刻：时钟可能回拨，同一秒里也会有好几轮。
+- 表：`messages.ref_msg_idx`（被引用消息的引用索引，按 `(user_id, msg_idx)` 建了索引）；`topics`（`provisional_title`、`title`、`summary`、`summarized_through`、`created_at`、`active_at`、`last_message_id`）与 `topic_messages`（消息 → 话题，带 `user_id`）；机器人各条气泡的引用索引在发送记录 `sends`（按 `(user_id, ref_idx)` 建了索引）。「最近活跃」按 `last_message_id`（归进来的最后一轮的回复编号）排序，不按时刻：时钟可能回拨，同一秒里也会有好几轮。
 - 日志只记话题编号与概率，不记标题与摘要。
 
 ### 选话题
@@ -96,7 +96,7 @@ Decisions 只能选、不能写。新话题的标题、话题摘要和档案更�
 - **输入**：旧的标题与摘要，加上次摘要之后的各轮文字版，写成 JSON（`title`、`summary`、`turns`）。`turns` 里用户消息是正文加附件的 `text`，回复是 `content`，只发了说明的回复不带；最多最近 20 轮，每条最多 2000 字，合计最多 12000 字，超出时丢掉更早的。没有新的轮次就不调用。
 - **按轮次取**（`journal.topic_turns_after()`）：`summarized_through` 记的是覆盖到的那一轮的回复，下一次取回复编号更大的那些轮，带上它们各自 `reply_to` 覆盖的用户消息，不论用户消息的编号大小。不按消息编号取：回答进行中发来的下一轮问题编号比上一轮的回复小（问1、问2、答1、答2），只按消息编号取会漏掉问2。只发了说明的回复照样是轮次的边界，它的问题照常带上。覆盖范围推进到这次带上的各轮里最大的回复编号，所以超出上限被丢掉的更早轮次之后不会补写。
 - **输出**：约定的两行纯文本「标题：……」「摘要：……」（摘要可以折行，压成一行），没有用结构化输出（对话接口没有这个参数）。标题超过 40 字、摘要超过 600 字（提示词建议的两倍）、缺一行、空白、模型没有正常写完（`FinishReason` 不是 completed）都按失败处理：只记日志，保留旧值，覆盖范围不动，下次带着更多轮重试。
-- **写回** `topics.set_summary()`（覆盖范围只前进）。用量一行，用途 `memory`、`model` 列是 `memory`，挂在输入里最后一条用户消息上；迁移 V10 按 SQLite 的做法重建用量表，把 `memory` 加进 `purpose` 的 CHECK 约束（保留第 7 版的 `searches`）。
+- **写回** `topics.set_summary()`（覆盖范围只前进）。用量一行，用途 `memory`、`model` 列是 `memory`，挂在输入里最后一条用户消息上（用量表 `purpose` 的取值含 `memory`）。
 - 日志只记话题编号、字数与覆盖的消息条数，不记标题与摘要。
 
 ### 后台任务的输出上限
@@ -107,7 +107,7 @@ Decisions 只能选、不能写。新话题的标题、话题摘要和档案更�
 
 里程碑 6b 的一部分，模块是 `profiles.py`（数据层）、`memory.py`（后台重写）、`routing.py`（档案题）。和话题线一样，只在配置了 `[decisions]` 与 `[memory]` 时启用。
 
-- **表** `profiles`（每个用户一行，迁移 V13 建、V15 重建）：内容、更新时间与版本号 `version`。版本号每次修改都推进，删除后也保留：删除是内容置空、版本加一。档案最多 500 字。
+- **表** `profiles`（每个用户一行）：内容、更新时间与版本号 `version`。版本号每次修改都推进，删除后也保留：删除是内容置空、版本加一。档案最多 500 字。
 - **什么时候更新**：每轮已有的 Decisions 调用里加一道是非题（`routing.PROFILE_QUESTION`），问用户刚发来的消息里有没有他自己的、新的稳定信息（称呼、偏好、重要的人和事），输入里带现有档案；概率不低于 `[memory].profile_threshold`（默认 0.5）时标记这一轮，回复之后在后台用 `[memory]` 的模型重写档案。大多数轮次不增加调用。题目失败不影响另外两道题。
 - 打开档案后每轮都问档案题。另外两道题都不用问的少数轮次（只剩一个候选模型，且是用户的第一条消息或话题已按引用定死），为档案题单独调用一次决策：第一条消息往往就是自我介绍。
 - **后台重写**与话题摘要共用 `Summarizer` 的每用户队列，两类任务轮流做；取得并发名额后才取出待合并的轮次；出队时记下档案的代次。提示词是 `[memory].profile_instructions`，输入是旧档案与排着的各轮对话，输出完整的新档案、「不变」或「清空」三种之一。写回前核对版本号与代次、来源消息都还在，否则丢弃。
@@ -146,5 +146,5 @@ Decisions 只能选、不能写。新话题的标题、话题摘要和档案更�
 
 ### 删干净
 
-- 迁移 V14 把 `messages`、`attachments`、`topics` 改成 `AUTOINCREMENT`，删除后编号不再复用：否则后台写回可能落到复用了编号、属于另一个用户的新行上。V15 另建删除时外键要查的四个索引。
+- `messages`、`attachments`、`topics`（以及 `users` 与提醒的表）是 `AUTOINCREMENT`，删除后编号不再复用：否则后台写回可能落到复用了编号、属于另一个用户的新行上。删除时外键要查的列（`messages.reply_to`、`usage.message_id`、`decisions.message_id`、`topics.summarized_through`）都有以它开头的索引。
 - 数据库连接打开 `secure_delete`，删除后做一次 WAL 检查点，免得删掉的内容留在文件里。备份里仍有旧数据，最多再留 `[backup].keep × interval_hours`（默认 7 天，见[「部署」的「备份」](deployment.md#备份)）。
