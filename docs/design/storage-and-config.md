@@ -20,7 +20,7 @@ SQLite 存储在 `src/qtalk_bot/storage.py`。
 
 - 标准库 `sqlite3`，数据库文件是 `data_dir` 下的 `qtalk.db`。只有一个连接，所有访问都在一个专用线程里执行，对外是 async 接口。
 - 多条语句要原子执行时用 `db.transaction(fn)`：`fn` 是同步函数，在数据库线程里整体执行，中间没有 `await`。
-- 表结构由有序的迁移列表维护，版本记在 `PRAGMA user_version`。第 1 项（`storage.py` 的 `_V1`）是全部表的初始结构（开发阶段合并过一次迁移，合并前的库没有升级路径）。已发布的迁移只能在末尾追加，从这个 V1 算起；迁移不得自行提交或回滚事务；版本高于程序已知的数据库拒绝打开（合并前的库与备份版本号都大于 1，因此打不开）。
+- 表结构由有序的迁移列表维护，版本记在 `PRAGMA user_version`。第 1 项（`storage.py` 的 `_V1`）是全部表的初始结构（开发阶段合并过一次迁移，合并前的库没有升级路径）。已发布的迁移只能在末尾追加，从这个 V1 算起；迁移不得自行提交或回滚事务；版本高于程序已知的数据库拒绝打开。合并前的库与备份都已清掉，现有的库与备份都从这个 V1 开始。
 - 表的列与约束以 `storage.py` 里的建表语句与注释为准，各设计文件只讲用法：`invites`、`users`、`refusals`、`service_state`、`processed_events` 见[「接入与授权」](access.md)；`messages` 见[「流水与送达状态」](conversation.md#流水与送达状态)，`usage` 见[「用量」](conversation.md#用量)，`sends` 见[「发送记录」](conversation.md#发送记录)，`decisions` 见[「选模型」的「记录」](model-routing.md#记录)；`attachments` 见[「附件」](attachments.md#表与配置)；`topics`、`topic_messages`、`profiles` 见[「记忆」](memory.md)；`reminders`、`reminder_failures`、`reminder_user_state`、`reminder_sends`、`reminder_send_items` 见[「提醒事项」的「存储」](reminders.md#存储)。
 - 迁移前备份：`Database.open(before_migration=...)` 在打开已有的库、要升级表结构时，先在数据库线程里调用钩子 `BeforeMigration`（拿到连接、真实路径、旧版本与放弃信号），钩子可以用 `backup_connection()` 把库备份到别处；钩子失败就不迁移。新建的空库不调用。存储层不知道备份放在哪里、留几份，这些见[「部署」的「备份」](deployment.md#备份)。
 - WAL 模式，`synchronous=NORMAL`：断电时可能丢最后几个事务，但不会损坏数据库。连接打开 `secure_delete`，理由见[「记忆」](memory.md#删干净)。
