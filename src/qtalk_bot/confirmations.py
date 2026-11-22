@@ -9,6 +9,7 @@
   再记 `TOKEN_SECONDS`（`remember()`，连同这次点的结果），本人再点时按结果回复；别人点的按失效处理。
 """
 
+import hashlib
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -61,6 +62,16 @@ def parse_click(data: str) -> Click | None:
         if data.startswith(prefix):
             return Click(kind, confirmed, data.removeprefix(prefix))
     return None
+
+
+GROUP_ID_LENGTH = 8
+"""确认消息上按钮分组（`group_id`）的长度。实测用过 8～9 个字母数字，更长的没有测过。"""
+
+
+def button_group(token: str) -> str:
+    """一条确认消息上按钮的分组：由这次确认的令牌派生（SHA-256 的前 `GROUP_ID_LENGTH` 位十六进制），每条确认消息
+    不同。不直接用令牌：`group_id` 的作用范围没有实测过（可能整个聊天里同名的都算一组），也不必把令牌多放一处。"""
+    return hashlib.sha256(token.encode()).hexdigest()[:GROUP_ID_LENGTH]
 
 
 # ---- 一轮里待确认的一项 ----

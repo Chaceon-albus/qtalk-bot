@@ -59,6 +59,7 @@ from .batching import Batcher
 from .chat import ChatHandler
 from .confirmations import BUTTON_PREFIXES
 from .conversation import (
+    ButtonTone,
     ChatInput,
     ChoiceButton,
     CommandButton,
@@ -1029,10 +1030,25 @@ class _QQReplyChannel:
         await _guarded(self._message.reply(markdown=markdown, keyboard=keyboard))
 
 
+# 单聊实测（2026-11-21）：这三种样式都被接受。
+_BUTTON_STYLES = {
+    ButtonTone.PLAIN: pyqbot.ButtonStyle.GRAY_OUTLINE,
+    ButtonTone.PRIMARY: pyqbot.ButtonStyle.BLUE_FILLED,
+    ButtonTone.DANGER: pyqbot.ButtonStyle.RED_TEXT,
+}
+
+
 def _keyboard_button(button: MessageButton) -> pyqbot.Button:
     match button:
-        case ChoiceButton(label=label, data=data, visited_label=visited):
-            return pyqbot.Button.callback(label, data, visited_label=visited)
+        case ChoiceButton():
+            return pyqbot.Button.callback(
+                button.label,
+                button.data,
+                visited_label=button.visited_label,
+                style=_BUTTON_STYLES[button.tone],
+                id=button.button_id,
+                group_id=button.group_id,
+            )
         case CommandButton(label=label, text=text):
             return pyqbot.Button.command(label, text, enter=True)
 

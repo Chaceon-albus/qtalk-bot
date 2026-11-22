@@ -286,6 +286,7 @@ from .confirmations import (
     TokenRegistry,
     Used,
     button_data,
+    button_group,
     kind_of,
     parse_click,
 )
@@ -429,6 +430,9 @@ FORGET_PREFIX = button_data(ButtonKind.FORGET_TOPIC, True, "")
 """「确认删除」按钮数据的前缀，后面是令牌。"""
 KEEP_PREFIX = button_data(ButtonKind.FORGET_TOPIC, False, "")
 """「取消」按钮数据的前缀，后面是令牌。"""
+CONFIRM_BUTTON_ID = "yes"
+DECLINE_BUTTON_ID = "no"
+"""确认消息上两个按钮在分组里的 `id`（同组的按钮各带一个，实测用过几个字母的）。"""
 BRIEF_REMINDERS = 20
 """系统提示词的提醒资料里最多列几条有效的提醒。"""
 RECENT_SENT_SECONDS = 24 * 3600
@@ -616,14 +620,33 @@ class ImageFetcher(Protocol):
         ...
 
 
+class ButtonTone(Enum):
+    """按钮的样式，接线层映射到平台的样式。"""
+
+    PLAIN = "plain"  # 灰框：放弃的那一个
+    PRIMARY = "primary"  # 蓝底：要做的那一个
+    DANGER = "danger"  # 红字：要做、而且会删掉东西的那一个
+
+
 @dataclass(frozen=True, slots=True)
 class ChoiceButton:
     """回调按钮：`label` 是按钮上的字，`data` 是点击后带回的数据（`Conversation.press_button()` 认它），
-    `visited_label` 是点过之后的字。"""
+    `visited_label` 是点过之后的字，`tone` 是样式。
+
+    `group_id` 与 `button_id` 要么都给、要么都不给（平台：同组的按钮不带 `id` 时整条消息被拒）。同一条消息上
+    `group_id` 相同的按钮点了一个，它显示 `visited_label`、其余变灰，并且一直保持；这只管界面，再点会不会起作用
+    仍由按钮数据里的令牌决定。"""
 
     label: str
     data: str
     visited_label: str
+    tone: ButtonTone = ButtonTone.PLAIN
+    group_id: str | None = None
+    button_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.group_id is None) != (self.button_id is None):
+            raise ValueError("group_id 与 button_id 要么都给、要么都不给")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1614,9 +1637,26 @@ class Conversation:
                 failed = texts.REMINDER_CANCEL_BUTTONS_FAILED
         token = self._tokens.issue(user, pending, turn.messages)
         (yes, yes_done), (no, no_done) = labels
+        # 两个按钮一组：点了一个，另一个一直灰着。会删掉东西的用红字，设提醒用蓝底，放弃的用灰框。
+        group = button_group(token)
+        tone = ButtonTone.PRIMARY if kind is ButtonKind.SET_REMINDER else ButtonTone.DANGER
         buttons = (
-            ChoiceButton(yes, button_data(kind, True, token), yes_done),
-            ChoiceButton(no, button_data(kind, False, token), no_done),
+            ChoiceButton(
+                yes,
+                button_data(kind, True, token),
+                yes_done,
+                tone=tone,
+                group_id=group,
+                button_id=CONFIRM_BUTTON_ID,
+            ),
+            ChoiceButton(
+                no,
+                button_data(kind, False, token),
+                no_done,
+                tone=ButtonTone.PLAIN,
+                group_id=group,
+                button_id=DECLINE_BUTTON_ID,
+            ),
         )
         try:
             await turn.channel.send_buttons(markdown, buttons)

@@ -81,6 +81,7 @@ from qtalk_bot.config import (
 from qtalk_bot.confirmations import BUTTON_PREFIXES
 from qtalk_bot.conversation import (
     TYPING_PULSE_SECONDS,
+    ButtonTone,
     ChoiceButton,
     CommandButton,
     Conversation,
@@ -509,6 +510,12 @@ async def test_friend_add_with_invite_gets_welcome_once(db: Database) -> None:
     assert is_markdown(body)
     assert text_of(body) == texts.welcome_message("小王").markdown
     assert keyboard_buttons(body) == [(texts.CAPABILITIES_LABEL, CAPABILITIES_BUTTON, 1)]
+    # 欢迎语的按钮不分组：一直能点，想再看一遍示例时还能点。
+    (row,) = _json_list(_json_object(_json_object(body["keyboard"])["content"])["rows"])
+    (button,) = _json_list(_json_object(row)["buttons"])
+    assert "group_id" not in _json_object(button)
+    assert "id" not in _json_object(button)
+    assert _json_object(_json_object(button)["render_data"])["style"] == 0  # 灰框
     invite = await db.transaction(access.get_invite_by_code, CODE)
     assert invite is not None
     assert invite.used_count == 1
@@ -3791,6 +3798,117 @@ async def test_reply_channel_sends_markdown_with_one_row_of_callback_buttons() -
     ]
 
 
+async def test_reply_channel_sends_confirmation_buttons_with_style_and_group() -> None:
+    message = _FakeButtonMessage()
+    channel = bot_module._QQReplyChannel(cast(pyqbot.C2CMessage, message))  # pyright: ignore[reportPrivateUsage]  测接线层的通道本身
+    group = "a1b2c3d4"
+
+    await channel.send_buttons(
+        "要设这条提醒吗？",
+        (
+            ChoiceButton(
+                "确认",
+                "remind:t",
+                "已确认",
+                tone=ButtonTone.PRIMARY,
+                group_id=group,
+                button_id="yes",
+            ),
+            ChoiceButton(
+                "取消",
+                "noremind:t",
+                "已取消",
+                tone=ButtonTone.PLAIN,
+                group_id=group,
+                button_id="no",
+            ),
+            ChoiceButton("删掉", "unremind:t", "已删", tone=ButtonTone.DANGER),
+        ),
+    )
+
+    (sent,) = message.replies
+    keyboard = sent["keyboard"]
+    assert isinstance(keyboard, pyqbot.Keyboard)
+    (row,) = _json_list(_json_object(keyboard.to_dict()["content"])["rows"])  # 发给平台的 JSON
+    assert _json_object(row)["buttons"] == [
+        {
+            "id": "yes",
+            "group_id": group,
+            "render_data": {"label": "确认", "visited_label": "已确认", "style": 4},
+            "action": {"type": 1, "data": "remind:t", "permission": {"type": 2}},
+        },
+        {
+            "id": "no",
+            "group_id": group,
+            "render_data": {"label": "取消", "visited_label": "已取消", "style": 0},
+            "action": {"type": 1, "data": "noremind:t", "permission": {"type": 2}},
+        },
+        {
+            "render_data": {"label": "删掉", "visited_label": "已删", "style": 3},
+            "action": {"type": 1, "data": "unremind:t", "permission": {"type": 2}},
+        },
+    ]
+
+
+class _FailingButtonMessage:
+    """回复时抛出 `error` 的消息（`C2CMessage.reply` 的替身）。"""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def reply(self, content: str | None = None, **kwargs: object) -> object:
+        raise self.error
+
+
+SECRET_TOKEN = "SECRETTOKEN0123456789"
+SECRET_GROUP = "sg9876543"
+SECRET_OPENID = "FAKE0PENID0SECRET000000000000000"
+
+
+@pytest.mark.parametrize(
+    ("status", "outcome_unknown", "expected"),
+    [(400, False, SendRejectedError), (500, True, SendUncertainError)],
+)
+async def test_rejected_confirmation_buttons_raise_a_redacted_error(
+    status: int, outcome_unknown: bool, expected: type[SendError]
+) -> None:
+    error = pyqbot.APIError(
+        f"发送失败：POST /v2/users/{SECRET_OPENID}/messages，按钮 remind:{SECRET_TOKEN}"
+        f"（group_id={SECRET_GROUP}）",
+        status_code=status,
+        err_code=40011021,
+        outcome_unknown=outcome_unknown,
+    )
+    channel = bot_module._QQReplyChannel(cast(pyqbot.C2CMessage, _FailingButtonMessage(error)))  # pyright: ignore[reportPrivateUsage]  测接线层的通道本身
+
+    with pytest.raises(expected) as info:
+        await channel.send_buttons(
+            "要设这条提醒吗？",
+            (
+                ChoiceButton(
+                    "确认",
+                    f"remind:{SECRET_TOKEN}",
+                    "已确认",
+                    tone=ButtonTone.PRIMARY,
+                    group_id=SECRET_GROUP,
+                    button_id="yes",
+                ),
+            ),
+        )
+
+    text = str(info.value)
+    assert "err_code=40011021" in text
+    for secret in (SECRET_TOKEN, SECRET_GROUP, SECRET_OPENID):
+        assert secret not in text
+
+
+def test_a_button_group_needs_an_id_and_the_other_way_round() -> None:
+    with pytest.raises(ValueError, match="group_id"):
+        ChoiceButton("确认", "remind:t", "已确认", group_id="a1b2c3d4")
+    with pytest.raises(ValueError, match="group_id"):
+        ChoiceButton("确认", "remind:t", "已确认", button_id="yes")
+
+
 async def test_reply_channel_sends_plain_markdown_without_buttons() -> None:
     message = _FakeButtonMessage()
     channel = bot_module._QQReplyChannel(cast(pyqbot.C2CMessage, message))  # pyright: ignore[reportPrivateUsage]  测接线层的通道本身
@@ -4076,6 +4194,10 @@ async def test_reply_channel_sends_command_buttons_that_send_their_text() -> Non
         ("提取文字", "把里面的文字提取出来", pyqbot.ButtonActionType.COMMAND, True),
         ("翻译", "翻译一下", pyqbot.ButtonActionType.COMMAND, True),
     ]
+    # 指令按钮不分组，样式不变。
+    assert [(b.id, b.group_id, b.render_data.style) for b in row.buttons] == [
+        (None, None, pyqbot.ButtonStyle.GRAY_OUTLINE)
+    ] * 2
 
 
 # ---- 提醒：主动消息开关与好友事件 ----

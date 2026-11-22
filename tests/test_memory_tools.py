@@ -5,9 +5,10 @@
 """
 
 import asyncio
+import hashlib
 import json
 import sqlite3
-from collections.abc import AsyncGenerator, AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -52,11 +53,14 @@ from qtalk_bot.config import (
     ModelSettings,
     TopicSettings,
 )
+from qtalk_bot.confirmations import button_group, parse_click
 from qtalk_bot.conversation import (
     FORGET_PREFIX,
     FORGET_TOKEN_SECONDS,
     KEEP_PREFIX,
+    ButtonTone,
     ChatInput,
+    ChoiceButton,
     Conversation,
     SendRejectedError,
     SendUncertainError,
@@ -502,6 +506,20 @@ async def press(chat: Conversation, openid: str, data: str) -> str | None:
     return replies[0] if replies else None
 
 
+def assert_grouped_by_token(pair: Sequence[ChoiceButton]) -> str:
+    """一条确认消息上的按钮都在同一个分组里，分组由按钮数据里的令牌派生（`button_group()`：SHA-256 的前 8 位
+    十六进制），不超过 9 个字符、不含令牌本身。返回这个分组。"""
+    clicks = [parse_click(b.data) for b in pair]
+    assert None not in clicks
+    (token,) = {click.token for click in clicks if click is not None}
+    expected = hashlib.sha256(token.encode()).hexdigest()[:8]
+    assert expected == button_group(token)
+    assert [b.group_id for b in pair] == [expected] * len(pair)
+    assert len(expected) <= 9
+    assert token not in expected
+    return expected
+
+
 def button_data(channel: FakeChannel) -> tuple[str, str]:
     """最后一条按钮消息里「确认删除」「取消」的数据。"""
     confirm, keep = channel.buttons[-1]
@@ -556,6 +574,12 @@ async def test_forget_topic_never_deletes_by_itself_and_sends_buttons(
         ("确认删除", "已确认"),
         ("取消", "已取消"),
     ]
+    # 会删掉东西的那一个用红字，放弃的用灰框；两个一组、各带一个 id。
+    assert [(b.tone, b.button_id) for b in buttons] == [
+        (ButtonTone.DANGER, "yes"),
+        (ButtonTone.PLAIN, "no"),
+    ]
+    assert_grouped_by_token(buttons)
     confirm, keep = button_data(channel)
     assert confirm.startswith(FORGET_PREFIX)
     assert keep.startswith(KEEP_PREFIX)

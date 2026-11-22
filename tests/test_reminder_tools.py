@@ -7,6 +7,7 @@
 
 import asyncio
 import json
+import logging
 import sqlite3
 from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
@@ -26,7 +27,14 @@ from tests.test_conversation import (
 )
 from tests.test_conversation_images import Call, Step, text_parts
 from tests.test_conversation_topics import Picker, say
-from tests.test_memory_tools import QueueModel, answer, forget, names, view
+from tests.test_memory_tools import (
+    QueueModel,
+    answer,
+    assert_grouped_by_token,
+    forget,
+    names,
+    view,
+)
 
 from qtalk_bot import access, texts
 from qtalk_bot.access import User, UserStatus
@@ -38,8 +46,14 @@ from qtalk_bot.config import (
     ReminderSettings,
     TopicSettings,
 )
-from qtalk_bot.confirmations import BUTTON_PREFIXES, TOKEN_SECONDS, ButtonKind, parse_click
-from qtalk_bot.conversation import Conversation, MessageButton
+from qtalk_bot.confirmations import (
+    BUTTON_PREFIXES,
+    TOKEN_SECONDS,
+    ButtonKind,
+    button_group,
+    parse_click,
+)
+from qtalk_bot.conversation import ButtonTone, ChoiceButton, Conversation, MessageButton
 from qtalk_bot.llm import ChatRequest, FunctionResult, Provider, Usage
 from qtalk_bot.media import Fetcher, MediaStore
 from qtalk_bot.memory_tools import FORGET_TOPIC_NAME, VIEW_MEMORY_NAME
@@ -168,6 +182,37 @@ def buttons(channel: FakeChannel) -> tuple[str, str]:
     return yes.data, no.data
 
 
+def looks(pair: Sequence[ChoiceButton]) -> list[tuple[ButtonTone, str | None]]:
+    """一条确认消息上按钮的样式与 `id`；同时断言它们在同一个由令牌派生的分组里（`assert_grouped_by_token()`）。"""
+    assert_grouped_by_token(pair)
+    return [(b.tone, b.button_id) for b in pair]
+
+
+async def test_each_confirmation_message_gets_its_own_button_group(
+    db: Database, tmp_path: Path
+) -> None:
+    # 分组的作用范围没有实测：两条确认消息的分组不能相同，免得点了一条，另一条也变灰。
+    alice = await invited(db, ALICE, "小王")
+    model = QueueModel()
+    chat = reminder_chat(db, tmp_path, model)
+    model.then(once(text="吃药"), *answer("请确认"))
+    first = await say(chat, alice, "明早 8 点提醒我吃药")
+    model.then(once(text="喝水"), *answer("请确认"))
+    second = await say(chat, alice, "明早 8 点提醒我喝水")
+
+    groups = [assert_grouped_by_token(channel.buttons[-1]) for channel in (first, second)]
+    assert groups[0] != groups[1]
+
+
+def test_button_group_is_short_alphanumeric_derived_from_the_token() -> None:
+    tokens = [f"token-{index}" for index in range(200)]
+    groups = [button_group(token) for token in tokens]
+    assert all(len(group) <= 9 and group.isascii() and group.isalnum() for group in groups)
+    assert len(set(groups)) == len(groups)
+    assert button_group(tokens[0]) == groups[0]  # 同一个令牌同一个分组
+    assert all(group not in token for group, token in zip(groups, tokens, strict=True))
+
+
 def markdown_of(channel: FakeChannel) -> str:
     return next(text for kind, text in reversed(channel.log) if kind == "buttons")
 
@@ -289,6 +334,8 @@ async def test_set_reminder_creates_nothing_until_confirmed(db: Database, tmp_pa
     assert await stored(db, alice) == []
     (pair,) = channel.buttons
     assert [(b.label, b.visited_label) for b in pair] == [("确认", "已确认"), ("取消", "已取消")]
+    # 要做的那一个用蓝底，放弃的用灰框；两个一组、各带一个 id。
+    assert looks(pair) == [(ButtonTone.PRIMARY, "yes"), (ButtonTone.PLAIN, "no")]
     markdown = markdown_of(channel)
     # 卡片：提醒文字是列表项，下面缩进的子条目，标签加粗；不写编号与括号。
     assert markdown == (
@@ -606,6 +653,8 @@ async def test_cancel_only_takes_the_users_active_reminders(db: Database, tmp_pa
     yes, _ = buttons(channel)
     assert yes.startswith("unremind:")
     assert [b.label for b in channel.buttons[-1]] == ["确认取消", "保留"]
+    # 会删掉东西的那一个用红字。
+    assert looks(channel.buttons[-1]) == [(ButtonTone.DANGER, "yes"), (ButtonTone.PLAIN, "no")]
 
     assert await press(chat, ALICE, yes) == "好的，取消了。"
     assert await stored(db, alice) == []
@@ -778,6 +827,95 @@ async def test_rejected_buttons_get_a_short_note(db: Database, tmp_path: Path) -
     await say(chat, alice, "提醒我", channel=channel)
 
     assert channel.sent[-1] == texts.REMINDER_SET_BUTTONS_FAILED
+
+
+class _EchoingRejection:
+    """单聊消息（`C2CMessage`）的替身：被动回复时抛 `pyqbot.APIError`，文案里回显这次请求的内容（openid、
+    Markdown 正文、键盘里每个按钮的 `data` 与 `group_id`），模拟平台把请求原样写进报错。发过的键盘记在
+    `keyboards` 里。"""
+
+    def __init__(self, openid: str, *, outcome_unknown: bool) -> None:
+        self.user_openid = openid
+        self.outcome_unknown = outcome_unknown
+        self.keyboards: list[dict[str, object]] = []
+
+    async def reply(
+        self, content: str | None = None, *, markdown: str | None = None, keyboard: object = None
+    ) -> object:
+        import pyqbot
+
+        assert isinstance(keyboard, pyqbot.Keyboard)
+        payload = keyboard.to_dict()
+        self.keyboards.append(payload)
+        raise pyqbot.APIError(
+            f"发送失败：POST /v2/users/{self.user_openid}/messages，"
+            f"markdown={markdown}，keyboard={json.dumps(payload, ensure_ascii=False)}",
+            status_code=500 if self.outcome_unknown else 400,
+            err_code=40011021,
+            outcome_unknown=self.outcome_unknown,
+        )
+
+
+@pytest.mark.parametrize("outcome_unknown", [False, True], ids=["rejected", "unknown"])
+async def test_a_failed_confirmation_leaks_none_of_this_turns_data_into_logs(
+    db: Database, tmp_path: Path, caplog: pytest.LogCaptureFixture, outcome_unknown: bool
+) -> None:
+    # 端到端：这一轮的确认消息经真实的接线层通道发出，平台的报错里回显了请求的内容。从这一轮开始之前就捕获全部
+    # 日志：这一轮真正用到的令牌、分组、openid 与提醒的正文都不能出现在日志里，也不能出现在转换后的异常里。
+    import pyqbot
+
+    from qtalk_bot import bot as bot_module
+    from qtalk_bot.conversation import SendError
+
+    secret_text = "吃秘密的降压药"
+    rejecting = _EchoingRejection(ALICE, outcome_unknown=outcome_unknown)
+    qq = bot_module._QQReplyChannel(cast(pyqbot.C2CMessage, rejecting))  # pyright: ignore[reportPrivateUsage]  用接线层真实的通道与异常转换
+    failures: list[SendError] = []
+
+    class Wired(FakeChannel):
+        """确认消息经真实的接线层通道发出，其余照旧由替身处理。"""
+
+        async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> None:
+            try:
+                await qq.send_buttons(markdown, buttons)
+            except SendError as exc:
+                failures.append(exc)
+                raise
+
+    with caplog.at_level(logging.INFO):
+        alice = await invited(db, ALICE, "小王")
+        model = QueueModel()
+        chat = reminder_chat(db, tmp_path, model)
+        channel = Wired()
+        model.then(once(text=secret_text), *answer("请点按钮确认"))
+        await say(chat, alice, "明早 8 点提醒我吃药", channel=channel)
+
+    # 这一轮真正用到的值：从发给平台的键盘里取出令牌与分组。
+    (keyboard,) = rejecting.keyboards
+    content = cast(dict[str, object], keyboard["content"])
+    (row,) = cast(list[dict[str, object]], content["rows"])
+    sent = cast(list[dict[str, object]], row["buttons"])
+    actions = [cast(dict[str, object], button["action"]) for button in sent]
+    clicks = [parse_click(str(action["data"])) for action in actions]
+    tokens = {click.token for click in clicks if click is not None}
+    groups = {str(button["group_id"]) for button in sent}
+    (token,) = tokens
+    (group,) = groups
+    secrets = (token, group, ALICE, secret_text)
+
+    (failure,) = failures
+    for secret in secrets:
+        assert secret not in str(failure)
+    assert "err_code=40011021" in str(failure)
+    if outcome_unknown:
+        assert texts.REMINDER_SET_BUTTONS_FAILED not in channel.sent  # 说不准时不补说明
+        assert any("不确定是否送达" in r.getMessage() for r in caplog.records)
+    else:
+        assert channel.sent[-1] == texts.REMINDER_SET_BUTTONS_FAILED
+        assert any("没能发给用户" in r.getMessage() for r in caplog.records)
+    logs = "\n".join(caplog.handler.format(record) for record in caplog.records)
+    for secret in secrets:
+        assert secret not in logs
 
 
 async def test_disabled_during_the_call_stops_without_another_hop(
