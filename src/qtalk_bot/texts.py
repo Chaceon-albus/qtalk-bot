@@ -186,6 +186,31 @@ HELP_MESSAGE = Rich(
     HELP,
 )
 
+ADMIN_PANEL_ITEMS = (
+    ("/invite", "创建邀请，后面写备注"),
+    ("/invites", "列出有效的邀请"),
+    ("/revoke", "撤销邀请，后面写编号"),
+    ("/users", "列出用户"),
+    ("/disable", "停用用户，后面写编号"),
+    ("/enable", "启用用户，后面写编号"),
+    ("/pause", "暂停服务"),
+    ("/resume", "恢复服务"),
+    ("/usage", "查看用量，可加用户编号"),
+    ("/help", "显示命令说明"),
+)
+"""管理员的指令面板（输入 `/` 时弹出）：每项是名字与说明，点一项把名字填进输入框，所以名字是不带参数的命令。
+长度按 `panel_width()` 量，不超过 `PANEL_NAME_WIDTH`、`PANEL_DESC_WIDTH`。"""
+
+PANEL_NAME_WIDTH = 14
+PANEL_DESC_WIDTH = 30
+
+
+def panel_width(text: str) -> int:
+    """指令面板里一段文字占的长度：ASCII 字符算 1，其余算 2。平台只写了「最多 14 个字符（约 7 个汉字）」
+    「最多 30 个字符（约 15 个汉字）」，一个汉字算 2 是从这里推的；全角标点等也按 2 算，宁可偏严。"""
+    return sum(1 if ord(char) < 0x80 else 2 for char in text)
+
+
 UNKNOWN_COMMAND = "没有这个命令，发送 /help 查看可用的命令。"
 
 INVITE_NOTE_MISSING = "请写上备注，例如：/invite 小王。备注会成为对方的名字。"

@@ -12,6 +12,7 @@ from collections.abc import (
     Awaitable,
     Callable,
     Coroutine,
+    Iterable,
     Sequence,
 )
 from pathlib import Path
@@ -131,6 +132,80 @@ def fake_library(monkeypatch: pytest.MonkeyPatch) -> list[FakeLibrary]:
     return created
 
 
+class FakePanels:
+    """机器人指令面板（`bot.panels`）的替身：没有面板，记下创建时关联的用户；`hang` 为真时创建一直不返回，被取消后
+    要一会儿才退出（像在途的请求），退出时在 `events` 里记一笔。"""
+
+    hang = False
+
+    def __init__(self) -> None:
+        self.created_for: list[tuple[str, ...]] = []
+        self.creating = asyncio.Event()
+        self.events: list[str] = []
+
+    def iter_panels(self, scope: pyqbot.PanelScope) -> AsyncIterator[pyqbot.PanelRecord]:
+        return _no_panels()
+
+    async def create(
+        self,
+        scope: pyqbot.PanelScope,
+        items: Iterable[pyqbot.PanelItem],
+        *,
+        remark: str | None = None,
+        user_openids: str | Iterable[str] = (),
+    ) -> str:
+        self.created_for.append(
+            (user_openids,) if isinstance(user_openids, str) else tuple(user_openids)
+        )
+        self.creating.set()
+        if self.hang:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.05)
+                self.events.append("面板同步退出")
+                raise
+        return "panel-1"
+
+    async def get(self, panel_id: str) -> pyqbot.PanelDetail:
+        raise AssertionError("启动测试里没有已有的面板")
+
+    async def set(
+        self, panel_id: str, items: Iterable[pyqbot.PanelItem], *, remark: str | None = None
+    ) -> int | None:
+        raise AssertionError("启动测试里没有已有的面板")
+
+    async def delete(self, panel_id: str) -> None:
+        raise AssertionError("启动测试里没有已有的面板")
+
+    async def add_targets(self, panel_id: str, *, user_openids: str | Iterable[str] = ()) -> None:
+        raise AssertionError("启动测试里没有已有的面板")
+
+    async def remove_targets(
+        self, panel_id: str, *, user_openids: str | Iterable[str] = ()
+    ) -> None:
+        raise AssertionError("启动测试里没有已有的面板")
+
+
+async def _no_panels() -> AsyncIterator[pyqbot.PanelRecord]:
+    for record in ():
+        yield record
+
+
+@pytest.fixture(autouse=True)
+def fake_panels(monkeypatch: pytest.MonkeyPatch) -> list[FakePanels]:
+    """每个 `pyqbot.Bot` 的指令面板都换成替身：启动后的面板同步不碰真实网络。"""
+    created: list[FakePanels] = []
+
+    def panels(http: object) -> FakePanels:
+        fake = FakePanels()
+        created.append(fake)
+        return fake
+
+    monkeypatch.setattr("pyqbot._client.Panels", panels)
+    return created
+
+
 async def finished(shutdown: Coroutine[object, object, bool], seconds: float = 5) -> None:
     """在独立的任务里关停，最多看 `seconds` 秒（只防挂死）：断言它在这之前自己做完、期间没有被取消过。不用
     `asyncio.timeout()` 包住它：`_shut_down()` 的等待会接住那次取消、接着等，测试就看不出它其实超时了。"""
@@ -230,6 +305,43 @@ def test_startup_sweeps_the_library_once_through_the_bot_client(
 
     (library,) = fake_library
     assert library.listings == 1
+
+
+def test_startup_syncs_the_admin_panel_through_the_bot_client(
+    config: Path, monkeypatch: pytest.MonkeyPatch, fake_panels: list[FakePanels]
+) -> None:
+    async def start(self: pyqbot.Bot) -> None:
+        async with asyncio.timeout(5):
+            await fake_panels[0].creating.wait()
+
+    monkeypatch.setattr(pyqbot.Bot, "start", start)
+    assert entry.main() == 0
+
+    (panels,) = fake_panels
+    assert panels.created_for == [(FAKE_ENV["ADMIN_OPENID"],)]  # 只关联管理员
+
+
+def test_the_admin_panel_sync_has_exited_before_the_qq_client_closes(
+    config: Path, monkeypatch: pytest.MonkeyPatch, fake_panels: list[FakePanels]
+) -> None:
+    # 同步经 QQ 的客户端发请求：关停时被取消后的收尾（在途的请求）要在关客户端之前做完。
+    monkeypatch.setattr(FakePanels, "hang", True)
+    real_close = pyqbot.Bot.close
+
+    async def start(self: pyqbot.Bot) -> None:
+        async with asyncio.timeout(5):
+            await fake_panels[0].creating.wait()  # 同步卡在请求里时关停
+
+    async def close(self: pyqbot.Bot) -> None:
+        fake_panels[0].events.append("bot.close")
+        await real_close(self)
+
+    monkeypatch.setattr(pyqbot.Bot, "start", start)
+    monkeypatch.setattr(pyqbot.Bot, "close", close)
+    assert entry.main() == 0
+
+    (panels,) = fake_panels
+    assert panels.events == ["面板同步退出", "bot.close"]
 
 
 def test_qq_base_url_is_passed_to_pyqbot(config: Path, monkeypatch: pytest.MonkeyPatch) -> None:

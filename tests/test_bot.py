@@ -17,6 +17,8 @@ from collections.abc import (
     AsyncIterator,
     Awaitable,
     Callable,
+    Iterable,
+    Mapping,
     MutableMapping,
     Sequence,
 )
@@ -32,7 +34,7 @@ import pyqbot
 import pytest
 from httpx2.websockets import ASGIWebSocketTransport
 
-from qtalk_bot import access, texts
+from qtalk_bot import access, commands, texts
 from qtalk_bot import bot as bot_module
 from qtalk_bot.access import User
 from qtalk_bot.alerts import AlertGroup, Alerts, AlertSendError, DeliveryCallback
@@ -65,6 +67,7 @@ from qtalk_bot.bot import (
     refused_host_alert,
     register,
     run_library_sweep,
+    sync_admin_panel,
 )
 from qtalk_bot.chat import ChatHandler
 from qtalk_bot.config import (
@@ -1571,6 +1574,650 @@ async def test_the_library_sweep_runs_at_start_and_then_on_its_interval() -> Non
         await task
 
     assert library.listings == 1
+
+
+# ---- 管理员的指令面板 ----
+
+
+def test_admin_panel_lists_each_admin_command_once() -> None:
+    names = [name for name, _ in texts.ADMIN_PANEL_ITEMS]
+    assert len(names) == len(set(names))
+    assert all(name.startswith("/") and " " not in name for name in names)  # 点了只填命令本身
+    assert {name.removeprefix("/") for name in names} == commands.COMMAND_NAMES
+
+
+@pytest.mark.parametrize(("name", "desc"), texts.ADMIN_PANEL_ITEMS)
+def test_admin_panel_items_fit_the_platform_limits(name: str, desc: str) -> None:
+    assert texts.panel_width(name) <= texts.PANEL_NAME_WIDTH
+    assert 0 < texts.panel_width(desc) <= texts.PANEL_DESC_WIDTH
+
+
+def test_panel_width_counts_non_ascii_characters_as_two() -> None:
+    assert texts.panel_width("/help") == 5
+    assert texts.panel_width("暂停服务") == 8
+    assert texts.panel_width("用户，编号") == 10  # 全角标点也算 2
+    assert texts.panel_width("x" * 14) == texts.PANEL_NAME_WIDTH
+    assert texts.panel_width("汉" * 15) == texts.PANEL_DESC_WIDTH
+
+
+PANEL_REMARK = bot_module.ADMIN_PANEL_REMARK
+OLD_ADMIN = "FAKE0PENID0OLDADMIN0000000000000"
+
+
+def our_panel(
+    panel_id: str,
+    items: Sequence[pyqbot.PanelItem] | None = None,
+    *,
+    remark: str | None = PANEL_REMARK,
+    target_type: pyqbot.PanelTargetType | None = pyqbot.PanelTargetType.SPECIFIC,
+) -> pyqbot.PanelRecord:
+    return pyqbot.PanelRecord(
+        panel_id=panel_id,
+        scope=pyqbot.PanelScope.C2C,
+        target_type=target_type,
+        panel=pyqbot.Panel(
+            items=tuple(bot_module.admin_panel_items() if items is None else items), remark=remark
+        ),
+    )
+
+
+def panel_detail(
+    panel_id: str,
+    items: Sequence[pyqbot.PanelItem] | None = None,
+    *,
+    remark: str | None = PANEL_REMARK,
+    target_type: pyqbot.PanelTargetType | None = pyqbot.PanelTargetType.SPECIFIC,
+    users: Sequence[str] = (),
+) -> pyqbot.PanelDetail:
+    return pyqbot.PanelDetail(
+        panel_id=panel_id,
+        scope=pyqbot.PanelScope.C2C,
+        target_type=target_type,
+        panel=pyqbot.Panel(
+            items=tuple(bot_module.admin_panel_items() if items is None else items), remark=remark
+        ),
+        user_openids=tuple(users),
+    )
+
+
+_READS = ("list", "get")
+
+
+class _FakePanels:
+    """指令面板（`bot.CommandPanels`）的替身：按 `records` 列出，`users` 是各面板关联的用户。详情默认与列表里的
+    相同（加上 `users`），`details` 可以另给（模拟列表与详情不一致）。
+
+    增删关联用户会改 `users`，之后取到的默认详情随之变化（`details` 里给定的不变，用来模拟字段缺失）。
+
+    每一次请求（读的也算）在执行或抛错之前记进 `calls`，`errors` 按方法名让那一步抛出；`failing_attempt` 给了
+    某个方法时，只有它的第几次（从 1 数）抛出。"""
+
+    def __init__(
+        self,
+        records: Sequence[pyqbot.PanelRecord] = (),
+        users: Mapping[str, Sequence[str]] | None = None,
+        *,
+        details: Mapping[str, pyqbot.PanelDetail] | None = None,
+        errors: dict[str, Exception] | None = None,
+        failing_attempt: Mapping[str, int] | None = None,
+        removals_take_effect: bool = True,
+    ) -> None:
+        self.removals_take_effect = removals_take_effect
+        self.records = list(records)
+        self.users = {key: list(value) for key, value in (users or {}).items()}
+        self.details = dict(details or {})
+        self.errors = errors or {}
+        self.failing_attempt = dict(failing_attempt or {})
+        self.attempts: dict[str, int] = {}
+        self.calls: list[tuple[str, ...]] = []
+        self.created: list[tuple[tuple[pyqbot.PanelItem, ...], str | None, tuple[str, ...]]] = []
+        self.set_calls: list[tuple[str, tuple[pyqbot.PanelItem, ...], str | None]] = []
+
+    @property
+    def writes(self) -> list[tuple[str, ...]]:
+        return [call for call in self.calls if call[0] not in _READS]
+
+    @property
+    def gets(self) -> list[str]:
+        return [call[1] for call in self.calls if call[0] == "get"]
+
+    def _attempt(self, method: str, *call: str) -> None:
+        self.calls.append(call)
+        attempt = self.attempts[method] = self.attempts.get(method, 0) + 1
+        if (error := self.errors.get(method)) is not None and self.failing_attempt.get(
+            method, attempt
+        ) == attempt:
+            raise error
+
+    async def _listing(self, scope: pyqbot.PanelScope) -> AsyncIterator[pyqbot.PanelRecord]:
+        assert scope == pyqbot.PanelScope.C2C
+        self._attempt("iter_panels", "list")
+        for record in self.records:
+            yield record
+
+    def iter_panels(self, scope: pyqbot.PanelScope) -> AsyncIterator[pyqbot.PanelRecord]:
+        return self._listing(scope)
+
+    async def create(
+        self,
+        scope: pyqbot.PanelScope,
+        items: Iterable[pyqbot.PanelItem],
+        *,
+        remark: str | None = None,
+        user_openids: str | Iterable[str] = (),
+    ) -> str:
+        self._attempt("create", "create")
+        assert scope == pyqbot.PanelScope.C2C
+        users = (user_openids,) if isinstance(user_openids, str) else tuple(user_openids)
+        self.created.append((tuple(items), remark, users))
+        return "panel-new"
+
+    async def get(self, panel_id: str) -> pyqbot.PanelDetail:
+        self._attempt("get", "get", panel_id)
+        if panel_id in self.details:
+            return self.details[panel_id]
+        listed = next(r for r in self.records if r.panel_id == panel_id)
+        return pyqbot.PanelDetail(
+            panel_id=panel_id,
+            scope=listed.scope,
+            target_type=listed.target_type,
+            panel=listed.panel,
+            user_openids=tuple(self.users.get(panel_id, ())),
+        )
+
+    async def set(
+        self, panel_id: str, items: Iterable[pyqbot.PanelItem], *, remark: str | None = None
+    ) -> int | None:
+        self._attempt("set", "set", panel_id)
+        self.set_calls.append((panel_id, tuple(items), remark))
+        return 2
+
+    async def delete(self, panel_id: str) -> None:
+        self._attempt("delete", "delete", panel_id)
+
+    async def add_targets(self, panel_id: str, *, user_openids: str | Iterable[str] = ()) -> None:
+        users = (user_openids,) if isinstance(user_openids, str) else tuple(user_openids)
+        self._attempt("add_targets", "add", panel_id, *users)
+        current = self.users.setdefault(panel_id, [])
+        current.extend(user for user in users if user not in current)
+
+    async def remove_targets(
+        self, panel_id: str, *, user_openids: str | Iterable[str] = ()
+    ) -> None:
+        users = (user_openids,) if isinstance(user_openids, str) else tuple(user_openids)
+        self._attempt("remove_targets", "remove", panel_id, *users)
+        if not self.removals_take_effect:
+            return
+        self.users[panel_id] = [user for user in self.users.get(panel_id, []) if user not in users]
+
+
+async def test_admin_panel_is_created_for_the_admin_only_when_missing() -> None:
+    panels = _FakePanels(
+        [our_panel("theirs", remark="别人的面板"), our_panel("plain", remark=None)]
+    )
+
+    await sync_admin_panel(panels, ADMIN)
+
+    ((items, remark, users),) = panels.created
+    assert items == bot_module.admin_panel_items()
+    assert [(item.name, item.desc) for item in items] == list(texts.ADMIN_PANEL_ITEMS)
+    assert all(item.type == pyqbot.PanelItemType.COMMAND for item in items)
+    assert remark == PANEL_REMARK
+    assert users == (ADMIN,)
+    assert panels.writes == [("create",)]  # 别人的面板不碰
+
+
+async def test_admin_panel_that_is_up_to_date_gets_no_write_requests() -> None:
+    panels = _FakePanels([our_panel("ours")], {"ours": [ADMIN]})
+
+    await sync_admin_panel(panels, ADMIN)
+
+    assert panels.calls == [("list",), ("get", "ours")]
+
+
+async def test_admin_panel_tolerates_fields_the_platform_fills_in() -> None:
+    # 取回的元素里，我们省略的字段可能写成 false 或空串。
+    returned = [
+        pyqbot.PanelItem(
+            name=name, desc=desc, type=pyqbot.PanelItemType.COMMAND, only_admin=False, link=""
+        )
+        for name, desc in texts.ADMIN_PANEL_ITEMS
+    ]
+    panels = _FakePanels([our_panel("ours", returned)], {"ours": [ADMIN]})
+
+    await sync_admin_panel(panels, ADMIN)
+
+    assert panels.writes == []
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        [pyqbot.PanelItem.command_button("/help", desc="显示命令说明")],  # 少了命令
+        [  # 说明改过
+            pyqbot.PanelItem.command_button(name, desc=f"{desc}。")
+            for name, desc in texts.ADMIN_PANEL_ITEMS
+        ],
+        list(reversed(bot_module.admin_panel_items())),  # 顺序不同
+        [],
+    ],
+)
+async def test_admin_panel_with_other_content_is_overwritten_keeping_the_remark(
+    items: list[pyqbot.PanelItem],
+) -> None:
+    panels = _FakePanels([our_panel("ours", items)], {"ours": [ADMIN]})
+
+    await sync_admin_panel(panels, ADMIN)
+
+    # 修改时不传备注会把它清空（pyqbot errata），下次启动就认不出自己的面板了。
+    assert panels.set_calls == [("ours", bot_module.admin_panel_items(), PANEL_REMARK)]
+    # 关联的用户本来就只有管理员：不必再取一次详情确认。
+    assert panels.calls == [("list",), ("get", "ours"), ("set", "ours")]
+
+
+async def test_admin_panel_follows_a_change_of_admin() -> None:
+    panels = _FakePanels([our_panel("ours")], {"ours": [OLD_ADMIN]})
+
+    await sync_admin_panel(panels, ADMIN)
+
+    assert panels.writes == [("add", "ours", ADMIN), ("remove", "ours", OLD_ADMIN)]
+
+
+async def test_admin_panel_drops_extra_users_in_batches_of_twenty() -> None:
+    others = [f"FAKE0PENID0OTHER{index:02d}" for index in range(25)]
+    panels = _FakePanels([our_panel("ours")], {"ours": [ADMIN, *others]})
+
+    await sync_admin_panel(panels, ADMIN)
+
+    assert panels.writes == [("remove", "ours", *others[:20]), ("remove", "ours", *others[20:])]
+
+
+async def test_admin_panel_with_no_users_gets_the_admin() -> None:
+    panels = _FakePanels([our_panel("ours")], {})
+
+    await sync_admin_panel(panels, ADMIN)
+
+    assert panels.writes == [("add", "ours", ADMIN)]
+
+
+async def test_duplicate_admin_panels_are_deleted_keeping_the_newest() -> None:
+    # 列表按设置时间从新到旧：留第一个，别人的面板不碰。
+    panels = _FakePanels(
+        [
+            our_panel("newest"),
+            our_panel("theirs", remark="别人的面板"),
+            our_panel("older", []),
+            our_panel("oldest"),
+        ],
+        {"newest": [ADMIN], "older": [ADMIN], "oldest": [OLD_ADMIN]},
+    )
+
+    await sync_admin_panel(panels, ADMIN)
+
+    assert panels.writes == [("delete", "older"), ("delete", "oldest")]
+
+
+async def test_admin_panel_shown_to_everyone_is_replaced() -> None:
+    # 同备注、却对所有人生效的面板改不成只关联管理员（平台拒绝对全局面板增删关联对象），删掉另建。
+    panels = _FakePanels([our_panel("global", target_type=pyqbot.PanelTargetType.ALL)])
+
+    await sync_admin_panel(panels, ADMIN)
+
+    assert panels.writes == [("create",), ("delete", "global")]
+    assert panels.created[0][2] == (ADMIN,)
+
+
+async def test_admin_panel_scope_comes_from_the_detail_not_the_listing() -> None:
+    # 列表带了我们的备注却没给作用范围，详情是对所有人生效的：不能覆盖内容、增删用户，只能替换。
+    panels = _FakePanels(
+        [our_panel("global", [], target_type=None)],
+        details={
+            "global": panel_detail(
+                "global", [], target_type=pyqbot.PanelTargetType.ALL, users=[OLD_ADMIN]
+            )
+        },
+    )
+
+    await sync_admin_panel(panels, ADMIN)
+
+    assert panels.calls == [("list",), ("get", "global"), ("create",), ("delete", "global")]
+
+
+@pytest.mark.parametrize("target_type", [None, pyqbot.PanelTargetType("weird")])
+async def test_admin_panel_with_an_unclear_scope_is_left_alone(
+    caplog: pytest.LogCaptureFixture, target_type: pyqbot.PanelTargetType | None
+) -> None:
+    panels = _FakePanels(
+        [our_panel("ours", []), our_panel("old")],
+        details={
+            "ours": panel_detail("ours", [], target_type=target_type, users=[OLD_ADMIN]),
+            "old": panel_detail("old", users=[ADMIN]),
+        },
+    )
+
+    with caplog.at_level(logging.INFO):
+        await sync_admin_panel(panels, ADMIN)
+
+    assert panels.calls == [("list",), ("get", "ours"), ("get", "old")]  # 只有读的请求
+    (warning,) = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert "ours" in warning.getMessage()
+    assert OLD_ADMIN not in formatted_logs(caplog)
+
+
+async def test_admin_panel_whose_detail_has_another_remark_is_not_ours() -> None:
+    panels = _FakePanels(
+        [our_panel("renamed", [])],
+        details={"renamed": panel_detail("renamed", [], remark="别人改过的备注", users=[ALICE])},
+    )
+
+    await sync_admin_panel(panels, ADMIN)
+
+    assert panels.calls == [("list",), ("get", "renamed"), ("create",)]  # 不改、不删它
+
+
+async def test_admin_panel_is_narrowed_to_the_admin_before_its_content_changes() -> None:
+    # 先收窄可见范围再改内容：中途失败时，旧用户不会看到更新后的管理命令。
+    # 改内容之前再取一次详情，确认只剩管理员。
+    panels = _FakePanels([our_panel("ours", [])], {"ours": [OLD_ADMIN]})
+
+    await sync_admin_panel(panels, ADMIN)
+
+    assert panels.calls == [
+        ("list",),
+        ("get", "ours"),
+        ("add", "ours", ADMIN),
+        ("remove", "ours", OLD_ADMIN),
+        ("get", "ours"),
+        ("set", "ours"),
+    ]
+
+
+async def test_admin_panel_content_is_not_changed_when_its_users_cannot_be_confirmed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # 详情里一直没有关联的用户（字段缺失时解成空的）：加上管理员之后也确认不了旧用户看不到它，不改内容，
+    # 也不再删别的面板。
+    panels = _FakePanels(
+        [our_panel("ours", []), our_panel("dup")],
+        {"dup": [ADMIN]},
+        details={"ours": panel_detail("ours", [], users=[])},
+    )
+
+    with caplog.at_level(logging.INFO):
+        await sync_admin_panel(panels, ADMIN)
+
+    assert panels.calls == [
+        ("list",),
+        ("get", "ours"),
+        ("get", "dup"),
+        ("add", "ours", ADMIN),
+        ("get", "ours"),
+    ]
+    (warning,) = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert "没能确认管理员的指令面板 ours 只关联管理员" in warning.getMessage()
+    assert ADMIN not in formatted_logs(caplog)
+
+
+async def test_admin_panel_content_is_not_changed_while_the_old_admin_is_still_listed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # 去掉旧用户的请求没报错，再取详情时旧管理员却还在：名单里有现任管理员不够，要恰好只有他。
+    panels = _FakePanels(
+        [our_panel("ours", []), our_panel("dup")],
+        {"ours": [OLD_ADMIN], "dup": [ADMIN]},
+        removals_take_effect=False,
+    )
+
+    with caplog.at_level(logging.INFO):
+        await sync_admin_panel(panels, ADMIN)
+
+    assert panels.calls == [
+        ("list",),
+        ("get", "ours"),
+        ("get", "dup"),
+        ("add", "ours", ADMIN),
+        ("remove", "ours", OLD_ADMIN),
+        ("get", "ours"),
+    ]
+    (warning,) = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert "没能确认管理员的指令面板 ours 只关联管理员" in warning.getMessage()
+    logs = formatted_logs(caplog)
+    for secret in (ADMIN, OLD_ADMIN):
+        assert secret not in logs
+
+
+async def test_admin_panel_content_is_not_changed_when_the_second_detail_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    panels = _FakePanels(
+        [our_panel("ours", [])],
+        {"ours": [OLD_ADMIN]},
+        errors={"get": pyqbot.NetworkError("超时", outcome_unknown=True)},
+        failing_attempt={"get": 2},
+    )
+
+    with caplog.at_level(logging.INFO):
+        await sync_admin_panel(panels, ADMIN)
+
+    assert panels.calls == [
+        ("list",),
+        ("get", "ours"),
+        ("add", "ours", ADMIN),
+        ("remove", "ours", OLD_ADMIN),
+        ("get", "ours"),
+    ]
+    (warning,) = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert "再取管理员的指令面板 ours 关联的用户" in warning.getMessage()
+    logs = formatted_logs(caplog)
+    for secret in (ADMIN, OLD_ADMIN):
+        assert secret not in logs
+
+
+@pytest.mark.parametrize("listed_remark", [PANEL_REMARK, None])
+async def test_panel_whose_detail_has_no_content_cannot_be_verified(
+    caplog: pytest.LogCaptureFixture, listed_remark: str | None
+) -> None:
+    # 详情里没有 panel：核实不了是不是自己的。当作不是的话，自己的面板会被再建一个。
+    panels = _FakePanels(
+        [our_panel("bare", remark=listed_remark)],
+        details={"bare": pyqbot.PanelDetail(panel_id="bare", user_openids=(ADMIN,))},
+    )
+
+    with caplog.at_level(logging.INFO):
+        await sync_admin_panel(panels, ADMIN)
+
+    assert panels.calls == [("list",), ("get", "bare")]  # 只有读的请求
+    (warning,) = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert "bare" in warning.getMessage()
+    assert ADMIN not in formatted_logs(caplog)
+
+
+def listed_without_remark(panel_id: str, panel: pyqbot.Panel | None) -> pyqbot.PanelRecord:
+    return pyqbot.PanelRecord(
+        panel_id=panel_id,
+        scope=pyqbot.PanelScope.C2C,
+        target_type=pyqbot.PanelTargetType.SPECIFIC,
+        panel=panel,
+    )
+
+
+@pytest.mark.parametrize(
+    "listed_panel",
+    [
+        None,
+        pyqbot.Panel(items=bot_module.admin_panel_items()),
+        pyqbot.Panel(items=bot_module.admin_panel_items(), remark=""),
+    ],
+)
+async def test_admin_panel_listed_without_remark_is_recognized_by_its_detail(
+    listed_panel: pyqbot.Panel | None,
+) -> None:
+    # 列表带不带备注没有实测：不带时按详情里的备注认，认出来就不再新建。
+    ours = pyqbot.Panel(items=bot_module.admin_panel_items(), remark=PANEL_REMARK)
+    panels = _FakePanels(
+        [listed_without_remark("ours", listed_panel), listed_without_remark("theirs", None)],
+        details={
+            "ours": panel_detail("ours", ours.items, users=[ADMIN]),
+            "theirs": panel_detail("theirs", [], remark="别人的面板", users=[ALICE]),
+        },
+    )
+
+    await sync_admin_panel(panels, ADMIN)
+
+    assert panels.writes == []
+    assert panels.gets == ["ours", "theirs"]  # 看关联的用户时不再取一次
+
+
+async def test_panels_listed_with_another_remark_are_not_fetched() -> None:
+    panels = _FakePanels([our_panel("theirs", remark="别人的面板"), our_panel("ours")])
+
+    await sync_admin_panel(panels, ADMIN)
+
+    assert panels.gets == ["ours"]
+
+
+async def test_panels_without_a_remark_anywhere_are_left_alone() -> None:
+    panels = _FakePanels(
+        [listed_without_remark("plain", None)],
+        details={"plain": panel_detail("plain", [], remark=None, users=[ALICE])},
+    )
+
+    await sync_admin_panel(panels, ADMIN)
+
+    assert panels.calls == [("list",), ("get", "plain"), ("create",)]  # 那个面板不碰
+
+
+async def test_admin_panel_is_not_created_when_a_detail_cannot_be_read(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # 认不出列表里的面板是不是自己的：宁可这次不同步，也不再建一个。
+    panels = _FakePanels(
+        [listed_without_remark("unknown", None)],
+        errors={"get": pyqbot.NetworkError(f"超时：{SECRET_IN_ERROR}", outcome_unknown=True)},
+    )
+
+    with caplog.at_level(logging.INFO):
+        await sync_admin_panel(panels, ADMIN)
+
+    assert panels.calls == [("list",), ("get", "unknown")]
+    (warning,) = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert "取指令面板 unknown 的详情" in warning.getMessage()
+    logs = formatted_logs(caplog)
+    for secret in (ADMIN, SECRET_IN_ERROR):
+        assert secret not in logs
+
+
+SECRET_IN_ERROR = f"/v2/users/{ADMIN}/panels"
+
+
+OTHERS = tuple(f"FAKE0PENID0OTHER{index:02d}" for index in range(25))
+
+
+# 每种失败都断言完整的请求序列：失败的那一次是最后一次请求、只尝试了一次，之后的步骤都没有做。
+@pytest.mark.parametrize(
+    ("method", "records", "users", "expected_calls", "step"),
+    [
+        ("iter_panels", [], {}, [("list",)], "列出单聊的指令面板"),
+        (  # 建新的失败：不删要替换的全局面板
+            "create",
+            [our_panel("global", target_type=pyqbot.PanelTargetType.ALL)],
+            {},
+            [("list",), ("get", "global"), ("create",)],
+            "创建管理员的指令面板",
+        ),
+        (
+            "get",
+            [our_panel("ours", [])],
+            {"ours": [OLD_ADMIN]},
+            [("list",), ("get", "ours")],
+            "取指令面板 ours 的详情",
+        ),
+        (  # 改内容失败：不删多余的面板
+            "set",
+            [our_panel("ours", []), our_panel("dup")],
+            {"ours": [ADMIN]},
+            [("list",), ("get", "ours"), ("get", "dup"), ("set", "ours")],
+            "修改",
+        ),
+        (  # 加管理员失败：不再去掉别的用户，也不改内容
+            "add_targets",
+            [our_panel("ours", [])],
+            {"ours": [OLD_ADMIN]},
+            [("list",), ("get", "ours"), ("add", "ours", ADMIN)],
+            "关联管理员",
+        ),
+        (  # 第一批失败：没有第二批，也不改内容
+            "remove_targets",
+            [our_panel("ours", [])],
+            {"ours": [ADMIN, *OTHERS]},
+            [("list",), ("get", "ours"), ("remove", "ours", *OTHERS[:20])],
+            "去掉别的用户",
+        ),
+        (  # 删第一个失败：不再删第二个
+            "delete",
+            [our_panel("ours"), our_panel("old"), our_panel("older")],
+            {"ours": [ADMIN]},
+            [
+                ("list",),
+                ("get", "ours"),
+                ("get", "old"),
+                ("get", "older"),
+                ("delete", "old"),
+            ],
+            "删掉多余的管理员指令面板 old",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "error",
+    [
+        api_error(400, 40030013),
+        pyqbot.NetworkError(f"超时：{SECRET_IN_ERROR}", outcome_unknown=True),
+        RuntimeError(f"客户端已关闭：{SECRET_IN_ERROR}"),
+    ],
+)
+async def test_admin_panel_failures_are_only_logged_once_without_openids(
+    caplog: pytest.LogCaptureFixture,
+    method: str,
+    records: list[pyqbot.PanelRecord],
+    users: dict[str, list[str]],
+    expected_calls: list[tuple[str, ...]],
+    step: str,
+    error: Exception,
+) -> None:
+    panels = _FakePanels(records, users, errors={method: error})
+
+    with caplog.at_level(logging.INFO):
+        await sync_admin_panel(panels, ADMIN)  # 不抛出
+
+    assert panels.calls == expected_calls
+    (warning,) = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert "没能同步管理员的指令面板" in warning.getMessage()
+    assert step in warning.getMessage()
+    logs = formatted_logs(caplog)
+    for secret in (ADMIN, OLD_ADMIN, SECRET_IN_ERROR, *OTHERS):
+        assert secret not in logs
+
+
+async def test_admin_panel_logs_name_panels_but_no_openids(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    panels = _FakePanels([our_panel("ours", []), our_panel("old")], {"ours": [OLD_ADMIN, ALICE]})
+
+    with caplog.at_level(logging.INFO):
+        await sync_admin_panel(panels, ADMIN)
+
+    assert panels.writes == [
+        ("add", "ours", ADMIN),
+        ("remove", "ours", ALICE, OLD_ADMIN),
+        ("set", "ours"),
+        ("delete", "old"),
+    ]
+    logs = formatted_logs(caplog)
+    assert "管理员的指令面板 ours" in logs
+    assert "删掉了多余的管理员指令面板 old" in logs
+    for secret in (ADMIN, OLD_ADMIN, ALICE):
+        assert secret not in logs
 
 
 async def test_reply_without_a_reference_index_leaves_it_empty(db: Database) -> None:

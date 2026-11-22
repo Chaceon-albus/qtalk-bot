@@ -21,6 +21,9 @@ errata「好友事件」实测都会推送）交给 `ReminderEvents.friend_chang
 流式消息没有确认结束、留着不删的，由定期清理（`run_library_sweep()`，单独的维护任务）删掉。图片本身的下载不在
 这里，用的是自己的 HTTP 客户端（`image_download.py`）。
 
+管理员的指令面板（输入 `/` 时弹出的管理命令）：启动后在后台由 `sync_admin_panel()` 同步一次，按备注
+`ADMIN_PANEL_REMARK` 认出自己的面板。
+
 已授权用户的消息带附件、引用、卡片等非文本内容时，还记一条它们的形态（`describe_non_text()`），为处理图片、
 语音、文件收集真实样本。这条日志会长期保留，所以只输出能确认安全的东西：数字、字数，以及对照白名单得到的
 固定标签（附件类型、卡片类型、平台域名、文件扩展名），对不上的一律记「其它」；正文、语音识别文本、文件名、
@@ -34,7 +37,14 @@ import logging
 import re
 import secrets
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Sequence,
+)
 from dataclasses import dataclass
 from http.cookiejar import DefaultCookiePolicy
 from typing import Protocol, runtime_checkable
@@ -750,6 +760,153 @@ class SharedLibrary:
             self._uses[image_id] = (uses - 1, uploaded)
             return
         await self.library.delete(image_id)
+
+
+ADMIN_PANEL_REMARK = "qtalk-bot 管理命令"
+"""管理员的指令面板的备注（只给开发者看）。同步时只凭它认出自己的面板，备注不同的面板一律不碰。"""
+
+_PANEL_TARGETS_PER_CALL = 20  # 增删关联对象一次最多 20 个（`Panels.add_targets()`）
+
+
+class CommandPanels(Protocol):
+    """机器人的指令面板（`pyqbot.Client.panels` 符合它）。"""
+
+    def iter_panels(self, scope: pyqbot.PanelScope) -> AsyncIterator[pyqbot.PanelRecord]: ...
+
+    async def create(
+        self,
+        scope: pyqbot.PanelScope,
+        items: Iterable[pyqbot.PanelItem],
+        *,
+        remark: str | None = None,
+        user_openids: str | Iterable[str] = (),
+    ) -> str: ...
+
+    async def get(self, panel_id: str) -> pyqbot.PanelDetail: ...
+
+    async def set(
+        self, panel_id: str, items: Iterable[pyqbot.PanelItem], *, remark: str | None = None
+    ) -> int | None: ...
+
+    async def delete(self, panel_id: str) -> None: ...
+
+    async def add_targets(
+        self, panel_id: str, *, user_openids: str | Iterable[str] = ()
+    ) -> None: ...
+
+    async def remove_targets(
+        self, panel_id: str, *, user_openids: str | Iterable[str] = ()
+    ) -> None: ...
+
+
+def admin_panel_items() -> tuple[pyqbot.PanelItem, ...]:
+    """管理员的指令面板的内容（`texts.ADMIN_PANEL_ITEMS`），每项是一个指令元素。"""
+    return tuple(
+        pyqbot.PanelItem.command_button(name, desc=desc) for name, desc in texts.ADMIN_PANEL_ITEMS
+    )
+
+
+type _ItemKey = tuple[str | None, str | None, str | None, bool, str | None]
+
+
+def _item_key(item: pyqbot.PanelItem) -> _ItemKey:
+    # 取回的元素里没设的字段可能是 null、false 或空串，与我们构造时省略的视为相同。
+    return (item.type, item.name, item.desc or None, bool(item.only_admin), item.link or None)
+
+
+async def sync_admin_panel(panels: CommandPanels, admin_openid: str) -> None:
+    """保证有一个只对管理员生效的单聊指令面板，内容是 `admin_panel_items()`、备注是 `ADMIN_PANEL_REMARK`。
+
+    详情是唯一的依据。列出单聊的面板，列表里备注是别的非空值的不碰、也不取详情；备注是我们的或没有备注的（列表带不带
+    备注没有实测）一律取详情，详情里的备注是 `ADMIN_PANEL_REMARK` 的才算自己的，备注是别的或没有的不是。之后的
+    内容、作用范围（`target_type`）与关联的用户都只看详情。
+
+    说不准的情况：详情里没有面板内容（`panel`）的，核实不了是不是自己的；自己的面板里作用范围没给或不认识的。
+    只要有一个这样的，就记一条警告、这次不发任何写的请求。其余自己的面板按作用范围分：`specific` 的可以留用；
+    `all`（对所有人生效、改不成只关联管理员）的要替换。
+
+    没有可以留用的就新建一个（只关联管理员）；有就留下最新的一个，先收窄可见范围再改内容：缺管理员时先关联上
+    （先加再减，免得中间出现一个没有关联用户的面板），再分批去掉别的用户，最后内容不一样时改成现在的（连同备注
+    一起传，不传会被清空）。起初的详情里关联的用户不是恰好管理员一个时，改内容之前再取一次详情确认；确认不了就
+    记一条警告、不再往下做，免得旧用户看到新内容。其余自己的面板（之前的失败留下的、要替换的 `all`）删掉。
+    都一样时只有读的请求。
+
+    启动后在后台调用一次。任何一步失败（平台拒绝、网络错误、客户端已关）只记一条警告、不再往下做，下次启动再试：
+    取详情失败时不新建，去掉别的用户失败时不改内容。日志里只有面板 ID，没有 openid。"""
+    step = "列出单聊的指令面板"
+    try:
+        listed = [record async for record in panels.iter_panels(pyqbot.PanelScope.C2C)]
+        ours: list[tuple[str, pyqbot.PanelDetail]] = []
+        unclear: list[str] = []
+        for record in listed:
+            remark = record.panel.remark if record.panel is not None else None
+            if remark and remark != ADMIN_PANEL_REMARK:
+                continue
+            step = f"取指令面板 {record.panel_id} 的详情"
+            detail = await panels.get(record.panel_id)
+            if detail.panel is None:
+                unclear.append(record.panel_id)  # 核实不了是不是自己的：当作不是的话会再建一个
+            elif detail.panel.remark == ADMIN_PANEL_REMARK:
+                ours.append((record.panel_id, detail))
+        scopes = (pyqbot.PanelTargetType.SPECIFIC, pyqbot.PanelTargetType.ALL)
+        unclear += [panel_id for panel_id, detail in ours if detail.target_type not in scopes]
+        if unclear:
+            logger.warning(
+                "指令面板 %s 的详情不完整或作用范围说不准，这次不同步管理员的指令面板",
+                "、".join(unclear),
+            )
+            return
+        usable = [
+            (panel_id, detail)
+            for panel_id, detail in ours
+            if detail.target_type == pyqbot.PanelTargetType.SPECIFIC
+        ]
+        items = admin_panel_items()
+        if not usable:
+            step = "创建管理员的指令面板"
+            panel_id = await panels.create(
+                pyqbot.PanelScope.C2C,
+                items,
+                remark=ADMIN_PANEL_REMARK,
+                user_openids=[admin_openid],
+            )
+            logger.info("创建了管理员的指令面板 %s", panel_id)
+        else:
+            panel_id, kept = usable[0]
+            users = set(kept.user_openids)
+            if admin_openid not in users:
+                step = f"给管理员的指令面板 {panel_id} 关联管理员"
+                await panels.add_targets(panel_id, user_openids=[admin_openid])
+                logger.info("管理员的指令面板 %s 关联上了现在的管理员", panel_id)
+            others = sorted(users - {admin_openid})
+            if others:
+                step = f"从管理员的指令面板 {panel_id} 去掉别的用户"
+                for start in range(0, len(others), _PANEL_TARGETS_PER_CALL):
+                    chunk = others[start : start + _PANEL_TARGETS_PER_CALL]
+                    await panels.remove_targets(panel_id, user_openids=chunk)
+                logger.info("管理员的指令面板 %s 去掉了 %d 个别的用户", panel_id, len(others))
+            if [_item_key(item) for item in kept.items] != [_item_key(item) for item in items]:
+                if users != {admin_openid}:
+                    # 详情里的 user_openids 缺失时解成空的：只凭增删的请求成功，确认不了旧用户已经看不到它。
+                    step = f"再取管理员的指令面板 {panel_id} 关联的用户"
+                    confirmed = set((await panels.get(panel_id)).user_openids)
+                    if confirmed != {admin_openid}:
+                        logger.warning(
+                            "没能确认管理员的指令面板 %s 只关联管理员，这次不改内容", panel_id
+                        )
+                        return
+                step = f"修改管理员的指令面板 {panel_id} 的内容"
+                await panels.set(panel_id, items, remark=ADMIN_PANEL_REMARK)
+                logger.info("管理员的指令面板 %s 的内容改成了现在的", panel_id)
+        for other_id, _ in ours:
+            if other_id != panel_id:
+                step = f"删掉多余的管理员指令面板 {other_id}"
+                await panels.delete(other_id)
+                logger.info("删掉了多余的管理员指令面板 %s", other_id)
+    except pyqbot.QQBotError as exc:
+        logger.warning("没能同步管理员的指令面板（%s）：%s", step, _describe(exc))
+    except Exception as exc:  # noqa: BLE001  客户端已关等：面板只是方便，不能影响别的功能；只记类型
+        logger.warning("没能同步管理员的指令面板（%s）：%s", step, type(exc).__name__)
 
 
 class _QQReplyChannel:

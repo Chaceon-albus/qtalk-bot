@@ -9,7 +9,8 @@
 （素材库）显示。
 
 运行期间的后台任务：定期清理过期的附件（并清理过期的提醒数据，`reminders.reminder_cleanup()`）；定期清理素材库里遗留
-的回答图片（`bot.run_library_sweep()`，与回答的通道共用一个 `bot.SharedLibrary`）；写心跳文件供
+的回答图片（`bot.run_library_sweep()`，与回答的通道共用一个 `bot.SharedLibrary`）；启动后同步一次只对管理员生效的
+指令面板（`bot.sync_admin_panel()`）；写心跳文件供
 `python -m qtalk_bot.health` 检查（`health.Heartbeat`，启动时先删掉旧的，心跳里带着 QQ 网关的状态）；定时备份
 （`maintenance.BackupScheduler`）；查磁盘余量（`maintenance.DiskWatch`）；看网关断没断（`gateway_watch.GatewayWatch`）；
 启用了 `[reminders]` 时到点发提醒（`reminders.ReminderScheduler`，经 `bot.ProactiveSender` 发主动消息，与对话共用每用户
@@ -47,6 +48,7 @@ from .bot import (
     refused_host_alert,
     register,
     run_library_sweep,
+    sync_admin_panel,
 )
 from .chat import ChatHandler
 from .config import (
@@ -310,6 +312,14 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                         uses_qq=True,
                     )
                 )
+            # 只对管理员生效的指令面板：启动后在后台同步一次。它也用 QQ 的客户端，关停时在关客户端之前停下。
+            maintenance.append(
+                Background(
+                    "指令面板同步",
+                    asyncio.create_task(sync_admin_panel(bot.panels, secrets.admin_openid)),
+                    uses_qq=True,
+                )
+            )
             if settings.reminders.enabled:
                 # 在 Conversation 建好之后才开始：之前开始的话，最初几次会拿到另一套锁。
                 reminders = ReminderScheduler(
@@ -370,8 +380,9 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
 
 @dataclass(frozen=True, slots=True)
 class Background:
-    """一个维护任务（心跳、定时备份、磁盘检查、网关检查、到点发提醒、素材库清理）：`stop` 是可选的同步停止请求，关停时
-    先于取消任务调用；`uses_qq` 为真的（素材库清理）关停时在关 QQ 的客户端之前就等它退出，其余的在最后等。"""
+    """一个维护任务（心跳、定时备份、磁盘检查、网关检查、到点发提醒、素材库清理、指令面板同步）：`stop` 是可选的同步
+    停止请求，关停时先于取消任务调用；`uses_qq` 为真的（素材库清理、指令面板同步）关停时在关 QQ 的客户端之前就等它
+    退出，其余的在最后等。"""
 
     name: str
     task: asyncio.Task[None]
@@ -410,7 +421,7 @@ async def _shut_down(
     downloader: ImageDownloader | None = None,
 ) -> bool:
     """按顺序关停，返回期间是否又被取消过。`maintenance` 是维护任务：心跳、定时备份、磁盘检查、网关检查、到点发提醒、
-    素材库清理。
+    素材库清理、指令面板同步。
     `downloader` 是回答里网上的图片的下载器（它有自己的 HTTP 客户端）。
 
     顺序：
@@ -434,7 +445,7 @@ async def _shut_down(
        QQ 的 HTTP 客户端发出，要在关闭它之前收住；`stop()` 是同步、无条件执行的，前面的收尾用完了时限也照样
        生效（否则 `aclose()` 可能在开始之前就被取消，在途的发送越过客户端的关闭）。之后再触发的提醒（如关停中
        还在下载的附件被拒）直接丢弃，只记日志。接着等第 0 步停掉的、标了 `uses_qq` 的维护任务（素材库的定期
-       清理）退出：它经 QQ 的 HTTP 客户端列出、删除素材，关了客户端再发请求只会报错。这一步用第 3 步的截止点，
+       清理、指令面板的同步）退出：它们经 QQ 的 HTTP 客户端发请求，关了客户端再发请求只会报错。这一步用第 3 步的截止点，
        不占给第 5、6 步留的 `BOT_CLOSE_SECONDS`；到点不再等（它已被取消，之后的请求失败只记日志）。
     5. `Bot.close()`：取消第 2 步到期时还没结束的处理函数（如还在下载附件的；消息在下载之前已经入库，被取消的
        下载按「没能下载」记），最多等它们 5 秒，再关 QQ 的 HTTP 客户端。
