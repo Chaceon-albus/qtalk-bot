@@ -26,7 +26,7 @@ Decisions 返回每个选项的概率，上下文按概率组装：
 
 Decisions 只能选、不能写。新话题的标题、话题摘要和档案更新交给后台的小模型，在回复之后做，不占用户等待的时间。
 
-用户引用旧消息时，pyqbot 给出被引用消息的索引（`message.ref_msg_idx`），`msg_elements` 里带回被引用的内容，可以直接定位话题，不必靠猜（见[「按引用定位」](#按引用定位)）。
+用户引用旧消息或机器人的某条气泡时，pyqbot 给出被引用消息的索引（`message.ref_msg_idx`），`msg_elements` 里带回被引用的内容，可以直接定位话题，不必靠猜（见[「按引用定位」](#按引用定位)）。
 
 ## 留给以后的口子
 
@@ -46,7 +46,7 @@ Decisions 只能选、不能写。新话题的标题、话题摘要和档案更�
 
 - **只在配置了 `[decisions]` 时启用。** 不配就不分话题，上下文是最近 `[chat].history_turns` 轮。`Router(..., topics=settings.topics)`，没有 `[decisions]` 或没有决策模型时 `Router.topics` 为空，`Conversation` 据此判断是否分话题，不另设开关。启用后即使只有一个模型，也会为话题题调用决策。
 - 模块：`topics.py` 是话题表与归属的数据层（候选、按引用定位、建行与归属、`set_summary()`）；话题里各轮的原文由 `journal.topic_history()` 取；选话题在 `routing.py`（`TopicQuery`、`choose_topic()`），与选模型同一个 `Selection`；合并历史在 `context.merge_history()`，记忆一段在 `prompt.Memory`；后台写标题与摘要在 `memory.py`。
-- 表（迁移 V9）：`messages.ref_msg_idx`（被引用消息的引用索引，按 `(user_id, msg_idx)` 建了索引）；`topics`（`provisional_title`、`title`、`summary`、`summarized_through`、`created_at`、`active_at`、`last_message_id`）与 `topic_messages`（消息 → 话题，带 `user_id`）。「最近活跃」按 `last_message_id`（归进来的最后一轮的回复编号）排序，不按时刻：时钟可能回拨，同一秒里也会有好几轮。
+- 表（迁移 V9）：`messages.ref_msg_idx`（被引用消息的引用索引，按 `(user_id, msg_idx)` 建了索引）；`topics`（`provisional_title`、`title`、`summary`、`summarized_through`、`created_at`、`active_at`、`last_message_id`）与 `topic_messages`（消息 → 话题，带 `user_id`）；机器人各条气泡的引用索引在发送记录 `sends`（迁移 V19，按 `(user_id, ref_idx)` 建了索引）。「最近活跃」按 `last_message_id`（归进来的最后一轮的回复编号）排序，不按时刻：时钟可能回拨，同一秒里也会有好几轮。
 - 日志只记话题编号与概率，不记标题与摘要。
 
 ### 选话题
@@ -60,10 +60,11 @@ Decisions 只能选、不能写。新话题的标题、话题摘要和档案更�
 
 ### 按引用定位
 
-- 用户引用了自己的旧消息或机器人回复他的消息时，按存下的 `msg_idx` 只在这个用户自己的流水里找；找到且那条消息有话题，就直接用那个话题，话题题不问（模型题照问）。拿不到索引的回复定位不了，照常交给决策。
+- 用户引用了自己的旧消息或机器人回复他的某条气泡时，只在这个用户自己的数据里找被引用的那条：他自己的消息按用户消息的 `msg_idx` 找，机器人的气泡按发送记录的引用索引找（见[「对话」的「发送记录」](conversation.md#发送记录)）。找到且有话题，就直接用那个话题，话题题不问（模型题照问）。拿不到索引的气泡定位不了，照常交给决策。
 - **引用的来源**（已实测，见 pyqbot 的 `docs/errata.md`）：先取 pyqbot 的 `message.ref_msg_idx`（`message_scene.ext` 里的 `ref_msg_idx=`），没有时由本项目回退到 `msg_elements` 第一项的 `msg_idx`（pyqbot 不做这个回退）；超过 512 个字符的当作没有。实测四次都对上：引用机器人的普通消息时 `ref_msg_idx` 等于发送结果的 `ext_info.ref_idx`，引用流式消息时等于 `StreamMessage.ref_idx`，引用用户自己的消息时等于那条消息的 `msg_idx`；`msg_elements` 只有被引用的那一项，它的 `msg_idx` 与 `ref_msg_idx` 相同，所以回退只是兜底。一轮里有几条消息带引用时，从最新的一条看起，第一个找得到话题的为准。
-- **机器人回复的索引**：回答送达后，把送达回答的那条消息的引用索引存进它在流水里那一行的 `messages.msg_idx`。流式回答取 `StreamMessage.ref_idx`（pyqbot 实测：每个分片的响应，含结束分片，都带同一个 `ext_info.ref_idx`；仍在每个成功的分片与结束分片之后都看一次，第一个不为空的为准）；流式被拒、改发纯文本的取发送结果的 `ext_info.ref_idx`；拿不到就留空，超过 512 个字符的也当作没有。只有回答的那条消息存：固定说明（模型失败、平台拒发后的说明）与过程消息都不存。`conversation.ReplyChannel` 的 `stream()`、`finish_stream()`、`send()` 返回发出的那条消息的引用索引（替身返回 `None` 即可），`conversation.py` 不依赖 pyqbot。
-- `topics.quoted_topic()` 用户消息与机器人的回复都认，但只在这个用户自己的流水里找，所以机器人回复别人的消息的索引解析不到（有测试）。
+- **机器人回复的索引**：这一轮的每条被动回复（过程消息、回答的每一条、改发的纯文本、固定说明、提醒列表、确认卡片、生成的图）各在发送记录里记一行，带它自己的引用索引；回复行不存（`messages.msg_idx` 只是用户消息的）。流式消息取 `StreamMessage.ref_idx`（pyqbot 实测：每个分片的响应，含结束分片，都带同一个 `ext_info.ref_idx`；仍在每个成功的分片与结束分片之后都看一次，第一个不为空的为准），普通消息（纯文本、Markdown、带按钮的 Markdown、图片）取发送结果的 `ext_info.ref_idx`；拿不到就留空，超过 512 个字符的也当作没有。`conversation.ReplyChannel` 的各个发送方法与过程消息的 `ReplyStream` 都返回发出的那条消息的引用索引（替身返回 `None` 即可），`conversation.py` 不依赖 pyqbot。
+- **从气泡到话题**：按引用索引找到发送记录所属的回复行，取回复行的话题；回复行没有归属时（没有结束的一轮，例如只显示了过程消息就关停，它的消息并进了下一轮），取它回答的那条用户消息的话题。同一个索引在用户消息与发送记录里都对上时（不应发生）取编号大的那一行。
+- `topics.quoted_topic()` 用户消息与机器人的气泡都认，但两路都只在这个用户自己的行里找，所以机器人回复别人的气泡的索引解析不到，两个人的数据里出现同一个索引字符串时也各查各的（有测试）。
 
 ### 上下文组装
 
