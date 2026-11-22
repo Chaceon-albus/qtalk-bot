@@ -20,6 +20,8 @@ from typing import Literal, cast
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import httpx2
+
 from .llm import INPUT_LIMITS, Modality, Provider
 from .llm.decisions import MAX_OPTIONS
 
@@ -103,6 +105,13 @@ MAX_RETENTION_DAYS = 3650
 DEFAULT_ATTACHMENT_HISTORY_TURNS = 3
 MAX_ATTACHMENT_HISTORY_TURNS = 20
 MAX_EXTRA_DOWNLOAD_HOSTS = 32
+DEFAULT_WEB_IMAGE_MAX_SIZE_MB = 10
+MAX_WEB_IMAGE_MAX_SIZE_MB = 10  # QQ 素材库单张图片的上限
+DEFAULT_WEB_IMAGE_TIMEOUT_SECONDS = 10
+MAX_WEB_IMAGE_TIMEOUT_SECONDS = 60  # 下载时回答停在图片那里等着，不能等太久
+DEFAULT_MAX_DISPLAY_PX = 512
+MIN_MAX_DISPLAY_PX = 64
+MAX_MAX_DISPLAY_PX = 2048
 
 DEFAULT_TEXT_DEBOUNCE_SECONDS = 0.0
 MAX_TEXT_DEBOUNCE_SECONDS = 10.0  # 防抖只为接住快速的连发，再长就违背了「来了就处理」
@@ -166,7 +175,8 @@ _OPENAI_IMAGE_QUALITIES: dict[str, OpenAIImageQuality] = {
 }
 
 # 下载白名单里的一个域名后缀：至少两段，每段 1–63 个字母、数字或连字符（不以连字符开头或结尾），最后一段是
-# 2–63 个字母，总长不超过 253。与 `bot.py` 判断主机名的规则一致，否则追加的后缀永远匹配不上。
+# 2–63 个字母，总长不超过 253。与 `media.HOST_NAME` 判断主机名的规则一致，否则追加的后缀永远匹配不上（`media` 依赖
+# 本模块，不能反过来引用它）。
 _DOMAIN = re.compile(r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
 _MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 _REASONING = re.compile(r"[a-z][a-z0-9_]{0,31}")
@@ -242,6 +252,8 @@ class ModelSettings:
             且总是英文），服务商仍给了也不展示。
         image_generation: 这个模型能用画图函数（出图由 `[image_generation]` 配置的图片模型完成）。没有
             `[image_generation]` 时不起作用，启动时记一条警告。
+        web_images: 这个模型可以在回答里用 `![说明](地址)` 插网上的图片，机器人下载白名单里图站的图、随回答
+            发出（`web_images.py`，规则在 `[web_images]`）。与其它能力开关不同，默认打开。
     """
 
     name: str
@@ -255,6 +267,7 @@ class ModelSettings:
     search: bool = False
     show_process: bool = False
     image_generation: bool = False
+    web_images: bool = True
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -444,6 +457,32 @@ class ImageGenerationSettings:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class WebImageSettings:
+    """`[web_images]` 表：回答里网上的图片（打开了 `[[models]].web_images` 的模型写的 `![说明](地址)`）怎么下载、
+    怎么显示，见 `web_images.py`。
+
+    Attributes:
+        max_size_mb: 单张图片的大小上限（MiB），不超过 QQ 素材库的上限；超过的不下载，去掉这张图。
+        download_timeout_seconds: 下载一张图的总时限（秒），超时就去掉这张图。
+        max_display_px: 显示时长边最多这么多像素，按原图的比例缩小，比它小的图不放大。
+        extra_hosts: 追加到内置图站白名单（`web_images.DEFAULT_HOSTS`）之后的域名后缀，已转成小写，规则同
+            `[attachments].extra_download_hosts`；它本身和它的子域名都放行。
+        proxy: 下载图片用的代理，协议与写法同 `ProviderSettings.proxy`。`None` 时不设代理（不沿用 `[qq].proxy`），
+            系统级的 `HTTPS_PROXY` 等环境变量照常生效。地址里可能带用户名和密码，所以不进 `repr`、日志与报错。
+    """
+
+    max_size_mb: int = DEFAULT_WEB_IMAGE_MAX_SIZE_MB
+    download_timeout_seconds: float = DEFAULT_WEB_IMAGE_TIMEOUT_SECONDS
+    max_display_px: int = DEFAULT_MAX_DISPLAY_PX
+    extra_hosts: tuple[str, ...] = ()
+    proxy: str | None = field(default=None, repr=False)
+
+    @property
+    def max_bytes(self) -> int:
+        return self.max_size_mb * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ProviderSettings:
     """`[providers.<服务商>]` 表：调用这家服务商时的端点与代理。
 
@@ -584,6 +623,7 @@ class Settings:
     memory: MemorySettings | None = None  # 只在 `decisions` 不为空时生效
     turns: TurnSettings = TurnSettings()
     image_generation: ImageGenerationSettings | None = None
+    web_images: WebImageSettings = WebImageSettings()
     backup: BackupSettings = BackupSettings()
     alerts: AlertSettings = AlertSettings()
     reminders: ReminderSettings = ReminderSettings()
@@ -847,6 +887,8 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
     turns_table = table.table("turns")
     turns = None if turns_table is None else _parse_turns(turns_table)
     image_ok, image_generation = _parse_image_generation(table)
+    web_images_table = table.table("web_images")
+    web_images = None if web_images_table is None else _parse_web_images(web_images_table)
     backup_table = table.table("backup")
     backup = None if backup_table is None else _parse_backup(backup_table)
     alerts_table = table.table("alerts")
@@ -878,6 +920,7 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         or not memory_ok
         or turns is None
         or not image_ok
+        or web_images is None
         or backup is None
         or alerts is None
         or reminders is None
@@ -898,6 +941,7 @@ def _parse_root(table: _Table, base_dir: Path) -> Settings | None:
         memory=memory,
         turns=turns,
         image_generation=image_generation,
+        web_images=web_images,
         backup=backup,
         alerts=alerts,
         reminders=reminders,
@@ -1041,6 +1085,39 @@ def _parse_attachments(table: _Table) -> AttachmentSettings | None:
         retention_days=retention_days,
         history_turns=history_turns,
         extra_download_hosts=extra_hosts,
+    )
+
+
+def _parse_web_images(table: _Table) -> WebImageSettings | None:
+    max_size_mb = _positive_int(
+        table, "max_size_mb", DEFAULT_WEB_IMAGE_MAX_SIZE_MB, MAX_WEB_IMAGE_MAX_SIZE_MB
+    )
+    timeout = table.number("download_timeout_seconds", DEFAULT_WEB_IMAGE_TIMEOUT_SECONDS)
+    if timeout is not None and not 0 < timeout <= MAX_WEB_IMAGE_TIMEOUT_SECONDS:
+        table.problem(
+            "download_timeout_seconds", f"应大于 0、不大于 {MAX_WEB_IMAGE_TIMEOUT_SECONDS}"
+        )
+        timeout = None
+    max_display_px = _bounded_int(
+        table, "max_display_px", DEFAULT_MAX_DISPLAY_PX, MIN_MAX_DISPLAY_PX, MAX_MAX_DISPLAY_PX
+    )
+    extra_hosts = _parse_download_hosts(table, "extra_hosts")
+    proxy_ok, proxy = _optional_url(table, "proxy", _PROXY_SCHEMES)
+    table.finish()
+    if (
+        max_size_mb is None
+        or timeout is None
+        or max_display_px is None
+        or extra_hosts is None
+        or not proxy_ok
+    ):
+        return None
+    return WebImageSettings(
+        max_size_mb=max_size_mb,
+        download_timeout_seconds=timeout,
+        max_display_px=max_display_px,
+        extra_hosts=extra_hosts,
+        proxy=proxy,
     )
 
 
@@ -1420,6 +1497,10 @@ def _optional_base_url(table: _Table) -> tuple[bool, str | None]:
 
 
 def _is_url(value: str, schemes: Sequence[str]) -> bool:
+    """协议是 `schemes` 之一、有主机名，并且 HTTP 客户端（`httpx2`）解析得了。主机名合不合法（国际化域名、IP 地址、
+    方括号里的 IPv6 等）以客户端自己的判断为准，不自己另写规则。"""
+    # 空白：TOML 允许写成转义，`urlsplit()` 会默默去掉其中的一些；先挑出来。其余字符（控制字符、U+200D 这类格式字符）
+    # 交给客户端判断：它拒绝不可打印的 ASCII 字符，格式字符在路径里照常可用。
     if any(c.isspace() for c in value):
         return False
     try:
@@ -1427,7 +1508,13 @@ def _is_url(value: str, schemes: Sequence[str]) -> bool:
         parts.port  # noqa: B018  端口不是数字时这里抛 ValueError
     except ValueError:
         return False
-    return parts.scheme.lower() in schemes and bool(parts.hostname)
+    if parts.scheme.lower() not in schemes or not parts.hostname:
+        return False
+    try:
+        httpx2.URL(value)
+    except httpx2.InvalidURL:
+        return False  # 异常的文案可能带着地址，不往外传
+    return True
 
 
 @dataclass(slots=True)
@@ -1447,6 +1534,7 @@ class _ModelDraft:
     search: bool | None
     show_process: bool | None
     image_generation: bool | None
+    web_images: bool | None
     ok: bool  # 这一项自身没有问题
 
 
@@ -1498,6 +1586,7 @@ def _parse_models(root: _Table) -> tuple[ModelSettings, ...] | None:
             search=cast(bool, d.search),
             show_process=cast(bool, d.show_process),
             image_generation=cast(bool, d.image_generation),
+            web_images=cast(bool, d.web_images),
         )
         for d in drafts
     )
@@ -1527,6 +1616,7 @@ def _parse_model(table: _Table) -> _ModelDraft:
     search = table.boolean("search", False)
     show_process = table.boolean("show_process", False)
     image_generation = table.boolean("image_generation", False)
+    web_images = table.boolean("web_images", True)
     table.finish()
     ok = (
         name is not None
@@ -1540,6 +1630,7 @@ def _parse_model(table: _Table) -> _ModelDraft:
         and search is not None
         and show_process is not None
         and image_generation is not None
+        and web_images is not None
     )
     return _ModelDraft(
         table=table,
@@ -1555,6 +1646,7 @@ def _parse_model(table: _Table) -> _ModelDraft:
         search=search,
         show_process=show_process,
         image_generation=image_generation,
+        web_images=web_images,
         ok=ok,
     )
 

@@ -8,6 +8,7 @@ import contextlib
 import itertools
 import json
 import logging
+import re
 import sqlite3
 import time
 import types
@@ -20,6 +21,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import aclosing, asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -38,24 +40,31 @@ from qtalk_bot.batching import Batcher
 from qtalk_bot.bot import (
     ALERT_KEY_PREFIX,
     DOWNLOAD_HOST_ALERTS,
+    LIBRARY_PREFIX,
     MAX_ATTACHMENTS_DESCRIBED,
     MAX_ELEMENTS_DESCRIBED,
     MAX_REDIRECTS,
     PLATFORM_HOSTS,
+    STALE_LIBRARY_SECONDS,
     AdminAlertSender,
     Handlers,
     QQChat,
     QQDownloader,
+    SharedLibrary,
     ShareLinks,
     chat_input,
     describe_non_text,
     download_hosts,
     download_refusal,
     fetch_bot_name,
+    is_library_file,
     is_rejection,
+    library_file_name,
+    library_sweep,
     refuse_cookies,
     refused_host_alert,
     register,
+    run_library_sweep,
 )
 from qtalk_bot.chat import ChatHandler
 from qtalk_bot.config import (
@@ -70,6 +79,8 @@ from qtalk_bot.conversation import (
     TYPING_PULSE_SECONDS,
     ChoiceButton,
     Conversation,
+    LibraryImage,
+    SendError,
     SendRejectedError,
     SendUncertainError,
 )
@@ -1245,6 +1256,323 @@ async def test_reply_channel_maps_image_errors(
     assert len(replying) == (1 if message.reply_error is not None else 0)
 
 
+@dataclass
+class _Listed:
+    """素材库里的一张图（`bot.LibraryItem` 的替身）。"""
+
+    image_id: str
+    url: str
+    file_name: str | None
+    created_at: int | None
+
+
+class _FakeLibrary:
+    """素材库（`bot.ImageLibrary`）的替身：记下上传与删除，按 `items` 列出。"""
+
+    def __init__(
+        self,
+        items: Sequence[_Listed] = (),
+        *,
+        upload_error: Exception | None = None,
+        delete_errors: dict[str, Exception] | None = None,
+        list_error: Exception | None = None,
+        ids: dict[bytes, str] | None = None,
+    ) -> None:
+        self.items = list(items)
+        self.upload_error = upload_error
+        self.delete_errors = delete_errors or {}
+        self.list_error = list_error
+        self.ids = ids or {}  # 按内容给定的编号（模拟平台把内容相同的上传合并成同一个编号）
+        self.uploads: list[tuple[bytes | None, str | None]] = []
+        self.deleted: list[str] = []
+
+    async def upload(self, *, data: bytes | None = None, file_name: str | None = None) -> _Listed:
+        if self.upload_error is not None:
+            raise self.upload_error
+        self.uploads.append((data, file_name))
+        image_id = self.ids.get(data or b"", f"id-{len(self.uploads)}")
+        return _Listed(image_id, f"qqbot-media://image/v1/{image_id}", None, None)
+
+    async def _listing(self) -> AsyncIterator[_Listed]:
+        for item in self.items:
+            yield item
+        if self.list_error is not None:
+            raise self.list_error
+
+    def iter_images(self) -> AsyncIterator[_Listed]:
+        return self._listing()
+
+    async def delete(self, image: str) -> None:
+        if (error := self.delete_errors.get(image)) is not None:
+            raise error
+        self.deleted.append(image)
+
+
+def library_channel(
+    library: _FakeLibrary | SharedLibrary | None,
+) -> bot_module._QQReplyChannel:  # pyright: ignore[reportPrivateUsage]  测接线层的通道本身
+    """一条消息的回复通道；给的是素材库的替身时为它单独包一层 `SharedLibrary`（共用的直接交给通道）。"""
+    message = cast(pyqbot.C2CMessage, _FakeStreamingMessage())
+    shared = SharedLibrary(library) if isinstance(library, _FakeLibrary) else library
+    return bot_module._QQReplyChannel(message, library=shared)  # pyright: ignore[reportPrivateUsage]  测接线层的通道本身
+
+
+@pytest.mark.parametrize(
+    ("mime_type", "extension"),
+    [("image/png", "png"), ("image/jpeg", "jpg"), ("image/gif", "gif"), ("image/webp", "webp")],
+)
+async def test_reply_channel_uploads_to_the_library_under_a_prefixed_name(
+    mime_type: str, extension: str
+) -> None:
+    library = _FakeLibrary()
+    channel = library_channel(library)
+
+    first = await channel.upload_image(b"data", mime_type)
+    second = await channel.upload_image(b"more", mime_type)
+
+    assert first == LibraryImage(url="qqbot-media://image/v1/id-1", image_id="id-1")
+    assert second.image_id == "id-2"
+    (data, name), (_, other) = library.uploads
+    assert data == b"data"
+    assert name is not None
+    assert other is not None
+    assert re.fullmatch(rf"{LIBRARY_PREFIX}[0-9a-f]{{16}}\.{extension}", name)
+    assert is_library_file(name)  # 定期清理认得出它
+    assert name != other  # 每张一个随机名
+    assert channel.budget.replies == 0  # 不是一条消息
+
+
+async def test_a_library_id_shared_by_two_channels_is_deleted_only_after_both_let_go() -> None:
+    # 平台若把内容相同的两次上传合并成同一个编号：先结束的一轮不能删掉另一条流式消息还在用的图。
+    library = _FakeLibrary(ids={b"same": "shared"})
+    shared = SharedLibrary(library)
+    alice, bob = library_channel(shared), library_channel(shared)
+
+    first = await alice.upload_image(b"same", "image/png")
+    second = await bob.upload_image(b"same", "image/png")
+    other = await bob.upload_image(b"other", "image/png")
+    assert first.image_id == second.image_id == "shared"
+
+    await alice.delete_image(first)
+    assert library.deleted == []  # 小李的回答还在用
+    await bob.delete_image(other)
+    assert library.deleted == ["id-3"]  # 编号不同的互不影响
+    await bob.delete_image(second)
+    assert library.deleted == ["id-3", "shared"]
+    assert len(shared) == 0
+
+
+async def test_the_same_id_twice_in_one_answer_is_deleted_once() -> None:
+    library = _FakeLibrary(ids={b"same": "shared"})
+    channel = library_channel(library)
+
+    images = [await channel.upload_image(b"same", "image/png") for _ in range(2)]
+    for image in images:
+        await channel.delete_image(image)
+
+    assert library.deleted == ["shared"]
+
+
+async def test_ids_left_for_the_sweep_drop_out_of_the_count_table() -> None:
+    # 流式消息没有确认结束的一轮不删素材、也不来减引用数：表里的编号在上次上传过了清理的年龄之后去掉。
+    now = [0.0]
+    library = _FakeLibrary()
+    shared = SharedLibrary(library, clock=lambda: now[0])
+    channel = library_channel(shared)
+
+    for _ in range(3):
+        await channel.upload_image(b"kept", "image/png")  # 一直不删
+    assert len(shared) == 3
+    now[0] = STALE_LIBRARY_SECONDS + 1
+    fresh = await channel.upload_image(b"new", "image/png")
+
+    assert len(shared) == 1
+    await channel.delete_image(fresh)
+    assert library.deleted == [fresh.image_id]
+    assert len(shared) == 0
+
+
+@pytest.mark.parametrize(
+    ("library", "mime_type"),
+    [
+        (_FakeLibrary(upload_error=api_error(400, 40035002)), "image/png"),  # 超过大小上限
+        (_FakeLibrary(upload_error=api_error(400, 40035007)), "image/png"),  # 超过 100 张
+        # 说不准传上去没有：也没有发给用户任何东西；真传上去的由定期清理删掉。
+        (_FakeLibrary(upload_error=pyqbot.NetworkError("超时", outcome_unknown=True)), "image/png"),
+        (_FakeLibrary(upload_error=RuntimeError("客户端已关闭")), "image/png"),
+        (_FakeLibrary(), "image/heic"),  # 素材库不收的格式
+        (None, "image/png"),  # 没有素材库
+    ],
+)
+async def test_reply_channel_upload_failures_are_rejections(
+    library: _FakeLibrary | None, mime_type: str
+) -> None:
+    channel = library_channel(library)
+
+    with pytest.raises(SendRejectedError) as info:
+        await channel.upload_image(b"data", mime_type)
+
+    assert "qqbot-media" not in str(info.value)
+    assert library is None or library.uploads == []
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (api_error(400, 40035008), SendRejectedError),  # 已经删了
+        (pyqbot.NetworkError("超时", outcome_unknown=True), SendUncertainError),
+        (RuntimeError("客户端已关闭"), SendRejectedError),
+    ],
+)
+async def test_reply_channel_deletes_from_the_library_and_maps_errors(
+    error: Exception, expected: type[SendError]
+) -> None:
+    library = _FakeLibrary(delete_errors={"bad": error})
+    channel = library_channel(library)
+
+    await channel.delete_image(LibraryImage(url="qqbot-media://image/v1/ok", image_id="ok"))
+    with pytest.raises(expected):
+        await channel.delete_image(LibraryImage(url="qqbot-media://image/v1/bad", image_id="bad"))
+
+    assert library.deleted == ["ok"]
+
+
+NOW = 1_800_000_000
+
+
+async def test_library_sweep_deletes_only_old_images_with_our_prefix(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    old = NOW - STALE_LIBRARY_SECONDS
+    library = _FakeLibrary(
+        [
+            _Listed("stale", "u1", library_file_name("png"), old),
+            _Listed("fresh", "u2", library_file_name("png"), old + 1),  # 可能还有回答在用
+            _Listed("theirs", "u3", "kline.png", old - 3600),  # 不是回答里的图
+            _Listed("unknown", "u4", library_file_name("png"), None),  # 平台没给上传时间
+            _Listed("nameless", "u5", None, old - 3600),
+            _Listed("older", "u6", library_file_name("jpg"), old - 86400),
+            _Listed("gif", "u7", f"{LIBRARY_PREFIX}0123456789abcdef.gif", old),
+            _Listed("webp", "u8", f"{LIBRARY_PREFIX}fedcba9876543210.webp", old),
+        ]
+    )
+
+    await library_sweep(SharedLibrary(library))(NOW)
+
+    assert library.deleted == ["stale", "older", "gif", "webp"]
+    assert "删掉了素材库里遗留的回答图片 4 张" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        f"{LIBRARY_PREFIX}logo.png",  # 前缀相同、人工上传的
+        f"{LIBRARY_PREFIX}aaaa.png",
+        f"{LIBRARY_PREFIX}0123456789abcdef0.png",  # 随机串长了
+        f"{LIBRARY_PREFIX}0123456789ABCDEF.png",  # 大写
+        f"{LIBRARY_PREFIX}0123456789abcdef.svg",  # 不是会传的格式
+        f"{LIBRARY_PREFIX}0123456789abcdef.png.bak",
+        f"x{LIBRARY_PREFIX}0123456789abcdef.png",
+        f"{LIBRARY_PREFIX}0123456789abcdef.png\n",
+    ],
+)
+async def test_library_sweep_leaves_names_not_in_the_generated_format(name: str) -> None:
+    old = NOW - STALE_LIBRARY_SECONDS - 86400
+    library = _FakeLibrary([_Listed("theirs", "u1", name, old)])
+
+    await library_sweep(SharedLibrary(library))(NOW)
+
+    assert not is_library_file(name)
+    assert library.deleted == []
+
+
+async def test_library_sweep_failures_are_only_logged(caplog: pytest.LogCaptureFixture) -> None:
+    old = NOW - STALE_LIBRARY_SECONDS - 1
+    library = _FakeLibrary(
+        [
+            _Listed("a", "u1", library_file_name("png"), old),
+            _Listed("b", "u2", library_file_name("png"), old),
+        ],
+        delete_errors={"a": api_error(500, None, outcome_unknown=True)},
+        list_error=pyqbot.NetworkError("超时", outcome_unknown=True),
+    )
+
+    await library_sweep(SharedLibrary(library))(NOW)  # 不抛出
+
+    assert library.deleted == ["b"]  # 列到一半出错：已经列出的照样清
+    assert "没能列出素材库里的图片" in caplog.text
+    assert "没能删掉素材库里遗留的图片" in caplog.text
+    closed = _FakeLibrary(list_error=RuntimeError("客户端已关闭"))
+    await library_sweep(SharedLibrary(closed))(NOW)
+    assert closed.deleted == []
+
+
+async def test_library_sweep_skips_an_old_id_that_was_just_uploaded_again() -> None:
+    # 平台若把内容相同的上传合并成同一个编号：列出时的旧图可能正被新的一轮用着，留给下一次清理。
+    now = [0.0]
+    old = NOW - STALE_LIBRARY_SECONDS - 86400
+    library = _FakeLibrary(
+        [
+            _Listed("shared", "u1", library_file_name("png"), old),
+            _Listed("lonely", "u2", library_file_name("png"), old),
+        ],
+        ids={b"same": "shared"},
+    )
+    shared = SharedLibrary(library, clock=lambda: now[0])
+    channel = library_channel(shared)
+    image = await channel.upload_image(b"same", "image/png")  # 新的一轮拿到了同一个编号
+    sweep = library_sweep(shared)
+
+    await sweep(NOW)
+    assert library.deleted == ["lonely"]
+
+    await channel.delete_image(image)  # 那一轮结束：只有它在用，真的删掉
+    assert library.deleted == ["lonely", "shared"]
+
+
+async def test_library_sweep_deletes_ids_left_for_it_once_they_are_old() -> None:
+    # 留给定期清理的素材不减引用数；上传超过清理的年龄之后照样删。
+    now = [0.0]
+    library = _FakeLibrary(
+        [_Listed("id-1", "u1", library_file_name("png"), NOW - STALE_LIBRARY_SECONDS)]
+    )
+    shared = SharedLibrary(library, clock=lambda: now[0])
+    await library_channel(shared).upload_image(b"kept", "image/png")  # 一直不删
+
+    await library_sweep(shared)(NOW)
+    assert library.deleted == []  # 这个进程刚传过：可能还在用
+    now[0] = STALE_LIBRARY_SECONDS + 1
+    await library_sweep(shared)(NOW)
+    assert library.deleted == ["id-1"]
+
+
+async def test_the_library_sweep_runs_at_start_and_then_on_its_interval() -> None:
+    listed = asyncio.Event()
+
+    class Counting(_FakeLibrary):
+        def __init__(self) -> None:
+            super().__init__()
+            self.listings = 0
+
+        def iter_images(self) -> AsyncIterator[_Listed]:
+            self.listings += 1
+            listed.set()
+            return super().iter_images()
+
+    library = Counting()
+    task = asyncio.create_task(
+        run_library_sweep(SharedLibrary(library), clock=lambda: NOW, interval=3600)
+    )
+    async with asyncio.timeout(5):
+        await listed.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert library.listings == 1
+
+
 async def test_reply_without_a_reference_index_leaves_it_empty(db: Database) -> None:
     await welcomed_alice(db)
     platform = Platform([c2c(ALICE, "你好", "ROBOT1.0_fake-1")])
@@ -1704,6 +2032,9 @@ async def test_downloader_errors_carry_no_address() -> None:
         ("https://qq.com.evil.example/a", "主机不在下载白名单里"),
         ("https://localhost/a", "主机不在下载白名单里"),
         ("https://multimedia.nt.qq.com.cn:bad/a", "地址不合法"),
+        # 方括号里不是 IP 的（`urlsplit` 当它是 IPvFuture，`hostname` 去掉了方括号）不能当成白名单里的域名。
+        ("https://[v1.multimedia.nt.qq.com.cn]/a", "地址不合法"),
+        ("https://[v1.multimedia.nt.qq.com.cn]:443/a", "地址不合法"),
     ],
 )
 async def test_downloads_only_go_to_known_platform_hosts(url: str, reason: str) -> None:

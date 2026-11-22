@@ -391,6 +391,7 @@ class RequestBuilder:
         memory: Memory | None = None,
         drawing_possible: bool = True,
         reminders: ReminderBrief | None = None,
+        web_images_possible: bool = False,
     ) -> None:
         self._store = store
         self._media_dir = media_dir  # 这个用户的附件目录名
@@ -408,6 +409,8 @@ class RequestBuilder:
         # `prompt.NO_DRAWING_AT_ALL`）。
         self._drawing_possible = drawing_possible
         self._reminders = reminders  # 启用了提醒时系统提示词里的提醒资料
+        # 回答里网上的图片能不能显示（对话给了下载器）：能的话，打开了 `web_images` 的模型的格式说明改成可以插图。
+        self._web_images_possible = web_images_possible
 
     def set_context(self, history: Sequence[HistoryEntry], memory: Memory | None) -> None:
         """换上选完话题之后才组装出的历史与记忆（分话题时，决策之后调用，组装请求之前）。"""
@@ -467,6 +470,7 @@ class RequestBuilder:
                 else None,
                 drawing_possible=self._drawing_possible,
                 reminders=self._reminders,
+                web_images=model.web_images and self._web_images_possible,
             ),
             messages=tuple(messages),
             max_output_tokens=self._max_output_tokens,

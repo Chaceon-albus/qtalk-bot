@@ -25,6 +25,7 @@ from qtalk_bot.config import AttachmentTimeoutAction, TurnSettings
 from qtalk_bot.conversation import (
     ChatInput,
     ChoiceButton,
+    LibraryImage,
     Received,
     ReplyChannel,
     ReplyStream,
@@ -200,6 +201,12 @@ class Channel:
 
     async def send_markdown(self, markdown: str) -> None:
         self.sent.append(f"[Markdown] {markdown}")
+
+    async def upload_image(self, data: bytes, mime_type: str) -> LibraryImage:
+        raise AssertionError("这里的替身不用素材库")
+
+    async def delete_image(self, image: LibraryImage) -> None:
+        raise AssertionError("这里的替身不用素材库")
 
     def open_process(self) -> ReplyStream:
         raise AssertionError("这里的替身不发过程消息")

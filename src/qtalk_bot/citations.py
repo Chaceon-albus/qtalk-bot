@@ -47,8 +47,8 @@ MAX_TITLE_LENGTH = 60
 SOURCES_HEADING = "来源："
 
 _SCHEMES = ("http", "https")
-# 主机部分：域名加可选的端口。域名的写法与 `config.py` 的 `_DOMAIN`（`extra_download_hosts`）、`bot.py` 的
-# `_HOST` 相同：由点分开的标签，每段 1–63 个字母、数字或连字符（不以连字符开头或结尾），最后一段是 2–63 个字母，
+# 主机部分：域名加可选的端口。域名的写法与 `config.py` 的 `_DOMAIN`（`extra_download_hosts`）、`media.py` 的
+# `HOST_NAME` 相同：由点分开的标签，每段 1–63 个字母、数字或连字符（不以连字符开头或结尾），最后一段是 2–63 个字母，
 # 全长不超过 253。只认小写，比较前先转成小写。
 _NETLOC = re.compile(r"(?P<host>[A-Za-z0-9.-]+)(?::(?P<port>[0-9]{1,5}))?")
 _DOMAIN = re.compile(r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")

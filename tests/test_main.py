@@ -1,15 +1,24 @@
 """启动入口 `python -m qtalk_bot`：不连接平台，`Bot.start()` 用替身代替。"""
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
 import signal
 import sqlite3
-from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Sequence,
+)
 from pathlib import Path
 from typing import cast
 from zoneinfo import ZoneInfo
 
+import httpx2
 import pyqbot
 import pytest
 
@@ -18,7 +27,7 @@ from qtalk_bot import memory
 from qtalk_bot.access import User
 from qtalk_bot.alerts import Alerts
 from qtalk_bot.batching import Batcher
-from qtalk_bot.bot import Handlers
+from qtalk_bot.bot import Handlers, LibraryItem
 from qtalk_bot.config import (
     AttachmentSettings,
     DecisionSettings,
@@ -27,6 +36,7 @@ from qtalk_bot.config import (
     MemorySettings,
     ModelSettings,
     Settings,
+    WebImageSettings,
     load_secrets,
     load_settings,
 )
@@ -34,10 +44,12 @@ from qtalk_bot.conversation import Conversation
 from qtalk_bot.describe import Describer
 from qtalk_bot.gate import Gate
 from qtalk_bot.health import Heartbeat
+from qtalk_bot.image_download import CLOSE_TIMEOUT_SECONDS, ImageDownloader
 from qtalk_bot.llm import ChatEvent, ChatRequest, Finished, FinishReason, Provider
 from qtalk_bot.media import Downloader, Fetcher, MediaStore
 from qtalk_bot.memory import Summarizer
 from qtalk_bot.storage import Database, StorageError
+from qtalk_bot.web_images import Failure, FetchFailed
 
 FAKE_ENV = {
     "APP_ID": "fake-app-id",
@@ -77,6 +89,81 @@ def fake_get_me(monkeypatch: pytest.MonkeyPatch) -> list[pyqbot.Bot]:
 
     monkeypatch.setattr(pyqbot.Bot, "get_me", get_me)
     return calls
+
+
+class FakeLibrary:
+    """机器人素材库（`bot.images`）的替身：空的，记下列出过几次；不该有上传与删除。"""
+
+    def __init__(self) -> None:
+        self.listings = 0
+        self.listed = asyncio.Event()
+
+    async def upload(
+        self, *, data: bytes | None = None, file_name: str | None = None
+    ) -> LibraryItem:
+        raise AssertionError("启动测试里不传素材")
+
+    def iter_images(self) -> AsyncIterator[LibraryItem]:
+        self.listings += 1
+        self.listed.set()
+        return _nothing_listed()
+
+    async def delete(self, image: str) -> None:
+        raise AssertionError("启动测试里不删素材")
+
+
+async def _nothing_listed() -> AsyncIterator[LibraryItem]:
+    for item in ():
+        yield item
+
+
+@pytest.fixture(autouse=True)
+def fake_library(monkeypatch: pytest.MonkeyPatch) -> list[FakeLibrary]:
+    """每个 `pyqbot.Bot` 的素材库都换成替身：启动后的素材库清理不碰真实网络。"""
+    created: list[FakeLibrary] = []
+
+    def images(http: object) -> FakeLibrary:
+        library = FakeLibrary()
+        created.append(library)
+        return library
+
+    monkeypatch.setattr("pyqbot._client.Images", images)
+    return created
+
+
+async def finished(shutdown: Coroutine[object, object, bool], seconds: float = 5) -> None:
+    """在独立的任务里关停，最多看 `seconds` 秒（只防挂死）：断言它在这之前自己做完、期间没有被取消过。不用
+    `asyncio.timeout()` 包住它：`_shut_down()` 的等待会接住那次取消、接着等，测试就看不出它其实超时了。"""
+    task = asyncio.ensure_future(shutdown)
+    await asyncio.wait({task}, timeout=seconds)
+    assert task.done(), "关停没有在限定的时间里自己做完"
+    assert task.result() is False  # 没有被取消过
+
+
+class OfflineSite:
+    """离线的图站替身（交给 `httpx2.MockTransport`）：记下收到的请求，一律回 404。"""
+
+    def __init__(self) -> None:
+        self.requests: list[httpx2.Request] = []
+
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        self.requests.append(request)
+        return httpx2.Response(404)
+
+
+@pytest.fixture(autouse=True)
+def offline_image_downloads(monkeypatch: pytest.MonkeyPatch) -> OfflineSite:
+    """`run()` 里建的图片下载器也用离线的传输：启动测试不经它下载，万一下载了也碰不到网络。"""
+    site = OfflineSite()
+
+    class Offline(ImageDownloader):
+        def __init__(
+            self, settings: WebImageSettings, *, transport: httpx2.AsyncBaseTransport | None = None
+        ) -> None:
+            super().__init__(settings, transport=httpx2.MockTransport(site))
+
+    monkeypatch.setattr(entry, "ImageDownloader", Offline)
+    return site
 
 
 def test_config_error_prints_message_and_exits_nonzero(
@@ -129,6 +216,20 @@ def test_run_opens_database_registers_handlers_and_closes(
         names = [row[0] for row in conn.execute("SELECT name FROM users")]
     conn.close()
     assert names == ["管理员"]
+
+
+def test_startup_sweeps_the_library_once_through_the_bot_client(
+    config: Path, monkeypatch: pytest.MonkeyPatch, fake_library: list[FakeLibrary]
+) -> None:
+    async def start(self: pyqbot.Bot) -> None:
+        async with asyncio.timeout(5):
+            await fake_library[0].listed.wait()  # 启动时的那一次清理
+
+    monkeypatch.setattr(pyqbot.Bot, "start", start)
+    assert entry.main() == 0
+
+    (library,) = fake_library
+    assert library.listings == 1
 
 
 def test_qq_base_url_is_passed_to_pyqbot(config: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -655,6 +756,177 @@ async def test_shutdown_stops_receiving_first_and_closes_the_bot_after_the_repli
     ]
 
 
+async def test_image_downloader_is_closed_after_the_replies_have_wound_down() -> None:
+    # 图片下载只在回答里用：等对话收尾（第 3 步）之后才关它自己的 HTTP 客户端，放在最后的后台收尾里。
+    order: list[str] = []
+
+    class RecordingBot:
+        async def stop(self) -> None:
+            order.append("bot.stop")
+
+        async def close(self) -> None:
+            order.append("bot.close")
+
+    class RecordingConversation:
+        async def drain(self) -> None:
+            order.append("conversation.drain")
+
+    class RecordingDownloader(ImageDownloader):
+        async def aclose(self, wait: float = CLOSE_TIMEOUT_SECONDS) -> None:
+            order.append("downloader.aclose")
+            await super().aclose(wait)
+
+    server = OfflineSite()
+    downloader = RecordingDownloader(WebImageSettings(), transport=httpx2.MockTransport(server))
+    await entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+        cast(pyqbot.Bot, RecordingBot()),
+        cast(Conversation, RecordingConversation()),
+        None,
+        None,
+        None,
+        downloader=downloader,
+    )
+
+    assert order == ["bot.stop", "conversation.drain", "bot.close", "downloader.aclose"]
+    failure = await downloader.fetch("https://images.nasa.gov/a.png")
+    assert failure == FetchFailed(Failure.NETWORK, host="images.nasa.gov", error="RuntimeError")
+    assert server.requests == []  # 客户端关了，请求根本没发出
+
+
+async def test_image_downloader_client_is_closed_even_when_the_budget_is_used_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 前面的收尾用完了总时限：被放弃的下载留下的收尾一直不完，客户端也照样关掉。关客户端留的那一段放宽到只起
+    # 防挂死的作用，机器停顿不影响结论。
+    monkeypatch.setattr(entry, "SHUTDOWN_GRACE_SECONDS", 0.2)
+    monkeypatch.setattr(entry, "BOT_CLOSE_SECONDS", 0.0)
+    monkeypatch.setattr(entry, "CLIENT_CLOSE_SECONDS", 30.0)
+
+    class QuickBot:
+        async def stop(self) -> None: ...
+
+        async def close(self) -> None: ...
+
+    class Replies:
+        async def drain(self) -> None:
+            await asyncio.Event().wait()  # 回答收尾一直不完，用光总时限
+
+    server = OfflineSite()
+    downloader = ImageDownloader(WebImageSettings(), transport=httpx2.MockTransport(server))
+    lingering = asyncio.create_task(_forever())  # 被放弃的下载留下的、一直关不完的响应
+    downloader._track(lingering)  # pyright: ignore[reportPrivateUsage]
+    waits: list[float] = []
+    real_aclose = downloader.aclose
+
+    async def aclose(wait: float = CLOSE_TIMEOUT_SECONDS) -> None:
+        waits.append(wait)
+        await real_aclose(wait)
+
+    monkeypatch.setattr(downloader, "aclose", aclose)
+    try:
+        await finished(
+            entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+                cast(pyqbot.Bot, QuickBot()),
+                cast(Conversation, Replies()),
+                None,
+                None,
+                None,
+                downloader=downloader,
+            )
+        )
+        failure = await downloader.fetch("https://images.nasa.gov/a.png")
+    finally:
+        lingering.cancel()
+
+    # 总时限已经用完：不再等后台的收尾，直接关客户端（生产环境只给关客户端留 CLIENT_CLOSE_SECONDS）。
+    assert waits == [0.0]
+    assert failure == FetchFailed(Failure.NETWORK, host="images.nasa.gov", error="RuntimeError")
+    assert server.requests == []
+
+
+async def test_image_downloader_waits_for_its_background_before_closing_the_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 总时限还有剩余时，关停先等被放弃的下载留下的收尾，做完了才关客户端。不靠真实时间：收尾由事件放开，各个时限
+    # 放宽到只起防挂死的作用。
+    monkeypatch.setattr(entry, "SHUTDOWN_GRACE_SECONDS", 60.0)
+    monkeypatch.setattr(entry, "BOT_CLOSE_SECONDS", 0.0)
+    monkeypatch.setattr(entry, "IMAGE_CLOSE_SECONDS", 30.0)
+
+    class QuickBot:
+        async def stop(self) -> None: ...
+
+        async def close(self) -> None: ...
+
+    server = OfflineSite()
+    downloader = ImageDownloader(WebImageSettings(), transport=httpx2.MockTransport(server))
+    release = asyncio.Event()
+
+    async def closing() -> None:
+        await release.wait()
+
+    lingering = asyncio.create_task(closing())  # 被放弃的下载留下的收尾，放开之前一直不完
+    downloader._track(lingering)  # pyright: ignore[reportPrivateUsage]
+    entered = asyncio.Event()
+    real_aclose = downloader.aclose
+
+    async def aclose(wait: float = CLOSE_TIMEOUT_SECONDS) -> None:
+        entered.set()
+        await real_aclose(wait)
+
+    monkeypatch.setattr(downloader, "aclose", aclose)
+    client = downloader._client  # pyright: ignore[reportPrivateUsage]  看客户端什么时候关
+    shutdown = asyncio.ensure_future(
+        entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+            cast(pyqbot.Bot, QuickBot()), None, None, None, None, downloader=downloader
+        )
+    )
+    try:
+        async with asyncio.timeout(5):  # 只防挂死
+            await entered.wait()  # 关停进入了等下载器收尾的那一步
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not client.is_closed  # 收尾还没做完：客户端还开着
+        assert not shutdown.done()
+        release.set()  # 收尾做完
+        await asyncio.wait({shutdown}, timeout=5)  # 只防挂死
+        assert shutdown.done()
+        assert shutdown.result() is False  # 自己做完，期间没有被取消
+        assert client.is_closed
+    finally:
+        release.set()
+        await asyncio.wait({lingering})
+
+    assert server.requests == []
+
+
+async def test_run_keeps_image_addresses_out_of_every_logger(
+    config: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # 不经 main() 直接调用 run() 时，httpx2 在 INFO 级别记的完整地址也不能进日志。
+    async def start(self: pyqbot.Bot) -> None: ...
+
+    monkeypatch.setattr(pyqbot.Bot, "start", start)
+    saved = {name: logging.getLogger(name).level for name in entry.QUIET_LOGGERS}
+    for name in saved:
+        logging.getLogger(name).setLevel(logging.NOTSET)  # 像一个没经过 main() 的进程
+    url = "https://images.nasa.gov/SECRET-PATH/a.png?q=SECRET-QUERY"
+    try:
+        await entry.run(load_secrets(), load_settings())
+        caplog.set_level(logging.DEBUG)
+        downloader = ImageDownloader(
+            WebImageSettings(), transport=httpx2.MockTransport(OfflineSite())
+        )
+        await downloader.fetch(url)
+        await downloader.aclose()
+    finally:
+        for name, level in saved.items():
+            logging.getLogger(name).setLevel(level)
+
+    assert [record.name for record in caplog.records if "SECRET" in record.getMessage()] == []
+    assert "SECRET" not in caplog.text
+
+
 async def test_stop_timeout_only_ends_the_wait_and_close_cancels_the_handler(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -675,10 +947,11 @@ async def test_stop_timeout_only_ends_the_wait_and_close_cancels_the_handler(
         async def drain(self) -> None:
             seen.append(("conversation.drain", downloading.done()))
 
-    async with asyncio.timeout(5):
-        await entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+    await finished(
+        entry._shut_down(  # pyright: ignore[reportPrivateUsage]
             bot, cast(Conversation, RecordingConversation()), None, None, None
         )
+    )
 
     assert seen == [("conversation.drain", False)]  # stop() 到期后处理函数仍在运行
     assert downloading.cancelled()  # 由 close() 取消
@@ -705,8 +978,8 @@ async def test_bot_close_keeps_its_share_of_the_budget_when_replies_take_too_lon
             await asyncio.sleep(0.05)
             closed.append(True)
 
-    async with asyncio.timeout(5):
-        await entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+    await finished(
+        entry._shut_down(  # pyright: ignore[reportPrivateUsage]
             cast(pyqbot.Bot, RecordingBot()),
             None,
             None,
@@ -714,6 +987,7 @@ async def test_bot_close_keeps_its_share_of_the_budget_when_replies_take_too_lon
             None,
             cast(Batcher, StuckBatcher()),
         )
+    )
 
     assert closed == [True]  # 收尾超时了，Bot 仍有时间关闭
 
@@ -862,8 +1136,8 @@ async def test_alerts_are_stopped_even_when_the_whole_budget_is_used_up(
     alerts.notify("k", "在途的提醒")
     await sending.wait()
     (in_flight,) = asyncio.all_tasks() - before
-    async with asyncio.timeout(5):
-        await entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+    await finished(
+        entry._shut_down(  # pyright: ignore[reportPrivateUsage]
             cast(pyqbot.Bot, QuickBot()),
             None,
             None,
@@ -873,6 +1147,7 @@ async def test_alerts_are_stopped_even_when_the_whole_budget_is_used_up(
             None,
             alerts,
         )
+    )
 
     assert in_flight.done() or in_flight.cancelling()  # 关停结束时已经取消了在途的发送
     assert not alerts.notify("k2", "关停之后")
@@ -883,6 +1158,85 @@ async def test_alerts_are_stopped_even_when_the_whole_budget_is_used_up(
 
 
 # ---- 里程碑 9：心跳、定时备份、磁盘检查、迁移前备份、模型的观察点 ----
+
+
+async def test_the_library_sweep_has_exited_before_the_qq_client_closes() -> None:
+    # 素材库的清理经 QQ 的客户端发请求：被取消后的收尾（如在途的请求）要在关客户端之前做完。
+    order: list[str] = []
+    cancelled = asyncio.Event()
+
+    class RecordingBot:
+        async def stop(self) -> None: ...
+
+        async def close(self) -> None:
+            order.append("bot.close")
+
+    async def sweeping() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await asyncio.sleep(0.05)  # 在途的请求收尾要一会儿
+            order.append("清理退出")
+            raise
+
+    sweep = entry.Background("素材库清理", asyncio.create_task(sweeping()), uses_qq=True)
+    await asyncio.sleep(0)
+
+    await entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+        cast(pyqbot.Bot, RecordingBot()), None, None, None, None, maintenance=[sweep]
+    )
+
+    assert cancelled.is_set()
+    assert order == ["清理退出", "bot.close"]
+
+
+async def test_a_library_sweep_stuck_after_cancel_does_not_keep_the_bot_from_closing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 等素材库的清理退出只用回答收尾的截止点：给 Bot.close() 与前台入库留的那一段不能被它占掉。不靠真实时间：
+    # 记下每一步等待用的截止点；清理那一步假装等到了截止点（它取消之后一直不退出），看 Bot.close() 照样执行。
+    order: list[str] = []
+    deadlines: dict[str, float] = {}
+    real_drain = entry._drain  # pyright: ignore[reportPrivateUsage]
+
+    async def drain(work: Awaitable[object], deadline: float, what: str) -> bool:
+        deadlines.setdefault(what, deadline)
+        if what == "停掉素材库清理":
+            return False  # 等到了截止点、不再等（真实的等待在别的测试里）
+        return await real_drain(work, deadline, what)
+
+    monkeypatch.setattr(entry, "_drain", drain)
+
+    class RecordingBot:
+        async def stop(self) -> None: ...
+
+        async def close(self) -> None:
+            order.append("bot.close")
+
+    release = asyncio.Event()
+
+    async def stuck() -> None:
+        while not release.is_set():
+            with contextlib.suppress(asyncio.CancelledError):
+                await release.wait()  # 取消之后也不退出，直到测试结束
+
+    sweep = entry.Background("素材库清理", asyncio.create_task(stuck()), uses_qq=True)
+    await asyncio.sleep(0)  # 让它先跑起来
+    try:
+        await finished(
+            entry._shut_down(  # pyright: ignore[reportPrivateUsage]
+                cast(pyqbot.Bot, RecordingBot()), None, None, None, None, maintenance=[sweep]
+            )
+        )
+        assert not sweep.task.done()
+    finally:
+        release.set()
+        await asyncio.wait({sweep.task})
+
+    assert order == ["bot.close"]
+    close_deadline = deadlines["关闭 QQ 连接与前台的处理函数"]
+    assert deadlines["停掉素材库清理"] == close_deadline - entry.BOT_CLOSE_SECONDS
 
 
 async def test_maintenance_stops_first_and_is_awaited_with_the_background(

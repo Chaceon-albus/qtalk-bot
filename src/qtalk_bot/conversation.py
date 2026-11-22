@@ -30,8 +30,9 @@
    （`Router.decision_limits`）把本轮语音的原声和文字题目一起交给它，题目里仍保留识别文本，原声超出内联上限
    的只用识别文本。
    调用过决策的话，调用对话模型之前在事务里再确认一次授权，已不能使用就停下，什么也不发。
-5. 按选出的模型的能力组装上下文（`context.RequestBuilder`），调用它，文字增量经 `MarkdownGuard` 处理后流式
-   回复。出现非空白的正文之前不开始流式消息。模型引用了来源（开了服务商内置搜索时的 `llm.Citation`）的，
+5. 按选出的模型的能力组装上下文（`context.RequestBuilder`），调用它，文字增量经 `web_images.ImageScanner`（它
+   内部先过 `MarkdownGuard`）处理后流式回复；模型写的图片语法按下文「回答里网上的图片」处理。出现非空白的正文之前
+   不开始流式消息。模型引用了来源（开了服务商内置搜索时的 `llm.Citation`）的，
    回答写完后在末尾接上「来源」一段（`citations.py`），它也算回答的一部分；改发纯文本时用纯文本的写法。
    回答接近平台的长度上限（约 15000 字节，超过时平台不看 Markdown 结构硬切）时主动分条（`splitting.py`）：在
    段落之间（或硬上限前的行边界）结束这条流式消息，等结束分片返回，再对同一条消息另开一条接着写；切在代码块里
@@ -178,6 +179,43 @@
 
 **判断插话**（`judge()`）：在事务里复查授权、取出正在回答的消息与新消息的文字版（只有这个用户自己的），交给
 `routing.SteerJudge`；决策记录与用量挂在新消息里最后一条上，被取消时也照记。
+
+**回答里网上的图片**（`docs/design/presentation.md`「图片随回答发出」）：每个模型的输出都经 `ImageScanner`，
+它认出的图片语法（`ImageRef`）不原样交给 QQ。这次调用的模型打开了 `web_images`、构造时给了 `image_fetcher` 时，
+下载这张图（`ImageFetcher`，只抓白名单里的图站）、按 `[web_images].max_display_px` 算显示尺寸、经通道传到素材库
+（`ReplyChannel.upload_image()`，不算被动回复），把 `web_images.render_image()` 写的图片语法放在原处；没打开、
+任何一步失败时放 `web_images.fallback_text()` 的说明文字。换上去的文字直接交给发送端，不再经 guard。
+- **复查授权**：下载之前、上传之前各在事务里复查一次（`_image_text()`）：模型调用开始之后被停用的用户，不再替他
+  把模型写的地址请求发给图站，也不再往素材库传，这张图改成说明文字。
+- **在哪里等**：在读模型流的任务里（`_attempt()` 的 `sink`），一张张按顺序等，等完再接着读模型。这样发送端只见到
+  文字，顺序、分条、第一片之前的 `claim()` 都照旧；第一张图之前什么都没显示时插话照常可以重来；插话停下、时限
+  到期、关停都是取消读流的任务，正在下载的图随之放弃。等图期间暂停这次调用的空闲时限（这段沉默是我们自己的，
+  不是模型的），总时限照常；下载有 `[web_images].download_timeout_seconds`，上传有 `IMAGE_UPLOAD_SECONDS`，回答
+  不会一直停在图片那里。发送端不再接受内容（流式回复被拒、出错、被停下）时不再等，图改成说明文字，模型流照常
+  读完，供改发纯文本用。下载之前、上传之前与采用结果之前都再看一次这次调用的总时限与发送端（`_unwanted()`）：
+  过了时限（看门的任务还没来得及把取消送到）或不再接受内容的，不下载、不上传、不采用（迟到的素材由后台删掉）。
+  这项检查也交给下载器（`ImageFetcher.fetch(wanted=...)`），它在自己的任务里紧挨着每一个请求与读取再问；上传的
+  检查在上传任务里、紧挨着调用通道。上传另有自己的绝对截止时刻（开始等时加 `IMAGE_UPLOAD_SECONDS`），任务开始时
+  与采用结果之前都按它比较。所有等到期的任务都在开始运行时才按绝对时刻算还剩多久（`_sleep_until()`），晚启动
+  不会推迟到期。
+- **到流结束才交出的图**（`ImageScanner.finish()`，如前面有一个到最后都没写完的链接标题）：这时读流的任务与时限
+  都已结束，所以只在这次调用正常结束（模型写完了）时才下载，最多等到这次调用的总时限；超时、出错、插话停下、被
+  取消的直接用说明文字。
+- **被取消时**：下载与上传在单独的任务里（`_wait_image()`），等图期间被取消时不等它们收尾（收尾可能比
+  `GRACE_SECONDS` 还慢，`_attempt()` 不会一直等读流的任务），立即把这张图与同一段里排在它后面的文字交给发送端
+  （图改成说明文字），发送端里的内容才与 guard 的状态（`closing_fence()`）对得上；图片这一步留在后台收尾，由
+  `drain()` 等待，最后还是传上去了的直接删掉。两道防线挡住晚到的内容：这次调用已经被放弃（`turn.run` 不再是它）
+  时不推；`_Outbox` 开始结束（`close()`）之后推进来的一律丢弃。
+- **记进流水的**：模型写的原文（`ImageRef.raw`），显示成图还是说明文字都一样；素材库的地址只是临时的。
+  `_Outbox` 按交给它的文字记送达，再把每张图那一段换回原文（`_Outbox.delivered_answer`），只送达了一半的不算。
+  改发纯文本时图一律写成说明文字，流水仍记原文。图不另存成附件。
+- **删除**：交给发送端的图记在 `_Turn.assets`，这一轮结束时，交给过通道的内容都有了确定的结局、开始过的每一条
+  流式消息都确认结束了（`_Outbox.settled`；什么都没交给通道也算）才在后台删掉（`_drop_assets()`，由 `drain()`
+  等待）。否则（结束分片失败或超时、分片送达不明、出错后放弃了流式消息）一张都不删，留给接线层的定期清理
+  （`bot.library_sweep()`，上传超过 2 小时的）：本地放弃不等于平台已经结束了这条消息，引用已删掉的素材时接口不
+  报错，用户看到的是「图片加载失败」。传上去了却没交给发送端的（发送端已不再接受、显示文字太长、这张图已经不再
+  等）立即删。删不掉只记日志；进程在上传之后、删除之前退出留下的也由定期清理删掉。同一个素材编号可能被几处共用，
+  接线层按引用数删（`bot.SharedLibrary`）。
 """
 
 import asyncio
@@ -225,7 +263,13 @@ from . import (
 from .access import User
 from .citations import Source
 from .commands import day_start
-from .config import AttachmentSettings, ChatSettings, ImageGenerationSettings, ReminderSettings
+from .config import (
+    AttachmentSettings,
+    ChatSettings,
+    ImageGenerationSettings,
+    ReminderSettings,
+    WebImageSettings,
+)
 from .confirmations import (
     TOKEN_SECONDS,
     ButtonKind,
@@ -295,7 +339,6 @@ from .llm import (
     inline_size,
 )
 from .llm.decisions import DecisionMedia
-from .markdown_guard import MarkdownGuard
 from .media import (
     PDF,
     SUPPORTED_KINDS,
@@ -337,6 +380,17 @@ from .routing import (
 from .splitting import Cut, Piece, StreamSplitter
 from .storage import Database
 from .triggers import Once
+from .web_images import (
+    IMAGE_DISPLAY_BYTES,
+    FetchedImage,
+    FetchFailed,
+    ImageRef,
+    ImageScanner,
+    ScanItem,
+    display_size,
+    fallback_text,
+    render_image,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -362,6 +416,12 @@ REPLY_DEADLINE_SECONDS = 55 * 60
 # 每次模型调用至少给这么久：离截止点不到这么久时不再换备用模型（高推理加搜索，一分钟内很难写出有用的回答），
 # 第一次调用的总时限也不短于它（宁可略微越过留出的余量，也给用户一次机会）。
 MIN_CALL_SECONDS = 60.0
+
+IMAGE_UPLOAD_SECONDS = 30.0
+"""回答里一张网上的图传到素材库最多等这么久，超时就改成说明文字。上传是三次请求（pyqbot 每次最多 30 秒），回答
+停在图片那里等着，不能等满。"""
+IMAGE_DELETE_SECONDS = 10.0
+"""删掉素材库里的一张图最多等这么久；删不掉的留给定期清理。"""
 
 CHECKPOINT_RETRY_DELAYS = (0.5, 1.0, 2.0)
 """删掉话题后 WAL 检查点被别的读者挡住时，各次重试之前等的秒数；都失败就记警告，留给之后的检查点。"""
@@ -525,6 +585,35 @@ class ReplyChannel(Protocol):
         """发一条 Markdown 加一行回调按钮的消息，算一次被动回复。它不是回答，引用索引不存，不返回。"""
         ...
 
+    async def upload_image(self, data: bytes, mime_type: str) -> LibraryImage:
+        """把一张图（`mime_type` 是按文件头判断的实际类型）传到机器人的素材库，返回能写进 Markdown 图片语法的地址
+        与删除用的编号。不发消息，不算被动回复。失败一律抛 `SendRejectedError`：上传不会把任何东西发给用户。"""
+        ...
+
+    async def delete_image(self, image: LibraryImage) -> None:
+        """这一处不再用这张图：从素材库删掉（同一个编号别处还在用时，接线层只减引用数）；已结束的消息里的图不受
+        影响。失败抛 `SendError`。"""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class LibraryImage:
+    """素材库里的一张图（`ReplyChannel.upload_image()` 的结果）：`url` 写进图片语法，`image_id` 删除时用。"""
+
+    url: str
+    image_id: str
+
+
+class ImageFetcher(Protocol):
+    """下载回答里网上的图片（接线层用 `image_download.ImageDownloader`）。"""
+
+    async def fetch(
+        self, url: str, *, wanted: Callable[[], bool] | None = None
+    ) -> FetchedImage | FetchFailed:
+        """下载模型写的地址上的图（白名单、时限、大小与格式由实现方把关）。`wanted` 是「这张图还要不要」：实现方在
+        发起每一个网络动作之前问它，不要了就停下。失败时返回 `FetchFailed`，不抛异常。"""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class ChoiceButton:
@@ -590,7 +679,7 @@ class _Attempt:
     provider_model: str
     usage: Usage | None
     ending: Ending
-    text: str = field(repr=False)  # 模型生成的全部文字（未经 MarkdownGuard 处理）
+    text: str = field(repr=False)  # 模型生成的全部文字（未经 ImageScanner 处理）
     given: frozenset[int] = frozenset()  # 这次请求里实际以原件交给模型的、本轮的附件
     sources: tuple[Source, ...] = ()  # 回答引用的来源，整理过（见 `citations.collect()`）
     revoked: bool = False  # 执行函数时复查授权不通过，这次调用就此停下（见 `_RevokedError`）
@@ -607,6 +696,8 @@ class _Attempt:
 
 # 有文字时算作给出了回答、不再换备用模型的结局。`steered` 只在回答已经交给 QQ 之后才会出现，本来也不换。
 _ANSWERED = frozenset((Ending.COMPLETED, Ending.MAX_TOKENS, Ending.INCOMPLETE, Ending.STEERED))
+# 模型写完了（流给出了 `Finished`）的结局。
+_FINISHED = frozenset((Ending.COMPLETED, Ending.MAX_TOKENS, Ending.INCOMPLETE))
 # 没有调用对话模型就结束的送达状态：复查授权不通过（withheld），或请求里没有可答的内容、只发了说明。
 _NOT_CALLED = frozenset((ReplyDelivery.WITHHELD, ReplyDelivery.FAILED, ReplyDelivery.NOTICE_LOST))
 # 流式回复正常结束、送达状态却记 `interrupted` 的结局：回答没写完就停了，已送达的部分后接了说明。
@@ -802,6 +893,8 @@ class _Turn:
         self.consumer: asyncio.Task[None] | None = None  # 读模型流的任务
         # 正文停在没闭合的代码围栏里时闭合它的那一行（`MarkdownGuard.closing_fence()`），接固定说明之前先接上。
         self.fence = ""
+        # 这一轮交给发送端的、素材库里的图（回答里网上的图片），一轮结束时处理（`Conversation._drop_assets()`）。
+        self.assets: list[LibraryImage] = []
         self.drawings = 0  # 这一轮成功出图的张数（`drawing.MAX_IMAGES_PER_TURN`）
         self.images: list[
             DrawnImage
@@ -822,7 +915,25 @@ class _Turn:
         self.profile_forgotten = False  # 这一轮调用过 `forget_profile_item`：不再排整份档案的重写
         # 这一轮带上的全部用户消息：用户点了「确认删除」时随话题一并删掉。
         self.messages: tuple[int, ...] = ()
+        # 回答这一轮的任务与它开始时的 `cancelling()`（`watch_owner()`）：它被要求取消（插话重来、关停）的那一刻起，
+        # `stopping` 为真，图片这一步据此不再发起网络动作（取消要等下一轮事件循环才送到）。
+        self._owner: asyncio.Task[object] | None = None
+        self._owner_cancelling = 0
         self.control.on_cut(self.cut)
+
+    def watch_owner(self) -> None:
+        """记下回答这一轮的任务（当前任务），见 `stopping`。"""
+        task = asyncio.current_task()
+        if task is not None:
+            self._owner, self._owner_cancelling = task, task.cancelling()
+
+    @property
+    def stopping(self) -> bool:
+        """这一轮已经被要求停下：插话重来（`TurnControl.preempted`），或回答这一轮的任务已被要求取消（关停）。"""
+        owner = self._owner
+        return self.control.preempted or (
+            owner is not None and owner.cancelling() > self._owner_cancelling
+        )
 
     def silent_card(self, ending: Ending) -> bool:
         """模型照提示没写回答文字（正常结束，结局 `empty`），而这一轮有待确认的一项（设置、修改、取消提醒或忘掉话题）
@@ -977,11 +1088,17 @@ class Conversation:
         image_generation: ImageGenerationSettings | None = None,
         reminders: FailureNotices | None = None,
         reminder_settings: ReminderSettings | None = None,
+        image_fetcher: ImageFetcher | None = None,
+        web_images: WebImageSettings | None = None,
         clock: Callable[[], float] = time.time,
         timer: Timer | None = None,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
         """`models` 按内部名字给出配置里的全部对话模型，`router` 决定每条消息用哪一个。
+
+        `image_fetcher` 不为空时，打开了 `web_images` 的模型在回答里写的网上的图片随回答显示（见模块 docstring 的
+        「回答里网上的图片」），显示尺寸按 `web_images`（`[web_images]`，不给时用默认值）；为空时那些图都改成说明文字，
+        系统提示词里也照旧不让模型插图。
 
         `reminders` 不为空时（启用了 `[reminders]`），每轮真正开始时先发提醒的失败通知（见 `_respond()`）。
         `reminder_settings` 不为空时（启用了 `[reminders]`），所有对话模型都有设置、列出、取消提醒的函数，系统提示词里
@@ -1009,6 +1126,8 @@ class Conversation:
         self._image_generation = image_generation
         self._reminders = reminders
         self._reminder_settings = reminder_settings
+        self._image_fetcher = image_fetcher
+        self._web_images = WebImageSettings() if web_images is None else web_images
         self._timezone = timezone
         self._clock = clock
         self._timer: Timer = timer or (lambda: asyncio.get_running_loop().time())
@@ -1649,6 +1768,7 @@ class Conversation:
             max_size_mb=max_size_mb,
             drawing_possible=any(self._draws(model.image_generation) for model in models),
             reminders=begun.reminders,
+            web_images_possible=self._image_fetcher is not None,
         )
 
         def open_process() -> ProcessStream | None:
@@ -1676,6 +1796,19 @@ class Conversation:
             else begun.received_at + REPLY_DEADLINE_SECONDS,
         )
         turn.messages = tuple(e.message_id for e in begun.current if e.message_id is not None)
+        turn.watch_owner()
+        try:
+            await self._answer(turn, builder, begun, control)
+        finally:
+            # 不论怎样结束（含意外的异常与 `BaseException`），这时引用素材的流式消息都已结束或已放弃（放弃的留给
+            # 定期清理，见 `_drop_assets()`）。
+            self._drop_assets(turn)
+
+    async def _answer(
+        self, turn: _Turn, builder: RequestBuilder, begun: _Begun, control: TurnControl
+    ) -> None:
+        """`_respond()` 建好 `_Turn` 之后的部分：生成、收尾、发列表与卡片、记账、排后台任务。"""
+        user = turn.user
         cancelled: asyncio.CancelledError | None = None
         failure: Exception | None = None
         try:
@@ -1888,6 +2021,24 @@ class Conversation:
             turn.process.chunks,
         )
         return attributed
+
+    def _drop_assets(self, turn: _Turn) -> None:
+        """一轮结束时处理这一轮交给发送端的图的素材。同步调用：被取消、出了意外的异常时也照样处理。
+
+        交给过通道的内容都有了确定的结局、开始过的每一条流式消息都确认结束了（`_Outbox.settled`）时，在后台删掉
+        （由 `drain()` 等待）。否则一张都不删，留给接线层的定期清理（`bot.library_sweep()`，上传超过 2 小时的）：
+        本地放弃了一条流式消息不等于平台已经结束了它，引用已删掉的素材时接口不报错，用户看到的是「图片加载失败」。"""
+        if not turn.assets:
+            return
+        images, turn.assets = turn.assets, []
+        if turn.outbox.settled:
+            self._delete_later(turn, images)
+            return
+        logger.info(
+            "用户 %s 这一轮的流式消息没有确认结束，回答里的 %d 张图留给素材库的定期清理",
+            turn.user.label,
+            len(images),
+        )
 
     async def _restart(self, turn: _Turn, begun: _Begun) -> None:
         """被插话重来（还什么都没显示）的收尾：列表与卡片不发、退回预留（重来的那一轮用同一条消息的余量），过程消息
@@ -2446,10 +2597,16 @@ class Conversation:
                     self._router.model(later.name).show_process for later in models[index:]
                 )
                 turn.pulse()
-                guard = MarkdownGuard()
+                # 每个模型都过扫描器：它也负责不让认不出的图片语法原样交给平台。原样放行有字节上限，从这条流式消息里
+                # 已经推进去的内容算起（现在回答之前没有别的内容，总是 0）。
+                scanner = ImageScanner(start_bytes=turn.outbox.pushed_bytes)
+                web = settings.web_images and self._image_fetcher is not None
+                total = self._call_limit(turn)
+                # 这次调用的总时限到期的时刻（读流的任务稍后才开始计时，这里不晚于它）。
+                ends_at = self._timer() + total
                 try:
                     attempt = await self._attempt(
-                        turn, model, request, guard, given, total=self._call_limit(turn)
+                        turn, model, request, scanner, given, total=total, web=web, until=ends_at
                     )
                 except asyncio.CancelledError:
                     # 先停下仍拿着请求（原件）的读模型任务，再归还名额；排队的分片先丢掉（同 _wind_down）。
@@ -2480,7 +2637,8 @@ class Conversation:
                 )
                 retry = False
             if retry:
-                # 还没有任何内容交给 QQ：丢掉排队的部分与 guard 里攒着的，换备用模型从头来。备用模型看不到这次调用里的
+                # 还没有任何内容交给 QQ：丢掉排队的部分与扫描器里攒着的，换备用模型从头来（已传到素材库的图照样留到
+                # 一轮结束时删）。备用模型看不到这次调用里的
                 # 函数调用：这次登记的待确认项也丢掉，备用模型自己重新调用了才发按钮。
                 turn.outbox.discard()
                 if turn.drop_pending() is not None:
@@ -2499,10 +2657,13 @@ class Conversation:
                     models[index + 1].name,
                 )
                 continue
-            turn.outbox.push(guard.finish())
+            # 到流结束才确定的图（如前面有一个到最后都没写完的链接标题）：这时读流的任务与时限都已结束，所以只在这次
+            # 调用正常结束时才下载，并且只用它剩下的总时限；超时、出错、插话停下、被取消的直接用说明文字。
+            finished = web and attempt.ending in _FINISHED
+            await self._place(turn, scanner.finish(), web=finished, until=ends_at)
             # 正文停在没闭合的代码围栏里时，后面接别的 Markdown（「来源」、固定说明）之前先闭合它，否则会被渲染成
             # 代码。只闭合一次。
-            turn.fence = guard.closing_fence()
+            turn.fence = scanner.guard.closing_fence()
             section = citations.markdown_section(attempt.sources)
             if section and attempt.text.strip():
                 # 回答写完之后接上「来源」：它也是回答的一部分（算进用户实际看到的内容），排在固定说明之前。
@@ -2678,23 +2839,278 @@ class Conversation:
         if result is _SendResult.DELIVERED:
             turn.sent_notices.update(fresh)
 
+    async def _place(
+        self,
+        turn: _Turn,
+        items: Sequence[ScanItem],
+        *,
+        web: bool,
+        run: _Run | None = None,
+        until: float | None = None,
+    ) -> None:
+        """把扫描器交出的文字与图片按顺序交给发送端。图片换成显示用的文字（`_wait_image()`），流水里记模型的原文
+        （`ImageRef.raw`）。
+
+        `run` 是在读流的任务里调用时这次调用的 `_Run`：等图期间暂停它的空闲时限；这次调用已经被放弃（`turn.run`
+        不再是它）时什么都不推。`until`（`Conversation` 的计时器上的时刻）不为空时，图最多等到那时。
+
+        等图期间被取消（插话停下、时限到期、关停）时，不等图片这一步收尾（它留在后台，见 `_abandon_image()`），
+        立即把这张图与之后的各项交给发送端，图都改成说明文字，再把取消传出去：扫描器（guard）已经看过它们，发送端
+        里的内容要与 `closing_fence()` 对得上；收尾慢的话，等它做完时这次调用可能已经被放弃、固定说明已经接上了。"""
+        for index, item in enumerate(items):
+            if isinstance(item, str):
+                self._push(turn, run, item)
+                continue
+            try:
+                shown = await self._wait_image(turn, item, web=web, run=run, until=until)
+            except asyncio.CancelledError:
+                for rest in items[index:]:
+                    if isinstance(rest, str):
+                        self._push(turn, run, rest)
+                    else:
+                        self._push(turn, run, fallback_text(rest.alt), record=rest.raw)
+                raise
+            text = shown.text
+            if len(text.encode()) > IMAGE_DISPLAY_BYTES:
+                # 扫描器按这个上限算之后原样放行的字节偏移（`render_image()` 已经保证，这里再确认一次）。
+                text = fallback_text(item.alt)
+            pushed = self._push(turn, run, text, record=item.raw)
+            if shown.asset is None:
+                continue
+            if pushed and text == shown.text:
+                turn.assets.append(shown.asset)
+            else:
+                self._delete_later(turn, [shown.asset])  # 没有交给发送端，没有消息引用它
+
+    @staticmethod
+    def _push(turn: _Turn, run: _Run | None, text: str, *, record: str | None = None) -> bool:
+        """推给发送端，返回是否收下。`run` 不为空而这次调用已经被放弃时不推（见 `_place()`）。"""
+        if run is not None and turn.run is not run:
+            return False
+        return turn.outbox.push(text, record=record)
+
+    async def _wait_image(
+        self, turn: _Turn, image: ImageRef, *, web: bool, run: _Run | None, until: float | None
+    ) -> _Shown:
+        """模型写的一张图在回答里显示成什么：`web` 为真时在单独的任务里下载、传到素材库（`_image_text()`），等它
+        的结果；没打开、发送端已不再接受内容时直接用说明文字。
+
+        和两件事赛跑，谁先到都不再等图、改成说明文字（图片这一步取消，留在后台收尾，见 `_abandon_image()`）：发送端
+        不再接受内容（`_Outbox.refusing`：流式回复被拒、出错、被停下，图反正进不了正文，模型流照常读完，供改发纯文本
+        用），以及 `until`。等的时候暂停 `run` 的空闲时限（这段沉默是我们自己的，不是模型的），总时限照常。被取消时
+        同样不等图片这一步收尾，取消立即传出去。"""
+        fallback = _Shown(fallback_text(image.alt))
+        if not web or self._image_fetcher is None or not turn.outbox.accepting:
+            return fallback
+        label = turn.user.label
+        if (why := self._unwanted(turn, until, run)) is not None:
+            logger.info("用户 %s 回答里的一张图：%s，改成说明文字", label, why)
+            return fallback
+        task = asyncio.ensure_future(self._image_text(turn, image, until, run))
+        refusing = asyncio.ensure_future(turn.outbox.refusing.wait())
+        expiry = None if until is None else asyncio.ensure_future(self._sleep_until(until))
+        others = [future for future in (refusing, expiry) if future is not None]
+        deadlines = None if run is None else run.deadlines
+        try:
+            with nullcontext() if deadlines is None else deadlines.paused():
+                await asyncio.wait({task, *others}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            self._abandon_image(turn, task)
+            raise
+        finally:
+            for other in others:
+                other.cancel()
+        # 采用之前重新看截止时刻与发送端：图与到期（或停下）在恢复之前都已结束时，不采用（迟到的素材由后台删掉）。
+        if (why := self._unwanted(turn, until, run)) is None and task.done():
+            return task.result()  # 意外的异常（如复查授权时数据库出错）照常抛出
+        logger.info(
+            "用户 %s 回答里的一张图不再等：%s，改成说明文字", label, why or "流式回复已经停下"
+        )
+        self._abandon_image(turn, task)
+        return fallback
+
+    def _unwanted(self, turn: _Turn, until: float | None, run: _Run | None) -> str | None:
+        """这张图还要不要：用不上了时返回原因。被下载器的 `wanted`、上传任务开始时与采用结果之前共用。
+
+        - 这次调用（`run`，正文中途的图；尾图为 `None`）已经决定停下：被插话停下（`run.steered`）、时限到期
+          （`run.deadlines.expired`）、已被放弃（`turn.run` 不再是它）、读流的任务已经在被取消（发送送达不明后停读、
+          关停）。这些时刻发送端可能还开着（还要接收尾的文字），不能只看它；
+        - 这一轮已经被要求停下（`_Turn.stopping`：插话重来、关停），取消还没送到；
+        - 这次调用的总时限（`until`）已经过了（看门的任务还没来得及把取消送到）；
+        - 发送端已经不再接受内容（被拒、出错、被停下、开始结束）。"""
+        if turn.stopping:
+            return "这一轮已经在停下"
+        if run is not None:
+            consumer = turn.consumer
+            if turn.run is not run:
+                return "这次调用已经放弃"
+            if run.steered:
+                return "插话停下了这次调用"
+            if run.deadlines is not None and run.deadlines.expired is not None:
+                return "这次调用的时限已经用完"
+            if consumer is not None and consumer.cancelling():
+                return "这次调用已经在停下"
+        if until is not None and self._timer() >= until:
+            return "这次调用的时限已经用完"
+        if not turn.outbox.accepting:
+            return "流式回复已经停下"
+        return None
+
+    async def _image_text(
+        self, turn: _Turn, image: ImageRef, until: float | None = None, run: _Run | None = None
+    ) -> _Shown:
+        """下载模型写的一张图、传到素材库，返回指向素材的图片语法，带着素材（由调用方记进 `turn.assets` 或删掉）；
+        已不能使用对话、任何一步失败时返回说明文字。只记日志，不抛异常（取消与复查授权时数据库的错误除外）。
+
+        下载之前、上传之前各在事务里复查一次授权（同 `_Drawer` 紧挨着出图再查一次）：模型调用开始之后被停用的用户，
+        不再替他把模型写的地址请求发给图站，也不再往素材库传。「这张图还要不要」（`_unwanted()`：这次调用 `run`
+        是否已经决定停下、总时限 `until`、发送端）紧挨着每个对外的动作看：调用下载器之前（之间没有 `await`）、下载器
+        的每一个请求与读取之前（`wanted`）、上传任务开始时（`_upload()`，任务排队期间过期、被插话停下或被拒收的也
+        拦得住）；用不上了的图不下载、不上传。采用结果之前由调用方再看一次。"""
+        fetcher, label = self._image_fetcher, turn.user.label
+        assert fetcher is not None
+        fallback = _Shown(fallback_text(image.alt))
+        if not await self._image_allowed(turn, "下载"):
+            return fallback
+        if (why := self._unwanted(turn, until, run)) is not None:
+            logger.info("用户 %s 回答里的一张图不再下载：%s，改成说明文字", label, why)
+            return fallback
+        try:
+            # 「还要不要」交给下载器，它在下载任务里紧挨着每一个请求与读取再问（下载器的任务要排队才开始）。
+            result = await fetcher.fetch(
+                image.url, wanted=lambda: self._unwanted(turn, until, run) is None
+            )
+        except Exception as exc:  # noqa: BLE001  一张图显示不了只改成说明文字，不能让这一轮出错；只记类型
+            logger.warning(
+                "用户 %s 回答里的一张图下载出错，改成说明文字：%s", label, type(exc).__name__
+            )
+            return fallback
+        if isinstance(result, FetchFailed):
+            why = self._unwanted(turn, until, run)
+            if why is not None:
+                logger.info("用户 %s 回答里的一张图不再下载：%s，改成说明文字", label, why)
+            else:
+                logger.info("用户 %s 回答里的一张图没能下载，改成说明文字：%s", label, result)
+            return fallback
+        if not await self._image_allowed(turn, "上传"):
+            return fallback
+        width, height = display_size(result.width, result.height, self._web_images.max_display_px)
+        # 上传在单独的任务里，只限时等它：到期（或这里被取消）时取消它、留在后台收尾，不等它自己返回；迟到的素材由
+        # 后台删掉，超时的图不显示。截止时刻与发送端的最后一次检查在那个任务里、紧挨着调用通道（`_upload()`）。
+        # 上传自己的截止时刻（`Conversation` 的计时器）：上传任务开始时与采用结果之前都按它比较，等到期的任务也按它
+        # 算剩下多久；上传在它之后才完成（等的一方还没恢复）的也不采用。
+        upload_ends = self._timer() + IMAGE_UPLOAD_SECONDS
+        upload = asyncio.ensure_future(self._upload(turn, until, run, upload_ends, result))
+        expiry = asyncio.ensure_future(self._sleep_until(upload_ends))
+        try:
+            await asyncio.wait({upload, expiry}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            self._abandon(turn, upload, _uploaded_asset)
+            raise
+        finally:
+            expiry.cancel()
+        if not upload.done() or self._timer() >= upload_ends:
+            logger.warning(
+                "用户 %s 回答里的一张图 %g 秒内没能传到素材库，改成说明文字",
+                label,
+                IMAGE_UPLOAD_SECONDS,
+            )
+            self._abandon(turn, upload, _uploaded_asset)
+            return fallback
+        try:
+            uploaded = upload.result()
+            if uploaded is None:
+                return fallback  # 任务开始时已经用不上了，没有上传
+        except SendError as exc:
+            logger.warning("用户 %s 回答里的一张图没能传到素材库，改成说明文字：%s", label, exc)
+            return fallback
+        except Exception as exc:  # noqa: BLE001  同下载；文案可能带地址，只记类型
+            logger.warning(
+                "用户 %s 回答里的一张图上传出错，改成说明文字：%s", label, type(exc).__name__
+            )
+            return fallback
+        try:
+            return _Shown(render_image(image.alt, uploaded.url, width, height), uploaded)
+        except ValueError:
+            logger.warning(
+                "素材库给的地址写不进图片语法，用户 %s 回答里的这张图改成说明文字", label
+            )
+            self._delete_later(turn, [uploaded])
+            return fallback
+
+    async def _upload(
+        self,
+        turn: _Turn,
+        until: float | None,
+        run: _Run | None,
+        ends: float,
+        image: FetchedImage,
+    ) -> LibraryImage | None:
+        """上传任务：开始时（可能在排队之后）先看「这张图还要不要」（`_unwanted()`）与上传自己的截止时刻 `ends`，
+        用不上了就不上传、返回 `None`；中间没有 `await`，紧接着调用通道。"""
+        why = self._unwanted(turn, until, run)
+        if why is None and self._timer() >= ends:
+            why = "上传的时限已经用完"
+        if why is not None:
+            logger.info("用户 %s 回答里的一张图不再上传：%s，改成说明文字", turn.user.label, why)
+            return None
+        return await turn.channel.upload_image(image.data, image.mime_type)
+
+    async def _sleep_until(self, moment: float) -> None:
+        """等到计时器上的 `moment`：开始运行时才算还剩多久，任务晚启动不会推迟到期。"""
+        await self._sleep(max(0.0, moment - self._timer()))
+
+    async def _image_allowed(self, turn: _Turn, what: str) -> bool:
+        if await self._db.transaction(self._allowed, turn.user):
+            return True
+        logger.info(
+            "用户 %s 已不能使用对话，回答里的这张图不再%s，改成说明文字", turn.user.label, what
+        )
+        return False
+
+    def _abandon_image(self, turn: _Turn, task: asyncio.Future[_Shown]) -> None:
+        """不再等这张图：取消图片这一步，让它在后台收尾（见 `_abandon()`）。"""
+        self._abandon(turn, task, _shown_asset)
+
+    def _abandon[T](
+        self, turn: _Turn, task: asyncio.Future[T], asset: Callable[[T], LibraryImage | None]
+    ) -> None:
+        """不再等图片这一步（整张图或其中的上传）：取消它，让它在后台收尾（由 `drain()` 等待）。收尾时（取消没能
+        打断上传）还是传到了素材库的（`asset` 从结果里取出），没有交给发送端、没有消息引用它，直接删掉。"""
+        task.cancel()
+        self._track(_settle_abandoned(turn, task, asset))
+
+    def _delete_later(self, turn: _Turn, images: Sequence[LibraryImage]) -> None:
+        """在后台删掉这些素材（由 `drain()` 等待）。"""
+        self._track(_delete_images(turn.channel, images, turn.user.label))
+
+    def _track(self, work: Coroutine[object, object, None]) -> None:
+        task = asyncio.ensure_future(work)
+        self._in_flight.add(task)
+        task.add_done_callback(self._in_flight.discard)
+        task.add_done_callback(_retrieve_any)
+
     async def _attempt(
         self,
         turn: _Turn,
         model: ChatModel,
         request: ChatRequest,
-        guard: MarkdownGuard,
+        scanner: ImageScanner,
         given: frozenset[int] = frozenset(),
         *,
         total: float,
+        web: bool = False,
+        until: float | None = None,
     ) -> _Attempt:
+        """`web` 为真时模型写的图片下载、传到素材库后显示，否则改成说明文字（见模块 docstring）。`until` 是这次调用
+        总时限到期的时刻（`Conversation` 的计时器上）：正文里的图最多等到那时，过了就不采用（见 `_wait_image()`）。"""
         run = _Run(model, given)
         turn.run = run
         show = self._router.model(model.name).show_process
 
-        def sink(text: str) -> None:
+        async def sink(text: str) -> None:
             run.parts.append(text)
-            turn.outbox.push(guard.feed(text))
+            await self._place(turn, scanner.feed(text), web=web, run=run, until=until)
 
         stages: set[tuple[type, str]] = set()
 
@@ -2757,7 +3173,7 @@ class Conversation:
         model: ChatModel,
         request: ChatRequest,
         run: _Run,
-        sink: Callable[[str], None],
+        sink: Callable[[str], Awaitable[None]],
         note: Callable[[ProcessEvent], None] = lambda _: None,
         progress: Callable[[ChatEvent], None] = lambda _: None,
         *,
@@ -2780,7 +3196,7 @@ class Conversation:
                     progress(event)
                     match event:
                         case TextDelta(text=text):
-                            sink(text)
+                            await sink(text)  # 遇到图片时在这里等它（见模块 docstring）
                         case Citation():
                             run.citations.append(event)
                         case Usage():
@@ -2873,8 +3289,10 @@ class Conversation:
             return outbox.outcome(ReplyDelivery.UNCERTAIN)
         # 流式回复被平台拒绝：全文改用纯文本再发一次。
         if last.text.strip() and self._fallback_room(turn):
-            answer = last.text + citations.plain_section(last.sources)
-            plain = answer if notice is None else f"{answer}\n\n{notice}"
+            sources = citations.plain_section(last.sources)
+            answer = last.text + sources  # 记进流水的：模型的原文
+            shown = _without_images(last.text) + sources  # 纯文本里显示不了图，图都写成说明文字
+            plain = shown if notice is None else f"{shown}\n\n{notice}"
             try:
                 ref_idx = await channel.send(plain)
             except SendRejectedError as exc:
@@ -2998,6 +3416,14 @@ class _Reply:
 
 
 @dataclass(frozen=True, slots=True)
+class _Shown:
+    """回答里的一张网上的图显示成的文字；传到了素材库时带着素材（`text` 引用它，还没交给发送端）。"""
+
+    text: str = field(repr=False)
+    asset: LibraryImage | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class _Attributed:
     """一轮结束、写了话题归属：归到的话题与这一轮的回复。"""
 
@@ -3082,6 +3508,83 @@ def _record_decisions(
         now=now,
         purpose=UsagePurpose.DECISION,
     )
+
+
+def _without_images(text: str) -> str:
+    """模型的原文里认得出的图片（同流式时 `ImageScanner` 认的）换成说明文字，其余原样，给改发的纯文本用。
+
+    扫描器交出的文字与它对应的原文等长（guard 只做等长的替换，见 `web_images` 的模块 docstring），图的原文是
+    `ImageRef.raw`，所以按长度在原文上走就能把文字取回原样。万一对不上，就用扫描器交出的文字。"""
+    scanner = ImageScanner()
+    items = [*scanner.feed(text), *scanner.finish()]
+    parts: list[str] = []
+    scanned: list[str] = []
+    position = 0
+    consistent = True
+    for item in items:
+        if isinstance(item, str):
+            parts.append(text[position : position + len(item)])
+            scanned.append(item)
+            position += len(item)
+        else:
+            consistent = consistent and text.startswith(item.raw, position)
+            parts.append(fallback_text(item.alt))
+            scanned.append(fallback_text(item.alt))
+            position += len(item.raw)
+    if not consistent or position != len(text):
+        logger.warning("改发纯文本时扫描结果与原文的长度对不上，改用扫描后的文字")
+        return "".join(scanned)
+    return "".join(parts)
+
+
+async def _delete_images(channel: ReplyChannel, images: Sequence[LibraryImage], label: str) -> None:
+    """从素材库删掉这些图（同时删），每张最多等 `IMAGE_DELETE_SECONDS`。删不掉只记日志，留给接线层的定期清理；每张
+    的失败都在自己那里接住，一张出意外时其余的照样删完、照样由调用方跟踪。"""
+
+    async def delete(image: LibraryImage) -> None:
+        try:
+            async with asyncio.timeout(IMAGE_DELETE_SECONDS):
+                await channel.delete_image(image)
+        except SendError as exc:
+            logger.warning("用户 %s 回答里的一张图没能从素材库删掉，留给定期清理：%s", label, exc)
+        except TimeoutError:
+            logger.warning(
+                "用户 %s 回答里的一张图 %g 秒内没能从素材库删掉，留给定期清理",
+                label,
+                IMAGE_DELETE_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001  删不掉只影响素材库的额度；文案可能带地址，只记类型
+            logger.warning(
+                "用户 %s 回答里的一张图从素材库删除时出错，留给定期清理：%s",
+                label,
+                type(exc).__name__,
+            )
+
+    await asyncio.gather(*(delete(image) for image in images))
+
+
+async def _settle_abandoned[T](
+    turn: _Turn, task: asyncio.Future[T], asset: Callable[[T], LibraryImage | None]
+) -> None:
+    """等不再等的图片这一步（已取消）收尾；它最后还是传到了素材库的话删掉：没有消息引用它。"""
+    await asyncio.wait((task,))
+    if task.cancelled():
+        return
+    if (exc := task.exception()) is not None:
+        logger.warning(
+            "用户 %s 回答里一张不再等的图收尾时出错：%s", turn.user.label, type(exc).__name__
+        )
+        return
+    if (late := asset(task.result())) is not None:
+        await _delete_images(turn.channel, [late], turn.user.label)
+
+
+def _shown_asset(shown: _Shown) -> LibraryImage | None:
+    return shown.asset
+
+
+def _uploaded_asset(image: LibraryImage | None) -> LibraryImage | None:
+    return image
 
 
 async def _stop_consumer(turn: _Turn) -> None:
@@ -3231,6 +3734,13 @@ class _TurnChannel:
         self._claim()
         self.budget.replies += 1
         await self._channel.send_buttons(markdown, buttons)
+
+    async def upload_image(self, data: bytes, mime_type: str) -> LibraryImage:
+        # 传到素材库不发消息：不 claim、不计被动回复。
+        return await self._channel.upload_image(data, mime_type)
+
+    async def delete_image(self, image: LibraryImage) -> None:
+        await self._channel.delete_image(image)
 
     def open_process(self) -> ProcessStream:
         """开始一条过程消息（调用方在要发第一片时才调用，所以这时就计数）。"""
@@ -4024,8 +4534,13 @@ class _Outbox:
     分条（`splitting.StreamSplitter`）：推进来的内容先经它决定在哪里结束这一条。执行切点时先交出这一条的最后一片
     （含补上的闭合围栏），等结束分片返回，再开新的一条，第一片以重开的围栏开头；结束分片失败时记下 `unclosed`，
     照样开新的一条。每开一条都是一次被动回复，开之前确认还给固定说明留着一次
-    （`ReplyBudget.affords_continuation()`），不够就不再分条，交给平台去拆。`_delivered` 只记模型的原文（不含补上
+    （`ReplyBudget.affords_continuation()`），不够就不再分条，交给平台去拆。`_delivered` 只记推进来的文字（不含补上
     的围栏行）。
+
+    推进来的文字可以带一段「记成什么」（`push(record=...)`，回答里网上的图片：显示的是改写的图片语法或说明文字，
+    记的是模型的原文）：`delivered_answer` 把完整送达的这几段换成要记的文字；一段只送达了一半时，从它开始的部分
+    都不算。停下（`stop()`）、出错、开始结束（`close()`）之后不再接受新内容，并置位 `refusing`；`settled` 说明
+    开始过的流式消息是不是都确认结束了（素材库的图能不能删）。
 
     `ref_idx` 记下通道在第一条流式消息的成功分片与结束分片之后报告的引用索引（第一个不为空的为准；pyqbot 实测
     每个分片的响应都带同一个），回答送达后存进回复行；分条之后的几条不记。
@@ -4058,21 +4573,29 @@ class _Outbox:
         self._splitter = StreamSplitter(label=label)
         self._queue: list[Piece] = []  # 已入队、还没交给通道的文字与切点
         self._prefix = ""  # 下一条的第一片开头要补上的（重开的围栏）
-        self._delivered: list[str] = []  # 确认送达的原文（不含补上的围栏行）
+        self._delivered: list[str] = []  # 确认送达的、推进来的文字（不含补上的围栏行）
         self._answer_length = 0  # 推进来的内容里，回答本身（不含固定说明）的长度
+        # 回答里要换成别的文字记下的几段：（在推进来的回答里从哪里开始，到哪里结束，记成什么），按先后。
+        self._records: list[tuple[int, int, str]] = []
         self._sender: asyncio.Task[None] | None = None
         self._finishing: asyncio.Task[str | None] | None = (
             None  # 最后一条的结束分片；只发一次，始终由这里管着
         )
-        self._closed = False  # 不再接受新内容
-        self._open = False  # 当前这条流式消息有内容确认送达、还没结束
+        self._closed = False  # 停下了：不再接受新内容，排队的也不发
+        self._sealed = False  # 开始结束（`close()`）：不再接受新内容，排队的照常发完
+        self._open = False  # 当前这条流式消息有内容确认送达、还没确认结束
+        self._in_doubt = False  # 有交给通道的分片（含结束分片）在途、还没有结局，见 `settled`
+        self._doubtful = False  # 有交给通道的分片（含结束分片）落得不确定的结局；一旦置位不再清除
         self._splitting = True  # 还在主动分条（被动回复的次数不够时停下）
         self.handed = False  # 有内容交给过通道（可能还在途、结果未知）
+        self.pushed_bytes = 0  # 推进来的文字一共多少字节（UTF-8，不含分条时补上的围栏行）
         self.streams = 0  # 开始过几条流式消息（有内容确认送达的）
         self.unclosed = False  # 正文都已确认，但某一条的结束分片失败
         self.ref_idx: str | None = None  # 第一条流式消息的引用索引，平台给出之后才有
         self.error: SendError | None = None
         self.broken = asyncio.Event()  # 出现说不准是否送达的错误时置位
+        # 不再接受新内容（停下、出错、开始结束）时置位：在等的图不必再等（`Conversation._wait_image()`）。
+        self.refusing = asyncio.Event()
 
     @property
     def has_content(self) -> bool:
@@ -4080,9 +4603,58 @@ class _Outbox:
         return self.handed or bool(self._queued_text().strip()) or bool(self._splitter.held.strip())
 
     @property
+    def accepting(self) -> bool:
+        """还接受新内容：没有停下、没有出错、还没开始结束。"""
+        return not self._closed and not self._sealed and self.error is None
+
+    @property
+    def settled(self) -> bool:
+        """交给过通道的内容都有了确定的结局，开始过的每一条流式消息都确认结束了：引用素材库的图的消息不会再变，
+        可以删素材。没有交给过通道任何内容时也算（素材没有被引用）。
+
+        每次交给通道（分片、分条时的结束分片、最后的结束分片，都经 `_hand()`）从交出那一刻起算在途（`_in_doubt`），
+        确认成功或被明确拒绝（`SendRejectedError`，确定没发出）才算有了结局；送达不明的错误、别的异常、被取消都算不
+        确定的结局（`_doubtful`），**一旦有过就不再清除**：之后的收尾再成功也不算数（例如分条时结束分片出了意外的
+        异常，通道已经丢掉了那条流式消息，收尾时再结束一次只是空操作）。不看发送任务结束了没有：通道接手之后抛出意外
+        的异常时，任务结束了，平台却可能已经收下那一片。被拒的分片不妨碍，只要它所在的那条流式消息还没开始；没有确认
+        结束的流式消息（结束分片失败或超时、出错后没有结束、收尾时放弃）都不算：本地放弃不等于平台已经结束了它，那时
+        删掉素材，用户看到的是「图片加载失败」。
+
+        因此它只会从真变假（交出新内容）、或在确认成功之后从假变真，有过不确定的结局之后永远为假。"""
+        if not self.handed:
+            return True
+        return not (self._in_doubt or self._doubtful or self.unclosed or self._open)
+
+    async def _hand[T](self, call: Coroutine[object, object, T]) -> T:
+        """把一次发送交给通道，记下它的结局（见 `settled`）。"""
+        self._in_doubt = True
+        try:
+            result = await call
+        except SendRejectedError:
+            self._in_doubt = False  # 确定没发出
+            raise
+        except BaseException:
+            self._doubtful = True
+            raise
+        self._in_doubt = False
+        return result
+
+    @property
     def delivered_answer(self) -> str:
-        """确认送达的回答（模型的原文，不含固定说明与分条时补上的围栏行）。"""
-        return "".join(self._delivered)[: self._answer_length]
+        """确认送达的回答（不含固定说明与分条时补上的围栏行），带了 `record` 的几段换成要记的文字。"""
+        delivered = "".join(self._delivered)[: self._answer_length]
+        parts: list[str] = []
+        position = 0
+        for start, end, record in self._records:
+            if start >= len(delivered):
+                break
+            parts.append(delivered[position:start])
+            if end > len(delivered):
+                return "".join(parts)  # 只送达了一半：从它开始都不算
+            parts.append(record)
+            position = end
+        parts.append(delivered[position:])
+        return "".join(parts)
 
     def outcome(self, delivery: ReplyDelivery) -> _Outcome:
         """以确认送达的回答与第一条流式消息的引用索引写成的结局。"""
@@ -4095,12 +4667,22 @@ class _Outbox:
     def _queued_text(self) -> str:
         return "".join(piece for piece in self._queue if isinstance(piece, str))
 
-    def push(self, text: str, *, answer: bool = True) -> None:
-        if not text or self.error is not None or self._closed:
-            return
+    def push(self, text: str, *, answer: bool = True, record: str | None = None) -> bool:
+        """推进要发的文字，返回是否收下（`accepting`）。`answer` 为假的是接在回答后面的固定说明（都在回答之后推进来）；
+        `record` 不为空时，这段回答送达后记成它（见类的 docstring）。停下、出错、开始结束（`close()`）之后推进来的
+        一律丢弃：被放弃的读流任务晚到的内容不能接在固定说明后面，也不能错开 `_records` 的偏移。"""
+        if not self.accepting:
+            return False
+        if not text:
+            return True
+        self.pushed_bytes += len(text.encode())
         if answer:
+            if record is not None:
+                start = self._answer_length
+                self._records.append((start, start + len(text), record))
             self._answer_length += len(text)
         self._enqueue(self._splitter.feed(text))
+        return True
 
     def _enqueue(self, pieces: Sequence[Piece]) -> None:
         for piece in pieces:
@@ -4119,16 +4701,19 @@ class _Outbox:
         self._queue.clear()
         self._splitter = StreamSplitter(label=self._label)
         self._answer_length = 0
+        self.pushed_bytes = 0
+        self._records.clear()
 
     async def close(self) -> None:
         """交出分条时攒着的最后一行，等攒着的内容发完，再结束流式回复。结束失败时记下 `unclosed`：正文已经
         送达，不重发。
 
         两处都用 `asyncio.wait()` 而不是直接 await：这里被取消时不连带打断在途的分片或结束分片，留给
-        `wind_down()` 限时等它们。
+        `wind_down()` 限时等它们。从一开始就不再接受新内容（`push()`）。
         """
-        if not self._closed and self.error is None:
+        if self.accepting:
             self._enqueue(self._splitter.finish())
+        self._refuse(sealed=True)
         sender = self._sender
         if sender is not None:
             await asyncio.wait((sender,))
@@ -4142,8 +4727,13 @@ class _Outbox:
 
     def stop(self) -> None:
         """不再接受新内容，丢掉还没交给通道的部分。在途的分片不受影响。"""
-        self._closed = True
+        self._refuse(closed=True)
         self._queue.clear()
+
+    def _refuse(self, *, closed: bool = False, sealed: bool = False) -> None:
+        self._closed |= closed
+        self._sealed |= sealed
+        self.refusing.set()
 
     async def wind_down(self, deadline: float) -> None:
         """被取消后的收尾：限时等在途的分片，然后尽量结束流式消息（已经在发的结束分片就接着等它）。"""
@@ -4153,6 +4743,7 @@ class _Outbox:
             await asyncio.wait((sender,), timeout=_remaining(deadline))
             if not sender.done():
                 _cancel_and_retrieve(sender)
+                self._doubtful = True  # 在途的那一片（或结束分片）结局不明
                 if self.handed and self.error is None:
                     self.error = SendUncertainError("关停时分片仍在途")
                 return
@@ -4165,20 +4756,25 @@ class _Outbox:
         else:
             _cancel_and_retrieve(finishing)
             self.unclosed = True
+            self._doubtful = True
 
     def cancel(self) -> None:
+        """出了意外、不再收尾：不再接受内容，取消还在发的分片与结束分片，它们的结局从此不明。"""
+        self._refuse(closed=True)
         for task in (self._sender, self._finishing):
             if task is not None and not task.done():
                 _cancel_and_retrieve(task)
+                self._doubtful = True
 
     def _start_finish(self) -> asyncio.Task[str | None]:
         if self._finishing is None:
-            self._finishing = asyncio.create_task(self._channel.finish_stream())
+            self._finishing = asyncio.create_task(self._hand(self._channel.finish_stream()))
         return self._finishing
 
     def _settle_finish(self, finishing: asyncio.Task[str | None]) -> None:
         if finishing.cancelled():
             self.unclosed = True
+            self._doubtful = True
             return
         exc = finishing.exception()
         if isinstance(exc, SendError):
@@ -4187,6 +4783,7 @@ class _Outbox:
         elif exc is not None:
             raise exc
         else:
+            self._open = False
             self._note_ref(finishing.result())
 
     def _take(self) -> tuple[str, Cut | None]:
@@ -4240,6 +4837,16 @@ class _Outbox:
         return True
 
     async def _send_pending(self) -> None:
+        """发送任务。出了意外的异常（不是 `SendError`）时从此不再接受、不再发任何内容，异常留给 `close()` 抛出：
+        不然下一次推进来的内容会另开一个发送任务接着发（可能开出新的一条流式消息），这个异常也没人取走。"""
+        try:
+            await self._send_queue()
+        except Exception:
+            self._refuse(closed=True)
+            self._queue.clear()
+            raise
+
+    async def _send_queue(self) -> None:
         if self._before_first is not None:
             await self._before_first()
             self._before_first = None
@@ -4253,9 +4860,10 @@ class _Outbox:
             if chunk:
                 self.handed = True
                 try:
-                    ref_idx = await self._channel.stream(chunk)
+                    ref_idx = await self._hand(self._channel.stream(chunk))
                 except SendError as exc:
                     self.error = exc
+                    self._refuse()
                     self._queue.clear()
                     if isinstance(exc, SendUncertainError):
                         self.broken.set()
@@ -4274,7 +4882,7 @@ class _Outbox:
         """分条：结束当前这一条，等结束分片返回之后才开下一条（平台会提前结束还没结束的那条）。失败时记下
         `unclosed`，照样开下一条。"""
         try:
-            ref_idx = await self._channel.finish_stream()
+            ref_idx = await self._hand(self._channel.finish_stream())
         except SendError as exc:
             logger.warning("分条时流式回复的结束分片没能送达：%s", exc)
             self.unclosed = True

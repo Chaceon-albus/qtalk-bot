@@ -36,6 +36,7 @@ from qtalk_bot.conversation import (
     ChatInput,
     ChoiceButton,
     Conversation,
+    LibraryImage,
     SendError,
     SendRejectedError,
     SendUncertainError,
@@ -249,6 +250,13 @@ class FakeChannel:
         self.buttons_failure: SendError | None = None
         self.markdown_failure: SendError | None = None
         self.image_ref: str | None = None
+        # 素材库：传上去、还没删的图（编号 → 内容）；`uploads` 按先后记下传过的 MIME 类型，`deleted` 记下删掉的编号。
+        self.library: dict[str, bytes] = {}
+        self.uploads: list[str] = []
+        self.deleted: list[str] = []
+        self.upload_failure: SendError | None = None
+        self.upload_gate: asyncio.Event | None = None  # 不为空时上传要等它置位才完成
+        self.delete_failure: SendError | None = None
 
     def open_process(self) -> FakeProcess:
         process = FakeProcess(self)
@@ -343,6 +351,28 @@ class FakeChannel:
             raise self.buttons_failure
         self.log.append(("buttons", markdown))
         self.buttons.append(tuple(buttons))
+
+    async def upload_image(self, data: bytes, mime_type: str) -> LibraryImage:
+        """传到素材库：记成（`upload`，编号），编号是 `img-1`、`img-2`……，地址是 `qqbot-media://image/<编号>`。"""
+        await asyncio.sleep(0)
+        if self.upload_gate is not None:
+            await self.upload_gate.wait()
+        if self.upload_failure is not None:
+            raise self.upload_failure
+        self.uploads.append(mime_type)
+        image_id = f"img-{len(self.uploads)}"
+        self.library[image_id] = data
+        self.log.append(("upload", image_id))
+        return LibraryImage(url=f"qqbot-media://image/{image_id}", image_id=image_id)
+
+    async def delete_image(self, image: LibraryImage) -> None:
+        """从素材库删掉：记成（`delete`，编号）。`delete_failure` 不为空时抛出它。"""
+        await asyncio.sleep(0)
+        if self.delete_failure is not None:
+            raise self.delete_failure
+        del self.library[image.image_id]
+        self.deleted.append(image.image_id)
+        self.log.append(("delete", image.image_id))
 
 
 class FakeProcess:

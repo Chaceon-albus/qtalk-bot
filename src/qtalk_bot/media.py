@@ -935,6 +935,22 @@ def _private_dir(path: Path) -> None:
 
 # ---- 下载 ----
 
+HOST_NAME = re.compile(r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
+"""合法的主机名（小写）：至少两段，每段 1–63 个字母、数字或连字符（不以连字符开头或结尾），最后一段是 2–63 个
+字母，总长不超过 253。IP 字面量（最后一段是数字，或含冒号）与以点结尾的名字都不匹配。"""
+
+
+def in_hosts(host: str, hosts: Sequence[str]) -> bool:
+    """主机名是白名单 `hosts`（小写的域名后缀）里的某一项，或它的子域名。按整段比较：后缀 `gov` 匹配
+    `nasa.gov`，不匹配 `data.gov.au`、`notgov`。调用方先把主机名转成小写。"""
+    return any(host == suffix or host.endswith(f".{suffix}") for suffix in hosts)
+
+
+def known_host(host: str, hosts: Sequence[str]) -> bool:
+    """主机名（不分大小写）是合法的域名，并且属于白名单 `hosts`。"""
+    host = host.lower()
+    return bool(HOST_NAME.fullmatch(host)) and in_hosts(host, hosts)
+
 
 class DownloadError(Exception):
     """下载失败。文案只有异常类型、HTTP 状态码或原因的分类这类不含地址的信息。"""

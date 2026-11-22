@@ -23,6 +23,7 @@ from qtalk_bot.config import (
     Settings,
     TopicSettings,
     TurnSettings,
+    WebImageSettings,
     load_secrets,
     load_settings,
 )
@@ -68,6 +69,8 @@ def test_example_config_is_valid_and_spells_out_the_defaults() -> None:
     assert example.backup == BackupSettings()
     assert example.alerts == AlertSettings()
     assert example.reminders == ReminderSettings()
+    # [web_images] 的代理默认不设，照抄示例不会意外带上代理。
+    assert example.web_images == WebImageSettings()
     # [describe] 的模型没有默认值，其余各项要与默认值一致。
     assert example.describe == DescribeSettings(provider=Provider.OPENAI, model="gpt-6-luna")
     # [memory] 同理；reasoning 默认不传。
@@ -91,6 +94,8 @@ def test_example_config_shows_both_providers_and_a_fallback() -> None:
     assert all(model.search for model in example.models)
     assert [model.show_process for model in example.models] == [True, False]
     assert [model.image_generation for model in example.models] == [True, False]
+    # web_images 默认打开，示例里不写。
+    assert all(model.web_images for model in example.models)
     # 可选项在示例里是注释掉的，照抄示例不会意外带上代理、改掉端点或指定推理强度。
     assert example.default_model.reasoning is None
     assert example.qq == QQSettings()
@@ -133,3 +138,4 @@ def test_commented_out_examples_are_valid_once_uncommented(tmp_path: Path) -> No
     assert settings.providers.openai.proxy == "socks5://127.0.0.1:1080"
     assert settings.providers.gemini.base_url == "https://generativelanguage.googleapis.com/"
     assert settings.providers.gemini.proxy == "http://127.0.0.1:7890"
+    assert settings.web_images.proxy == "socks5h://127.0.0.1:1080"

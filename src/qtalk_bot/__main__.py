@@ -5,7 +5,11 @@
 创建对话模型、决策模型、写图片描述的模型与出图的图片模型（成败经 `model_watch.ModelWatch` 统计、告警）、构造
 `pyqbot.Bot`、注册处理函数（经 `batching.Batcher` 交给对话）并运行。
 
-运行期间的后台任务：定期清理过期的附件（并清理过期的提醒数据，`reminders.reminder_cleanup()`）；写心跳文件供
+回答里网上的图片由 `image_download.ImageDownloader` 下载（自己的 HTTP 客户端与 `[web_images].proxy`），经 `bot.images`
+（素材库）显示。
+
+运行期间的后台任务：定期清理过期的附件（并清理过期的提醒数据，`reminders.reminder_cleanup()`）；定期清理素材库里遗留
+的回答图片（`bot.run_library_sweep()`，与回答的通道共用一个 `bot.SharedLibrary`）；写心跳文件供
 `python -m qtalk_bot.health` 检查（`health.Heartbeat`，启动时先删掉旧的，心跳里带着 QQ 网关的状态）；定时备份
 （`maintenance.BackupScheduler`）；查磁盘余量（`maintenance.DiskWatch`）；看网关断没断（`gateway_watch.GatewayWatch`）；
 启用了 `[reminders]` 时到点发提醒（`reminders.ReminderScheduler`，经 `bot.ProactiveSender` 发主动消息，与对话共用每用户
@@ -35,12 +39,14 @@ from .bot import (
     ProactiveSender,
     QQChat,
     QQDownloader,
+    SharedLibrary,
     ShareLinks,
     download_hosts,
     fetch_bot_name,
     refuse_cookies,
     refused_host_alert,
     register,
+    run_library_sweep,
 )
 from .chat import ChatHandler
 from .config import (
@@ -58,6 +64,8 @@ from .describe import Describer
 from .gate import Gate
 from .gateway_watch import GatewayWatch
 from .health import GatewayReading, Heartbeat, clear_heartbeat
+from .image_download import CLOSE_TIMEOUT_SECONDS as IMAGE_CLOSE_SECONDS
+from .image_download import ImageDownloader
 from .llm.providers import ChatModels
 from .maintenance import (
     BackupScheduler,
@@ -149,6 +157,7 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
 
     调用方要先用 `check_provider_secrets()` 确认用到的服务商都有密钥。
     """
+    quiet_third_party_logs()
     memory = memory_settings(settings)
     image_generation = image_generation_settings(settings)
     private_data_dir(settings.data_dir)
@@ -182,6 +191,7 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
         describer: Describer | None = None
         summarizer: Summarizer | None = None
         fetcher: Fetcher | None = None
+        downloader: ImageDownloader | None = None
         conversation: Conversation | None = None
         batcher: Batcher | None = None
         handlers: Handlers | None = None
@@ -257,6 +267,8 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                     settings.attachments,
                     on_host_refused=refused_host_alert(alerts),
                 )
+                # 回答里网上的图片：自己的 HTTP 客户端与代理（`[web_images]`），不借 QQ 的。
+                downloader = ImageDownloader(settings.web_images)
                 conversation = Conversation(
                     db,
                     admin_openid=secrets.admin_openid,
@@ -283,9 +295,21 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                     image_generation=image_generation,
                     reminders=reminder_service if settings.reminders.enabled else None,
                     reminder_settings=settings.reminders if settings.reminders.enabled else None,
+                    image_fetcher=downloader,
+                    web_images=settings.web_images,
                 )
                 batcher = Batcher(conversation, settings.turns)
-                chat = QQChat(batcher)
+                # 回答的通道与素材库的定期清理共用它（按编号记引用、清理时跳过刚重新传过的）。
+                library = SharedLibrary(bot.images)
+                chat = QQChat(batcher, library=library)
+                # 素材库里遗留的回答图片：启动时与之后每小时各清一次。它用 QQ 的客户端，关停时在关客户端之前停下。
+                maintenance.append(
+                    Background(
+                        "素材库清理",
+                        asyncio.create_task(run_library_sweep(library)),
+                        uses_qq=True,
+                    )
+                )
             if settings.reminders.enabled:
                 # 在 Conversation 建好之后才开始：之前开始的话，最初几次会拿到另一套锁。
                 reminders = ReminderScheduler(
@@ -307,14 +331,10 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                 buttons=None if conversation is None else conversation.press_button,
                 reminders=reminder_service,
             )
-            cleanup = asyncio.create_task(
-                run_cleanup(
-                    db,
-                    store,
-                    settings.attachments,
-                    also=(reminder_cleanup(db, settings.reminders),),
-                )
-            )
+            also: list[Callable[[int], Awaitable[None]]] = [
+                reminder_cleanup(db, settings.reminders)
+            ]
+            cleanup = asyncio.create_task(run_cleanup(db, store, settings.attachments, also=also))
             logger.info("机器人启动")
             await bot.start()
         except BaseException:
@@ -329,6 +349,7 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                 alerts,
                 summarizer,
                 maintenance=maintenance,
+                downloader=downloader,
             )
             raise
         if await _shut_down(
@@ -342,18 +363,20 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
             alerts,
             summarizer,
             maintenance=maintenance,
+            downloader=downloader,
         ):
             raise asyncio.CancelledError  # 关停期间又被取消过：收尾做完了，再把取消传出去
 
 
 @dataclass(frozen=True, slots=True)
 class Background:
-    """一个维护任务（心跳、定时备份、磁盘检查、网关检查、到点发提醒）：`stop` 是可选的同步停止请求，关停时先于取消任务
-    调用。"""
+    """一个维护任务（心跳、定时备份、磁盘检查、网关检查、到点发提醒、素材库清理）：`stop` 是可选的同步停止请求，关停时
+    先于取消任务调用；`uses_qq` 为真的（素材库清理）关停时在关 QQ 的客户端之前就等它退出，其余的在最后等。"""
 
     name: str
     task: asyncio.Task[None]
     stop: Callable[[], None] | None = None
+    uses_qq: bool = False
 
 
 SHUTDOWN_GRACE_SECONDS = 15.0
@@ -363,6 +386,9 @@ BOT_STOP_SECONDS = 5.0
 """等 `Bot.stop()` 的时限：断开网关后等前台的处理函数自然结束（Gate 的决定、写流水、下载附件）。下载自己的时限
 （`[attachments].download_timeout_seconds`）可能更长，不等满：到期只结束等待，还没结束的由之后的 `Bot.close()`
 取消，被取消的下载按「没能下载」记进流水。"""
+
+CLIENT_CLOSE_SECONDS = 1.0
+"""关停的最后给关图片下载的 HTTP 客户端留的时间（只是关掉连接池），不算在总时限里。"""
 
 BOT_CLOSE_SECONDS = 8.0
 """总时限里留给 `Bot.close()` 与其后等前台处理函数的部分：pyqbot 取消处理函数后最多等 5 秒，再加关闭连接、
@@ -381,8 +407,11 @@ async def _shut_down(
     summarizer: Summarizer | None = None,
     *,
     maintenance: Sequence[Background] = (),
+    downloader: ImageDownloader | None = None,
 ) -> bool:
-    """按顺序关停，返回期间是否又被取消过。`maintenance` 是维护任务：心跳、定时备份、磁盘检查、网关检查、到点发提醒。
+    """按顺序关停，返回期间是否又被取消过。`maintenance` 是维护任务：心跳、定时备份、磁盘检查、网关检查、到点发提醒、
+    素材库清理。
+    `downloader` 是回答里网上的图片的下载器（它有自己的 HTTP 客户端）。
 
     顺序：
     0. 停掉 `maintenance`（同步）：先发各自的停止请求（定时备份借此通知正在复制的备份在下一步之前放弃、删掉临时
@@ -404,7 +433,9 @@ async def _shut_down(
     4. `Alerts.stop()` 与 `Alerts.aclose()`：同步地不再接受新的提醒、取消还在发的，再限时等它们退出。提醒经
        QQ 的 HTTP 客户端发出，要在关闭它之前收住；`stop()` 是同步、无条件执行的，前面的收尾用完了时限也照样
        生效（否则 `aclose()` 可能在开始之前就被取消，在途的发送越过客户端的关闭）。之后再触发的提醒（如关停中
-       还在下载的附件被拒）直接丢弃，只记日志。
+       还在下载的附件被拒）直接丢弃，只记日志。接着等第 0 步停掉的、标了 `uses_qq` 的维护任务（素材库的定期
+       清理）退出：它经 QQ 的 HTTP 客户端列出、删除素材，关了客户端再发请求只会报错。这一步用第 3 步的截止点，
+       不占给第 5、6 步留的 `BOT_CLOSE_SECONDS`；到点不再等（它已被取消，之后的请求失败只记日志）。
     5. `Bot.close()`：取消第 2 步到期时还没结束的处理函数（如还在下载附件的；消息在下载之前已经入库，被取消的
        下载按「没能下载」记），最多等它们 5 秒，再关 QQ 的 HTTP 客户端。
     6. `Handlers.drain()`：等前台的处理真正结束。被取消的处理函数仍会等 Gate 的决定、把放行的消息写进流水；
@@ -413,7 +444,11 @@ async def _shut_down(
     7. 向后台发出停止请求：停掉清理、`Describer.stop()`、`Summarizer.stop()`、`Fetcher.stop()`。这些是同步的、
        无条件执行，前面用完了时间也照样发出，免得后台任务在模型客户端和数据库关闭后还在跑。
     8. 限时等后台收尾：清理任务、第 0 步停掉的维护任务（放弃的备份已删掉临时文件，已经改名完成的是完整的；线程
-       里的文件操作取消不了，只限时等）、描述与话题摘要的任务和它们受保护的写入、下载与响应的关闭。
+       里的文件操作取消不了，只限时等）、描述与话题摘要的任务和它们受保护的写入、下载与响应的关闭；最后关掉图片
+       下载器的 HTTP 客户端（`downloader.aclose()`）。它只在回答里用：第 3 步之后不会再有新的下载，所以放在这里，
+       第 3 步超时时还没下完的图就此失败、改成说明文字。它在总时限剩下的时间里等被放弃的下载收尾，之后不论等没等完
+       都关客户端；关客户端另外留 `CLIENT_CLOSE_SECONDS`，总时限已经用完时也照样关。素材库的删除经 QQ 的客户端，在
+       第 3 步里（`Conversation.drain()` 等它们）。
     之后由调用方（外层的 `async with`）关模型的客户端与数据库。
 
     每一步的等待都受保护：再次取消（如连按两次 Ctrl+C）不会打断这一段；但所有等待共用
@@ -440,6 +475,11 @@ async def _shut_down(
         alerts.stop()
         # 在途的发送已被取消，很快退出；用总时限而不是回答收尾的时限，回答收尾超时了也照样等它们退出。
         interrupted |= await _drain(alerts.aclose(), deadline, "等待给管理员的提醒退出")
+    for background in maintenance:
+        if background.uses_qq:
+            # 用回答收尾的截止点：不占给 Bot.close() 与前台入库留的时间。它已经被取消，等不完的话，之后关了客户端，
+            # 它的请求失败也只记日志。
+            interrupted |= await _drain(background.task, replies_deadline, f"停掉{background.name}")
     interrupted |= await _drain(bot.close(), deadline, "关闭 QQ 连接与前台的处理函数")
     if handlers is not None:
         interrupted |= await _drain(handlers.drain(), deadline, "等待放行的消息写进流水")
@@ -461,6 +501,13 @@ async def _shut_down(
         interrupted |= await _drain(summarizer.aclose(), deadline, "等待话题摘要收尾")
     if fetcher is not None:
         interrupted |= await _drain(fetcher.aclose(), deadline, "等待下载收尾")
+    if downloader is not None:
+        loop = asyncio.get_running_loop()
+        remaining = max(0.0, deadline - loop.time())
+        closing = downloader.aclose(wait=min(remaining, IMAGE_CLOSE_SECONDS))
+        interrupted |= await _drain(
+            closing, loop.time() + remaining + CLIENT_CLOSE_SECONDS, "关闭图片下载的客户端"
+        )
     return interrupted
 
 
@@ -550,14 +597,23 @@ async def _supervise(
             signals.uninstall(loop)
 
 
+QUIET_LOGGERS = ("httpx2", "httpcore2", "openai", "google_genai", "google.genai")
+"""压到 WARNING 的第三方日志器，见 `quiet_third_party_logs()`。"""
+
+
+def quiet_third_party_logs() -> None:
+    """把 `QUIET_LOGGERS` 压到 WARNING。httpx2 在 INFO 级别记录每个请求的完整地址：单聊接口的路径里有 openid，
+    回答里网上的图片的地址属于聊天内容。两家大模型 SDK 的 DEBUG 日志里有请求体（聊天内容），也压住，免得有人把根
+    日志级别调到 DEBUG。`main()` 与 `run()` 都调用它，直接调用 `run()` 时也在第一个请求之前生效。"""
+    for name in QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    # httpx2 在 INFO 级别记录每个请求的地址，单聊接口的路径里有 openid。两家大模型 SDK 的 DEBUG 日志里
-    # 有请求体（聊天内容），也压住，免得有人把根日志级别调到 DEBUG。
-    for name in ("httpx2", "httpcore2", "openai", "google_genai", "google.genai"):
-        logging.getLogger(name).setLevel(logging.WARNING)
+    quiet_third_party_logs()
     try:
         secrets = load_secrets()
         settings = load_settings()

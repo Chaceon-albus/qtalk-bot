@@ -31,6 +31,7 @@ from qtalk_bot.config import (
     Settings,
     TopicSettings,
     TurnSettings,
+    WebImageSettings,
     check_provider_secrets,
     config_path,
     load_secrets,
@@ -1591,6 +1592,289 @@ def test_image_generation_provider_needs_its_key() -> None:
         check_provider_secrets(settings, secrets)
     assert info.value.problems == ("配置里用到了 gemini 的模型，但环境变量 GEMINI_API_KEY 未设置",)
     check_provider_secrets(settings, load_secrets(FAKE_SECRETS))
+
+
+# ---- [web_images] 与模型的 web_images 开关 ----
+
+
+def test_model_web_images_switch_defaults_to_on(tmp_path: Path) -> None:
+    settings = load_settings(write_config(tmp_path, ""))
+    assert settings.models[0].web_images is True
+    assert ModelSettings(name="a", provider=Provider.OPENAI, model="m").web_images is True
+    off = MODELS + "web_images = false\n"
+    assert (
+        load_settings(write_config(tmp_path, off, "b.toml", models=False)).models[0].web_images
+        is False
+    )
+    wrong = MODELS + 'web_images = "no"\n'
+    error = config_error(write_config(tmp_path, wrong, "c.toml", models=False))
+    assert error.problems == ("models[0].web_images：应为布尔值，实际是字符串",)
+
+
+def test_web_images_defaults_when_omitted(tmp_path: Path) -> None:
+    web_images = load_settings(write_config(tmp_path, "")).web_images
+    assert web_images == WebImageSettings(
+        max_size_mb=10,
+        download_timeout_seconds=10,
+        max_display_px=512,
+        extra_hosts=(),
+        proxy=None,
+    )
+    assert web_images.max_bytes == 10 * 1024 * 1024
+    # 只写了一部分键的表，其余取默认值。
+    partial = load_settings(write_config(tmp_path, "[web_images]\nmax_size_mb = 2\n", "b.toml"))
+    assert partial.web_images == WebImageSettings(max_size_mb=2)
+
+
+def test_web_images_values_are_read(tmp_path: Path) -> None:
+    text = (
+        "[web_images]\nmax_size_mb = 1\ndownload_timeout_seconds = 2.5\nmax_display_px = 64\n"
+        'extra_hosts = ["Images.Example.ORG", " nasa.gov "]\nproxy = "socks5h://user:pass@h:1080"\n'
+    )
+    web_images = load_settings(write_config(tmp_path, text)).web_images
+    assert web_images == WebImageSettings(
+        max_size_mb=1,
+        download_timeout_seconds=2.5,
+        max_display_px=64,
+        extra_hosts=("images.example.org", "nasa.gov"),
+        proxy="socks5h://user:pass@h:1080",
+    )
+    assert web_images.max_bytes == 1024 * 1024
+    upper = "[web_images]\nmax_size_mb = 10\ndownload_timeout_seconds = 60\nmax_display_px = 2048\n"
+    assert load_settings(write_config(tmp_path, upper, "b.toml")).web_images == WebImageSettings(
+        max_size_mb=10, download_timeout_seconds=60, max_display_px=2048
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ("max_size_mb = 0", "web_images.max_size_mb：应为正整数"),
+        ("max_size_mb = 11", "web_images.max_size_mb：不能大于 10"),
+        ("max_size_mb = 2.5", "web_images.max_size_mb：应为整数，实际是浮点数"),
+        (
+            "download_timeout_seconds = 0",
+            "web_images.download_timeout_seconds：应大于 0、不大于 60",
+        ),
+        (
+            "download_timeout_seconds = 60.5",
+            "web_images.download_timeout_seconds：应大于 0、不大于 60",
+        ),
+        (
+            'download_timeout_seconds = "10"',
+            "web_images.download_timeout_seconds：应为数字，实际是字符串",
+        ),
+        ("max_display_px = 63", "web_images.max_display_px：不能小于 64"),
+        ("max_display_px = 2049", "web_images.max_display_px：不能大于 2048"),
+        (
+            'extra_hosts = "a.example.com"',
+            "web_images.extra_hosts：应为字符串的数组，实际是字符串",
+        ),
+        (
+            'extra_hosts = ["a.example.com", "A.example.com"]',
+            "web_images.extra_hosts[1]：与前面的项重复",
+        ),
+        ("enabled = true", "web_images.enabled：未知的键"),
+    ],
+)
+def test_invalid_web_images(tmp_path: Path, text: str, problem: str) -> None:
+    path = write_config(tmp_path, f"[web_images]\n{text}\n")
+    assert config_error(path).problems == (problem,)
+
+
+@pytest.mark.parametrize(
+    ("value", "problem"),
+    [
+        # 单段的后缀只在内置名单里用，配置里追加的要至少两段。
+        ('"gov"', "应为合法的域名（至少两段，只含字母、数字和连字符，最后一段是字母）"),
+        ('"edu"', "应为合法的域名（至少两段，只含字母、数字和连字符，最后一段是字母）"),
+        ('"https://images.example.com"', "只写域名，不能带协议"),
+        ('"images.example.com/path"', "只写域名，不能带路径"),
+        ('"images.example.com:8443"', "只写域名，不能带端口"),
+        ('"1.2.3.4"', "不能是 IP 地址"),
+        ('"  "', "不能为空"),
+    ],
+)
+def test_invalid_web_image_extra_host(tmp_path: Path, value: str, problem: str) -> None:
+    text = f"[web_images]\nextra_hosts = [{value}]\n"
+    error = config_error(write_config(tmp_path, text))
+    assert error.problems == (f"web_images.extra_hosts[0]：{problem}",)
+    if (raw := value.strip('" ')) and raw not in ("gov", "edu"):
+        assert raw not in str(error)  # 报错不回显取值
+
+
+def test_web_image_extra_hosts_are_limited_in_number(tmp_path: Path) -> None:
+    hosts = ", ".join(f'"h{n}.example.com"' for n in range(33))
+    error = config_error(write_config(tmp_path, f"[web_images]\nextra_hosts = [{hosts}]\n"))
+    assert error.problems == ("web_images.extra_hosts：最多 32 项",)
+
+
+@pytest.mark.parametrize(
+    "proxy",
+    [
+        "http://h:1",
+        "https://h:1",
+        "socks5://h:1080",
+        "socks5h://h:1080",
+        "SOCKS5://h:1080",
+        "socks5h://user:pass@h:1080",
+    ],
+)
+def test_web_images_proxy_is_read(tmp_path: Path, proxy: str) -> None:
+    text = f'[web_images]\nproxy = "{proxy}"\n'
+    assert load_settings(write_config(tmp_path, text)).web_images.proxy == proxy
+
+
+def test_web_images_proxy_does_not_fall_back_to_the_qq_proxy(tmp_path: Path) -> None:
+    text = '[qq]\nproxy = "socks5h://127.0.0.1:1080"\n'
+    settings = load_settings(write_config(tmp_path, text))
+    assert settings.qq.proxy == "socks5h://127.0.0.1:1080"
+    assert settings.web_images.proxy is None
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        (
+            f'[web_images]\nproxy = "{SECRET_PROXY}"\n',
+            "web_images.proxy：应为完整的地址，协议是 http、https、socks5、socks5h 之一",
+        ),
+        (
+            '[web_images]\nproxy = "user:hunter2@127.0.0.1:7890"\n',
+            "web_images.proxy：应为完整的地址，协议是 http、https、socks5、socks5h 之一",
+        ),
+        ('[web_images]\nproxy = ""\n', "web_images.proxy：不能为空"),
+        ("[web_images]\nproxy = 1\n", "web_images.proxy：应为字符串，实际是整数"),
+    ],
+)
+def test_invalid_web_images_proxy(tmp_path: Path, text: str, problem: str) -> None:
+    error = config_error(write_config(tmp_path, text))
+    assert error.problems == (problem,)
+    assert "hunter2" not in str(error)
+
+
+def test_web_images_proxy_is_not_in_repr() -> None:
+    settings = WebImageSettings(proxy="socks5h://user:hunter2@h:1080")
+    assert "hunter2" not in repr(settings)
+    settings_repr = repr(
+        Settings(
+            timezone=ZoneInfo("UTC"),
+            data_dir=Path("/data"),
+            models=(ModelSettings(name="a", provider=Provider.OPENAI, model="m", default=True),),
+            web_images=settings,
+        )
+    )
+    assert "hunter2" not in settings_repr
+
+
+def test_web_images_must_be_a_table(tmp_path: Path) -> None:
+    error = config_error(write_config(tmp_path, 'web_images = "on"\n'))
+    assert error.problems == ("web_images：应为表，实际是字符串",)
+
+
+PROXY_PROBLEM = "应为完整的地址，协议是 http、https、socks5、socks5h 之一"
+
+
+@pytest.mark.parametrize(
+    ("table", "key", "escaped", "problem"),
+    [
+        # TOML 允许把控制字符与空白写成转义；HTTP 客户端要到建连接时才拒绝，所以在这里报错。
+        ("web_images", "proxy", "\\u0001", PROXY_PROBLEM),
+        ("web_images", "proxy", "\\u007f", PROXY_PROBLEM),
+        ("web_images", "proxy", "\\u00a0", PROXY_PROBLEM),
+        ("web_images", "proxy", "\\t", PROXY_PROBLEM),
+        ("qq", "proxy", "\\u0001", PROXY_PROBLEM),
+        ("providers.openai", "proxy", "\\n", PROXY_PROBLEM),
+        ("qq", "base_url", "\\u0001", "应为完整的地址，协议是 http、https 之一"),
+        ("providers.gemini", "base_url", "\\u2028", "应为完整的地址，协议是 http、https 之一"),
+        ("providers.gemini", "base_url", "\\u3000", "应为完整的地址，协议是 http、https 之一"),
+    ],
+)
+def test_urls_with_control_characters_or_blanks_are_rejected(
+    tmp_path: Path, table: str, key: str, escaped: str, problem: str
+) -> None:
+    text = f'[{table}]\n{key} = "http://user:hunter2@proxy.example.com/{escaped}"\n'
+    error = config_error(write_config(tmp_path, text))
+    assert error.problems == (f"{table}.{key}：{problem}",)
+    assert "hunter2" not in str(error)
+
+
+@pytest.mark.parametrize(
+    ("table", "key", "url", "problem"),
+    [
+        # 方括号里只能是 IPv6 地址
+        ("web_images", "proxy", "http://[v1.example.org]:8080", PROXY_PROBLEM),
+        ("qq", "proxy", "socks5h://user:hunter2@[not-ipv6]:1080", PROXY_PROBLEM),
+        ("providers.openai", "proxy", "http://[1.2.3.4]:8080", PROXY_PROBLEM),
+        ("qq", "base_url", "https://[v1.example.org]/", "应为完整的地址，协议是 http、https 之一"),
+    ],
+)
+def test_bracketed_hosts_must_be_ipv6(
+    tmp_path: Path, table: str, key: str, url: str, problem: str
+) -> None:
+    error = config_error(write_config(tmp_path, f'[{table}]\n{key} = "{url}"\n'))
+    assert error.problems == (f"{table}.{key}：{problem}",)
+    assert "hunter2" not in str(error)
+    assert "example.org" not in str(error)
+
+
+@pytest.mark.parametrize("proxy", ["http://[::1]:8080", "socks5h://user:pass@[2001:db8::1]:1080"])
+def test_ipv6_proxies_are_accepted(tmp_path: Path, proxy: str) -> None:
+    text = f'[web_images]\nproxy = "{proxy}"\n'
+    assert load_settings(write_config(tmp_path, text)).web_images.proxy == proxy
+
+
+# 地址合不合法以 HTTP 客户端（httpx2）的判断为准：它拒绝的，读配置时就拒绝；它接受的，这里也接受。
+@pytest.mark.parametrize(
+    ("table", "key", "url", "problem"),
+    [
+        ("web_images", "proxy", "http://☃.example.org:8080", PROXY_PROBLEM),
+        ("qq", "proxy", "socks5h://user:hunter2@999.1.1.1:1080", PROXY_PROBLEM),
+        ("qq", "base_url", "https://ａpi.example.org/", "应为完整的地址，协议是 http、https 之一"),
+    ],
+)
+def test_urls_the_http_client_rejects_are_rejected(
+    tmp_path: Path, table: str, key: str, url: str, problem: str
+) -> None:
+    error = config_error(write_config(tmp_path, f'[{table}]\n{key} = "{url}"\n'))
+    assert error.problems == (f"{table}.{key}：{problem}",)
+    assert "hunter2" not in str(error)
+    assert "example.org" not in str(error)
+    assert "999" not in str(error)
+
+
+@pytest.mark.parametrize(
+    "proxy",
+    [
+        "http://localhost:7890",
+        "http://my_proxy:7890",
+        "socks5://127.0.0.1:1080",
+        "http://h.example.org.:1",
+        "http://代理.example.org:8080",  # 国际化域名
+        "http://\u212a.example.org:8080",  # 开尔文符号：客户端按 IDNA 转成 k，照样接受
+        "http://ex%41mple.org:8080",
+    ],
+)
+def test_proxies_the_http_client_accepts_are_accepted(tmp_path: Path, proxy: str) -> None:
+    text = f'[web_images]\nproxy = "{proxy}"\n'
+    assert load_settings(write_config(tmp_path, text)).web_images.proxy == proxy
+
+
+@pytest.mark.parametrize(("escaped", "code"), [("\\u200d", 0x200D), ("\\u200b", 0x200B)])
+def test_format_characters_in_the_path_are_left_to_the_http_client(
+    tmp_path: Path, escaped: str, code: int
+) -> None:
+    # 回归：路径里有 U+200D 这类格式字符的地址原来能加载，客户端也照常处理；预检只拒绝空白。
+    text = f'[providers.openai]\nbase_url = "https://gateway.example.org/👩{escaped}💻/v1"\n'
+    providers = load_settings(write_config(tmp_path, text)).providers
+    assert providers.openai.base_url == f"https://gateway.example.org/👩{chr(code)}💻/v1"
+
+
+def test_internationalized_base_url_loads_again(tmp_path: Path) -> None:
+    # 回归：国际化域名的 base_url 原来能加载，客户端会把主机名转成 xn--…
+    text = '[providers.openai]\nbase_url = "https://bücher.example/v1"\n'
+    providers = load_settings(write_config(tmp_path, text)).providers
+    assert providers.openai.base_url == "https://bücher.example/v1"
 
 
 # ---- [backup] 与 [alerts]（里程碑 9）----

@@ -16,6 +16,11 @@ errata「好友事件」实测都会推送）交给 `ReminderEvents.friend_chang
 的 HTTP 客户端（`bot.http_client`）下载，不另建客户端，所以 `[qq].proxy`（传给 `pyqbot.Bot(proxy=...)`）对下载
 同样生效。
 
+回答里网上的图片经机器人的素材库显示（`_QQReplyChannel.upload_image()`、`delete_image()`，文件名由
+`library_file_name()` 生成，同一个编号按引用数删，见 `SharedLibrary`）；进程在上传之后、删除之前退出留下的，以及
+流式消息没有确认结束、留着不删的，由定期清理（`run_library_sweep()`，单独的维护任务）删掉。图片本身的下载不在
+这里，用的是自己的 HTTP 客户端（`image_download.py`）。
+
 已授权用户的消息带附件、引用、卡片等非文本内容时，还记一条它们的形态（`describe_non_text()`），为处理图片、
 语音、文件收集真实样本。这条日志会长期保留，所以只输出能确认安全的东西：数字、字数，以及对照白名单得到的
 固定标签（附件类型、卡片类型、平台域名、文件扩展名），对不上的一律记「其它」；正文、语音识别文本、文件名、
@@ -27,7 +32,9 @@ import contextlib
 import ipaddress
 import logging
 import re
-from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+import secrets
+import time
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from http.cookiejar import DefaultCookiePolicy
 from typing import Protocol, runtime_checkable
@@ -44,13 +51,16 @@ from .confirmations import BUTTON_PREFIXES
 from .conversation import (
     ChatInput,
     ChoiceButton,
+    LibraryImage,
     SendError,
     SendRejectedError,
     SendUncertainError,
 )
 from .gate import Chat, Delivery, FriendAdded, Gate, IncomingMessage, Reply, ShareLinkError
 from .media import (
+    CLEANUP_INTERVAL_SECONDS,
     GIF,
+    HOST_NAME,
     JPEG,
     PNG,
     WEBP,
@@ -60,6 +70,8 @@ from .media import (
     HostRefusedError,
     HostRefusedHook,
     IncomingAttachment,
+    in_hosts,
+    known_host,
 )
 from .process import ReplyBudget
 
@@ -76,7 +88,6 @@ PLATFORM_HOSTS = (
     "qpic.cn",  # 文档示例里的图片地址
     "gtimg.cn",  # 文档示例里的小程序图标
 )
-_HOST = re.compile(r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
 
 
 type ButtonHandler = Callable[[str, str, Callable[[str], Awaitable[None]]], Awaitable[None]]
@@ -163,11 +174,15 @@ class QQChat:
     那条消息上，回给新消息会让平台提前结束正在写的流式消息（pyqbot errata，40034019）。
     """
 
-    def __init__(self, batcher: Batcher) -> None:
+    def __init__(self, batcher: Batcher, *, library: SharedLibrary | None = None) -> None:
+        """`library` 是机器人的素材库（包着 `bot.images`，与定期清理共用），回答里网上的图片经它显示，各个通道共用
+        它；不给时那些图都改成说明文字。"""
         self._batcher = batcher
+        self._library = library
 
     async def handle(self, user: User, message: pyqbot.C2CMessage) -> None:
-        await self._batcher.submit(user, chat_input(message), _QQReplyChannel(message))
+        channel = _QQReplyChannel(message, library=self._library)
+        await self._batcher.submit(user, chat_input(message), channel)
 
     def answering(self, openid: str) -> _QQReplyChannel | None:
         """这个用户正在回答的一轮的回复挂在哪条消息上（它的通道）；没有在回答时为 `None`。结果只在当下有效，
@@ -302,7 +317,7 @@ def download_refusal(url: str, hosts: Sequence[str] = PLATFORM_HOSTS) -> str | N
 
     每一跳（包括第一跳与每次重定向的目标）都要检查：只认 http(s)；不能带用户信息（否则 HTTP 客户端会据此
     构造 Basic 鉴权）；主机名是 IP 字面量时拒绝（内网、回环、链路本地等地址明确说是内网，公网 IP 也不在
-    白名单里）；主机名必须是合法的域名，并属于下载白名单 `hosts`（与形态日志共用一份）。
+    白名单里）；方括号里不是 IP 的也拒绝；主机名必须是合法的域名，并属于下载白名单 `hosts`（与形态日志共用一份）。
     """
     refusal = _refusal(url, hosts)
     return None if refusal is None else refusal.reason
@@ -336,10 +351,13 @@ def _refusal(url: str, hosts: Sequence[str]) -> _Refusal | None:
     if address is not None:
         reason = "主机是 IP 地址" if address.is_global else "主机是内网地址"
         return _Refusal(reason, _host_refused(reason, texts.HOST_KIND_IP, is_host=False))
+    if "[" in parts.netloc or "]" in parts.netloc:
+        # 方括号里只能是 IP 字面量；`hostname` 会去掉方括号，`[v1.multimedia.nt.qq.com.cn]` 这样的不能当成域名放行。
+        return _Refusal("地址不合法")
     reason = "主机不在下载白名单里"
-    if not _HOST.fullmatch(host):
+    if not HOST_NAME.fullmatch(host):
         return _Refusal(reason, _host_refused(reason, texts.HOST_KIND_UNRECOGNIZED, is_host=False))
-    if not _in_hosts(host, hosts):
+    if not in_hosts(host, hosts):
         # 主机名是合法的域名：提醒里只写它（urlsplit 已转成小写，不含端口、路径与查询串）。
         return _Refusal(reason, _host_refused(reason, host, is_host=True))
     return None
@@ -560,7 +578,178 @@ def refuse_cookies(client: pyqbot.Client) -> None:
 
 
 # pyqbot 上传时按扩展名推断为图片的格式（guide 第 4 节；实测 jpg、gif、webp 都能发）里，生成的图可能用到的几种。
+# 素材库也按扩展名定格式，收的正是这四种（guide 第 8 节；errata「素材库：`.jpg` 被接受」）。
 _IMAGE_EXTENSIONS = {PNG: "png", JPEG: "jpg", GIF: "gif", WEBP: "webp"}
+
+LIBRARY_PREFIX = "qtalk-web-"
+"""回答里网上的图片传到素材库时文件名的前缀，完整的格式见 `library_file_name()`。"""
+
+_LIBRARY_TOKEN_BYTES = 8
+_LIBRARY_FILE = re.compile(
+    rf"{re.escape(LIBRARY_PREFIX)}[0-9a-f]{{{2 * _LIBRARY_TOKEN_BYTES}}}"
+    rf"\.(?:{'|'.join(sorted(_IMAGE_EXTENSIONS.values()))})"
+)
+
+
+def library_file_name(extension: str) -> str:
+    """回答里一张网上的图传到素材库时的文件名：`LIBRARY_PREFIX`、16 位随机的十六进制串与扩展名。进程在上传之后、
+    删除之前退出时素材会留下，`library_sweep()` 只按这个完整的格式（`is_library_file()`）认出它们，不碰前缀相同、
+    别人传的素材。"""
+    return f"{LIBRARY_PREFIX}{secrets.token_hex(_LIBRARY_TOKEN_BYTES)}.{extension}"
+
+
+def is_library_file(name: str | None) -> bool:
+    """`name` 是不是 `library_file_name()` 生成的文件名。"""
+    return name is not None and _LIBRARY_FILE.fullmatch(name) is not None
+
+
+STALE_LIBRARY_SECONDS = 2 * 3600
+"""素材库里回答用的图（`is_library_file()`）上传超过这么久就当作遗留的删掉。一轮回答最晚在用户那条消息之后约 60
+分钟结束（`conversation.REPLY_DEADLINE_SECONDS` 加收尾），图又是在那之后才传的，所以 2 小时之前传的不会还有回答在用。"""
+
+
+class LibraryItem(Protocol):
+    """素材库里的一张图（`pyqbot.MediaImage` 符合它）。"""
+
+    @property
+    def image_id(self) -> str: ...
+
+    @property
+    def url(self) -> str: ...
+
+    @property
+    def file_name(self) -> str | None: ...
+
+    @property
+    def created_at(self) -> int | None: ...
+
+
+class ImageLibrary(Protocol):
+    """机器人的素材库（`pyqbot.Client.images` 符合它）。"""
+
+    async def upload(
+        self, *, data: bytes | None = None, file_name: str | None = None
+    ) -> LibraryItem: ...
+
+    def iter_images(self) -> AsyncIterator[LibraryItem]: ...
+
+    async def delete(self, image: str) -> None: ...
+
+
+def library_sweep(
+    library: SharedLibrary, *, max_age: int = STALE_LIBRARY_SECONDS
+) -> Callable[[int], Awaitable[None]]:
+    """素材库的一次清理（参数是当前的 Unix 秒，见 `run_library_sweep()`）：删掉素材库里文件名完整符合
+    `library_file_name()` 的格式、上传超过 `max_age` 秒的图（进程在上传与删除之间退出留下的，以及流式消息没有确认
+    结束、留给这里删的）。别的素材（名字不符合这个格式的、平台没给上传时间的）不碰。
+
+    和回答的通道共用 `library`（`SharedLibrary`）：每张删之前问它，这个进程最近（`STALE_LIBRARY_SECONDS` 之内）
+    传过同一个编号的就跳过，留给下一次。平台如果把内容相同的上传合并成同一个编号，列出时的旧图可能正被新的一轮用着。
+    列不出或删不掉只记日志，下次再试。"""
+
+    async def sweep(now: int) -> None:
+        cutoff = now - max_age
+        stale: list[str] = []
+        try:
+            async for image in library.library.iter_images():
+                created = image.created_at
+                if is_library_file(image.file_name) and created is not None and created <= cutoff:
+                    stale.append(image.image_id)
+        except pyqbot.QQBotError as exc:
+            logger.warning("没能列出素材库里的图片：%s", _describe(exc))
+        except RuntimeError as exc:  # 客户端已关闭
+            logger.warning("没能列出素材库里的图片：%s", type(exc).__name__)
+            return
+        deleted = skipped = 0
+        for image_id in stale:
+            if library.recently_uploaded(image_id):
+                skipped += 1
+                continue
+            try:
+                await library.library.delete(image_id)
+            except pyqbot.QQBotError as exc:
+                logger.warning("没能删掉素材库里遗留的图片：%s", _describe(exc))
+            except (RuntimeError, ValueError) as exc:
+                logger.warning("没能删掉素材库里遗留的图片：%s", type(exc).__name__)
+            else:
+                deleted += 1
+        if stale:
+            logger.info(
+                "删掉了素材库里遗留的回答图片 %d 张（找到 %d 张，%d 张刚重新传过、留到下次）",
+                deleted,
+                len(stale),
+                skipped,
+            )
+
+    return sweep
+
+
+async def run_library_sweep(
+    library: SharedLibrary,
+    *,
+    clock: Callable[[], float] = time.time,
+    interval: float = CLEANUP_INTERVAL_SECONDS,
+) -> None:
+    """素材库的定期清理（`library_sweep()`）：启动时一次，之后每隔 `interval` 秒一次（与附件清理的节奏相同），直到
+    被取消。它经 QQ 的 HTTP 客户端发请求，所以是单独的维护任务，关停时在关 QQ 客户端之前停下（`__main__._shut_down()`）。
+    出错只记日志。"""
+    sweep = library_sweep(library)
+    while True:
+        try:
+            await sweep(int(clock()))
+        except Exception as exc:  # noqa: BLE001  清理失败不能让机器人停下，下次再试；只记类型
+            logger.warning("清理素材库时出错：%s", type(exc).__name__)
+        await asyncio.sleep(interval)
+
+
+class SharedLibrary:
+    """进程内共用的素材库（回答里网上的图片），按素材编号记还有几处在用。启动时建一个，交给 `QQChat`（它再交给每个
+    `_QQReplyChannel`）与定期清理（`library_sweep()`）。
+
+    平台会不会把内容相同的两次上传合并成同一个编号没有实测。如果会，两个用户的回答（或同一个回答里的两处）就共用
+    一个编号，先结束的那一轮把它删了，另一条还在写的流式消息里的图就坏了。所以上传得到编号时加一，删除时减一，
+    减到零才真的调用平台的删除。
+
+    一轮的流式消息没有确认结束时，它的素材不删、留给定期清理（`conversation.Conversation._drop_assets()`），也就
+    不来减：那几处一直算作在用，别的回答删不掉它。计数表不会因此越积越多：上次上传已经超过 `STALE_LIBRARY_SECONDS`
+    的编号在下次上传时从表里去掉，那时已经没有回答还在用它们，留下的素材归 `library_sweep()` 删。
+    """
+
+    def __init__(
+        self, library: ImageLibrary, *, clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        self.library = library
+        self._clock = clock
+        self._uses: dict[str, tuple[int, float]] = {}  # 编号 → （在用的处数，最近一次上传的时刻）
+
+    def __len__(self) -> int:
+        """计数表里有几个编号。"""
+        return len(self._uses)
+
+    def recently_uploaded(self, image_id: str) -> bool:
+        """这个进程在 `STALE_LIBRARY_SECONDS` 之内传过这个编号（定期清理据此跳过它）。只看上传的时刻、不看引用数：
+        留给定期清理的那些一直不来减数，看引用数的话就永远删不掉了；还在用的一定是这段时间里传的。"""
+        entry = self._uses.get(image_id)
+        return entry is not None and self._clock() - entry[1] <= STALE_LIBRARY_SECONDS
+
+    async def upload(self, data: bytes, file_name: str) -> LibraryItem:
+        """传上去，给得到的编号加一处。"""
+        image = await self.library.upload(data=data, file_name=file_name)
+        now = self._clock()
+        for image_id, (_, uploaded) in list(self._uses.items()):
+            if now - uploaded > STALE_LIBRARY_SECONDS:
+                del self._uses[image_id]
+        uses, _ = self._uses.get(image.image_id, (0, now))
+        self._uses[image.image_id] = (uses + 1, now)
+        return image
+
+    async def delete(self, image_id: str) -> None:
+        """一处不再用它：别处还在用时只减一，否则从平台删掉。表里没有的（已经过期去掉的）照样删。"""
+        uses, uploaded = self._uses.pop(image_id, (1, 0.0))
+        if uses > 1:
+            self._uses[image_id] = (uses - 1, uploaded)
+            return
+        await self.library.delete(image_id)
 
 
 class _QQReplyChannel:
@@ -575,10 +764,14 @@ class _QQReplyChannel:
 
     回答分条：`finish_stream()` 之后（不论成功与否）再调 `stream()`，对同一条消息另开一条流式消息
     （pyqbot 实测同一条消息可以先后回复几条流式消息；前一条要先结束，否则平台会提前结束它）。
+
+    素材库（回答里网上的图片）：`upload_image()` 以 `library_file_name()` 的名字传上去，`delete_image()` 删掉，都经
+    进程内共用的 `SharedLibrary`（按编号记引用数）。没有给 `library` 时上传一律被拒（那些图改成说明文字）。
     """
 
-    def __init__(self, message: pyqbot.C2CMessage) -> None:
+    def __init__(self, message: pyqbot.C2CMessage, *, library: SharedLibrary | None = None) -> None:
         self._message = message
+        self._library = library
         self._stream: pyqbot.StreamMessage | None = None
         self.budget = ReplyBudget()
 
@@ -630,6 +823,33 @@ class _QQReplyChannel:
         replying()
         sent = await _guarded(self._message.reply(media=photo))
         return None if sent.ext_info is None else _ref_value(sent.ext_info.ref_idx)
+
+    async def upload_image(self, data: bytes, mime_type: str) -> LibraryImage:
+        """传到素材库（不发消息）。失败一律算 `SendRejectedError`（含网络错误）：上传不会把任何东西发给用户；
+        说不准是否传上去的，由 `library_sweep()` 日后删掉。"""
+        extension = _IMAGE_EXTENSIONS.get(mime_type)
+        if self._library is None:
+            raise SendRejectedError("没有素材库")
+        if extension is None:
+            raise SendRejectedError("素材库不收这种格式的图片")
+        try:
+            image = await self._library.upload(data, library_file_name(extension))
+        except pyqbot.QQBotError as exc:
+            raise SendRejectedError(f"上传到素材库失败：{_describe(exc)}") from None
+        except (RuntimeError, ValueError, OSError) as exc:
+            raise SendRejectedError(f"上传到素材库失败：{type(exc).__name__}") from None
+        return LibraryImage(url=image.url, image_id=image.image_id)
+
+    async def delete_image(self, image: LibraryImage) -> None:
+        """不再用这张图：别的回答还在用同一个编号时只减引用数（`SharedLibrary.delete()`），否则从平台删掉。"""
+        if self._library is None:
+            raise SendRejectedError("没有素材库")
+        try:
+            await self._library.delete(image.image_id)
+        except pyqbot.QQBotError as exc:
+            raise _send_error(exc) from None
+        except (RuntimeError, ValueError) as exc:  # 客户端已关闭，或编号为空
+            raise SendRejectedError(type(exc).__name__) from None
 
     async def send_markdown(self, markdown: str) -> None:
         await _guarded(self._message.reply(markdown=markdown))
@@ -1081,20 +1301,10 @@ def _host(url: str | None, hosts: Sequence[str]) -> str:
         or "\\" in url
         or "@" in parts.netloc
         or host is None
-        or not _known_host(host, hosts)
+        or not known_host(host, hosts)
     ):
         return "有（其它主机）"
     return f"有（主机 {host}）"
-
-
-def _known_host(host: str, hosts: Sequence[str]) -> bool:
-    """主机名是合法的域名，并且属于下载白名单 `hosts`。"""
-    return bool(_HOST.fullmatch(host)) and _in_hosts(host, hosts)
-
-
-def _in_hosts(host: str, hosts: Sequence[str]) -> bool:
-    """主机名是 `hosts` 里的某一项，或它的子域名。"""
-    return any(host == suffix or host.endswith(f".{suffix}") for suffix in hosts)
 
 
 def _length(text: str | None) -> str:

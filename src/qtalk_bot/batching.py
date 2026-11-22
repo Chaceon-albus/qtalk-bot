@@ -79,6 +79,7 @@ from .config import AttachmentTimeoutAction, TurnSettings
 from .conversation import (
     ChatInput,
     ChoiceButton,
+    LibraryImage,
     Received,
     ReplyChannel,
     ReplyStream,
@@ -736,6 +737,12 @@ class _RoutedChannel:
     async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
         # 收消息时不发按钮；为了符合协议照样转发（同 `send_image()`）。
         await self._target().send_buttons(markdown, buttons)
+
+    async def upload_image(self, data: bytes, mime_type: str) -> LibraryImage:
+        raise AssertionError("收消息时不用素材库")
+
+    async def delete_image(self, image: LibraryImage) -> None:
+        raise AssertionError("收消息时不用素材库")
 
     def open_process(self) -> ReplyStream:
         raise AssertionError("收消息时不发过程消息")
