@@ -1144,11 +1144,15 @@ class Conversation:
         reminder_settings: ReminderSettings | None = None,
         image_fetcher: ImageFetcher | None = None,
         web_images: WebImageSettings | None = None,
+        bot_name: str | None = None,
         clock: Callable[[], float] = time.time,
         timer: Timer | None = None,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
         """`models` 按内部名字给出配置里的全部对话模型，`router` 决定每条消息用哪一个。
+
+        `bot_name` 是启动时取到的机器人在 QQ 上的名字（没取到时为 `None`），只写进对话请求的系统提示词最前面的
+        身份那一句（`prompt.identity_line()`），后台调用不带。
 
         `image_fetcher` 不为空时，打开了 `web_images` 的模型在回答里写的网上的图片随回答显示（见模块 docstring 的
         「回答里网上的图片」），显示尺寸按 `web_images`（`[web_images]`，不给时用默认值）；为空时那些图都改成说明文字，
@@ -1181,6 +1185,9 @@ class Conversation:
         self._reminders = reminders
         self._reminder_settings = reminder_settings
         self._image_fetcher = image_fetcher
+        self._bot_name = (
+            bot_name  # 启动时取到的机器人名字，只给对话请求的系统提示词（`prompt.identity_line()`）
+        )
         self._web_images = WebImageSettings() if web_images is None else web_images
         self._timezone = timezone
         self._clock = clock
@@ -1857,6 +1864,7 @@ class Conversation:
             drawing_possible=any(self._draws(model.image_generation) for model in models),
             reminders=begun.reminders,
             web_images_possible=self._image_fetcher is not None,
+            bot_name=self._bot_name,
         )
 
         def open_process() -> ProcessStream | None:

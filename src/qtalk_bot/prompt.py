@@ -1,6 +1,7 @@
 """系统提示词。
 
-由这几部分组成：配置里的人设（`[chat].persona`，各模型共用）、这次所用模型的补充提示词（`[[models]].persona_extra`，
+由这几部分组成：程序写的身份那一句（`identity_line()`：「你叫「名字」，是 QQ 上的一个聊天助手。」，名字是启动时取到的
+机器人在 QQ 上的名字，没取到时不带名字；身份是事实，由程序填，人设里只留可以调的部分）、配置里的人设（`[chat].persona`，各模型共用）、这次所用模型的补充提示词（`[[models]].persona_extra`，
 不为空时才有，只做小幅度的定制，单独一段紧跟在人设之后；OpenAI 的模型没写时用内置的 `config.DEFAULT_PERSONA_EXTRA`）、格式说明（QQ 能渲染什么）、附件标记的说明、历史里发送时间
 标记的说明（`SENT_TIME_GUIDE`；标记本身由 `context.py` 加在历史里每条用户消息的开头，见 `sent_time_mark()`）、
 当前时间（按配置的时区）。格式说明的最后一条按请求而定（`format_guide()`）：模型打开了 `[[models]].web_images`、
@@ -25,13 +26,14 @@
 能画图的请求（里程碑 10，`ReferableImage`）另加一段「可以引用的图片」（`referable_section()`）：列出这次上下文里
 本地文件还在的图片的编号、来源、在哪一轮与描述，改图或参照某张图时用这些编号。
 
-**顺序**（`system_prompt()`）：先是固定的说明（人设与补充、格式说明、附件与发送时间的说明、过程的说明、不能画图的
+**顺序**（`system_prompt()`）：先是固定的说明（身份那一句、人设与补充、格式说明、附件与发送时间的说明、过程的说明、不能画图的
 说明、记忆的说明、提醒的说明、需要确认的操作），再是会变的资料（可以引用的图片、记忆的资料、提醒资料），当前时间在最后。服务商按
 前缀缓存输入，前缀里一出现每轮都变的内容，后面的固定文字就缓存不到，所以会变的都排在固定的之后。
 这里是给模型看的，不是面向用户的文案，所以不放 `texts.py`。上下文的组装见 `context.py`。
 """
 
 import json
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -382,6 +384,34 @@ def sent_time_mark(moment: datetime) -> str:
     return f"[发送时间：{moment:%Y-%m-%d %H:%M} 星期{_WEEKDAYS[moment.weekday()]}]"
 
 
+MAX_BOT_NAME_CHARS = 40
+"""写进身份那一句的机器人名字最多几个字符，超过的截掉。"""
+
+
+def clean_bot_name(name: str | None) -> str | None:
+    """写进系统提示词之前整理机器人的名字：压成一行、去掉首尾空白，去掉不可见字符（`unicodedata.category()` 以
+    C 开头的）与「」这两个括号字符（免得名字跑出外面的引号），超过 `MAX_BOT_NAME_CHARS` 个字符的截掉。整理后为空
+    时返回 `None`（按没取到算）。"""
+    if name is None:
+        return None
+    kept = "".join(
+        " " if char.isspace() else char
+        for char in name
+        if char.isspace() or (char not in "「」" and not unicodedata.category(char).startswith("C"))
+    )
+    cleaned = " ".join(kept.split())[:MAX_BOT_NAME_CHARS].strip()
+    return cleaned or None
+
+
+def identity_line(name: str | None) -> str:
+    """系统提示词最前面的身份那一句，由程序写：身份是事实，人设（`[chat].persona`）里只留可以调的部分。取到了
+    机器人在 QQ 上的名字时带上名字（经 `clean_bot_name()` 整理），没取到时不带。"""
+    cleaned = clean_bot_name(name)
+    if cleaned is None:
+        return "你是 QQ 上的一个聊天助手。"
+    return f"你叫「{cleaned}」，是 QQ 上的一个聊天助手。"
+
+
 def system_prompt(
     persona: str,
     now: datetime,
@@ -394,11 +424,13 @@ def system_prompt(
     drawing_possible: bool = True,
     reminders: ReminderBrief | None = None,
     web_images: bool = False,
+    bot_name: str | None = None,
 ) -> str:
     """`now` 要带时区。各段之间空一行，没有的段跳过。
 
     先是固定的说明（同一个部署、同一组开关下每轮都一样），再是会变的资料，最后是当前时间：服务商按前缀缓存输入，
     前缀里一出现每轮都变的内容，后面的固定文字就缓存不到。
+    0. 身份那一句（`identity_line(bot_name)`，`bot_name` 是启动时取到的机器人在 QQ 上的名字，没取到时为 `None`）。
     1. 人设；`persona_extra`（这个模型的 `[[models]].persona_extra`）不为空时作为单独的一段紧跟在人设之后。
     2. 格式说明（`format_guide()`：`web_images` 为真时可以插网上的图片，这次能不能画图看 `images`）；
        `ATTACHMENT_GUIDE`；`SENT_TIME_GUIDE`（历史里用户消息开头的发送时间标记）。
@@ -417,7 +449,7 @@ def system_prompt(
     stamp = now.strftime("%Y-%m-%d %H:%M")
     zone = now.tzname() if not isinstance(now.tzinfo, ZoneInfo) else now.tzinfo.key
     clock = f"当前时间：{stamp}（星期{_WEEKDAYS[now.weekday()]}，{zone}）。"
-    sections = [persona.strip()]
+    sections = [identity_line(bot_name), persona.strip()]
     if persona_extra.strip():
         sections.append(persona_extra.strip())
     sections += [

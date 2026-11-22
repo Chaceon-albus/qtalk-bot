@@ -87,6 +87,7 @@ def profiled(
     *,
     threshold: float | None = 0.5,
     persona_extra: str = "",
+    bot_name: str | None = None,
 ) -> Conversation:
     """启用话题线；`threshold` 不为空时问档案题，`writer` 不为空时在后台写摘要与档案。`persona_extra` 是对话模型的
     补充提示词。"""
@@ -120,6 +121,7 @@ def profiled(
         settings=ChatSettings(),
         timezone=SHANGHAI,
         summarizer=summarizer,
+        bot_name=bot_name,
         clock=lambda: START,
     )
 
@@ -220,6 +222,32 @@ async def test_background_calls_never_carry_the_models_persona_extra(db: Databas
     assert writer.summaries.requests
     assert writer.rewrites.requests
     assert [request for request in background if extra in call_input(request)] == []
+    await summarizer_of(chat).aclose()
+
+
+async def test_only_the_chat_request_carries_the_bot_name(db: Database) -> None:
+    # 机器人的名字只进对话请求的系统提示词（身份那一句，在最前面）；决策、话题摘要、重写档案的输入里都没有。
+    name = "名字标记-3e8c"
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("好的老王"))
+    decider = Picker()
+    writer = Writer()
+    chat = profiled(db, decider, model, writer, bot_name=name)
+
+    await say(chat, alice, "以后叫我老王")
+    await settle(chat)
+    await say(chat, alice, "今天吃什么")
+    await settle(chat)
+
+    assert len(model.requests) == 2
+    for request in model.requests:
+        assert request.system.startswith(f"你叫「{name}」，是 QQ 上的一个聊天助手。\n\n")
+        assert name not in messages_input(request)
+    background = [*decider.requests, *writer.summaries.requests, *writer.rewrites.requests]
+    assert decider.requests
+    assert writer.summaries.requests
+    assert writer.rewrites.requests
+    assert [request for request in background if name in call_input(request)] == []
     await summarizer_of(chat).aclose()
 
 

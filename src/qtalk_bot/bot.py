@@ -172,17 +172,19 @@ class ShareLinks:
             raise ShareLinkError from exc
 
 
-async def fetch_bot_name(client: pyqbot.Client) -> str:
-    """取机器人的名字（`GET /users/@me`），用在邀请里。取不到或为空时退回通用的说法，不让启动失败。"""
+async def fetch_bot_name(client: pyqbot.Client) -> str | None:
+    """取机器人在 QQ 上的名字（`GET /users/@me`），启动时取一次，用在邀请文案与对话的系统提示词里。取不到或为空时
+    返回 `None`，不让启动失败：邀请里改用通用的称呼（`Gate`），系统提示词里用不带名字的身份那一句
+    （`prompt.identity_line()`）。"""
     try:
         me = await client.get_me()
     except pyqbot.QQBotError as exc:
         logger.warning("没能取到机器人的名字，邀请里改用通用的称呼：%s", _describe(exc))
-        return texts.DEFAULT_BOT_NAME
+        return None
     name = " ".join((me.username or "").split())  # 名字只放在一行里
     if not name:
         logger.warning("平台没有给出机器人的名字，邀请里改用通用的称呼")
-        return texts.DEFAULT_BOT_NAME
+        return None
     return name
 
 

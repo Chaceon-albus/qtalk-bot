@@ -577,7 +577,7 @@ async def test_request_has_system_prompt_history_and_current_message(db: Databas
     await say(chat, alice, "第二问")
 
     request = model.requests[-1]
-    assert request.system.startswith("你是测试用的人设。")
+    assert request.system.startswith("你是 QQ 上的一个聊天助手。\n\n你是测试用的人设。")
     assert FORMAT_GUIDE_WITHOUT_DRAWING in request.system
     assert "当前时间：2027-01-15 16:00（星期五，Asia/Shanghai）" in request.system
     assert request.max_output_tokens == 777
@@ -731,8 +731,12 @@ async def test_each_model_gets_its_own_persona_extra_including_the_fallback(db: 
     await say(chat, alice, "你好")
 
     (first,), (second,) = primary.requests, fallback.requests
-    assert first.system.startswith("共用的人设。\n\n主模型的补充。\n\n回复会显示在 QQ 聊天里")
-    assert second.system.startswith("共用的人设。\n\n备用的补充。\n\n回复会显示在 QQ 聊天里")
+    assert first.system.startswith(
+        "你是 QQ 上的一个聊天助手。\n\n共用的人设。\n\n主模型的补充。\n\n回复会显示在 QQ 聊天里"
+    )
+    assert second.system.startswith(
+        "你是 QQ 上的一个聊天助手。\n\n共用的人设。\n\n备用的补充。\n\n回复会显示在 QQ 聊天里"
+    )
     assert "备用的补充" not in first.system
     assert "主模型的补充" not in second.system
 
@@ -2230,6 +2234,7 @@ def media_chat(
     fetcher: Fetcher | None = None,
     clock: ManualClock | None = None,
     persona_extra: str = "",
+    bot_name: str | None = None,
 ) -> Conversation:
     """第一个模型是默认模型；每个模型带上它声明的 `inputs`。`clock` 不为空时用作过程消息与「正在输入」的时钟。
     `persona_extra` 给每个模型都配上。"""
@@ -2259,6 +2264,7 @@ def media_chat(
         attachments=attachments,
         fetcher=fetcher or Fetcher(store or MediaStore.under(tmp_path), downloader, attachments),
         describer=describer,
+        bot_name=bot_name,
         clock=lambda: START,
         timer=None if clock is None else clock,
         sleep=asyncio.sleep if clock is None else clock.sleep,
@@ -2755,6 +2761,50 @@ async def test_background_describe_and_decision_never_carry_the_persona_extra(
     assert describing.requests
     background = [*decider.requests, *describing.requests]
     assert [request for request in background if extra in call_input(request)] == []
+
+
+async def test_background_describe_and_decision_never_carry_the_bot_name(
+    db: Database, tmp_path: Path
+) -> None:
+    # 机器人的名字只进对话请求的系统提示词：图片描述与选模型的决策的输入里都没有它。
+    name = "名字标记-7a41"
+    alice = await invited(db, ALICE, "小王")
+    describing = ScriptedModel("describe", answer("一只橘猫"))
+    describer = describer_of(db, tmp_path, describing)
+    solve, support = ScriptedModel("solve", answer("好")), ScriptedModel("support", answer("好"))
+    decider = FakeDecider(chances(solve=0.9, support=0.1))
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({IMAGE_URL: PNG_A}),
+        (solve, BLIND),
+        (support, BLIND),
+        describer=describer,
+        decider=decider,
+        bot_name=name,
+    )
+
+    await send(chat, alice, "看我家猫", image_attachment())
+    await describer.wait_idle()
+
+    assert solve.requests
+    for request in solve.requests:
+        assert request.system.startswith(f"你叫「{name}」，是 QQ 上的一个聊天助手。\n\n")
+        assert name not in messages_input(request)
+    assert decider.requests
+    assert describing.requests
+    assert [r for r in (*decider.requests, *describing.requests) if name in call_input(r)] == []
+
+
+async def test_without_a_bot_name_the_prompt_uses_the_nameless_identity(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("好"))
+
+    await say(conversation(db, model), alice, "你好")
+
+    (request,) = model.requests
+    assert request.system.startswith("你是 QQ 上的一个聊天助手。\n\n")
+    assert texts.DEFAULT_BOT_NAME not in request.system
 
 
 async def test_failed_description_does_not_affect_the_reply(db: Database, tmp_path: Path) -> None:

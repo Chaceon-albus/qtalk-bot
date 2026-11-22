@@ -229,13 +229,15 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                 alerts,
             )
             maintenance.append(Background("网关检查", asyncio.create_task(gateway.run())))
+            # 机器人在 QQ 上的名字只在启动时取一次：邀请文案（取不到时 Gate 用通用的称呼）与对话的系统提示词共用。
+            bot_name = await fetch_bot_name(bot)
             gate = Gate(
                 db,
                 admin_openid=secrets.admin_openid,
                 timezone=settings.timezone,
                 invites=settings.invites,
                 share_link=ShareLinks(bot),
-                bot_name=await fetch_bot_name(bot),
+                bot_name=bot_name,
                 dir_taken=store.dir_taken,
             )
             await gate.prepare()
@@ -300,6 +302,7 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                     reminder_settings=settings.reminders if settings.reminders.enabled else None,
                     image_fetcher=downloader,
                     web_images=settings.web_images,
+                    bot_name=bot_name,
                 )
                 batcher = Batcher(conversation, settings.turns)
                 # 回答的通道与素材库的定期清理共用它（按编号记引用、清理时跳过刚重新传过的）。

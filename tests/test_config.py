@@ -1684,7 +1684,12 @@ def test_default_memory_instructions_turn_relative_times_into_dates() -> None:
 def test_default_persona_ends_with_the_guidance_for_risk_of_harm() -> None:
     # 过渡性的指引，只针对伤害自己或他人、身处危险的情况（见 docs/design/open-questions.md）。
     first, guidance = DEFAULT_PERSONA.split("\n\n")
-    assert first.endswith("用户用什么语言提问，就用什么语言回答。")
+    # 身份那一句由程序写在系统提示词最前面（prompt.identity_line()），人设里不再写「你是……」。
+    assert first == (
+        "用户是在问问题、而不是闲聊或倾诉时，应使用简明扼要、准确的语言回答；始终使用和用户相同的语言，"
+        "不确定的事情直说不确定，不可以编造事实。"
+    )
+    assert "你是" not in DEFAULT_PERSONA
     assert guidance == (
         "用户流露出伤害自己或他人的念头，或者正处在危险里时：认真对待，先接住对方的感受，不说教、不急着讲道理；"
         "问清对方现在是否安全，鼓励他联系身边信得过的人或当地的急救与心理援助热线，并说明你会继续陪着聊。"

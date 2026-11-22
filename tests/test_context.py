@@ -445,7 +445,9 @@ async def test_a_model_parsed_from_config_carries_the_built_in_persona_extra(
     with_extra = (await request.build(plain)).request.system
     without = (await request.build(bare)).request.system
 
-    assert with_extra.startswith(f"人设\n\n{DEFAULT_PERSONA_EXTRA}\n\n")
+    assert with_extra.startswith(
+        f"你是 QQ 上的一个聊天助手。\n\n人设\n\n{DEFAULT_PERSONA_EXTRA}\n\n"
+    )
     assert DEFAULT_PERSONA_EXTRA not in without
     assert without == with_extra.replace(f"{DEFAULT_PERSONA_EXTRA}\n\n", "", 1)
 

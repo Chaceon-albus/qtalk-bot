@@ -17,7 +17,7 @@ from collections.abc import (
     Sequence,
 )
 from pathlib import Path
-from typing import Self, cast
+from typing import Any, Self, cast
 from zoneinfo import ZoneInfo
 
 import httpx2
@@ -25,7 +25,7 @@ import pyqbot
 import pytest
 
 from qtalk_bot import __main__ as entry
-from qtalk_bot import memory
+from qtalk_bot import memory, texts
 from qtalk_bot.access import User
 from qtalk_bot.alerts import Alerts
 from qtalk_bot.batching import Batcher
@@ -513,6 +513,103 @@ def test_startup_asks_for_the_bot_name(
     monkeypatch.setattr(pyqbot.Bot, "start", start)
     assert entry.main() == 0
     assert len(fake_get_me) == 1
+
+
+@dataclasses.dataclass
+class StartupOutputs:
+    """启动之后用到机器人名字的两处实际写出的文字。"""
+
+    invitation: str = ""
+    system: str = ""
+
+
+def startup_outputs(monkeypatch: pytest.MonkeyPatch) -> StartupOutputs:
+    """跑一遍启动入口：在 `Bot.start()` 的替身里经启动时建好的 `Gate` 让管理员创建一个邀请，经 `Conversation` 让
+    管理员说一句话（对话模型的流用替身，不访问网络），记下邀请文案与对话请求的系统提示词。"""
+    from tests.test_conversation import FakeChannel
+
+    from qtalk_bot import access
+    from qtalk_bot.conversation import ChatInput
+    from qtalk_bot.gate import IncomingMessage, Reply
+    from qtalk_bot.llm import TextDelta
+    from qtalk_bot.llm.openai_responses import OpenAIChatModel
+
+    gates: list[Gate] = []
+    conversations: list[Conversation] = []
+    requests: list[ChatRequest] = []
+    outputs = StartupOutputs()
+    real_gate, real_conversation = Gate.__init__, Conversation.__init__
+
+    def gate_init(self: Gate, *args: Any, **kwargs: Any) -> None:  # 原样转交
+        real_gate(self, *args, **kwargs)
+        gates.append(self)
+
+    def conversation_init(self: Conversation, *args: Any, **kwargs: Any) -> None:  # 原样转交
+        real_conversation(self, *args, **kwargs)
+        conversations.append(self)
+
+    async def stream(self: OpenAIChatModel, request: ChatRequest) -> AsyncGenerator[ChatEvent]:
+        requests.append(request)
+        yield TextDelta("好")
+        yield Finished(FinishReason.COMPLETED)
+
+    async def share_link(self: pyqbot.Bot, *, callback_data: str | None = None) -> str:
+        return "https://example.invalid/share"
+
+    async def start(self: pyqbot.Bot) -> None:
+        (gate,) = gates
+        (chat,) = conversations
+        admin = FAKE_ENV["ADMIN_OPENID"]
+        outcome = await gate.on_message(
+            IncomingMessage(openid=admin, message_id="ROBOT1.0_fake-1", content="/invite 小王")
+        )
+        assert isinstance(outcome, Reply)
+        outputs.invitation = outcome.chain()[1].text
+        db = chat._db  # pyright: ignore[reportPrivateUsage]  启动时建好的那个数据库
+        user = await db.transaction(access.get_user_by_openid, admin)
+        assert user is not None
+        await chat.handle(user, [ChatInput(message_id="qq-fake-1", text="你好")], FakeChannel())
+        (request,) = requests
+        outputs.system = request.system
+
+    monkeypatch.setattr(Gate, "__init__", gate_init)
+    monkeypatch.setattr(Conversation, "__init__", conversation_init)
+    monkeypatch.setattr(OpenAIChatModel, "stream", stream)
+    monkeypatch.setattr(pyqbot.Bot, "generate_share_link", share_link)
+    monkeypatch.setattr(pyqbot.Bot, "start", start)
+    assert entry.main() == 0
+    return outputs
+
+
+def test_the_bot_name_fetched_once_reaches_the_invitation_and_the_chat_prompt(
+    config: Path, monkeypatch: pytest.MonkeyPatch, fake_get_me: list[pyqbot.Bot]
+) -> None:
+    outputs = startup_outputs(monkeypatch)
+
+    assert len(fake_get_me) == 1  # 整个启动只取一次
+    assert "邀请您来和测试助手聊聊天" in outputs.invitation
+    assert outputs.system.startswith("你叫「测试助手」，是 QQ 上的一个聊天助手。\n\n")
+
+
+@pytest.mark.parametrize("failure", ["error", "empty"])
+def test_without_a_bot_name_the_invitation_and_the_prompt_use_their_own_fallbacks(
+    config: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    calls: list[pyqbot.Bot] = []
+
+    async def get_me(self: pyqbot.Bot) -> pyqbot.BotInfo:
+        calls.append(self)
+        if failure == "error":
+            raise pyqbot.NetworkError("超时")
+        return pyqbot.BotInfo(id="1", username="  ")
+
+    monkeypatch.setattr(pyqbot.Bot, "get_me", get_me)
+    outputs = startup_outputs(monkeypatch)  # 启动不失败
+
+    assert len(calls) == 1
+    assert f"邀请您来和{texts.DEFAULT_BOT_NAME}聊聊天" in outputs.invitation
+    assert outputs.system.startswith("你是 QQ 上的一个聊天助手。\n\n")
+    assert texts.DEFAULT_BOT_NAME not in outputs.system
 
 
 def test_bot_is_closed_when_preparation_fails_after_get_me(

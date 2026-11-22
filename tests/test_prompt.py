@@ -26,8 +26,10 @@ from qtalk_bot.prompt import (
     ReferableImage,
     ReminderBrief,
     ReminderEntry,
+    clean_bot_name,
     confirm_guide,
     format_guide,
+    identity_line,
     memory_data,
     sent_time_mark,
     system_prompt,
@@ -134,7 +136,9 @@ def test_persona_extra_is_its_own_section_right_after_the_persona() -> None:
     plain = system_prompt("人设", NOW)
     extra = system_prompt("人设", NOW, persona_extra="  \n只回答用户问的。\n  ")
 
-    assert extra.startswith(f"人设\n\n只回答用户问的。\n\n{FORMAT_GUIDE_WITHOUT_DRAWING}\n\n")
+    assert extra.startswith(
+        f"你是 QQ 上的一个聊天助手。\n\n人设\n\n只回答用户问的。\n\n{FORMAT_GUIDE_WITHOUT_DRAWING}\n\n"
+    )
     assert extra.replace("只回答用户问的。\n\n", "", 1) == plain
 
 
@@ -142,7 +146,7 @@ def test_persona_extra_is_its_own_section_right_after_the_persona() -> None:
 def test_an_empty_persona_extra_leaves_the_prompt_unchanged(empty: str) -> None:
     assert system_prompt("人设", NOW, persona_extra=empty) == system_prompt("人设", NOW)
     assert system_prompt("人设", NOW, persona_extra=empty).startswith(
-        f"人设\n\n{FORMAT_GUIDE_WITHOUT_DRAWING}\n\n"
+        f"你是 QQ 上的一个聊天助手。\n\n人设\n\n{FORMAT_GUIDE_WITHOUT_DRAWING}\n\n"
     )
 
 
@@ -209,6 +213,7 @@ def full_prompt(
         memory=memory_of(summary),
         images=images,
         reminders=brief_of(reminder),
+        bot_name="小助手",
     )
 
 
@@ -219,8 +224,11 @@ def in_order(text: str, *pieces: str) -> bool:
 
 def test_fixed_guides_come_before_the_changing_data() -> None:
     drawing = full_prompt(images=image_of("一只猫"), summary="摘要甲", reminder="吃药")
+    # 身份那一句是固定说明的第一段，接着是人设与紧跟其后的补充。
+    assert drawing.startswith("你叫「小助手」，是 QQ 上的一个聊天助手。\n\n人设\n\n补充\n\n")
     assert in_order(
         drawing,
+        "你叫「小助手」",
         "人设",
         "补充",
         FORMAT_GUIDE,
@@ -305,6 +313,7 @@ def test_only_the_changing_data_differs_after_the_fixed_prefix() -> None:
     later = datetime(2027, 1, 16, 9, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
     first = full_prompt(images=image_of("一只猫"), summary="摘要甲", reminder="吃药")
     second = full_prompt(images=image_of("一条狗"), summary="摘要乙", reminder="开会", now=later)
+    assert first.startswith(identity_line("小助手"))  # 身份那一句在固定说明的最前面
     end_of_reminder_guide = first.index(REMINDER_GUIDE) + len(REMINDER_GUIDE)
     assert common_prefix(first, second) >= end_of_reminder_guide
     # 「需要确认的操作」也是固定的说明，前缀覆盖到它的末尾。
@@ -320,3 +329,41 @@ def test_only_the_changing_data_differs_after_the_fixed_prefix() -> None:
     assert common_prefix(one, two) >= end_of_memory_guide
     forget_only = confirm_guide(topics=True, reminders=False)
     assert common_prefix(one, two) >= one.index(forget_only) + len(forget_only)
+
+
+# ---- 身份那一句 ----
+
+
+def test_identity_line_with_and_without_a_name() -> None:
+    assert identity_line("小助手") == "你叫「小助手」，是 QQ 上的一个聊天助手。"
+    assert identity_line(None) == "你是 QQ 上的一个聊天助手。"
+    # 系统提示词以它开头，单独一段，后面空一行接人设。
+    assert system_prompt("人设", NOW, bot_name="小助手").startswith(
+        "你叫「小助手」，是 QQ 上的一个聊天助手。\n\n人设\n\n"
+    )
+    assert system_prompt("人设", NOW).startswith("你是 QQ 上的一个聊天助手。\n\n人设\n\n")
+
+
+@pytest.mark.parametrize(
+    ("raw", "cleaned"),
+    [
+        ("  小 助手 ", "小 助手"),
+        ("小\n助\t手", "小 助 手"),  # 压成一行
+        ("「小助手」", "小助手"),  # 去掉「」，免得名字跑出外面的引号
+        ("小\u200b助\x00手", "小助手"),  # 不可见字符去掉
+        ("名" * 50, "名" * 40),  # 超长截到 40 个字符
+        ("「」\u200b \n", None),  # 整理后为空：按没取到算
+        ("", None),
+        (None, None),
+    ],
+)
+def test_bot_name_is_cleaned_before_it_goes_into_the_prompt(
+    raw: str | None, cleaned: str | None
+) -> None:
+    assert clean_bot_name(raw) == cleaned
+    expected = (
+        "你是 QQ 上的一个聊天助手。"
+        if cleaned is None
+        else f"你叫「{cleaned}」，是 QQ 上的一个聊天助手。"
+    )
+    assert identity_line(raw) == expected

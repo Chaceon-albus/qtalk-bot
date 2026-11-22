@@ -207,7 +207,7 @@ class Gate:
         timezone: ZoneInfo,
         invites: InviteSettings,
         share_link: ShareLinkFactory,
-        bot_name: str = texts.DEFAULT_BOT_NAME,
+        bot_name: str | None = None,
         clock: Callable[[], int] = _now,
         new_code: Callable[[], str] = _new_code,
         dir_taken: DirTaken | None = None,
@@ -216,7 +216,9 @@ class Gate:
         self._dir_taken = dir_taken
         self._admin_openid = admin_openid
         self._timezone = timezone
-        if _EMBEDDED_CODE.search(bot_name):
+        if bot_name is None:
+            bot_name = texts.DEFAULT_BOT_NAME  # 没取到机器人的名字：邀请里用通用的称呼
+        elif _EMBEDDED_CODE.search(bot_name):
             # 名字里有形如邀请码的串时，对方原样贴回邀请会认出两个不同的串而兑换不了。
             logger.warning("机器人的名字里有形如邀请码的串，邀请里改用通用的称呼")
             bot_name = texts.DEFAULT_BOT_NAME

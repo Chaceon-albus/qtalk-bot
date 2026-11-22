@@ -3270,7 +3270,7 @@ async def test_failing_summary_does_not_block_the_chat(
 # ---- 机器人的名字 ----
 
 
-async def bot_name_from(response: httpx2.Response) -> str:
+async def bot_name_from(response: httpx2.Response) -> str | None:
     def handle(request: httpx2.Request) -> httpx2.Response:
         if request.url.path == "/app/getAppAccessToken":
             return httpx2.Response(200, json={"access_token": "fake-token", "expires_in": "7200"})
@@ -3298,8 +3298,9 @@ async def test_bot_name_comes_from_get_me() -> None:
         httpx2.Response(200, json={"id": "1", "username": "  "}),
     ],
 )
-async def test_bot_name_falls_back_when_unavailable(response: httpx2.Response) -> None:
-    assert await bot_name_from(response) == texts.DEFAULT_BOT_NAME
+async def test_bot_name_is_none_when_unavailable(response: httpx2.Response) -> None:
+    # 取不到时是 None：通用的称呼由用它的地方（邀请文案）自己退回，不当成名字写进系统提示词。
+    assert await bot_name_from(response) is None
 
 
 async def test_shutdown_waits_for_responses_left_closing_by_cancelled_downloads() -> None:

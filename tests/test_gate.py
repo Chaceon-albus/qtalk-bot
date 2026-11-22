@@ -1557,6 +1557,23 @@ def test_escaped_text_has_no_link_shape_or_unescaped_specials() -> None:
         assert len(match.group(1)) % 2 == 1, escaped
 
 
+async def test_without_a_bot_name_the_invitation_uses_the_generic_one(h: Harness) -> None:
+    # 启动时没取到机器人的名字（`fetch_bot_name()` 给 None）：邀请文案照旧用通用的称呼。
+    h.gate = Gate(
+        h.db,
+        admin_openid=ADMIN,
+        timezone=SHANGHAI,
+        invites=InviteSettings(),
+        share_link=h.links,
+        bot_name=None,
+        clock=h.clock,
+        new_code=lambda: code_for(1),
+    )
+    outcome = await h.message(ADMIN, "/invite 小王")
+    assert isinstance(outcome, Reply)
+    assert f"邀请您来和{texts.DEFAULT_BOT_NAME}聊聊天" in outcome.chain()[1].text
+
+
 async def test_bot_name_with_a_code_like_string_is_replaced(
     h: Harness, caplog: pytest.LogCaptureFixture
 ) -> None:
