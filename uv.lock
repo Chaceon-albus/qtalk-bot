@@ -701,7 +701,7 @@ wheels = [
 [[package]]
 name = "pyqbot"
 version = "0.1.0"
-source = { git = "https://github.com/capric98/pyqbot?rev=35093b6ddb164cf85a91f0d79e3d0e7c57321616#35093b6ddb164cf85a91f0d79e3d0e7c57321616" }
+source = { git = "https://github.com/capric98/pyqbot?rev=ffea6ba2ef02b8b4a0e8641aa38feba4487ceeb5#ffea6ba2ef02b8b4a0e8641aa38feba4487ceeb5" }
 dependencies = [
     { name = "httpx2", extra = ["socks", "ws"] },
     { name = "msgspec" },
@@ -779,7 +779,7 @@ requires-dist = [
     { name = "google-genai", specifier = ">=3.6.1" },
     { name = "httpx2", specifier = ">=2.16,<3" },
     { name = "openai", specifier = ">=3.55.1" },
-    { name = "pyqbot", git = "https://github.com/capric98/pyqbot?rev=35093b6ddb164cf85a91f0d79e3d0e7c57321616" },
+    { name = "pyqbot", git = "https://github.com/capric98/pyqbot?rev=ffea6ba2ef02b8b4a0e8641aa38feba4487ceeb5" },
     { name = "socksio", specifier = ">=1,<2" },
 ]
 

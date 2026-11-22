@@ -56,7 +56,7 @@ xfail_strict = true
 filterwarnings = ["error"]
 
 [tool.uv.sources]
-pyqbot = { git = "https://github.com/capric98/pyqbot", rev = "35093b6ddb164cf85a91f0d79e3d0e7c57321616" }
+pyqbot = { git = "https://github.com/capric98/pyqbot", rev = "ffea6ba2ef02b8b4a0e8641aa38feba4487ceeb5" }
 
 [dependency-groups]
 dev = [
