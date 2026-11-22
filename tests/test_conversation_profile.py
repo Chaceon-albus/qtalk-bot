@@ -19,6 +19,7 @@ from tests.test_conversation import (
     call_input,
     decision_rows,
     invited,
+    messages_input,
     text_of,
     usage_by_purpose,
 )
@@ -210,7 +211,10 @@ async def test_background_calls_never_carry_the_models_persona_extra(db: Databas
     await say(chat, alice, "今天吃什么")
     await settle(chat)
 
-    assert all(extra in request.system for request in model.requests)
+    assert len(model.requests) == 2
+    for request in model.requests:
+        assert extra in request.system
+        assert extra not in messages_input(request)  # 只在系统提示词里，不进历史与这一轮的消息
     background = [*decider.requests, *writer.summaries.requests, *writer.rewrites.requests]
     assert len(decider.requests) == 2
     assert writer.summaries.requests

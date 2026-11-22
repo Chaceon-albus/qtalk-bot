@@ -117,6 +117,11 @@ def call_input(request: ChatRequest | DecisionRequest) -> str:
     return str(dataclasses.asdict(request))
 
 
+def messages_input(request: ChatRequest) -> str:
+    """对话请求的全部消息（历史与这一轮的用户消息、助手消息）写成文字，不含系统提示词。"""
+    return str([dataclasses.asdict(message) for message in request.messages])
+
+
 DONE = Finished(FinishReason.COMPLETED)
 
 type Action = Callable[[], Awaitable[None]]
@@ -2743,7 +2748,9 @@ async def test_background_describe_and_decision_never_carry_the_persona_extra(
     await describer.wait_idle()
 
     assert solve.requests
-    assert all(extra in request.system for request in solve.requests)
+    for request in solve.requests:
+        assert extra in request.system
+        assert extra not in messages_input(request)  # 只在系统提示词里，不进消息
     assert decider.requests
     assert describing.requests
     background = [*decider.requests, *describing.requests]
@@ -4436,11 +4443,18 @@ def steering(
     *,
     clock: ManualClock | None = None,
     idle_timeout_seconds: float = 300,
+    persona_extra: str = "",
 ) -> Conversation:
     """只有一个模型（不选模型）；`decider` 不为空时配置了 `[decisions]`，用它判断插话。`clock` 不为空时模型调用的
-    时限按它计时。"""
+    时限按它计时。`persona_extra` 是这个模型的补充提示词。"""
     settings = [
-        ModelSettings(name=model.name, provider=model.provider, model=model.model, default=True)
+        ModelSettings(
+            name=model.name,
+            provider=model.provider,
+            model=model.model,
+            default=True,
+            persona_extra=persona_extra,
+        )
     ]
     decisions = DecisionSettings(provider=Provider.GEMINI, model="decision-fake")
     return Conversation(
@@ -4459,6 +4473,32 @@ def steering(
 
 async def user_ids(db: Database) -> list[int]:
     return [r["id"] for r in await db.fetch_all("SELECT id FROM messages WHERE role = 'user'")]
+
+
+async def test_the_steer_decision_never_carries_the_persona_extra(db: Database) -> None:
+    # 回答进行中补发消息时单独发起的插话决策（STEER_QUESTION）也是后台调用，输入里没有对话模型的补充提示词。
+    extra = "只给对话模型的补充-5d2b"
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    model = ScriptedModel("main", [gate, *answer("合起来的回答")])
+    decider = FakeDecider(steer_result(0.9))
+    chat = steering(db, model, decider, persona_extra=extra)
+    batcher = batcher_of(chat, ManualClock())
+
+    await submit(batcher, alice, message("写个排序"), FakeChannel())
+    await started(model, 1)
+    await submit(batcher, alice, message("用 Python"), FakeChannel())
+    await started(model, 2)
+    gate.set()
+    await finish(batcher)
+
+    (judged,) = decider.requests
+    assert [question.name for question in judged.questions] == [STEER_QUESTION]
+    assert extra not in call_input(judged)
+    assert len(model.requests) == 2
+    for request in model.requests:
+        assert extra in request.system
+        assert extra not in messages_input(request)
 
 
 async def test_supplement_cancels_the_hidden_answer_and_restarts_with_the_new_message(
