@@ -1,17 +1,16 @@
-"""话题线的数据层（`topics.py`）、话题里的历史（`journal.topic_history()`）与迁移 V9。"""
+"""话题线的数据层（`topics.py`）、话题里的历史（`journal.topic_history()`）。"""
 
 import sqlite3
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
 import pytest
-from tests.test_storage import legacy_user
 
 from qtalk_bot import access, journal, sends, topics
 from qtalk_bot.journal import Ending, HistoryEntry, ReplyDelivery
 from qtalk_bot.llm import Role
 from qtalk_bot.sends import SendKind, SendStatus, SentRecord
-from qtalk_bot.storage import DATABASE_FILENAME, MIGRATIONS, Database
+from qtalk_bot.storage import DATABASE_FILENAME, Database
 
 ALICE = "FAKE-OPENID-ALICE"
 BOB = "FAKE-OPENID-BOB"
@@ -74,35 +73,6 @@ async def attributed(db: Database) -> list[tuple[int, int, int]]:
         "SELECT message_id, topic_id, user_id FROM topic_messages ORDER BY message_id"
     )
     return [(r["message_id"], r["topic_id"], r["user_id"]) for r in rows]
-
-
-# ---- 迁移 ----
-
-
-async def test_version_8_database_gets_topic_tables_and_an_empty_ref_column(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / DATABASE_FILENAME
-    async with await Database.open(path, migrations=MIGRATIONS[:8]) as old:
-        user = await old.transaction(legacy_user, ALICE, "小王", 0)
-        await old.transaction(journal.add_user_message, user.id, "旧消息", "qq-1", 0)
-
-    async with await Database.open(path) as db:
-        row = await db.fetch_one("SELECT content, ref_msg_idx FROM messages")
-        assert row is not None
-        assert tuple(row) == ("旧消息", None)
-        # 6a 之前的消息不回填话题。
-        assert await db.fetch_all("SELECT * FROM topics") == []
-        assert await attributed(db) == []
-
-        def later(conn: sqlite3.Connection) -> tuple[int, int]:
-            return turn(conn, user.id, "新的一轮", "答")
-
-        topic_id, message_id = await db.transaction(later)
-        assert [(m, t) for m, t, _ in await attributed(db)] == [
-            (message_id, topic_id),
-            (message_id + 1, topic_id),
-        ]
 
 
 async def test_topic_rows_reject_unknown_users(db: Database) -> None:
@@ -412,21 +382,23 @@ async def test_quote_of_a_turn_that_did_not_end_finds_the_topic_of_its_question(
     assert await db.transaction(topics.quoted_topic, alice, [quoting]) == topic
 
 
-async def test_quote_ignores_a_leftover_index_on_a_reply_row(db: Database) -> None:
-    # 回复的引用索引只在发送记录里；回复行上残留的 msg_idx（不应再有）不再被认。
+async def test_reply_rows_cannot_carry_a_quote_index(db: Database) -> None:
+    # 回复的引用索引只在发送记录里：流水的回复行上不能有 msg_idx，按引用定位也不会认到回复行。
     alice = await new_user(db, ALICE, "小王")
 
-    def write(conn: sqlite3.Connection) -> int:
+    def write(conn: sqlite3.Connection) -> tuple[int, int]:
         _, question = turn(conn, alice, "话题甲", "答甲")
-        conn.execute(
-            "UPDATE messages SET msg_idx = 'REFIDX_leftover' WHERE reply_to = ?", (question,)
-        )
-        return journal.add_user_message(
+        quoting = journal.add_user_message(
             conn, alice, "引用", "qq-q", 0, ref_msg_idx="REFIDX_leftover"
         )
+        return question, quoting
 
-    quoting = await db.transaction(write)
+    question, quoting = await db.transaction(write)
 
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+        await db.execute(
+            "UPDATE messages SET msg_idx = 'REFIDX_leftover' WHERE reply_to = ?", (question,)
+        )
     assert await db.transaction(topics.quoted_topic, alice, [quoting]) is None
 
 

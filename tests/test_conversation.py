@@ -4254,7 +4254,7 @@ async def test_raw_marker_stored_before_the_upgrade_never_reaches_the_model(
     await db.transaction(legacy)
     await say(chat, alice, "今天怎么样")
 
-    # 升级前存下的原始标记去掉后什么都不剩：这条用户消息不进请求，只剩那条回复。
+    # 早期版本存下的原始标记去掉后什么都不剩：这条用户消息不进请求，只剩那条回复。
     assert model.requests[0].messages[0] == Message.text(Role.ASSISTANT, "哈哈")
     assert STICKER_TEXT not in json.dumps(
         [text_of(p) for m in model.requests[0].messages for p in m.parts], ensure_ascii=False

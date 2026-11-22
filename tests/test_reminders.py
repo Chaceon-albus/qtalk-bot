@@ -749,32 +749,6 @@ async def test_reminders_are_sent_even_when_the_switch_is_off(db: Database) -> N
     assert (await db.transaction(get_user_state, alice.id)).push is PushState.ON
 
 
-async def test_old_push_off_rows_are_shown_as_send_errors(db: Database) -> None:
-    # 库里旧的「未开启主动消息」行：显示时按「发送出错」处理，同一条提醒的两种合成一种。
-    alice = await invited(db, ALICE, "小王")
-    created = await add(db, alice, "喝水", kind="calendar", times=["16:00"])
-    rid = created.reminder.id
-
-    def plant(conn: sqlite3.Connection) -> None:
-        fail(conn, alice, rid, FailureReason.PUSH_OFF, T0, content="喝水")
-        fail(conn, alice, rid, FailureReason.SEND_ERROR, T0 + 86400, content="喝水")
-        fail(conn, alice, None, FailureReason.PUSH_OFF, T0 + 60, content="旧的")
-
-    await db.transaction(plant)
-    replies = Replies()
-
-    await ReminderService(db, admin_openid=ADMIN, timezone=TZ).notify_in_turn(alice, replies)
-
-    (text,) = replies.texts
-    assert text.split("\n")[0] == "有 2 条提醒没能按时发出，原因是发送出错："
-    assert "- 喝水\n    每 10 分钟一次，错过 2 次，发送出错\n" in text
-    assert "- 旧的\n    原定 11 月 20 日 星期五 15:31，发送出错\n" in text
-    assert "未开启" not in text
-    assert "主动" not in text
-    assert FailureReason.PUSH_OFF.label == texts.REMINDER_REASON_SEND_ERROR
-    assert await failures(db, alice) == []  # 照样标为已告知
-
-
 def enable(conn: sqlite3.Connection, user: User, now: int) -> None:
     """同 `/enable`：恢复用户，并在同一个事务里恢复时推进。"""
     from qtalk_bot.reminder_state import sync_pause
@@ -978,13 +952,13 @@ async def test_failures_merge_per_reminder_reason_until_notified(db: Database) -
     def plant(conn: sqlite3.Connection) -> None:
         fail(conn, alice, rid, FailureReason.LATE, T0 + 600, times=2)
         fail(conn, alice, rid, FailureReason.LATE, T0)
-        fail(conn, alice, rid, FailureReason.PUSH_OFF, T0 + 60)
+        fail(conn, alice, rid, FailureReason.SEND_ERROR, T0 + 60)
 
     await db.transaction(plant)
     records = await failures(db, alice)
     assert [(r.reason, r.times, r.first_at, r.last_at) for r in records] == [
         (FailureReason.LATE, 3, T0, T0 + 600),
-        (FailureReason.PUSH_OFF, 1, T0 + 60, T0 + 60),
+        (FailureReason.SEND_ERROR, 1, T0 + 60, T0 + 60),
     ]
     notice = compose_notice(records, timezone=TZ, now=T0)
     assert notice is not None
@@ -1000,7 +974,7 @@ def test_notice_lists_at_most_ten_lines_and_the_retry_hint() -> None:
         FailureRecord(
             id=n,
             reminder_id=n,
-            reason=FailureReason.PUSH_OFF,
+            reason=FailureReason.SEND_ERROR,
             content=f"第 {n} 条",
             rule="每天 08:00",
             times=1,
@@ -1334,11 +1308,7 @@ async def test_disable_and_enable_commands_record_the_pause(db: Database) -> Non
     await run_at(make_scheduler(db, sender, clock), clock, at("2026-11-20T16:00") + 20)
 
     assert paused.paused_since == at("2026-11-20T15:59")
-    assert (resumed.paused_since, resumed.pause_started, resumed.pause_ended) == (
-        None,
-        at("2026-11-20T15:59"),
-        at("2026-11-20T16:00") + 10,
-    )
+    assert resumed.paused_since is None
     assert sender.sent == []
     assert await failures(db, alice) == []
 
@@ -1488,7 +1458,7 @@ async def test_purge_keeps_reminders_with_unnotified_failures(db: Database) -> N
 
     def plant(conn: sqlite3.Connection) -> None:
         fail(conn, alice, rid, FailureReason.LATE, T0)
-        fail(conn, alice, rid, FailureReason.PUSH_OFF, T0)
+        fail(conn, alice, rid, FailureReason.SEND_ERROR, T0)
 
     await db.transaction(plant)
     now = T0 + 10 * 86400
@@ -1545,8 +1515,8 @@ async def test_resuming_skips_every_overdue_occurrence(db: Database) -> None:
     assert current.next == Occurrence(2, at("2026-11-21T09:10"))  # 照常消耗次数
 
 
-async def test_friend_added_back_after_an_upgrade_still_skips(db: Database) -> None:
-    # 升级前就删了好友（没有 paused_since）：重新加好友照样恢复时推进。
+async def test_friend_added_back_without_a_recorded_pause_still_skips(db: Database) -> None:
+    # 删了好友、却没有记下暂停的开始（paused_since 为空）：重新加好友照样恢复时推进。
     alice = await invited(db, ALICE, "小王")
     once = await add(db, alice, "一次", kind="once", at="2026-11-20T16:00")
     await db.execute(

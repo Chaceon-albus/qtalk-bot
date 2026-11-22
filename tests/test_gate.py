@@ -272,7 +272,7 @@ async def usage_fixture(h: Harness) -> tuple[User, User]:
         add_usage_row(conn, alice.id, purpose.DECISION, (1250, None, 0), START)
         add_usage_row(conn, alice.id, purpose.DESCRIBE, (70, None, 9), START)
         add_usage_row(conn, alice.id, purpose.IMAGE, (7, None, 1120), START)
-        # 上个月的：话题摘要只在累计里出现；缓存为空的对话像升级前的旧行。
+        # 上个月的：话题摘要只在累计里出现；缓存为空的对话像服务商没报告缓存的行。
         add_usage_row(conn, alice.id, purpose.MEMORY, (3000, 1000, 200), LAST_MONTH)
         add_usage_row(conn, alice.id, purpose.CHAT, (1_240_000, None, 5000), LAST_MONTH, 1)
 

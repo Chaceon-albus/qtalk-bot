@@ -131,7 +131,7 @@ class UsageTotals:
     """一段时间里某种用途的调用合计。
 
     `calls` 是用量表的行数（出图是张数）；token 数与搜索次数只累加服务商报告了的，`cached_input_tokens` 是
-    `input_tokens` 里命中缓存的部分（升级前的行与没有报告的为空，不计）；`unreported` 是输入或输出 token 没有报告
+    `input_tokens` 里命中缓存的部分（没有报告的为空，不计）；`unreported` 是输入或输出 token 没有报告
     的行数。
     """
 
@@ -178,17 +178,10 @@ def add_user_message(
     """把用户发来的文字（没有文字时是空串）写进流水，返回它的编号。`msg_idx` 是平台的引用索引；`faces_only`
     表示这条消息只由表情组成（`faces.is_sticker()`），它只留个记录，永远不进模型的输入；`ref_msg_idx` 是它
     引用的那条消息的引用索引（按引用定位话题时用）。"""
-    columns = "user_id, role, content, qq_message_id, created_at, msg_idx, faces_only"
-    marks = "?, 'user', ?, ?, ?, ?, ?"
-    values: list[object] = [user_id, content, qq_message_id, now, msg_idx, int(faces_only)]
-    if ref_msg_idx is not None:
-        # 没有引用时不写这一列（默认为空），迁移测试里第 9 版之前的库也能照常写入。
-        columns += ", ref_msg_idx"
-        marks += ", ?"
-        values.append(ref_msg_idx)
     row = conn.execute(
-        f"INSERT INTO messages ({columns}) VALUES ({marks}) RETURNING id",  # noqa: S608  只拼列名常量与 ? 占位符
-        values,
+        "INSERT INTO messages (user_id, role, content, qq_message_id, created_at, msg_idx,"
+        " faces_only, ref_msg_idx) VALUES (?, 'user', ?, ?, ?, ?, ?, ?) RETURNING id",
+        (user_id, content, qq_message_id, now, msg_idx, int(faces_only), ref_msg_idx),
     ).fetchone()
     message_id: int = row["id"]
     return message_id
@@ -297,7 +290,7 @@ def update_attachment(
     )
 
 
-# generated：附件挂在助手的回复上，就是那一轮里模型画的图（见迁移 `_V11_IMAGES`）。
+# generated：附件挂在助手的回复上，就是那一轮里模型画的图（见 `storage.py` 里 `attachments` 表的注释）。
 _ATTACHMENT_COLUMNS = (
     "id, message_id, kind, status, quoted, mime_type, size, path, text, filename, description,"
     " given, coalesce((SELECT m.role = 'assistant' FROM messages AS m"

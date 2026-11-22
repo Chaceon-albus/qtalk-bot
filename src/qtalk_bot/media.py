@@ -15,9 +15,7 @@ pyqbot 的 HTTP 客户端实现）。
   原始文件名，也不用内容哈希（会让不同用户的同一个文件撞到一起，也会泄露「两个人发过同一个文件」）。读取时
   只用附件表里存的文件名，拒绝含路径分隔符、`..` 或以 `.` 开头的名字，并确认解析后仍直接在这个用户的目录里
   （`MediaStore.locate()`），否则当作不存在。附件根目录或用户目录本身是符号链接时，读、写、删一律拒绝（数据
-  恢复或迁移后可能出现）。
-- **搬目录**：迁移 V16 之前用户目录名是用户编号。启动时（迁移之后、清理与收消息之前）`relocate_user_dirs()` 按
-  V16 登记的待搬映射把旧的数字目录搬到新名字，幂等，失败或没能搬完就拒绝启动；没搬完的旧目录不算无主目录。
+  恢复后可能出现）。
 - **清理**（每小时一次）：附件表里过期的行改成 `expired` 并删掉文件；再按用户目录扫一遍，删掉附件表没有引用、
   修改时间早于一小时前的孤儿文件（下载后没能写进流水的、中途留下的临时文件，以及生成后没能记进附件表的图）；
   最后删掉不属于任何用户、过了保存期限的目录（`MediaStore.sweep_unowned()`）。模型画的图（挂在助手回复上的附件
@@ -41,7 +39,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .config import AttachmentSettings
-from .storage import Database, StorageError
+from .storage import Database
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +74,7 @@ SUPPORTED_KINDS = frozenset((AttachmentKind.IMAGE, AttachmentKind.VOICE, Attachm
 
 
 class AttachmentStatus(StrEnum):
-    """原件的情况，见迁移 `_V4_ATTACHMENTS` 的注释。"""
+    """原件的情况，见 `storage.py` 里 `attachments` 表的注释。"""
 
     STORED = "stored"
     FAILED = "failed"
@@ -423,7 +421,6 @@ def clean_summary(text: str) -> str:
 # ---- 本地存放 ----
 
 _MEDIA_DIR = re.compile(r"[0-9a-f]{32}")
-_LEGACY_DIR = re.compile(r"[0-9]+")
 _TEMP_NAME = re.compile(re.escape(TEMP_PREFIX) + r"[0-9a-f]{32}")
 
 
@@ -441,26 +438,6 @@ def valid_filename(name: str) -> bool:
         and ".." not in name
         and not any(char in name for char in ("/", "\\", "\0"))
     )
-
-
-class Relocation(StrEnum):
-    """启动时搬一个用户的旧目录（`attachments/<用户编号>/`）的结果，值是写日志用的说明。"""
-
-    NOTHING = "没有旧目录"
-    RENAMED = "整体改名"
-    MERGED = "逐个文件移过去"
-    CONFLICT = "新旧目录里有同名、内容不同的文件（或同名的不是普通文件），没有动"
-    SAME_DIRECTORY = "新旧目录是同一个目录（例如绑定挂载），没有动"
-    SYMLINK = "旧目录是符号链接，没有动"
-    NOT_A_DIRECTORY = "旧目录不是目录，没有动"
-    TARGET_UNSAFE = "新目录是符号链接或不是目录，没有动"
-    ROOT_UNSAFE = "附件根目录是符号链接或不是目录，没有动"
-
-    @property
-    def done(self) -> bool:
-        """搬完了（含本来就没有旧目录），改动已经落盘：可以从待搬的映射里删掉。其余的都要拒绝启动，映射留着，
-        旧目录也不算无主目录。"""
-        return self in (Relocation.NOTHING, Relocation.RENAMED, Relocation.MERGED)
 
 
 class MediaStore:
@@ -645,10 +622,8 @@ class MediaStore:
         return removed
 
     def sweep_unowned(self, owned: Collection[str], cutoff: float) -> int:
-        """删掉无主的用户目录，返回删了几个：根目录下名字是 32 位十六进制或全数字（迁移前的旧目录）、不在 `owned`
-        里、目录本身与里面所有东西的修改时间都早于 `cutoff`（Unix 秒，附件的保存期限）的目录。其它名字的目录、
-        普通文件与符号链接不碰。`owned` 要包括所有用户的目录名与还没搬完的旧目录的编号（`relocate()`）。只能在启动时
-        搬完旧目录之后调用。看不清（遍历出错、无权访问）的目录，以及它本身或里面任何一层是挂载点的目录，整个跳过，
+        """删掉无主的用户目录，返回删了几个：根目录下名字是 32 位十六进制、不在 `owned` 里、目录本身与里面所有东西的修改时间都早于 `cutoff`（Unix 秒，附件的保存期限）的目录。其它名字的目录、
+        普通文件与符号链接不碰。`owned` 要包括所有用户的目录名。看不清（遍历出错、无权访问）的目录，以及它本身或里面任何一层是挂载点的目录，整个跳过，
         什么都不删；删不掉的只记日志。
 
         挂载点有两道判断：读得到 `/proc/self/mountinfo`（Linux）时，按其中的挂载点认出候选目录本身或里面的挂载点，
@@ -662,7 +637,7 @@ class MediaStore:
         removed = 0
         for directory in self.root.iterdir():
             name = directory.name
-            if name in owned or not (_MEDIA_DIR.fullmatch(name) or _LEGACY_DIR.fullmatch(name)):
+            if name in owned or not _MEDIA_DIR.fullmatch(name):
                 continue
             try:
                 found = os.lstat(directory)
@@ -706,80 +681,6 @@ class MediaStore:
             return True
         return True
 
-    def relocate(self, user_id: int, media_dir: str) -> Relocation:
-        """把迁移前的旧目录 `root/<user_id>/` 搬到 `root/<media_dir>/`，幂等：
-
-        - 没有附件根目录或没有旧目录：什么也不做；
-        - 只有旧目录：整体改名（`os.rename`）；
-        - 两个都在（上次搬到一半）：先逐个核对，新目录里已有同名的，两边都是普通文件、大小与字节都相同就删掉旧目录里的
-          那份，否则是冲突，什么都不动；没有冲突时把其余的逐个移过去，再删掉空的旧目录；
-        - 根目录是符号链接或不是目录、旧目录是符号链接或不是目录、新目录是符号链接或不是目录：不动。
-
-        改名或合并之后把受影响的目录（附件根目录、新目录，合并时还有旧目录）fsync，确认落盘才返回搬完：调用方随后就删掉
-        待搬的记录，断电后不能出现「记录没了、改名却丢了」。「没有旧目录」时也 fsync 根目录与新目录：上次的改名可能还
-        没落盘就崩溃了。
-
-        「是否存在」一律用 `lstat()` 判断：确实不存在才算没有，无权访问等错误照常抛出。文件操作与 fsync 失败照常抛
-        `OSError`，由调用方决定退出。只有 `NOTHING`、`RENAMED`、`MERGED` 算搬完（见 `Relocation.done`）。
-
-        Raises:
-            ValueError: `media_dir` 不是合法的用户目录名。
-        """
-        target = self.user_dir(media_dir)
-        root = _lstat(self.root)
-        if root is None:
-            return Relocation.NOTHING
-        if not stat.S_ISDIR(root.st_mode):
-            return Relocation.ROOT_UNSAFE
-        legacy = self.root / str(user_id)
-        existing = _lstat(target)
-        # 先校验已经存在的新目录，再看旧目录：上次整体改名后 fsync 失败、留下了记录，这次新名字若被占着，不能当成
-        # 「没有旧目录」就算搬完。
-        if existing is not None and not stat.S_ISDIR(existing.st_mode):  # 符号链接或普通文件
-            return Relocation.TARGET_UNSAFE
-        found = _lstat(legacy)
-        if found is None:
-            _fsync_dir(self.root)
-            if existing is not None:
-                _fsync_dir(target)
-            return Relocation.NOTHING
-        if stat.S_ISLNK(found.st_mode):
-            return Relocation.SYMLINK
-        if not stat.S_ISDIR(found.st_mode):
-            return Relocation.NOT_A_DIRECTORY
-        if existing is None:
-            os.rename(legacy, target)
-            _fsync_dir(self.root)
-            _fsync_dir(target)
-            return Relocation.RENAMED
-        if (found.st_dev, found.st_ino) == (existing.st_dev, existing.st_ino):
-            # 例如新目录是旧目录的绑定挂载：每个文件都会和自己比成相同，去重会删掉唯一的一份。
-            return Relocation.SAME_DIRECTORY
-        moves: list[Path] = []
-        duplicates: list[Path] = []
-        for entry in sorted(legacy.iterdir()):
-            other = _lstat(target / entry.name)
-            if other is None:
-                moves.append(entry)
-            elif _same_regular_file(entry, target / entry.name, other):
-                duplicates.append(entry)
-            else:
-                return Relocation.CONFLICT
-        if duplicates:
-            # 删旧副本之前先让保留的那份连同目录项落盘：它可能是运维者刚复制进来的，只在页缓存里。
-            for entry in duplicates:
-                _fsync_file(target / entry.name)
-            _fsync_dir(target)
-        for entry in duplicates:
-            entry.unlink()
-        for entry in moves:
-            os.rename(entry, target / entry.name)
-        _fsync_dir(target)
-        _fsync_dir(legacy)
-        legacy.rmdir()
-        _fsync_dir(self.root)
-        return Relocation.MERGED
-
     def remove_user(self, media_dir: str) -> None:
         """删掉这个用户的全部附件（留给以后做删除用户时用，现在没有调用方）。用户目录是符号链接时只删链接本身。
 
@@ -800,75 +701,6 @@ def _lstat(path: Path) -> os.stat_result | None:
         return os.lstat(path)
     except FileNotFoundError:
         return None
-
-
-def _fsync_dir(path: Path) -> None:
-    """把目录的改动（其中的改名、删除）同步到盘上。"""
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _fsync_file(path: Path) -> None:
-    """把文件的内容同步到盘上。不跟随符号链接（调用方已用 `lstat()` 确认是普通文件）。"""
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-COMPARE_BLOCK_BYTES = 1024 * 1024
-
-
-def _same_regular_file(legacy: Path, target: Path, target_stat: os.stat_result) -> bool:
-    """两边都是普通文件（不是符号链接），大小与字节都相同。打开时不跟随符号链接，打开后再确认一次是普通文件。"""
-    legacy_stat = os.lstat(legacy)
-    if not (stat.S_ISREG(legacy_stat.st_mode) and stat.S_ISREG(target_stat.st_mode)):
-        return False
-    if legacy_stat.st_size != target_stat.st_size:
-        return False
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-    left, right = os.open(legacy, flags), None
-    try:
-        right = os.open(target, flags)
-        if not (stat.S_ISREG(os.fstat(left).st_mode) and stat.S_ISREG(os.fstat(right).st_mode)):
-            return False
-        left_fd, right_fd = left, right
-        return same_content(
-            lambda n: os.read(left_fd, n), lambda n: os.read(right_fd, n), COMPARE_BLOCK_BYTES
-        )
-    finally:
-        os.close(left)
-        if right is not None:
-            os.close(right)
-
-
-def same_content(
-    read_left: Callable[[int], bytes], read_right: Callable[[int], bytes], block: int
-) -> bool:
-    """按块比较两份内容是否相同。每块都读满 `block` 字节或读到结尾再比较，不受底层读取短读的影响。"""
-    while True:
-        a, b = _read_block(read_left, block), _read_block(read_right, block)
-        if a != b:
-            return False
-        if len(a) < block:  # 两边同时读到了结尾
-            return True
-
-
-def _read_block(read: Callable[[int], bytes], size: int) -> bytes:
-    """反复调用 `read`，直到凑满 `size` 字节或读到结尾（返回空串）。"""
-    chunks: list[bytes] = []
-    remaining = size
-    while remaining > 0:
-        chunk = read(remaining)
-        if not chunk:
-            break
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
 
 
 MOUNTINFO = Path("/proc/self/mountinfo")
@@ -1355,9 +1187,7 @@ def _write_all(fd: int, data: bytes) -> None:
 async def purge_expired(db: Database, store: MediaStore, *, cutoff: int, now: int) -> int:
     """删掉 `cutoff`（Unix 秒）之前存下的附件文件，附件表里改成 `expired`；再按用户目录清掉孤儿文件：附件表
     没有引用、修改时间早于 `now - ORPHAN_GRACE_SECONDS` 的；最后删掉不属于任何用户、最新的修改时间也早于 `cutoff`
-    的目录（`MediaStore.sweep_unowned()`）。返回删掉的文件数（不含无主目录里的）。
-
-    只能在启动时搬完旧目录（`relocate_user_dirs()`）之后调用：否则还没搬的数字目录会被当成无主目录。"""
+    的目录（`MediaStore.sweep_unowned()`）。返回删掉的文件数（不含无主目录里的）。"""
     from . import journal  # 避免循环导入：journal 要用这里的类型
 
     expired = await db.transaction(journal.expire_attachments, cutoff)
@@ -1365,91 +1195,19 @@ async def purge_expired(db: Database, store: MediaStore, *, cutoff: int, now: in
         await asyncio.to_thread(store.delete, media_dir, name)
     # 先取引用与用户目录、再看修改时间：之后才落盘、入库的文件修改时间是新的，不会被当成孤儿；之后才建的用户，
     # 目录也是新的，不会被当成无主目录。
-    referenced, owned, pending = await db.transaction(_references)
+    referenced, owned = await db.transaction(_references)
     orphans = await asyncio.to_thread(store.sweep, now - ORPHAN_GRACE_SECONDS, referenced, owned)
-    # 还没搬完的旧数字目录（目标不安全、有同名文件等）也算有主：里面可能是唯一的原件，修好之后要接着搬。
-    unowned = await asyncio.to_thread(store.sweep_unowned, owned | pending, cutoff)
+    unowned = await asyncio.to_thread(store.sweep_unowned, owned, cutoff)
     if unowned:
         logger.info("删掉了 %d 个不属于任何用户的附件目录", unowned)
     return len(expired) + orphans
 
 
-def _references(conn: sqlite3.Connection) -> tuple[set[tuple[str, str]], set[str], set[str]]:
-    """（附件表引用的文件，所有用户的目录名，还没搬完的旧数字目录名）。"""
+def _references(conn: sqlite3.Connection) -> tuple[set[tuple[str, str]], set[str]]:
+    """（附件表引用的文件，所有用户的目录名）。"""
     from . import access, journal
 
-    pending = {str(user_id) for user_id, _ in access.pending_relocations(conn)}
-    return journal.referenced_paths(conn), access.media_dirs(conn), pending
-
-
-class RelocationError(StorageError):
-    """启动时没能把旧的数字目录搬到新名字。文案有原因的分类与新旧目录名（运维者要靠它们找到目录；目录名不是
-    秘密，`/users` 也显示），不含完整路径与文件名。"""
-
-
-async def relocate_user_dirs(db: Database, store: MediaStore) -> None:
-    """启动时按迁移 V16 登记的待搬映射（`media_relocations`），把旧目录 `attachments/<用户编号>/` 搬到
-    `attachments/<media_dir>/`（见 `MediaStore.relocate()`）。要在数据库打开（迁移完成）之后、附件清理启动与开始收消息
-    之前调用。
-
-    - 只处理映射表里的行，不按当前的用户编号认领目录：从 V16 之前的备份恢复后，盘上可能留着备份之后才加入的用户的
-      数字目录，新用户拿到同一个编号也不会继承它。
-    - 有待搬的行时先做一次 WAL 检查点，确认迁移的提交已经写进主库并落盘，再改名：`synchronous=NORMAL` 下断电可能
-      丢掉刚提交的事务，而目录改名已经落盘，重启时会生成另一批目录名，搬过去的目录就对不上了。
-    - 某个用户搬完（含本来就没有旧目录）、改动落盘之后才删掉那一行。没能搬完的（目录不安全、同名文件内容不同）一律
-      拒绝启动，记录留着，日志里写明用户编号与原因，由运维者处理后重启接着搬：不带着「原件还在数字目录里」的状态
-      对外服务。幂等：任何一步崩溃，下次启动都会接着做。
-
-    Raises:
-        RelocationError: 检查点没能完成，文件操作或 fsync 失败（如没有权限），或有没能搬完的目录。文案不含路径与文件名。
-    """
-    from . import access
-
-    pending = await db.transaction(access.pending_relocations)
-    if not pending:
-        return
-    try:
-        durable = await db.checkpoint()
-    except sqlite3.Error as exc:
-        match exc:
-            case sqlite3.Error(sqlite_errorname=str() as reason):
-                pass
-            case _:
-                reason = type(exc).__name__
-        logger.error("搬附件目录之前的检查点失败：%s", reason)
-        raise RelocationError(f"搬附件目录之前的检查点失败：{reason}") from exc
-    if not durable:
-        logger.error("搬附件目录之前的检查点没能完成")
-        raise RelocationError("搬附件目录之前的检查点没能完成，没有搬目录")
-    for user_id, media_dir in pending:
-        try:
-            result = await asyncio.to_thread(store.relocate, user_id, media_dir)
-        except (OSError, ValueError) as exc:
-            reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else None
-            logger.error(
-                "用户 #%d 的附件目录没能搬到新名字：%s（新目录名 %s）",
-                user_id,
-                reason or type(exc).__name__,
-                media_dir,
-            )
-            raise RelocationError(
-                f"用户 #{user_id} 的附件目录没能搬到新名字：{reason or type(exc).__name__}"
-                f"（旧目录名 {user_id}，新目录名 {media_dir}）"
-            ) from exc
-        if not result.done:
-            logger.error(
-                "用户 #%d 的附件目录没能搬到新名字：%s（新目录名 %s）",
-                user_id,
-                result.value,
-                media_dir,
-            )
-            raise RelocationError(
-                f"用户 #{user_id} 的附件目录没能搬到新名字：{result.value}"
-                f"（旧目录名 {user_id}，新目录名 {media_dir}）；处理好之后重启"
-            )
-        await db.transaction(access.finish_relocation, user_id)
-        if result is not Relocation.NOTHING:
-            logger.info("用户 #%d 的附件目录已搬到新名字（%s）", user_id, result.value)
+    return journal.referenced_paths(conn), access.media_dirs(conn)
 
 
 async def run_cleanup(

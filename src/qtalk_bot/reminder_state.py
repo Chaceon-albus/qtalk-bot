@@ -1,8 +1,7 @@
 """提醒的用户状态（里程碑 8）：资料卡上的主动消息开关、好友状态，以及提醒的暂停与恢复。
 
 单独成一个模块，只依赖 `access` 与 `triggers`：管理员停用、启用用户的命令（`commands.py`）与确认欢迎语（`gate.py`）
-也要处理恢复，而 `reminders.py` 依赖 `commands` 与 `gate`，不能反过来。表是第 17 版的 `reminder_user_state`，第 18 版
-加了暂停与开关事件的列。
+也要处理恢复，而 `reminders.py` 依赖 `commands` 与 `gate`，不能反过来。表是 `reminder_user_state`。
 
 提醒暂停（`pause_reason()`）：删了好友、被停用、没有授权。暂停期间到期的次数不发、不补、不记失败。
 
@@ -12,8 +11,7 @@
   就到期、还没来得及处理的几次（如正在等用户锁）也一起推进，这是接受的代价。这些地方是：`/enable`、重新加好友、
   欢迎语确认发出（兑换邀请之后，或补发的欢迎语）；调度器派发时发现之前记过暂停（`paused_since` 不为空）而现在已经
   恢复，也同样推进。
-- 第 18 版的 `paused_since` 记下暂停从什么时候开始（派发时据此认出「已经恢复」）；`pause_started`、`pause_ended` 只是
-  记录最近一次暂停的起止，程序不再据此判断。
+- 列 `paused_since` 记下暂停从什么时候开始（派发时据此认出「已经恢复」），恢复时清掉。
 
 函数都是同步的，第一个参数是连接，由调用方放进事务里；时间一律是 UTC 的 Unix 秒。
 """
@@ -55,29 +53,20 @@ class UserReminderState:
         push: 主动消息开关。
         push_updated_at: 最近一次改开关状态的时刻（我们的时钟）。
         push_event_at: 最近一次授权互动的平台时间；更早的授权互动（晚到的旧事件）不再改开关。
-        push_trial_day: 第 17 版的列，已不再使用：到点不管开关一律去发（用户 2026-11-20 决定），不再「每天试发一次」。
         friend_removed: 删了好友。
         friend_updated_at: 最近一次好友事件的平台时间。
         paused_since: 提醒从什么时候起暂停；没有暂停时为 `None`。
-        pause_started: 最近一次已经结束的暂停的开始时刻。
-        pause_ended: 它结束（恢复）的时刻。
     """
 
     push: PushState = PushState.UNKNOWN
     push_updated_at: int | None = None
     push_event_at: int | None = None
-    push_trial_day: str | None = None
     friend_removed: bool = False
     friend_updated_at: int | None = None
     paused_since: int | None = None
-    pause_started: int | None = None
-    pause_ended: int | None = None
 
 
-_COLUMNS = (
-    "push, push_updated_at, push_event_at, push_trial_day, friend_removed, friend_updated_at,"
-    " paused_since, pause_started, pause_ended"
-)
+_COLUMNS = "push, push_updated_at, push_event_at, friend_removed, friend_updated_at, paused_since"
 
 
 def get_user_state(conn: sqlite3.Connection, user_id: int) -> UserReminderState:
@@ -91,12 +80,9 @@ def get_user_state(conn: sqlite3.Connection, user_id: int) -> UserReminderState:
         push=PushState(row["push"]),
         push_updated_at=row["push_updated_at"],
         push_event_at=row["push_event_at"],
-        push_trial_day=row["push_trial_day"],
         friend_removed=bool(row["friend_removed"]),
         friend_updated_at=row["friend_updated_at"],
         paused_since=row["paused_since"],
-        pause_started=row["pause_started"],
-        pause_ended=row["pause_ended"],
     )
 
 
@@ -180,7 +166,7 @@ def sync_pause(
 
     - 仍在暂停：没记过开始的记下 `paused_since`。
     - 可以发了，且 `resumed` 为真（调用方刚清掉一个暂停原因：启用、重新加好友、欢迎语确认发出）或之前记过暂停：推进
-      这个用户已经过去、还没处理的次数（`skip_overdue()`），把这次暂停的起止记下来，清掉 `paused_since`。
+      这个用户已经过去、还没处理的次数（`skip_overdue()`），清掉 `paused_since`。
     """
     paused = pause_reason(conn, user, admin_openid) is not None
     state = get_user_state(conn, user.id)
@@ -197,9 +183,7 @@ def sync_pause(
     skipped = skip_overdue(conn, user.id, timezone, now)
     if state.paused_since is not None:
         conn.execute(
-            "UPDATE reminder_user_state SET pause_started = paused_since, pause_ended = ?,"
-            " paused_since = NULL WHERE user_id = ?",
-            (max(now, state.paused_since), user.id),
+            "UPDATE reminder_user_state SET paused_since = NULL WHERE user_id = ?", (user.id,)
         )
     return skipped
 

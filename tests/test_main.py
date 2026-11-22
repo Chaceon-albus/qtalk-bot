@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
+import os
 import signal
 import sqlite3
 from collections.abc import (
@@ -16,7 +17,7 @@ from collections.abc import (
     Sequence,
 )
 from pathlib import Path
-from typing import cast
+from typing import Self, cast
 from zoneinfo import ZoneInfo
 
 import httpx2
@@ -49,7 +50,14 @@ from qtalk_bot.image_download import CLOSE_TIMEOUT_SECONDS, ImageDownloader
 from qtalk_bot.llm import ChatEvent, ChatRequest, Finished, FinishReason, Provider
 from qtalk_bot.media import Downloader, Fetcher, MediaStore
 from qtalk_bot.memory import Summarizer
-from qtalk_bot.storage import Database, StorageError
+from qtalk_bot.storage import (
+    DEFAULT_BUSY_TIMEOUT,
+    MIGRATIONS,
+    BeforeMigration,
+    Database,
+    Migration,
+    StorageError,
+)
 from qtalk_bot.web_images import Failure, FetchFailed
 
 FAKE_ENV = {
@@ -1453,17 +1461,40 @@ def test_stale_heartbeat_is_replaced_by_a_fresh_one(
     assert '"updated_at": 1}' not in heartbeat.read_text(encoding="utf-8")
 
 
-def _make_old_database(path: Path) -> int:
-    from qtalk_bot.storage import MIGRATIONS
+LATER_MIGRATIONS = (*MIGRATIONS, "CREATE TABLE later_probe (id INTEGER PRIMARY KEY) STRICT;")
+"""测试用的「以后的第 2 版」：现在只有第 1 版，已有的库没有要升级的，迁移前备份要靠它才走得到。"""
 
-    old = len(MIGRATIONS) - 1
+
+class LaterDatabase(Database):
+    """默认按 `LATER_MIGRATIONS` 打开的数据库：替换 `__main__` 里的 `Database`，生产代码不用改。"""
+
+    @classmethod
+    async def open(
+        cls,
+        path: str | os.PathLike[str],
+        *,
+        migrations: Sequence[Migration] = LATER_MIGRATIONS,
+        busy_timeout: float = DEFAULT_BUSY_TIMEOUT,
+        before_migration: BeforeMigration | None = None,
+    ) -> Self:
+        return await super().open(
+            path,
+            migrations=migrations,
+            busy_timeout=busy_timeout,
+            before_migration=before_migration,
+        )
+
+
+def _make_old_database(path: Path, monkeypatch: pytest.MonkeyPatch) -> int:
+    """按现在的迁移建一个库，并让启动入口以为还有下一版要升级。返回这个库的版本。"""
 
     async def create() -> None:
-        async with await Database.open(path, migrations=MIGRATIONS[:old]):
+        async with await Database.open(path):
             pass
 
     asyncio.run(create())
-    return old
+    monkeypatch.setattr(entry, "Database", LaterDatabase)
+    return len(MIGRATIONS)
 
 
 def _version(path: Path) -> int:
@@ -1480,7 +1511,7 @@ def test_existing_database_is_backed_up_before_migration_on_startup(
 
     monkeypatch.setattr(pyqbot.Bot, "start", start)
     database = config.parent / "data" / "qtalk.db"
-    old = _make_old_database(database)
+    old = _make_old_database(database, monkeypatch)
 
     assert entry.main() == 0
 
@@ -1494,7 +1525,7 @@ def test_failed_migration_backup_exits_without_migrating(
     config: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     database = config.parent / "data" / "qtalk.db"
-    old = _make_old_database(database)
+    old = _make_old_database(database, monkeypatch)
     (config.parent / "data" / "backups").write_text("挡住备份目录", encoding="utf-8")
 
     assert entry.main() == entry.EXIT_RUNTIME_ERROR
@@ -1571,132 +1602,3 @@ def test_gateway_watch_is_started_and_stopped_with_the_other_maintenance(
 
     assert checked  # 启动后检查过
     assert pyqbot.GatewayState.STOPPED not in checked  # 关停时先于 Bot.stop() 停掉，看不到 STOPPED
-
-
-# ---- 用户附件目录改用随机名：启动时搬目录 ----
-
-
-def _make_v15_database_with_a_legacy_attachment(path: Path) -> int:
-    """第 15 版的库：一个用户，一张附件（路径是 `<用户编号>/<文件名>`）。返回用户编号。"""
-    from tests.test_storage import legacy_user
-
-    from qtalk_bot.storage import MIGRATIONS
-
-    async def create() -> int:
-        async with await Database.open(path, migrations=MIGRATIONS[:15]) as old:
-            user = await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
-
-            def plant(conn: sqlite3.Connection) -> None:
-                (message,) = conn.execute(
-                    "INSERT INTO messages (user_id, role, content, created_at)"
-                    " VALUES (?, 'user', '', 0) RETURNING id",
-                    (user.id,),
-                ).fetchone()
-                conn.execute(
-                    "INSERT INTO attachments (user_id, message_id, position, quoted, kind, status,"
-                    " path, text, created_at) VALUES (?, ?, 0, 0, 'image', 'stored', ?, '[图片]',"
-                    " CAST(strftime('%s', 'now') AS INTEGER))",  # 刚存下，启动时的清理不会让它过期
-                    (user.id, message, f"{user.id}/old.png"),
-                )
-
-            await old.transaction(plant)
-            return user.id
-
-    return asyncio.run(create())
-
-
-def test_startup_moves_legacy_attachment_dirs_before_cleanup_and_serving(
-    config: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    data = config.parent / "data"
-    user_id = _make_v15_database_with_a_legacy_attachment(data / "qtalk.db")
-    legacy = data / "attachments" / str(user_id)
-    legacy.mkdir(parents=True)
-    (legacy / "old.png").write_bytes(b"\x89PNG\r\n\x1a\nOLD")
-    seen: list[str] = []
-    real_cleanup = entry.run_cleanup
-
-    async def cleanup(
-        db: Database,
-        store: MediaStore,
-        settings: AttachmentSettings,
-        *,
-        also: Sequence[Callable[[int], Awaitable[None]]] = (),
-    ) -> None:
-        seen.append(f"清理：旧目录{'还在' if legacy.exists() else '已搬走'}")
-        await real_cleanup(db, store, settings, also=also)
-
-    async def start(self: pyqbot.Bot) -> None:
-        seen.append(f"开始收消息：旧目录{'还在' if legacy.exists() else '已搬走'}")
-
-    monkeypatch.setattr(entry, "run_cleanup", cleanup)
-    monkeypatch.setattr(pyqbot.Bot, "start", start)
-
-    assert entry.main() == 0
-
-    # 清理任务可能还没轮到运行就随关停取消了；只要运行过，看到的都是搬完之后的样子。
-    assert "开始收消息：旧目录已搬走" in seen
-    assert all(event.endswith("已搬走") for event in seen)
-    with sqlite3.connect(data / "qtalk.db") as conn:
-        ((media_dir,),) = conn.execute(
-            "SELECT media_dir FROM users WHERE id = ?", (user_id,)
-        ).fetchall()
-        ((path,),) = conn.execute("SELECT path FROM attachments").fetchall()
-    conn.close()
-    assert path == "old.png"
-    assert MediaStore.under(data).read(media_dir, path) == b"\x89PNG\r\n\x1a\nOLD"
-    assert not legacy.exists()
-
-
-def test_failed_relocation_exits_as_a_storage_error_without_serving(
-    config: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    data = config.parent / "data"
-    user_id = _make_v15_database_with_a_legacy_attachment(data / "qtalk.db")
-    (data / "attachments" / str(user_id)).mkdir(parents=True)
-    started: list[pyqbot.Bot] = []
-
-    async def start(self: pyqbot.Bot) -> None:
-        started.append(self)
-
-    def refuse(self: MediaStore, user_id: int, media_dir: str) -> object:
-        raise PermissionError(13, "Permission denied", str(self.root))
-
-    monkeypatch.setattr(pyqbot.Bot, "start", start)
-    monkeypatch.setattr(MediaStore, "relocate", refuse)
-
-    assert entry.main() == entry.EXIT_RUNTIME_ERROR
-
-    err = capsys.readouterr().err
-    assert "数据库有误" in err
-    assert "附件目录没能搬到新名字：Permission denied" in err
-    assert str(data) not in err
-    assert "Traceback" not in err
-    assert started == []
-
-
-def test_failed_checkpoint_before_relocation_exits_without_moving(
-    config: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    data = config.parent / "data"
-    user_id = _make_v15_database_with_a_legacy_attachment(data / "qtalk.db")
-    legacy = data / "attachments" / str(user_id)
-    legacy.mkdir(parents=True)
-    (legacy / "old.png").write_bytes(b"x")
-    started: list[pyqbot.Bot] = []
-
-    async def start(self: pyqbot.Bot) -> None:
-        started.append(self)
-
-    async def blocked(self: Database) -> bool:
-        return False  # 被别的读者挡住，没能做完
-
-    monkeypatch.setattr(pyqbot.Bot, "start", start)
-    monkeypatch.setattr(Database, "checkpoint", blocked)
-
-    assert entry.main() == entry.EXIT_RUNTIME_ERROR
-
-    err = capsys.readouterr().err
-    assert "数据库有误：搬附件目录之前的检查点没能完成" in err
-    assert (legacy / "old.png").exists()  # 没有改名
-    assert started == []

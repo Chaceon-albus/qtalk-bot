@@ -40,7 +40,6 @@ from tests.test_conversation_images import (
 from tests.test_conversation_profile import Writer
 from tests.test_conversation_topics import Picker, say, topic_answer
 from tests.test_memory import add_turn
-from tests.test_storage import legacy_user
 
 from qtalk_bot import access, describe, journal, profiles, texts, topics
 from qtalk_bot import conversation as conversation_module
@@ -113,7 +112,7 @@ from qtalk_bot.prompt import (
     system_prompt,
 )
 from qtalk_bot.routing import Router
-from qtalk_bot.storage import DATABASE_FILENAME, MIGRATIONS, Database
+from qtalk_bot.storage import DATABASE_FILENAME, Database
 
 DAY = 86400
 
@@ -1537,86 +1536,6 @@ async def test_ids_are_not_reused_after_deleting_the_largest(db: Database) -> No
     assert topic2 > topic
 
 
-async def test_version_13_database_keeps_data_ids_and_foreign_keys(tmp_path: Path) -> None:
-    path = tmp_path / DATABASE_FILENAME
-    async with await Database.open(path, migrations=MIGRATIONS[:13]) as old:
-        user = await old.transaction(legacy_user, ALICE, "小王", 0)
-
-        def plant(conn: sqlite3.Connection) -> tuple[int, int, int, int]:
-            message, reply = _plain_turn(conn, user.id, "问")
-            (image,) = journal.add_generated_images(
-                conn,
-                user_id=user.id,
-                message_id=reply,
-                images=[
-                    DrawnImage(path=f"{user.id}/a.jpg", mime_type=JPEG, size=1, description="猫")
-                ],
-                now=START,
-            )
-            topic = topics.attribute(
-                conn, user.id, None, [message], title_text="问", reply_id=reply, now=START
-            )
-            journal.add_usage(
-                conn,
-                user_id=user.id,
-                message_id=message,
-                model="main",
-                provider=Provider.OPENAI,
-                provider_model="m",
-                input_tokens=1,
-                output_tokens=1,
-                now=START,
-            )
-            # 删掉最大的编号，留一个空位：升级前这里会被复用。
-            extra, _ = _plain_turn(conn, user.id, "多余")
-            conn.execute("DELETE FROM messages WHERE id >= ?", (extra,))
-            return message, reply, image.id, topic
-
-        message, reply, image, topic = await old.transaction(plant)
-        before = {
-            table: [tuple(r) for r in await old.fetch_all(f"SELECT * FROM {table} ORDER BY id")]  # noqa: S608  表名是常量
-            for table in ("messages", "attachments", "topics")
-        }
-
-    # 第 16 版把附件的路径改成只有文件名（目录由用户的 media_dir 决定），其余不变。
-    before["attachments"] = [(*row[:9], "a.jpg", *row[10:]) for row in before["attachments"]]
-    async with await Database.open(path) as db:
-        for table, rows in before.items():
-            after = await db.fetch_all(f"SELECT * FROM {table} ORDER BY id")  # noqa: S608  表名是常量
-            assert [tuple(r) for r in after] == rows, table
-        assert await db.fetch_all("PRAGMA foreign_key_check") == []
-        sql = await db.fetch_all(
-            "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
-            " AND name IN ('messages', 'attachments', 'topics')"
-        )
-        assert all("AUTOINCREMENT" in row["sql"] for row in sql)
-        assert len(sql) == 3
-        indexes = {
-            row["name"]
-            for row in await db.fetch_all("SELECT name FROM sqlite_master WHERE type = 'index'")
-        }
-        assert {
-            "messages_by_user",
-            "messages_replies",
-            "messages_by_msg_idx",
-            "attachments_by_user",
-            "attachments_by_time",
-            "topics_by_activity",
-        } <= indexes
-        # 外键照常生效：删掉消息时归属与附件随之级联，用量断开引用。
-        await db.execute("DELETE FROM messages WHERE id = ?", (message,))
-        assert await db.fetch_all("SELECT * FROM attachments WHERE id = ?", (image,)) == []
-        assert await db.fetch_all("SELECT * FROM topic_messages") == []
-        assert [r[0] for r in await db.fetch_all("SELECT message_id FROM usage")] == [None]
-        # 升级之后删掉最大的编号，再新建不复用（升级前已经空出来的编号不在保证之内）。
-        _, newest = await db.transaction(lambda conn: _plain_turn(conn, user.id, "新"))
-        await db.execute("DELETE FROM messages WHERE id >= ?", (newest - 1,))
-        again, _ = await db.transaction(lambda conn: _plain_turn(conn, user.id, "再新"))
-        assert again > newest
-        assert topic > 0
-        assert reply > message
-
-
 def test_memory_guide_and_new_topic_note_in_the_prompt() -> None:
     with_profile = memory_section(Memory(profile_tool=True))
     assert MEMORY_GUIDE in with_profile
@@ -1718,26 +1637,6 @@ def test_parse_profile_rejects_markers_written_as_items() -> None:
     ):
         assert parse_profile(bad) is None, bad
     assert parse_profile("- 口头禅：不变") is not None  # 正常的条目不受影响
-
-
-async def test_profiles_from_the_committed_version_13_upgrade(tmp_path: Path) -> None:
-    # 2e222bf 提交时的第 13 版（content != '' 的约束、没有版本号）：升级后已有档案的版本号从 1 起，空内容可以写。
-    path = tmp_path / DATABASE_FILENAME
-    async with await Database.open(path, migrations=MIGRATIONS[:13]) as old:
-        user = await old.transaction(legacy_user, ALICE, "小王", 0)
-        await old.execute(
-            "INSERT INTO profiles (user_id, content, updated_at) VALUES (?, ?, ?)",
-            (user.id, "- 称呼：小王", 5),
-        )
-        with pytest.raises(sqlite3.IntegrityError):
-            await old.execute("UPDATE profiles SET content = '' WHERE user_id = ?", (user.id,))
-
-    async with await Database.open(path) as db:
-        found = await db.transaction(profiles.get_profile, user.id)
-        assert found == profiles.Profile("- 称呼：小王", 5, version=1)
-        assert await db.transaction(profiles.delete_profile, user.id)
-        assert await db.transaction(profiles.profile_version, user.id) == 2
-        assert await db.fetch_all("PRAGMA foreign_key_check") == []
 
 
 @pytest.mark.parametrize(

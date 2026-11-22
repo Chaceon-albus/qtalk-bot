@@ -7,7 +7,7 @@ import os
 import sqlite3
 import stat
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator
+from collections.abc import AsyncGenerator, AsyncIterator, Generator
 from pathlib import Path
 
 import pytest
@@ -37,7 +37,7 @@ from qtalk_bot.media import (
     purge_expired,
     text_version,
 )
-from qtalk_bot.storage import DATABASE_FILENAME, MIGRATIONS, Database, StorageError
+from qtalk_bot.storage import DATABASE_FILENAME, Database
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"\x00" * 16
@@ -1044,282 +1044,16 @@ async def test_drawn_images_follow_the_same_cleanup_rules(tmp_path: Path, db: Da
     assert [tuple(r) for r in rows] == [("expired", None), ("stored", recorded_new)]
 
 
-# ---- 用户附件目录改用随机名：搬旧目录、新用户的目录检查、无主目录 ----
+# ---- 用户目录：新用户的目录检查、无主目录 ----
 
 
-def legacy_dir(store: MediaStore, user_id: int, *names: str) -> Path:
-    """迁移前的数字目录，里面放上 `names` 这些文件（内容是文件名）。"""
-    directory = store.root / str(user_id)
+def plain_dir(store: MediaStore, dirname: str, *names: str) -> Path:
+    """附件根目录下名为 `dirname` 的目录，里面放上 `names` 这些文件（内容是文件名）。"""
+    directory = store.root / dirname
     directory.mkdir(parents=True, mode=0o700, exist_ok=True)
     for name in names:
         (directory / name).write_bytes(name.encode())
     return directory
-
-
-def test_relocate_renames_a_lone_legacy_directory(tmp_path: Path) -> None:
-    store = MediaStore.under(tmp_path)
-    legacy = legacy_dir(store, 3, "a.png", ".partial-left")
-
-    assert store.relocate(3, D1) is media.Relocation.RENAMED
-
-    assert not legacy.exists()
-    assert store.read(D1, "a.png") == b"a.png"
-    assert (store.user_dir(D1) / ".partial-left").exists()  # 残留的临时文件随目录过去，由孤儿清理删
-    assert mode(store.user_dir(D1)) == 0o700
-    assert store.relocate(3, D1) is media.Relocation.NOTHING  # 重复运行什么也不做
-    assert store.read(D1, "a.png") == b"a.png"
-
-
-def test_relocate_merges_when_both_directories_exist(tmp_path: Path) -> None:
-    store = MediaStore.under(tmp_path)
-    store.user_dir(D1).mkdir(parents=True)
-    (store.user_dir(D1) / "moved.png").write_bytes(b"moved.png")  # 上次已经移过去的
-    legacy = legacy_dir(store, 3, "b.png", "c.pdf")
-
-    assert store.relocate(3, D1) is media.Relocation.MERGED
-
-    assert not legacy.exists()
-    assert sorted(p.name for p in store.user_dir(D1).iterdir()) == ["b.png", "c.pdf", "moved.png"]
-    assert store.relocate(3, D1) is media.Relocation.NOTHING
-
-
-@pytest.mark.parametrize(
-    "existing",
-    [b"different", b"same.pnX", "symlink", "directory"],
-    ids=["other-bytes", "same-size-other-bytes", "symlink", "directory"],
-)
-def test_relocate_refuses_a_conflicting_name_and_moves_nothing(
-    tmp_path: Path, existing: bytes | str
-) -> None:
-    store = MediaStore.under(tmp_path)
-    store.user_dir(D1).mkdir(parents=True)
-    clash = store.user_dir(D1) / "same.png"
-    match existing:
-        case bytes():
-            clash.write_bytes(existing)
-        case "symlink":
-            os.symlink(tmp_path / "nowhere", clash)
-        case _:
-            clash.mkdir()
-    legacy = legacy_dir(store, 3, "other.png", "same.png")
-
-    assert store.relocate(3, D1) is media.Relocation.CONFLICT
-
-    assert sorted(p.name for p in legacy.iterdir()) == ["other.png", "same.png"]  # 什么都不动
-    assert sorted(p.name for p in store.user_dir(D1).iterdir()) == ["same.png"]
-
-
-def test_relocate_drops_identical_duplicates_and_moves_the_rest(tmp_path: Path) -> None:
-    store = MediaStore.under(tmp_path)
-    store.user_dir(D1).mkdir(parents=True)
-    (store.user_dir(D1) / "same.png").write_bytes(b"same.png")  # 上次已经移过去、又留了一份
-    legacy = legacy_dir(store, 3, "same.png", "other.png")
-
-    assert store.relocate(3, D1) is media.Relocation.MERGED
-
-    assert not legacy.exists()
-    assert store.read(D1, "same.png") == b"same.png"
-    assert store.read(D1, "other.png") == b"other.png"
-
-
-def test_relocate_does_not_touch_symlinks_or_non_directories(tmp_path: Path) -> None:
-    store = MediaStore.under(tmp_path)
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    (elsewhere / "secret.png").write_bytes(b"secret")
-    store.root.mkdir(parents=True)
-    os.symlink(elsewhere, store.root / "3")
-    (store.root / "4").write_bytes(b"not a directory")
-    legacy_dir(store, 5, "a.png")
-    os.symlink(elsewhere, store.root / D2)  # 新目录是符号链接
-
-    assert store.relocate(3, D1) is media.Relocation.SYMLINK
-    assert store.relocate(4, D1) is media.Relocation.NOT_A_DIRECTORY
-    assert store.relocate(5, D2) is media.Relocation.TARGET_UNSAFE
-
-    assert (store.root / "3").is_symlink()
-    assert not store.user_dir(D1).exists()
-    assert sorted(p.name for p in elsewhere.iterdir()) == ["secret.png"]  # 没有往链接目标里搬东西
-    assert (store.root / "5" / "a.png").exists()
-
-
-def test_relocate_finishes_on_the_next_run_after_failing_midway(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = MediaStore.under(tmp_path)
-    store.user_dir(D1).mkdir(parents=True)
-    legacy = legacy_dir(store, 3, "a.png", "b.png", "c.png")
-    real_rename = os.rename
-    calls = 0
-
-    def flaky(source: os.PathLike[str] | str, target: os.PathLike[str] | str) -> None:
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise PermissionError(13, "Permission denied")
-        real_rename(source, target)
-
-    monkeypatch.setattr(media.os, "rename", flaky)
-    with pytest.raises(PermissionError):
-        store.relocate(3, D1)
-    monkeypatch.undo()
-    assert len(list(store.user_dir(D1).iterdir())) == 1  # 搬到一半
-
-    assert store.relocate(3, D1) is media.Relocation.MERGED
-
-    assert not legacy.exists()
-    assert sorted(p.name for p in store.user_dir(D1).iterdir()) == ["a.png", "b.png", "c.png"]
-
-
-def test_relocate_refuses_invalid_directory_names(tmp_path: Path) -> None:
-    store = MediaStore.under(tmp_path)
-    legacy_dir(store, 3, "a.png")
-    with pytest.raises(ValueError, match="用户目录名无效"):
-        store.relocate(3, "../escape")
-    assert (store.root / "3" / "a.png").exists()
-
-
-async def register(db: Database, *users: access.User) -> None:
-    """像迁移 V16 那样把这些用户登记进待搬的映射。"""
-    for user in users:
-        await db.execute(
-            "INSERT INTO media_relocations (user_id, media_dir) VALUES (?, ?)",
-            (user.id, user.media_dir),
-        )
-
-
-async def pending(db: Database) -> list[int]:
-    return [user_id for user_id, _ in await db.transaction(access.pending_relocations)]
-
-
-async def test_relocate_user_dirs_moves_only_registered_users(
-    tmp_path: Path, db: Database, caplog: pytest.LogCaptureFixture
-) -> None:
-    store = MediaStore.under(tmp_path)
-    alice = await new_user(db)
-    bob = await new_user(db, "FAKE-OPENID-BOB")
-    carol = await new_user(db, "FAKE-OPENID-CAROL")  # 没有旧目录
-    dave = await new_user(db, "FAKE-OPENID-DAVE")  # V16 之后才建的用户，不在映射里
-    await register(db, alice, bob, carol)
-    legacy_dir(store, alice.id, "a.png")
-    store.user_dir(bob.media_dir).mkdir(parents=True)
-    legacy_dir(store, bob.id, "b.png")
-    someone_elses = legacy_dir(store, dave.id, "not-daves.png")
-
-    with caplog.at_level(logging.INFO):
-        await media.relocate_user_dirs(db, store)
-        await media.relocate_user_dirs(db, store)  # 幂等
-
-    assert store.read(alice.media_dir, "a.png") == b"a.png"
-    assert store.read(bob.media_dir, "b.png") == b"b.png"
-    assert not (store.root / str(alice.id)).exists()
-    assert not (store.root / str(bob.id)).exists()
-    assert (someone_elses / "not-daves.png").exists()  # 不按当前编号认领
-    assert not store.user_dir(dave.media_dir).exists()
-    assert await pending(db) == []
-    assert "FAKE-OPENID" not in caplog.text
-
-
-async def test_restored_backup_does_not_hand_a_later_users_directory_to_a_new_user(
-    tmp_path: Path,
-) -> None:
-    # 从第 15 版的备份恢复：库里只有用户 1、2，盘上还有备份之后加入的用户 3 的数字目录。
-    from tests.test_storage import legacy_user
-
-    path = tmp_path / DATABASE_FILENAME
-    async with await Database.open(path, migrations=MIGRATIONS[:15]) as old:
-        for openid in ("FAKE-OPENID-A", "FAKE-OPENID-B"):
-            await old.transaction(legacy_user, openid, "某某", 0)
-    store = MediaStore.under(tmp_path)
-    legacy_dir(store, 1, "one.png")
-    legacy_dir(store, 2, "two.png")
-    later = legacy_dir(store, 3, "later-users.png")
-
-    async with await Database.open(path) as db:
-        await media.relocate_user_dirs(db, store)
-        newcomer = await db.transaction(access.ensure_user, "FAKE-OPENID-NEW", "新人", 0)
-        assert newcomer.id == 3  # 计数器随备份回退，拿到了同一个编号
-        await media.relocate_user_dirs(db, store)  # 重启
-
-        assert (later / "later-users.png").exists()
-        assert not store.user_dir(newcomer.media_dir).exists()
-        assert await pending(db) == []
-        aged(later, 100)
-        await purge_expired(db, store, cutoff=1000, now=int(time.time()))
-
-    assert not later.exists()  # 过了保存期限，按无主目录删掉
-
-
-async def test_relocation_checkpoints_before_renaming(
-    tmp_path: Path, db: Database, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = MediaStore.under(tmp_path)
-    alice = await new_user(db)
-    await register(db, alice)
-    legacy_dir(store, alice.id, "a.png")
-    events: list[str] = []
-    real_checkpoint = Database.checkpoint
-    real_rename = os.rename
-
-    async def checkpoint(self: Database) -> bool:
-        events.append("检查点")
-        return await real_checkpoint(self)
-
-    def rename(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
-        events.append("改名")
-        real_rename(source, target)
-
-    monkeypatch.setattr(Database, "checkpoint", checkpoint)
-    monkeypatch.setattr(media.os, "rename", rename)
-
-    await media.relocate_user_dirs(db, store)
-    await media.relocate_user_dirs(db, store)  # 没有待搬的了：不再做检查点
-
-    assert events == ["检查点", "改名"]
-
-
-@pytest.mark.parametrize("failure", ["incomplete", "error"])
-async def test_failed_checkpoint_stops_before_renaming(
-    tmp_path: Path, db: Database, monkeypatch: pytest.MonkeyPatch, failure: str
-) -> None:
-    store = MediaStore.under(tmp_path)
-    alice = await new_user(db)
-    await register(db, alice)
-    legacy = legacy_dir(store, alice.id, "a.png")
-
-    async def checkpoint(self: Database) -> bool:
-        if failure == "error":
-            raise sqlite3.OperationalError("database is locked")
-        return False
-
-    monkeypatch.setattr(Database, "checkpoint", checkpoint)
-    with pytest.raises(media.RelocationError, match="检查点"):
-        await media.relocate_user_dirs(db, store)
-
-    assert (legacy / "a.png").exists()
-    assert not store.user_dir(alice.media_dir).exists()
-    assert await pending(db) == [alice.id]
-
-
-async def test_relocate_user_dirs_failure_is_a_storage_error(
-    tmp_path: Path, db: Database, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = MediaStore.under(tmp_path)
-    alice = await new_user(db)
-    await register(db, alice)
-    legacy_dir(store, alice.id, "a.png")
-
-    def refuse(source: object, target: object) -> None:
-        raise PermissionError(13, "Permission denied", str(source))
-
-    monkeypatch.setattr(media.os, "rename", refuse)
-    with pytest.raises(
-        media.RelocationError, match="附件目录没能搬到新名字：Permission denied"
-    ) as caught:
-        await media.relocate_user_dirs(db, store)
-    assert isinstance(caught.value, StorageError)
-    assert str(tmp_path) not in str(caught.value)
-    assert await pending(db) == [alice.id]
 
 
 @contextlib.contextmanager
@@ -1334,23 +1068,14 @@ def no_access(path: Path) -> Generator[None]:
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root 不受目录权限限制")
-async def test_unreadable_attachments_root_is_not_treated_as_missing(
-    tmp_path: Path, db: Database
-) -> None:
+def test_unreadable_attachments_root_is_not_treated_as_missing(tmp_path: Path) -> None:
     store = MediaStore.under(tmp_path)
-    alice = await new_user(db)
-    await register(db, alice)
-    legacy_dir(store, alice.id, "a.png")
+    plain_dir(store, D2, "a.png")
 
     with no_access(store.root):
-        with pytest.raises(PermissionError):
-            store.relocate(alice.id, alice.media_dir)
-        with pytest.raises(media.RelocationError, match="Permission denied"):
-            await media.relocate_user_dirs(db, store)
         assert store.dir_taken(D1)  # 无法确认不存在：按已存在处理
 
-    assert await pending(db) == [alice.id]
-    assert (store.root / str(alice.id) / "a.png").exists()
+    assert not store.dir_taken(D1)
 
 
 @pytest.mark.parametrize("root", ["dangling", "symlink", "file"])
@@ -1382,164 +1107,6 @@ def test_dir_taken_tells_missing_from_existing(tmp_path: Path) -> None:
     assert sorted(p.name for p in store.root.iterdir()) == sorted([D1, D2, D7])  # 只看不改
 
 
-@pytest.mark.parametrize(
-    "blocker", ["target-symlink", "target-file", "clash", "legacy-symlink", "legacy-file", "root"]
-)
-async def test_unfinished_relocation_refuses_to_start_and_resumes_after_the_fix(
-    tmp_path: Path, db: Database, caplog: pytest.LogCaptureFixture, blocker: str
-) -> None:
-    store = MediaStore.under(tmp_path)
-    alice = await new_user(db)
-    bob = await new_user(db, "FAKE-OPENID-BOB")
-    await register(db, alice, bob)
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    real_root = tmp_path / "real-attachments"
-    store.root.mkdir()
-    legacy = store.root / str(alice.id)
-    target = store.root / alice.media_dir
-    if blocker == "legacy-symlink":
-        os.symlink(elsewhere, legacy)
-    elif blocker == "legacy-file":
-        legacy.write_bytes(b"not a directory")
-    else:
-        legacy_dir(store, alice.id, "a.png")
-    legacy_dir(store, bob.id, "b.png")
-    match blocker:
-        case "target-symlink":
-            os.symlink(elsewhere, target)
-        case "target-file":
-            target.write_bytes(b"not a directory")
-        case "clash":
-            target.mkdir()
-            (target / "a.png").write_bytes(b"another file")
-        case "root":
-            store.root.rename(real_root)
-            os.symlink(real_root, store.root)
-        case _:
-            pass
-    expected = {
-        "target-symlink": "新目录是符号链接或不是目录",
-        "target-file": "新目录是符号链接或不是目录",
-        "clash": "新旧目录里有同名、内容不同的文件",
-        "legacy-symlink": "旧目录是符号链接",
-        "legacy-file": "旧目录不是目录",
-        "root": "附件根目录是符号链接或不是目录",
-    }[blocker]
-
-    with caplog.at_level(logging.ERROR), pytest.raises(media.RelocationError) as caught:
-        await media.relocate_user_dirs(db, store)
-
-    message = str(caught.value)
-    assert message.startswith(f"用户 #{alice.id} 的附件目录没能搬到新名字：{expected}")
-    assert message.endswith("处理好之后重启")
-    assert f"新目录名 {alice.media_dir}" in message  # 运维者靠它找到目录
-    assert str(tmp_path) not in message
-    assert "a.png" not in message
-    assert f"用户 #{alice.id} 的附件目录没能搬到新名字" in caplog.text
-    assert await pending(db) == [alice.id, bob.id]  # 记录都留着，后面的没开始搬
-    if blocker == "root":
-        assert (real_root / str(bob.id) / "b.png").exists()
-    else:
-        assert (store.root / str(bob.id) / "b.png").exists()
-    if blocker in ("target-symlink", "target-file", "clash"):
-        aged(legacy, 100)  # 恢复出来的原件保留着很早的修改时间
-        await purge_expired(db, store, cutoff=1000, now=int(time.time()))
-        assert (legacy / "a.png").exists()  # 待搬记录里的数字目录不按无主目录删
-
-    # 运维者处理好之后重启，接着搬完。
-    match blocker:
-        case "target-symlink" | "target-file":
-            target.unlink()
-        case "clash":
-            (target / "a.png").unlink()
-        case "legacy-symlink" | "legacy-file":
-            legacy.unlink()
-        case _:
-            store.root.unlink()
-            real_root.rename(store.root)
-    await media.relocate_user_dirs(db, store)
-
-    if blocker.startswith("legacy"):
-        assert not store.user_dir(alice.media_dir).exists()
-    else:
-        assert store.read(alice.media_dir, "a.png") == b"a.png"
-    assert store.read(bob.media_dir, "b.png") == b"b.png"
-    assert not (store.root / str(alice.id)).is_symlink()
-    assert not (store.root / str(alice.id)).exists()
-    assert await pending(db) == []
-    assert sorted(p.name for p in elsewhere.iterdir()) == []
-
-
-@pytest.mark.parametrize("outcome", ["renamed", "merged", "nothing"])
-async def test_failed_fsync_keeps_the_relocation_record(
-    tmp_path: Path, db: Database, monkeypatch: pytest.MonkeyPatch, outcome: str
-) -> None:
-    store = MediaStore.under(tmp_path)
-    alice = await new_user(db)
-    await register(db, alice)
-    store.root.mkdir()
-    if outcome != "nothing":
-        legacy_dir(store, alice.id, "a.png")
-    if outcome == "merged":
-        store.user_dir(alice.media_dir).mkdir()
-    synced: list[str] = []
-
-    def failing(path: Path) -> None:
-        synced.append(path.name)
-        raise OSError(5, "Input/output error")
-
-    monkeypatch.setattr(media, "_fsync_dir", failing)
-    with pytest.raises(media.RelocationError, match="Input/output error"):
-        await media.relocate_user_dirs(db, store)
-    monkeypatch.undo()
-
-    assert synced  # 确实要求落盘
-    assert await pending(db) == [alice.id]  # 没确认落盘就不删记录
-    await media.relocate_user_dirs(db, store)  # 下次启动接着做
-    assert await pending(db) == []
-    if outcome != "nothing":
-        assert store.read(alice.media_dir, "a.png") == b"a.png"
-
-
-async def test_directories_are_synced_before_the_record_is_deleted(
-    tmp_path: Path, db: Database, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = MediaStore.under(tmp_path)
-    alice = await new_user(db)
-    bob = await new_user(db, "FAKE-OPENID-BOB")
-    await register(db, alice, bob)
-    legacy_dir(store, alice.id, "a.png")  # 整体改名
-    store.user_dir(bob.media_dir).mkdir(parents=True)
-    legacy_dir(store, bob.id, "b.png")  # 合并
-    events: list[str] = []
-    real_fsync = media._fsync_dir  # pyright: ignore[reportPrivateUsage]
-    real_finish = access.finish_relocation
-
-    def fsync(path: Path) -> None:
-        events.append(f"fsync {path.name}")
-        real_fsync(path)
-
-    def finish(conn: sqlite3.Connection, user_id: int) -> None:
-        events.append(f"删记录 {user_id}")
-        real_finish(conn, user_id)
-
-    monkeypatch.setattr(media, "_fsync_dir", fsync)
-    monkeypatch.setattr(access, "finish_relocation", finish)
-    await media.relocate_user_dirs(db, store)
-
-    root = store.root.name
-    assert events == [
-        f"fsync {root}",
-        f"fsync {alice.media_dir}",
-        f"删记录 {alice.id}",
-        f"fsync {bob.media_dir}",
-        f"fsync {bob.id}",
-        f"fsync {root}",
-        f"删记录 {bob.id}",
-    ]
-
-
 def fake_device(monkeypatch: pytest.MonkeyPatch, mount: Path) -> None:
     """让 `mount` 的 `lstat()` 报告另一个设备号，模拟挂载点；同时让 mountinfo 读不到，只靠比较设备号。"""
     monkeypatch.setattr(media, "MOUNTINFO", mount.parent / "no-such-mountinfo")
@@ -1565,7 +1132,7 @@ def test_unowned_directory_with_a_mount_point_is_skipped(
     (unowned / "deep" / "mounted").mkdir(parents=True)
     (unowned / "visible.png").write_bytes(b"x")
     (unowned / "deep" / "mounted" / "in-use.dat").write_bytes(b"y")
-    other = legacy_dir(store, 12, "old.png")
+    other = plain_dir(store, "f" * 32, "old.png")
     aged(unowned, 100)
     aged(other, 100)
     fake_device(monkeypatch, unowned if where == "itself" else unowned / "deep" / "mounted")
@@ -1613,7 +1180,7 @@ def test_unowned_directories_are_removed_only_after_the_retention_period(tmp_pat
     stale_random = store.root / ("a" * 32)
     stale_random.mkdir(parents=True)
     (stale_random / "x.png").write_bytes(b"x")
-    stale_numeric = legacy_dir(store, 12, "y.png")
+    numeric = plain_dir(store, "12", "y.png")  # 全数字的名字不是用户目录名，不碰
     recently_touched = store.root / ("b" * 32)
     recently_touched.mkdir()
     (recently_touched / "z.png").write_bytes(b"z")
@@ -1630,17 +1197,16 @@ def test_unowned_directories_are_removed_only_after_the_retention_period(tmp_pat
     os.symlink(elsewhere, linked)
     loose_file = store.root / ("d" * 32)
     loose_file.write_bytes(b"file")
-    for path in (stale_random, stale_numeric, recently_touched, owned, other_name, upper):
+    for path in (stale_random, numeric, recently_touched, owned, other_name, upper):
         aged(path, old)
     aged(elsewhere, old)
     os.utime(loose_file, (old, old))
     os.utime(recently_touched / "z.png", (fresh, fresh))  # 里面有新文件，目录本身是旧的
 
-    assert store.sweep_unowned({D1}, cutoff) == 2
+    assert store.sweep_unowned({D1}, cutoff) == 1
 
     assert not stale_random.exists()
-    assert not stale_numeric.exists()
-    for kept in (recently_touched, owned, other_name, upper, loose_file, elsewhere):
+    for kept in (recently_touched, owned, other_name, numeric, upper, loose_file, elsewhere):
         assert kept.exists(), kept
     assert linked.is_symlink()
 
@@ -1656,7 +1222,7 @@ async def test_purge_removes_unowned_directories_after_retention(
     leftover.mkdir()
     (leftover / "old.png").write_bytes(PNG_BYTES)
     aged(leftover, 100)
-    young = legacy_dir(store, 77, "new.png")
+    young = plain_dir(store, "f" * 32, "new.png")
 
     await purge_expired(db, store, cutoff=1000, now=int(time.time()))
 
@@ -1666,7 +1232,7 @@ async def test_purge_removes_unowned_directories_after_retention(
     assert store.read(alice.media_dir, mine) is None  # 没有记录、超过一小时：按孤儿删了文件
 
 
-# ---- 第三轮评审：同设备的绑定挂载、保留副本先落盘、同一目录、新目录先校验、短读 ----
+# ---- 第三轮评审：同设备的绑定挂载 ----
 
 
 def test_mount_points_are_parsed_with_octal_escapes() -> None:
@@ -1709,7 +1275,7 @@ def test_same_device_bind_mounts_from_mountinfo_are_skipped(
     (unowned / "deep" / "my mount").mkdir(parents=True)
     (unowned / "visible.png").write_bytes(b"x")
     (unowned / "deep" / "my mount" / "in-use.dat").write_bytes(b"y")
-    other = legacy_dir(store, 12, "old.png")
+    other = plain_dir(store, "f" * 32, "old.png")
     sibling = store.root / ("e" * 31 + "f")  # 名字是候选目录名的前缀加一位，不受影响
     sibling.mkdir()
     for path in (unowned, other, sibling):
@@ -1742,175 +1308,3 @@ def test_unreadable_mountinfo_falls_back_to_device_numbers(
 
     assert store.sweep_unowned(set(), 1000) == 1  # 没有挂载点：照常删
     assert not unowned.exists()
-
-
-async def test_retained_duplicate_is_synced_before_the_old_copy_is_removed(
-    tmp_path: Path, db: Database, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = MediaStore.under(tmp_path)
-    alice = await new_user(db)
-    await register(db, alice)
-    target = store.user_dir(alice.media_dir)
-    target.mkdir(parents=True)
-    (target / "same.png").write_bytes(b"same.png")  # 运维者刚复制进来的那份
-    legacy = legacy_dir(store, alice.id, "same.png", "other.png")
-    events: list[str] = []
-    real_file, real_dir = media._fsync_file, media._fsync_dir  # pyright: ignore[reportPrivateUsage]
-
-    def fsync_file(path: Path) -> None:
-        events.append(
-            f"文件 {path.parent.name}/{path.name}，旧副本{'在' if (legacy / path.name).exists() else '没了'}"
-        )
-        real_file(path)
-
-    def fsync_dir(path: Path) -> None:
-        state = "在" if (legacy / "same.png").exists() else "没了"
-        events.append(f"目录 {path.name}，旧副本{state}")
-        real_dir(path)
-
-    monkeypatch.setattr(media, "_fsync_file", fsync_file)
-    monkeypatch.setattr(media, "_fsync_dir", fsync_dir)
-    await media.relocate_user_dirs(db, store)
-
-    assert events[:2] == [
-        f"文件 {alice.media_dir}/same.png，旧副本在",
-        f"目录 {alice.media_dir}，旧副本在",
-    ]
-    assert events[2:] == [
-        f"目录 {alice.media_dir}，旧副本没了",
-        f"目录 {alice.id}，旧副本没了",
-        f"目录 {store.root.name}，旧副本没了",
-    ]
-    assert store.read(alice.media_dir, "same.png") == b"same.png"
-    assert store.read(alice.media_dir, "other.png") == b"other.png"
-    assert await pending(db) == []
-
-
-async def test_failed_sync_of_the_retained_copy_keeps_the_old_one(
-    tmp_path: Path, db: Database, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = MediaStore.under(tmp_path)
-    alice = await new_user(db)
-    await register(db, alice)
-    store.user_dir(alice.media_dir).mkdir(parents=True)
-    (store.user_dir(alice.media_dir) / "same.png").write_bytes(b"same.png")
-    legacy = legacy_dir(store, alice.id, "same.png")
-
-    def failing(path: Path) -> None:
-        raise OSError(5, "Input/output error")
-
-    monkeypatch.setattr(media, "_fsync_file", failing)
-    with pytest.raises(media.RelocationError, match="Input/output error"):
-        await media.relocate_user_dirs(db, store)
-
-    assert (legacy / "same.png").exists()
-    assert await pending(db) == [alice.id]
-
-
-async def test_old_and_new_paths_to_the_same_directory_are_refused(
-    tmp_path: Path, db: Database, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # 新目录是旧目录的绑定挂载：两个路径的设备号与 inode 相同。用替身让 lstat 报告同一个目录。
-    store = MediaStore.under(tmp_path)
-    alice = await new_user(db)
-    await register(db, alice)
-    legacy = legacy_dir(store, alice.id, "only.png")
-    target = store.user_dir(alice.media_dir)
-    target.mkdir()
-    (target / "only.png").write_bytes(b"only.png")  # 同一个目录里的同一个文件，经两个路径看到
-    real_lstat = media._lstat  # pyright: ignore[reportPrivateUsage]
-
-    def lstat(path: Path) -> os.stat_result | None:
-        return real_lstat(legacy if path == target else path)
-
-    monkeypatch.setattr(media, "_lstat", lstat)
-    assert store.relocate(alice.id, alice.media_dir) is media.Relocation.SAME_DIRECTORY
-    with pytest.raises(media.RelocationError, match="新旧目录是同一个目录"):
-        await media.relocate_user_dirs(db, store)
-
-    assert (legacy / "only.png").exists()  # 什么都没删
-    assert (target / "only.png").exists()
-    assert await pending(db) == [alice.id]
-
-
-@pytest.mark.parametrize("occupant", ["symlink", "file"])
-async def test_missing_legacy_dir_with_an_unsafe_target_is_refused(
-    tmp_path: Path, db: Database, occupant: str
-) -> None:
-    # 上次整体改名之后 fsync 失败、留下了记录；这次旧目录已经没了，新名字却被占着。
-    store = MediaStore.under(tmp_path)
-    alice = await new_user(db)
-    await register(db, alice)
-    store.root.mkdir()
-    target = store.root / alice.media_dir
-    if occupant == "symlink":
-        os.symlink(tmp_path / "nowhere", target)
-    else:
-        target.write_bytes(b"not a directory")
-
-    assert store.relocate(alice.id, alice.media_dir) is media.Relocation.TARGET_UNSAFE
-    with pytest.raises(media.RelocationError, match="新目录是符号链接或不是目录"):
-        await media.relocate_user_dirs(db, store)
-    assert await pending(db) == [alice.id]
-
-    target.unlink()
-    await media.relocate_user_dirs(db, store)  # 处理好之后重启
-    assert await pending(db) == []
-
-
-def test_unsafe_root_is_judged_before_a_missing_legacy_dir(tmp_path: Path) -> None:
-    store = MediaStore.under(tmp_path)
-    os.symlink(tmp_path / "nowhere", store.root)
-    assert store.relocate(3, D1) is media.Relocation.ROOT_UNSAFE
-
-
-def chunked(data: bytes, sizes: list[int]) -> Callable[[int], bytes]:
-    """替身：按 `sizes` 依次短读（每次最多给这么多），用完之后按请求的长度给。"""
-    position = 0
-    plan = iter(sizes)
-
-    def read(n: int) -> bytes:
-        nonlocal position
-        limit = next(plan, n)
-        chunk = data[position : position + min(n, limit)]
-        position += len(chunk)
-        return chunk
-
-    return read
-
-
-@pytest.mark.parametrize("block", [4, 7, 64])
-def test_short_reads_do_not_look_like_different_content(block: int) -> None:
-    data = bytes(range(50))
-
-    assert media.same_content(chunked(data, [3, 1, 2]), chunked(data, []), block)
-    assert media.same_content(chunked(data, []), chunked(data, [1] * 60), block)
-    assert not media.same_content(chunked(data, [3]), chunked(data[:-1] + b"\xff", [2, 2]), block)
-    assert not media.same_content(chunked(data, [5]), chunked(data[:-1], []), block)
-    assert media.same_content(chunked(b"", []), chunked(b"", [0]), block)
-
-
-def test_identical_files_compare_equal_despite_short_reads(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = MediaStore.under(tmp_path)
-    content = bytes(range(256)) * 50
-    store.user_dir(D1).mkdir(parents=True)
-    (store.user_dir(D1) / "same.png").write_bytes(content)
-    legacy = legacy_dir(store, 3)
-    (legacy / "same.png").write_bytes(content)
-    real_read = os.read
-    calls = 0
-
-    def short_read(fd: int, n: int) -> bytes:
-        nonlocal calls
-        calls += 1
-        return real_read(fd, min(n, 1000 if calls % 2 else 333))  # 两侧交替短读，长度不同
-
-    monkeypatch.setattr(media.os, "read", short_read)
-    monkeypatch.setattr(media, "COMPARE_BLOCK_BYTES", 4096)
-    result = store.relocate(3, D1)
-    monkeypatch.undo()
-
-    assert result is media.Relocation.MERGED
-    assert (store.user_dir(D1) / "same.png").read_bytes() == content

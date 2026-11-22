@@ -20,7 +20,6 @@ from tests.test_conversation import (
     invited,
     text_of,
 )
-from tests.test_storage import legacy_user
 
 from qtalk_bot import access, journal, memory, topics
 from qtalk_bot.access import User, UserStatus
@@ -39,7 +38,7 @@ from qtalk_bot.llm import (
 from qtalk_bot.memory import Summarizer, parse
 from qtalk_bot.model_watch import WatchedChatModel
 from qtalk_bot.prompt import MEMORY_NOTICE, Memory, memory_section
-from qtalk_bot.storage import DATABASE_FILENAME, MIGRATIONS, Database
+from qtalk_bot.storage import DATABASE_FILENAME, Database
 
 GOOD = "标题：快速排序\n摘要：用户在学快速排序，已经讲了分区的做法。"
 
@@ -533,49 +532,7 @@ async def test_shutdown_cancels_the_work_keeps_the_usage_and_leaves_no_task(
     assert worker.pending == 0
 
 
-# ---- 迁移 V10 ----
-
-
-async def test_version_9_usage_rows_survive_and_memory_is_accepted(tmp_path: Path) -> None:
-    path = tmp_path / DATABASE_FILENAME
-    async with await Database.open(path, migrations=MIGRATIONS[:9]) as old:
-        user = await old.transaction(legacy_user, ALICE, "小王", 0)
-        await old.execute(
-            "INSERT INTO usage (user_id, model, provider, provider_model, input_tokens,"
-            " output_tokens, created_at, purpose, searches)"
-            " VALUES (?, 'main', 'openai', 'gpt-fake', 5, 6, 7, 'chat', 2)",
-            (user.id,),
-        )
-        with pytest.raises(sqlite3.IntegrityError):
-            await old.execute(
-                "INSERT INTO usage (user_id, model, provider, provider_model, created_at, purpose)"
-                " VALUES (?, 'memory', 'openai', 'm', 0, 'memory')",
-                (user.id,),
-            )
-
-    async with await Database.open(path) as db:
-        row = await db.fetch_one(
-            "SELECT model, input_tokens, output_tokens, created_at, purpose, searches FROM usage"
-        )
-        assert row is not None
-        assert tuple(row) == ("main", 5, 6, 7, "chat", 2)
-        await db.transaction(
-            lambda conn: journal.add_usage(
-                conn,
-                user_id=user.id,
-                message_id=None,
-                model=MEMORY_USAGE_MODEL,
-                provider=Provider.OPENAI,
-                provider_model="m",
-                input_tokens=1,
-                output_tokens=1,
-                now=0,
-                purpose=journal.UsagePurpose.MEMORY,
-            )
-        )
-        (summary,) = await db.transaction(journal.usage_summary, 0)
-        assert sum(totals.calls for totals in summary.total.values()) == 2
-        assert sum(totals.searches for totals in summary.total.values()) == 2
+# ---- 输出上限 ----
 
 
 async def test_output_limit_is_passed_only_when_configured(db: Database) -> None:

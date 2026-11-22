@@ -9,7 +9,6 @@ import threading
 import time
 from collections.abc import AsyncIterator, Iterator
 from contextlib import closing, suppress
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -24,20 +23,6 @@ from qtalk_bot.storage import (
 )
 
 HANG_GUARD = 5  # 秒：并发相关的测试回归时应失败而不是挂起
-
-
-@dataclass(frozen=True, slots=True)
-class LegacyUser:
-    id: int
-
-
-def legacy_user(conn: sqlite3.Connection, openid: str, name: str, now: int) -> LegacyUser:
-    """在第 16 版之前的库里建一个用户（那时 `users` 还没有 `media_dir`，`access.ensure_user()` 用不了）。"""
-    row = conn.execute(
-        "INSERT INTO users (openid, name, joined_at) VALUES (?, ?, ?) RETURNING id",
-        (openid, name, now),
-    ).fetchone()
-    return LegacyUser(row[0])
 
 
 CREATE_PARENTS = "CREATE TABLE parents (id INTEGER PRIMARY KEY, name TEXT NOT NULL);"
@@ -138,12 +123,6 @@ async def test_connection_settings(db: Database) -> None:
     assert await pragma("foreign_keys") == 1
     assert await pragma("busy_timeout") == 5000
     assert await pragma("synchronous") == 1  # NORMAL
-
-
-async def test_default_migrations_open_a_fresh_database(db_path: Path) -> None:
-    async with await Database.open(db_path):
-        pass
-    assert user_version(db_path) == len(MIGRATIONS)
 
 
 async def test_in_memory_database_is_rejected(
@@ -765,86 +744,312 @@ async def test_backup_ignores_stale_wal_left_next_to_target(db: Database, tmp_pa
     assert names == ["fresh"]
 
 
-# ---- 第 16 版：用户的附件目录改用随机名 ----
+# ---- 业务表结构（迁移列表的第 1 项） ----
 
 
-async def _v15_database(path: Path, attachment_paths: dict[int, list[str]]) -> None:
-    """第 15 版的库：用户 1、2、3（3 没有任何数据），每个用户按 `attachment_paths` 挂附件，另有一张已过期的附件、
-    话题与档案，好检查引用 users 的各张表。"""
-    from qtalk_bot import journal, topics
+EXPECTED_COLUMNS = {
+    "invites": [
+        "id",
+        "code",
+        "note",
+        "max_uses",
+        "used_count",
+        "expires_at",
+        "revoked_at",
+        "created_at",
+    ],
+    "users": [
+        "id",
+        "openid",
+        "name",
+        "invite_id",
+        "status",
+        "disabled_notice_sent",
+        "welcomed_at",
+        "joined_at",
+        "media_dir",
+    ],
+    "refusals": ["openid", "refused_at"],
+    "service_state": ["id", "paused", "updated_at"],
+    "processed_events": ["key", "processed_at"],
+    "messages": [
+        "id",
+        "user_id",
+        "role",
+        "content",
+        "qq_message_id",
+        "reply_to",
+        "model",
+        "finish",
+        "delivery",
+        "created_at",
+        "msg_idx",
+        "faces_only",
+        "process",
+        "ref_msg_idx",
+    ],
+    "usage": [
+        "id",
+        "user_id",
+        "message_id",
+        "model",
+        "provider",
+        "provider_model",
+        "input_tokens",
+        "output_tokens",
+        "created_at",
+        "purpose",
+        "searches",
+        "cached_input_tokens",
+    ],
+    "decisions": [
+        "id",
+        "user_id",
+        "message_id",
+        "question",
+        "provider",
+        "provider_model",
+        "probabilities",
+        "chosen",
+        "kept_previous",
+        "latency_ms",
+        "error",
+        "created_at",
+    ],
+    "attachments": [
+        "id",
+        "user_id",
+        "message_id",
+        "position",
+        "quoted",
+        "kind",
+        "status",
+        "mime_type",
+        "size",
+        "path",
+        "filename",
+        "text",
+        "describe_status",
+        "created_at",
+        "description",
+        "given",
+    ],
+    "topics": [
+        "id",
+        "user_id",
+        "provisional_title",
+        "title",
+        "summary",
+        "summarized_through",
+        "created_at",
+        "active_at",
+        "last_message_id",
+    ],
+    "topic_messages": ["message_id", "topic_id", "user_id"],
+    "profiles": ["user_id", "content", "version", "updated_at"],
+    "reminders": [
+        "id",
+        "user_id",
+        "action",
+        "content",
+        "trigger",
+        "timezone",
+        "anchor_at",
+        "next_index",
+        "next_fire_at",
+        "status",
+        "created_at",
+        "ended_at",
+    ],
+    "reminder_failures": [
+        "id",
+        "user_id",
+        "reminder_id",
+        "reason",
+        "content",
+        "rule",
+        "times",
+        "first_at",
+        "last_at",
+        "notified_at",
+        "updated_at",
+    ],
+    "reminder_user_state": [
+        "user_id",
+        "push",
+        "push_updated_at",
+        "friend_removed",
+        "friend_updated_at",
+        "push_event_at",
+        "paused_since",
+    ],
+    "reminder_sends": ["id", "user_id", "status", "started_at", "finished_at"],
+    "reminder_send_items": ["send_id", "position", "reminder_id", "content", "rule", "fire_at"],
+    "sends": ["reply_id", "seq", "user_id", "kind", "status", "content", "ref_idx"],
+}
 
-    async with await Database.open(path, migrations=MIGRATIONS[:15]) as old:
-        for openid, name in (("FAKE-OPENID-A", "小王"), ("FAKE-OPENID-B", "小李")):
-            await old.transaction(legacy_user, openid, name, 0)
-        await old.transaction(legacy_user, "FAKE-OPENID-C", "小张", 0)
+EXPECTED_AUTOINCREMENT = {
+    "users",
+    "messages",
+    "attachments",
+    "topics",
+    "reminders",
+    "reminder_failures",
+    "reminder_sends",
+}
 
-        def plant(conn: sqlite3.Connection) -> None:
-            for user_id, paths in attachment_paths.items():
-                message = journal.add_user_message(conn, user_id, "看图", f"qq-{user_id}", 0)
-                for position, stored in enumerate(paths):
-                    conn.execute(
-                        "INSERT INTO attachments (user_id, message_id, position, quoted, kind,"
-                        " status, path, text, created_at)"
-                        " VALUES (?, ?, ?, 0, 'image', 'stored', ?, '[图片]', 0)",
-                        (user_id, message, position, stored),
-                    )
-                conn.execute(
-                    "INSERT INTO attachments (user_id, message_id, position, quoted, kind, status,"
-                    " path, text, created_at) VALUES (?, ?, ?, 0, 'image', 'expired', NULL,"
-                    " '[图片]', 0)",
-                    (user_id, message, len(paths)),
-                )
-                topics.create_topic(conn, user_id, "看图", now=0, last_message_id=message)
-                conn.execute(
-                    "INSERT INTO profiles (user_id, content, version, updated_at)"
-                    " VALUES (?, '- 称呼：某某', 1, 0)",
-                    (user_id,),
-                )
+EXPECTED_INDEXES = {
+    "processed_events_by_time",
+    "messages_by_user",
+    "messages_replies",
+    "messages_by_msg_idx",
+    "messages_by_reply_to",
+    "usage_by_user",
+    "usage_images_by_time",
+    "usage_by_message",
+    "decisions_by_user",
+    "decisions_by_message",
+    "attachments_by_user",
+    "attachments_by_time",
+    "topics_by_activity",
+    "topics_by_summarized_through",
+    "topic_messages_by_topic",
+    "reminders_due",
+    "reminders_by_user",
+    "reminders_ended",
+    "reminder_failures_open",
+    "reminder_failures_by_user",
+    "reminder_failures_by_reminder",
+    "reminder_failures_notified",
+    "reminder_sends_by_user",
+    "reminder_sends_in_flight",
+    "reminder_sends_by_time",
+    "reminder_send_items_by_reminder",
+    "sends_by_user_ref",
+}
 
-        await old.transaction(plant)
+# （表，列，指向的表，删除时的行为）
+EXPECTED_FOREIGN_KEYS = {
+    ("users", "invite_id", "invites", "NO ACTION"),
+    ("messages", "user_id", "users", "NO ACTION"),
+    ("messages", "reply_to", "messages", "CASCADE"),
+    ("usage", "user_id", "users", "NO ACTION"),
+    ("usage", "message_id", "messages", "SET NULL"),
+    ("decisions", "user_id", "users", "NO ACTION"),
+    ("decisions", "message_id", "messages", "SET NULL"),
+    ("attachments", "user_id", "users", "NO ACTION"),
+    ("attachments", "message_id", "messages", "CASCADE"),
+    ("topics", "user_id", "users", "NO ACTION"),
+    ("topics", "summarized_through", "messages", "SET NULL"),
+    ("topic_messages", "message_id", "messages", "CASCADE"),
+    ("topic_messages", "topic_id", "topics", "CASCADE"),
+    ("topic_messages", "user_id", "users", "NO ACTION"),
+    ("profiles", "user_id", "users", "NO ACTION"),
+    ("reminders", "user_id", "users", "CASCADE"),
+    ("reminder_failures", "user_id", "users", "CASCADE"),
+    ("reminder_failures", "reminder_id", "reminders", "SET NULL"),
+    ("reminder_user_state", "user_id", "users", "CASCADE"),
+    ("reminder_sends", "user_id", "users", "CASCADE"),
+    ("reminder_send_items", "send_id", "reminder_sends", "CASCADE"),
+    ("reminder_send_items", "reminder_id", "reminders", "SET NULL"),
+    ("sends", "reply_id", "messages", "CASCADE"),
+    ("sends", "user_id", "users", "NO ACTION"),
+}
 
 
-def _schema(path: Path) -> dict[str, str]:
-    with sqlite3.connect(path) as conn:
-        rows: list[tuple[str, str | None]] = conn.execute(
-            "SELECT name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'"
-        ).fetchall()
-    conn.close()
-    return {name: sql or "" for name, sql in rows}
+def test_there_is_exactly_one_migration() -> None:
+    # 已发布的迁移只能在末尾追加：改表结构要加第 2 项，不能改第 1 项。改了这里的数字，也要相应地补上从第 1 版升级的测试。
+    assert len(MIGRATIONS) == 1
 
 
-async def test_version_16_gives_users_random_dirs_and_strips_attachment_prefixes(
-    db_path: Path,
-) -> None:
-    from qtalk_bot import access, media
+async def test_default_migrations_open_a_fresh_database(db_path: Path) -> None:
+    async with await Database.open(db_path):
+        pass
+    assert user_version(db_path) == 1
 
-    await _v15_database(db_path, {1: ["1/a.png", "1/b.jpg"], 2: ["2/a.png"]})
-    before = _schema(db_path)
-    with sqlite3.connect(db_path) as conn:
-        users_before = conn.execute(
-            "SELECT id, openid, name, invite_id, status, disabled_notice_sent, welcomed_at,"
-            " joined_at FROM users ORDER BY id"
-        ).fetchall()
-    conn.close()
 
-    async with await Database.open(db_path, migrations=MIGRATIONS[:16]) as db:
-        users = await db.transaction(access.list_users)
-        rows = await db.fetch_all(
-            "SELECT user_id, path, status FROM attachments ORDER BY user_id, position"
-        )
-        copied = await db.fetch_all(
-            "SELECT id, openid, name, invite_id, status, disabled_notice_sent, welcomed_at,"
-            " joined_at FROM users ORDER BY id"
-        )
+async def test_fresh_database_has_exactly_the_expected_schema(db_path: Path) -> None:
+    async with await Database.open(db_path) as db:
+        tables = {
+            row["name"]: row["sql"]
+            for row in await db.fetch_all(
+                "SELECT name, sql FROM sqlite_schema WHERE type = 'table'"
+            )
+        }
+        indexes = {
+            row["name"]
+            for row in await db.fetch_all(
+                "SELECT name FROM sqlite_schema WHERE type = 'index' AND sql IS NOT NULL"
+            )
+        }
+        columns: dict[str, list[str]] = {}
+        foreign_keys: set[tuple[str, str, str, str]] = set()
+        strict: dict[str, bool] = {}
+        for table in EXPECTED_COLUMNS:
+            info = await db.fetch_all("SELECT name FROM pragma_table_info(?)", (table,))
+            columns[table] = [row["name"] for row in info]
+            for row in await db.fetch_all(
+                'SELECT "from", "table", on_delete FROM pragma_foreign_key_list(?)', (table,)
+            ):
+                foreign_keys.add((table, row["from"], row["table"], row["on_delete"]))
+            listed = await db.fetch_one("SELECT strict FROM pragma_table_list(?)", (table,))
+            assert listed is not None
+            strict[table] = bool(listed["strict"])
+        service = await db.fetch_all("SELECT id, paused FROM service_state")
         assert await db.fetch_all("PRAGMA foreign_key_check") == []
-        relocations = await db.transaction(access.pending_relocations)
-        sequence = await db.fetch_one("SELECT seq FROM sqlite_sequence WHERE name = 'users'")
-        assert await db.fetch_one("SELECT 1 FROM sqlite_sequence WHERE name = 'users_new'") is None
-        # 引用 users 的外键照常生效。
-        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+
+    assert set(tables) == set(EXPECTED_COLUMNS) | {"sqlite_sequence"}
+    assert columns == EXPECTED_COLUMNS
+    assert {
+        name for name, sql in tables.items() if sql is not None and "AUTOINCREMENT" in sql
+    } == EXPECTED_AUTOINCREMENT
+    assert indexes == EXPECTED_INDEXES
+    assert foreign_keys == EXPECTED_FOREIGN_KEYS
+    assert all(strict.values())
+    assert [tuple(row) for row in service] == [(1, 0)]
+
+
+async def test_schema_checks_reject_rows_the_code_never_writes(db_path: Path) -> None:
+    from qtalk_bot import access, journal
+    from qtalk_bot.journal import Ending, ReplyDelivery
+
+    async with await Database.open(db_path) as db:
+        user = await db.transaction(access.ensure_user, "FAKE-OPENID-A", "小王", 0)
+
+        def write(conn: sqlite3.Connection) -> tuple[int, int]:
+            question = journal.add_user_message(
+                conn, user.id, "问", "qq-1", 0, msg_idx="REFIDX_q", ref_msg_idx="REFIDX_old"
+            )
+            reply = journal.add_reply(
+                conn,
+                user_id=user.id,
+                reply_to=question,
+                content="答",
+                model="main",
+                ending=Ending.COMPLETED,
+                delivery=ReplyDelivery.STREAMED,
+                now=0,
+            )
+            return question, reply
+
+        question, reply = await db.transaction(write)
+        stored = await db.fetch_one(
+            "SELECT msg_idx, ref_msg_idx FROM messages WHERE id = ?", (question,)
+        )
+        assert stored is not None
+        assert tuple(stored) == ("REFIDX_q", "REFIDX_old")
+        # 回复行的引用索引在发送记录里，流水里回复的 msg_idx 与 ref_msg_idx 总是空的。
+        for column in ("msg_idx", "ref_msg_idx"):
+            with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+                await db.execute(
+                    f"UPDATE messages SET {column} = 'REFIDX_r' WHERE id = ?",  # noqa: S608  列名是常量
+                    (reply,),
+                )
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
             await db.execute(
-                "INSERT INTO messages (user_id, role, content, created_at)"
-                " VALUES (99, 'user', '', 0)"
+                "INSERT INTO reminder_failures (user_id, reason, content, rule, times, first_at,"
+                " last_at, updated_at) VALUES (?, 'push_off', '喝水', '每天', 1, 0, 0, 0)",
+                (user.id,),
             )
         with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
             await db.execute(
@@ -852,227 +1057,70 @@ async def test_version_16_gives_users_random_dirs_and_strips_attachment_prefixes
                 ("../" + "a" * 29,),
             )
 
-    assert user_version(db_path) == 16
-    assert [tuple(row) for row in copied] == [tuple(row) for row in users_before]
-    dirs = [user.media_dir for user in users]
-    assert all(media.valid_media_dir(d) for d in dirs)
-    assert len(set(dirs)) == 3
-    assert [tuple(row) for row in rows] == [
-        (1, "a.png", "stored"),
-        (1, "b.jpg", "stored"),
-        (1, None, "expired"),
-        (2, "a.png", "stored"),
-        (2, None, "expired"),
-    ]
-    assert sequence is not None
-    assert sequence[0] == 3
-    after = _schema(db_path)
-    assert "AUTOINCREMENT" in after["users"]
-    assert "media_dir" in after["users"]
-    # 索引一个不少，没有多出 users_new 之类；只多了待搬的映射表，登记了迁移时的每个用户。
-    assert set(after) == set(before) | {"media_relocations"}
-    assert relocations == [(user.id, user.media_dir) for user in users]
-    for name, sql in before.items():
-        if name != "users":
-            assert after[name] == sql, name  # 别的表（含对 users 的外键）原样不动
-    assert "REFERENCES users" in after["messages"]
 
-
-async def test_version_16_ids_are_not_reused_after_deleting_the_largest(db_path: Path) -> None:
+async def test_user_ids_are_not_reused_after_deleting_the_largest(db_path: Path) -> None:
     from qtalk_bot import access
 
-    await _v15_database(db_path, {1: ["1/a.png"]})
-
     async with await Database.open(db_path) as db:
-        await db.execute("DELETE FROM users WHERE id = 3")  # 编号最大、没有任何数据的那个
-        newcomer = await db.transaction(access.ensure_user, "FAKE-OPENID-D", "小赵", 0)
-        again = await db.transaction(access.ensure_user, "FAKE-OPENID-D", "小赵", 0)
-        another = await db.transaction(access.ensure_user, "FAKE-OPENID-E", "小钱", 0)
-        relocations = await db.transaction(access.pending_relocations)
+        first = await db.transaction(access.ensure_user, "FAKE-OPENID-A", "小王", 0)
+        second = await db.transaction(access.ensure_user, "FAKE-OPENID-B", "小李", 0)
+        await db.execute("DELETE FROM users WHERE id = ?", (second.id,))
+        newcomer = await db.transaction(access.ensure_user, "FAKE-OPENID-C", "小张", 0)
+        again = await db.transaction(access.ensure_user, "FAKE-OPENID-C", "小张", 0)
 
-    assert newcomer.id == 4
+    assert (first.id, second.id) == (1, 2)
+    assert newcomer.id == 3
     assert again == newcomer  # 已有的不再插入，也不消耗编号
-    assert another.id == 5
-    assert [user_id for user_id, _ in relocations] == [1, 2]  # 删掉的连带删除；新用户不进待搬的映射
+    assert newcomer.media_dir not in (first.media_dir, second.media_dir)
 
 
-@pytest.mark.parametrize(
-    "bad",
-    [
-        "2/a.png",  # 别的用户的前缀
-        "a.png",  # 没有前缀
-        "1/../2/a.png",
-        "1/sub/a.png",
-        "1/..",
-        "1/.partial-x",
-        "1/",
-        "11/a.png",
-        "1\\a.png",
-    ],
-)
-async def test_version_16_refuses_paths_outside_the_users_own_directory(
-    db_path: Path, bad: str
+async def test_database_with_a_higher_version_is_refused_untouched(
+    db_path: Path,
 ) -> None:
-    await _v15_database(db_path, {1: ["1/ok.png", bad], 2: ["2/ok.png"]})
-    before = _schema(db_path)
+    # 例如开发阶段合并迁移之前的库与备份（版本号大于 1）。
+    db_path.parent.mkdir(parents=True)
     with sqlite3.connect(db_path) as conn:
-        paths_before = conn.execute("SELECT id, path FROM attachments ORDER BY id").fetchall()
+        conn.execute("CREATE TABLE media_relocations (user_id INTEGER PRIMARY KEY) STRICT")
+        conn.execute("PRAGMA user_version = 19")
     conn.close()
-
-    with pytest.raises(
-        StorageError, match=r"迁移到版本 16 失败.*附件 #2 的路径不是它所属用户目录下的文件名"
-    ):
+    with pytest.raises(StorageError, match="数据库版本 19 高于程序支持的最高版本 1"):
         await Database.open(db_path)
-
-    assert user_version(db_path) == 15
-    assert _schema(db_path) == before
-    with sqlite3.connect(db_path) as conn:
-        paths_after = conn.execute("SELECT id, path FROM attachments ORDER BY id").fetchall()
-    conn.close()
-    assert paths_after == paths_before
-    assert "users_new" not in table_names(db_path)
-    assert "media_relocations" not in table_names(db_path)
+    assert user_version(db_path) == 19
+    assert table_names(db_path) == {"media_relocations"}
+    assert journal_mode(db_path) == "delete"
+    assert not await asyncio.to_thread(Path(f"{db_path}-wal").exists)
 
 
-async def test_version_17_adds_the_reminder_tables(db_path: Path) -> None:
-    from qtalk_bot import access
-
-    async with await Database.open(db_path, migrations=MIGRATIONS[:16]) as old:
-        await old.transaction(access.ensure_user, "FAKE-OPENID-A", "小王", 0)
-    before = _schema(db_path)
-
-    async with await Database.open(db_path, migrations=MIGRATIONS[:17]) as db:
-        assert await db.fetch_all("PRAGMA foreign_key_check") == []
-        users = await db.transaction(access.list_users)
-
-    assert user_version(db_path) == 17
-    assert [user.name for user in users] == ["小王"]
-    after = _schema(db_path)
-    for name, sql in before.items():
-        assert after[name] == sql, name  # 已有的表原样不动
-    added = set(after) - set(before)
-    assert {
-        "reminders",
-        "reminder_failures",
-        "reminder_user_state",
-        "reminder_sends",
-        "reminder_send_items",
-    } <= added
-    assert "AUTOINCREMENT" in after["reminders"]
-    assert "ON DELETE CASCADE" in after["reminders"]
+LATER_PROBE = "CREATE TABLE later_probe (id INTEGER PRIMARY KEY) STRICT;"
+"""测试用的「以后的第 2 版」：迁移前备份的钩子只在已有的库要升级时调用，现在只有第 1 版，要靠它才走得到。"""
 
 
-async def test_version_18_adds_pause_and_switch_columns(db_path: Path) -> None:
-    from qtalk_bot import access
-    from qtalk_bot.reminder_state import PushState, get_user_state
+async def test_before_migration_hook_runs_once_when_a_later_version_is_added(
+    tmp_path: Path,
+) -> None:
+    later = (*MIGRATIONS, LATER_PROBE)
+    calls: list[tuple[Path, int, bool]] = []
 
-    async with await Database.open(db_path, migrations=MIGRATIONS[:17]) as old:
-        user = await old.transaction(access.ensure_user, "FAKE-OPENID-A", "小王", 0)
-        await old.execute(
-            "INSERT INTO reminder_user_state (user_id, push, push_updated_at) VALUES (?, 'off', 5)",
-            (user.id,),
-        )
+    def hook(conn: sqlite3.Connection, path: Path, version: int, abort: threading.Event) -> None:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_schema")}
+        calls.append((path, version, "later_probe" in tables))
 
-    async with await Database.open(db_path, migrations=MIGRATIONS[:18]) as db:
-        assert await db.fetch_all("PRAGMA foreign_key_check") == []
-        state = await db.transaction(get_user_state, user.id)
+    existing = tmp_path / "existing.db"
+    async with await Database.open(existing) as old:
+        await old.execute("INSERT INTO refusals (openid, refused_at) VALUES ('FAKE-OPENID', 1)")
+    async with await Database.open(existing, migrations=later, before_migration=hook) as db:
+        kept = await db.fetch_all("SELECT openid FROM refusals")
+    assert calls == [(existing.resolve(), 1, False)]  # 在升级之前、拿到的是真实路径与旧版本
+    assert [row["openid"] for row in kept] == ["FAKE-OPENID"]
+    assert user_version(existing) == 2
 
-    assert user_version(db_path) == 18
-    assert (state.push, state.push_updated_at, state.push_event_at) == (PushState.OFF, 5, None)
-    assert (state.paused_since, state.pause_started, state.pause_ended) == (None, None, None)
-
-
-def _v18_reply(
-    conn: sqlite3.Connection,
-    user_id: int,
-    content: str,
-    delivery: str,
-    msg_idx: str | None,
-    *,
-    image: bool = False,
-) -> int:
-    """在第 18 版的库里写一轮：用户消息加回复，回复行上带 `msg_idx`（那时回复的引用索引存在这里）；`image` 为真时
-    回复挂着一张生成的图。"""
-    count = conn.execute("SELECT count(*) FROM messages").fetchone()[0]
-    question = conn.execute(
-        "INSERT INTO messages (user_id, role, content, qq_message_id, created_at, msg_idx)"
-        " VALUES (?, 'user', '问', ?, 0, ?) RETURNING id",
-        (user_id, f"qq-{count}", f"REFIDX_user_{count}"),
-    ).fetchone()[0]
-    reply = conn.execute(
-        "INSERT INTO messages (user_id, role, content, reply_to, model, finish, delivery,"
-        " created_at, msg_idx) VALUES (?, 'assistant', ?, ?, 'main', 'completed', ?, 0, ?)"
-        " RETURNING id",
-        (user_id, content, question, delivery, msg_idx),
-    ).fetchone()[0]
-    if image:
-        conn.execute(
-            "INSERT INTO attachments (user_id, message_id, position, quoted, kind, status,"
-            " mime_type, size, path, text, created_at)"
-            " VALUES (?, ?, 0, 0, 'image', 'stored', 'image/png', 4, ?, '[图片]', 0)",
-            (user_id, reply, f"drawn-{reply}.png"),
-        )
-    return reply
-
-
-async def test_version_19_moves_reply_indices_into_send_records(db_path: Path) -> None:
-    from qtalk_bot import access
-
-    async with await Database.open(db_path, migrations=MIGRATIONS[:18]) as old:
-        user = await old.transaction(access.ensure_user, "FAKE-OPENID-A", "小王", 0)
-
-        def write(conn: sqlite3.Connection) -> list[int]:
-            uid = user.id
-            return [
-                # 挂着生成的图：索引的来源拿不准，一律说不准。
-                _v18_reply(conn, uid, "", "images", "REFIDX_images"),
-                _v18_reply(conn, uid, "", "failed", "REFIDX_failed_image", image=True),
-                _v18_reply(conn, uid, "看图", "streamed", "REFIDX_text_image", image=True),
-                # 没有图：流式送达与改发纯文本记送达。
-                _v18_reply(conn, uid, "流式", "streamed", "REFIDX_streamed"),
-                _v18_reply(conn, uid, "停下", "interrupted", "REFIDX_interrupted"),
-                _v18_reply(conn, uid, "纯文本", "plain", "REFIDX_plain"),
-                # 其余都说不准，正文照搬（方括号说明也不特别处理）。
-                _v18_reply(conn, uid, "半截", "rejected", "REFIDX_half"),
-                _v18_reply(conn, uid, "[发了提醒列表：1 条提醒]", "card", "REFIDX_card"),
-                # 不搬：没有索引、索引太长。
-                _v18_reply(conn, uid, "没有索引", "streamed", None),
-                _v18_reply(conn, uid, "太长", "streamed", "x" * 513),
-            ]
-
-        replies = await old.transaction(write)
-    before = _schema(db_path)
-
-    async with await Database.open(db_path) as db:
-        assert await db.fetch_all("PRAGMA foreign_key_check") == []
-        sends = await db.fetch_all(
-            "SELECT reply_id, seq, user_id, kind, status, content, ref_idx FROM sends"
-            " ORDER BY reply_id"
-        )
-        indices = await db.fetch_all("SELECT role, msg_idx FROM messages ORDER BY id")
-
-    assert user_version(db_path) == len(MIGRATIONS) == 19
-    assert all((row["seq"], row["user_id"]) == (0, user.id) for row in sends)
-    assert [row["reply_id"] for row in sends] == replies[:8]
-    assert [(r["kind"], r["status"], r["content"], r["ref_idx"]) for r in sends] == [
-        ("image", "uncertain", None, "REFIDX_images"),
-        ("image", "uncertain", None, "REFIDX_failed_image"),
-        ("answer", "uncertain", "看图", "REFIDX_text_image"),
-        ("answer", "delivered", "流式", "REFIDX_streamed"),
-        ("answer", "delivered", "停下", "REFIDX_interrupted"),
-        ("plain", "delivered", "纯文本", "REFIDX_plain"),
-        ("answer", "uncertain", "半截", "REFIDX_half"),
-        ("answer", "uncertain", "[发了提醒列表：1 条提醒]", "REFIDX_card"),
-    ]
-    # 回复行的 msg_idx 清空，用户消息的照旧。
-    assert all(row["msg_idx"] is None for row in indices if row["role"] == "assistant")
-    assert [row["msg_idx"] for row in indices if row["role"] == "user"][:2] == [
-        "REFIDX_user_0",
-        "REFIDX_user_2",
-    ]
-    after = _schema(db_path)
-    assert set(after) - set(before) >= {"sends", "sends_by_user_ref"}
-    assert "ON DELETE CASCADE" in after["sends"]
+    calls.clear()
+    async with await Database.open(existing, migrations=later, before_migration=hook):
+        pass  # 已是最新
+    async with await Database.open(tmp_path / "fresh.db", migrations=later, before_migration=hook):
+        pass  # 新建的空库
+    assert calls == []
+    assert user_version(tmp_path / "fresh.db") == 2
 
 
 async def test_send_records_reject_bad_rows_and_follow_their_reply(db_path: Path) -> None:

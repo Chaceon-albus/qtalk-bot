@@ -1,7 +1,6 @@
 """启动入口：`python -m qtalk_bot`。
 
 读配置与密钥、打开数据库（要升级表结构时先备份到 `<数据目录>/backups/`，见 `maintenance.migration_backup()`）、
-把迁移前的数字附件目录搬到随机名（`media.relocate_user_dirs()`，做完之前不对外服务，失败按「数据库有误」退出）、
 创建对话模型、决策模型、写图片描述的模型与出图的图片模型（成败经 `model_watch.ModelWatch` 统计、告警）、构造
 `pyqbot.Bot`、注册处理函数（经 `batching.Batcher` 交给对话）并运行。
 
@@ -76,7 +75,7 @@ from .maintenance import (
     migration_backup,
     remove_stale_partials,
 )
-from .media import Fetcher, MediaStore, relocate_user_dirs, run_cleanup
+from .media import Fetcher, MediaStore, run_cleanup
 from .memory import Summarizer
 from .model_watch import ModelWatch
 from .reminders import ReminderScheduler, ReminderService, UserLocks, reminder_cleanup
@@ -183,8 +182,6 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
         ) as models,
     ):
         store = MediaStore.under(settings.data_dir)
-        # 在心跳、清理与收消息之前：没搬完的数字目录里的附件读不到；搬之前先做检查点，见 relocate_user_dirs()。
-        await relocate_user_dirs(db, store)
         bot = _make_bot(secrets, settings)
         refuse_cookies(bot)  # 附件下载与 pyqbot 共用这个客户端，见 `refuse_cookies()`
         alerts = Alerts(AdminAlertSender(bot, secrets.admin_openid))

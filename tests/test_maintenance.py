@@ -593,11 +593,17 @@ def test_backup_abandoned_before_it_starts_writes_nothing(tmp_path: Path) -> Non
 # ---- 迁移前备份 ----
 
 
+LATER = (*MIGRATIONS, "CREATE TABLE later_probe (id INTEGER PRIMARY KEY) STRICT;")
+"""测试用的「以后的第 2 版」：现在只有第 1 版，已有的库没有要升级的，迁移前备份要靠它才走得到。"""
+
+
 async def make_old_database(path: Path) -> int:
-    old = len(MIGRATIONS) - 1
-    async with await Database.open(path, migrations=MIGRATIONS[:old]) as database:
-        await database.execute("INSERT INTO refusals VALUES ('FAKE-OPENID', 1)")
-    return old
+    """按现在的迁移建一个有数据的库，返回它的版本（比 `LATER` 低一版）。"""
+    async with await Database.open(path) as database:
+        await database.execute(
+            "INSERT INTO refusals (openid, refused_at) VALUES ('FAKE-OPENID', 1)"
+        )
+    return len(MIGRATIONS)
 
 
 def version_of(path: Path) -> int:
@@ -612,13 +618,13 @@ async def test_existing_database_is_backed_up_before_migrating(tmp_path: Path) -
     directory = backup_dir(path.parent)
     hook = migration_backup(directory, clock=Clock(), free_bytes=lambda _: PLENTY)
 
-    async with await Database.open(path, before_migration=hook):
+    async with await Database.open(path, migrations=LATER, before_migration=hook):
         pass
 
     (backup,) = directory.iterdir()
     assert backup.name == migration_name(old, NOW)
     assert version_of(backup) == old
-    assert version_of(path) == len(MIGRATIONS)
+    assert version_of(path) == len(LATER)
     assert backup.stat().st_mode & 0o777 == 0o600
     assert directory.stat().st_mode & 0o777 == 0o700
 
@@ -632,7 +638,7 @@ async def test_only_the_latest_three_migration_backups_are_kept(tmp_path: Path) 
     scheduled = [touch(directory, scheduled_name(NOW - day * DAY)) for day in range(1, 3)]
     hook = migration_backup(directory, clock=Clock(), free_bytes=lambda _: PLENTY)
 
-    async with await Database.open(path, before_migration=hook):
+    async with await Database.open(path, migrations=LATER, before_migration=hook):
         pass
 
     kept = list_backups(directory, MIGRATION_PATTERN)
@@ -647,7 +653,7 @@ async def test_failed_backup_stops_the_migration(tmp_path: Path) -> None:
     hook = migration_backup(directory, clock=Clock(), free_bytes=lambda _: 0)
 
     with pytest.raises(StorageError) as info:
-        await Database.open(path, before_migration=hook)
+        await Database.open(path, migrations=LATER, before_migration=hook)
 
     assert "迁移前的备份失败" in str(info.value)
     assert "磁盘剩余空间不足" in str(info.value)
@@ -662,7 +668,7 @@ async def test_hook_errors_are_reported_without_paths(tmp_path: Path) -> None:
     hook = migration_backup(blocker / "backups", clock=Clock(), free_bytes=lambda _: PLENTY)
 
     with pytest.raises(StorageError) as info:
-        await Database.open(path, before_migration=hook)
+        await Database.open(path, migrations=LATER, before_migration=hook)
 
     message = str(info.value)
     assert "迁移前的备份失败" in message
@@ -676,9 +682,10 @@ async def test_new_and_current_databases_are_not_backed_up(tmp_path: Path) -> No
         calls.append(version)
 
     path = tmp_path / "qtalk.db"
-    async with await Database.open(path, before_migration=hook):
+    async with await Database.open(path, migrations=LATER, before_migration=hook):
         pass  # 新建的空库（版本 0）
-    async with await Database.open(path, before_migration=hook):
+    assert version_of(path) == len(LATER)
+    async with await Database.open(path, migrations=LATER, before_migration=hook):
         pass  # 已是最新
 
     assert calls == []
@@ -693,7 +700,7 @@ async def test_migration_backup_keeps_the_new_copy_when_the_clock_went_back(
     later = [touch(directory, migration_name(old - 1, NOW + day * DAY)) for day in range(1, 4)]
     hook = migration_backup(directory, clock=Clock(), free_bytes=lambda _: PLENTY)
 
-    async with await Database.open(path, before_migration=hook):
+    async with await Database.open(path, migrations=LATER, before_migration=hook):
         pass
 
     assert (directory / migration_name(old, NOW)).exists()
@@ -717,7 +724,7 @@ async def test_cancelled_open_abandons_the_migration_backup(tmp_path: Path) -> N
         finally:
             finished.set()
 
-    task = asyncio.create_task(Database.open(path, before_migration=hook))
+    task = asyncio.create_task(Database.open(path, migrations=LATER, before_migration=hook))
     assert await asyncio.to_thread(started.wait, 5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -744,7 +751,7 @@ async def test_cancellation_after_the_backup_still_stops_the_migration(tmp_path:
         finally:
             finished.set()
 
-    task = asyncio.create_task(Database.open(path, before_migration=hook))
+    task = asyncio.create_task(Database.open(path, migrations=LATER, before_migration=hook))
     assert await asyncio.to_thread(backed_up.wait, 5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):

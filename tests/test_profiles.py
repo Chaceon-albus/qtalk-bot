@@ -1,4 +1,4 @@
-"""用户档案的数据层（`profiles.py`）与迁移 V13：数据库是真的。"""
+"""用户档案的数据层（`profiles.py`）：数据库是真的。"""
 
 import sqlite3
 from collections.abc import AsyncIterator
@@ -6,11 +6,10 @@ from pathlib import Path
 
 import pytest
 from tests.test_conversation import ALICE, BOB, START, invited
-from tests.test_storage import legacy_user
 
 from qtalk_bot import profiles
 from qtalk_bot.profiles import PROFILE_LIMIT, Profile, ProfileTooLongError, clean_profile
-from qtalk_bot.storage import DATABASE_FILENAME, MIGRATIONS, Database
+from qtalk_bot.storage import DATABASE_FILENAME, Database
 
 
 @pytest.fixture
@@ -121,21 +120,8 @@ def test_repr_has_no_content() -> None:
     assert "秘密" not in repr(Profile("- 秘密", START))
 
 
-# ---- 迁移 V13 ----
-
-
-async def test_version_12_database_gains_an_empty_profiles_table(tmp_path: Path) -> None:
-    path = tmp_path / DATABASE_FILENAME
-    async with await Database.open(path, migrations=MIGRATIONS[:12]) as old:
-        user = await old.transaction(legacy_user, ALICE, "小王", 0)
-        with pytest.raises(sqlite3.OperationalError):
-            await old.fetch_all("SELECT * FROM profiles")
-
-    async with await Database.open(path) as db:
-        assert await db.fetch_all("SELECT * FROM profiles") == []
-        await db.transaction(lambda conn: profiles.set_profile(conn, user.id, "- 喜欢猫", now=1))
-        found = await db.transaction(profiles.get_profile, user.id)
-        assert found == Profile("- 喜欢猫", 1)
-        # STRICT 与 CHECK：版本号从 1 起。
-        with pytest.raises(sqlite3.IntegrityError):
-            await db.execute("UPDATE profiles SET version = 0 WHERE user_id = ?", (user.id,))
+async def test_profile_version_starts_from_one(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    await db.transaction(lambda conn: profiles.set_profile(conn, alice.id, "- 喜欢猫", now=1))
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.execute("UPDATE profiles SET version = 0 WHERE user_id = ?", (alice.id,))

@@ -173,19 +173,6 @@ def media_dirs(conn: sqlite3.Connection) -> set[str]:
     return {row["media_dir"] for row in conn.execute("SELECT media_dir FROM users")}
 
 
-def pending_relocations(conn: sqlite3.Connection) -> list[tuple[int, str]]:
-    """迁移 V16 登记、还没搬完的旧目录：（用户编号，新的目录名），按编号排序。之后新建的用户不在其中。"""
-    return [
-        (row["user_id"], row["media_dir"])
-        for row in conn.execute("SELECT user_id, media_dir FROM media_relocations ORDER BY user_id")
-    ]
-
-
-def finish_relocation(conn: sqlite3.Connection, user_id: int) -> None:
-    """这个用户的旧目录已经搬完（或本来就没有），不再需要搬。"""
-    conn.execute("DELETE FROM media_relocations WHERE user_id = ?", (user_id,))
-
-
 def ensure_user(
     conn: sqlite3.Connection,
     openid: str,

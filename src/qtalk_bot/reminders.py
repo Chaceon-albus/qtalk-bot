@@ -1,6 +1,6 @@
 """提醒（里程碑 8）：数据层、准入检查、到点发送、失败通知、主动消息开关与好友状态。
 
-触发规则的解析与时刻的计算在 `triggers.py`（纯函数），面向用户的文案在 `texts.py`。表结构见 `storage.py` 的第 17 版。
+触发规则的解析与时刻的计算在 `triggers.py`（纯函数），面向用户的文案在 `texts.py`。表结构见 `storage.py` 里提醒的几张表。
 设置、列出、取消提醒的函数与按钮确认（第二部分）建在这里的接口上：`parse_trigger()` 校验规则，`check_admission()` 与
 `create_reminder()` 做准入检查与新建，`cancel_reminders()` 取消，`summarize_schedule()`、`rule_text()` 渲染规则与接下来
 的几次，`active_reminders()`、`recent_deliveries()`、`get_user_state()`、`pause_reason()` 给列表与系统提示词取数据。
@@ -115,23 +115,16 @@ class ReminderStatus(StrEnum):
 
 
 class FailureReason(StrEnum):
-    """提醒没能按时发出的粗分原因；值存进失败表。`PUSH_OFF` 不再记（被平台拒发一律记 `SEND_ERROR`，用户 2026-11-20
-    定），只为认出库里已有的旧行：显示时按「发送出错」处理（`shown`）。"""
+    """提醒没能按时发出的粗分原因；值存进失败表。被平台拒发一律记 `SEND_ERROR`。"""
 
-    PUSH_OFF = "push_off"
     LATE = "late"
     SEND_ERROR = "send_error"
     RATE_LIMITED = "rate_limited"
     MAYBE_LOST = "maybe_lost"
 
     @property
-    def shown(self) -> FailureReason:
-        """显示时归入的原因：旧的 `PUSH_OFF` 行按 `SEND_ERROR` 处理。"""
-        return FailureReason.SEND_ERROR if self is FailureReason.PUSH_OFF else self
-
-    @property
     def label(self) -> str:
-        return _REASON_LABELS[self.shown]
+        return _REASON_LABELS[self]
 
 
 _REASON_LABELS = {
@@ -992,8 +985,8 @@ class FailureNotice:
 def compose_notice(
     records: Sequence[FailureRecord], *, timezone: ZoneInfo, now: int
 ) -> FailureNotice | None:
-    """把还没告知的失败写成一条通知：同一条提醒（不论原因）合并成一行，按最早的原定时刻排列；原因按显示的归类合并
-    （`FailureReason.shown`）。没有失败时为 `None`。"""
+    """把还没告知的失败写成一条通知：同一条提醒（不论原因）合并成一行，按最早的原定时刻排列，各原因的次数合计。
+    没有失败时为 `None`。"""
     if not records:
         return None
     groups: dict[tuple[str, int], list[FailureRecord]] = {}
@@ -1010,7 +1003,7 @@ def compose_notice(
         latest = max(group, key=lambda r: r.id)
         totals: dict[FailureReason, int] = {}
         for record in group:
-            reason = record.reason.shown
+            reason = record.reason
             totals[reason] = totals.get(reason, 0) + record.times
         reasons = sorted(totals.items(), key=lambda item: (-item[1], _REASON_ORDER[item[0]]))
         once = sum(totals.values()) == 1
@@ -1022,7 +1015,7 @@ def compose_notice(
                 reasons=tuple((reason.label, times) for reason, times in reasons),
             )
         )
-    shown = sorted({r.reason.shown for r in records}, key=_REASON_ORDER.__getitem__)
+    shown = sorted({r.reason for r in records}, key=_REASON_ORDER.__getitem__)
     labels = [reason.label for reason in shown]
     return FailureNotice(
         text=texts.reminder_failures(lines, labels),

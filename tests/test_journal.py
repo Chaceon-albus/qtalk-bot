@@ -5,7 +5,6 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
-from tests.test_storage import legacy_user
 
 from qtalk_bot import access, journal
 from qtalk_bot.journal import Ending, HistoryEntry, ReplyDelivery, UsageTotals
@@ -20,7 +19,7 @@ from qtalk_bot.media import (
     DescribeStatus,
     GeneratedImage,
 )
-from qtalk_bot.storage import DATABASE_FILENAME, MIGRATIONS, Database
+from qtalk_bot.storage import DATABASE_FILENAME, Database
 
 
 @pytest.fixture
@@ -193,20 +192,41 @@ async def test_usage_rows_store_null_rather_than_zero(db: Database) -> None:
     assert (row["input_tokens"], row["output_tokens"]) == (None, None)
 
 
-async def test_existing_version_1_database_is_upgraded_in_place(tmp_path: Path) -> None:
-    path = tmp_path / DATABASE_FILENAME
-    async with await Database.open(path, migrations=MIGRATIONS[:1]) as old:
-        await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
-
-    async with await Database.open(path) as db:
-        (user,) = await db.transaction(access.list_users)
-        assert user.name == "小王"
-
-        def write(conn: sqlite3.Connection) -> list[HistoryEntry]:
-            current = journal.add_user_message(conn, user.id, "升级后的第一句", "qq-1", 0)
-            return journal.pending_messages(conn, user.id, current + 1)
-
-        assert await db.transaction(write) == [HistoryEntry(Role.USER, "升级后的第一句")]
+async def test_usage_table_checks_purpose_and_counts(db: Database) -> None:
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+    insert = (
+        "INSERT INTO usage (user_id, model, provider, provider_model, created_at, purpose)"
+        " VALUES (?, 'x', 'openai', 'y', 0, ?)"
+    )
+    for purpose in journal.UsagePurpose:
+        await db.execute(insert, (alice, purpose.value))
+    await db.execute(
+        "INSERT INTO usage (user_id, model, provider, provider_model, created_at)"
+        " VALUES (?, 'main', 'openai', 'gpt-fake', 0)",
+        (alice,),
+    )
+    row = await db.fetch_one(
+        "SELECT purpose, searches, cached_input_tokens FROM usage ORDER BY id DESC"
+    )
+    assert row is not None
+    assert tuple(row) == ("chat", None, None)  # 不写用途时是对话，搜索次数与缓存命中为空
+    with pytest.raises(sqlite3.IntegrityError):
+        await db.execute(insert, (alice, "other"))
+    for column in ("input_tokens", "output_tokens", "searches", "cached_input_tokens"):
+        negative = f"INSERT INTO usage (user_id, model, provider, provider_model, created_at, {column}) VALUES (?, 'm', 'openai', 'm', 0, -1)"  # noqa: S608  列名是常量
+        with pytest.raises(sqlite3.IntegrityError):
+            await db.execute(negative, (alice,))
+    with pytest.raises(sqlite3.IntegrityError):  # 用量行引用用户
+        await db.execute(
+            "INSERT INTO usage (user_id, model, provider, provider_model, created_at)"
+            " VALUES (999, 'main', 'openai', 'm', 0)"
+        )
+    plan = await db.fetch_all(
+        "EXPLAIN QUERY PLAN SELECT count(*) FROM usage WHERE purpose = 'image' AND created_at >= ?",
+        (0,),
+    )
+    # 所有用户合计的出图数走时间索引。
+    assert any("usage_images_by_time" in r["detail"] for r in plan)
 
 
 # ---- 里程碑 4：决策记录、用量的用途、上一轮的模型 ----
@@ -377,31 +397,6 @@ async def test_usage_summary_keeps_decisions_apart_from_chat(db: Database) -> No
     assert summary.total[chat] == UsageTotals(calls=1, input_tokens=200, output_tokens=50)
 
 
-async def test_version_2_database_gets_the_decisions_table_and_chat_purpose(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / DATABASE_FILENAME
-    async with await Database.open(path, migrations=MIGRATIONS[:2]) as old:
-        user = await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
-        await old.execute(
-            "INSERT INTO usage (user_id, model, provider, provider_model, created_at)"
-            " VALUES (?, 'main', 'openai', 'gpt-fake', 0)",
-            (user.id,),
-        )
-
-    async with await Database.open(path) as db:
-        row = await db.fetch_one("SELECT purpose FROM usage")
-        assert row is not None
-        assert row["purpose"] == "chat"
-        assert await db.fetch_all("SELECT * FROM decisions") == []
-        with pytest.raises(sqlite3.IntegrityError):
-            await db.execute(
-                "INSERT INTO usage (user_id, model, provider, provider_model, created_at, purpose)"
-                " VALUES (?, 'main', 'openai', 'gpt-fake', 0, 'other')",
-                (user.id,),
-            )
-
-
 async def test_usage_summary_survives_rows_that_bypassed_the_usage_checks(db: Database) -> None:
     # 一行能落库的 2**63 - 1 和别的行相加，SUM() 会抛 integer overflow，整个 /usage 都看不到；
     # total() 不会溢出，总数封顶。
@@ -537,50 +532,6 @@ async def test_stored_attachment_needs_a_path(db: Database) -> None:
 
     with pytest.raises(sqlite3.IntegrityError):
         await db.transaction(bad)
-
-
-async def test_version_3_database_keeps_its_usage_and_accepts_describe(tmp_path: Path) -> None:
-    path = tmp_path / DATABASE_FILENAME
-    async with await Database.open(path, migrations=MIGRATIONS[:3]) as old:
-        user = await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
-        await old.execute(
-            "INSERT INTO usage (user_id, model, provider, provider_model, input_tokens,"
-            " output_tokens, created_at, purpose) VALUES (?, 'decisions', 'openai', 'luna', 40,"
-            " 0, 5, 'decision')",
-            (user.id,),
-        )
-
-    async with await Database.open(path) as db:
-        row = await db.fetch_one("SELECT model, input_tokens, created_at, purpose FROM usage")
-        assert row is not None
-        assert tuple(row) == ("decisions", 40, 5, "decision")
-
-        def add(conn: sqlite3.Connection) -> None:
-            journal.add_usage(
-                conn,
-                user_id=user.id,
-                message_id=None,
-                model=journal.DESCRIBE_USAGE_MODEL,
-                provider=Provider.GEMINI,
-                provider_model="gemini-lite",
-                input_tokens=70,
-                output_tokens=9,
-                now=6,
-                purpose=journal.UsagePurpose.DESCRIBE,
-            )
-
-        await db.transaction(add)
-        with pytest.raises(sqlite3.IntegrityError):
-            await db.execute(
-                "INSERT INTO usage (user_id, model, provider, provider_model, created_at, purpose)"
-                " VALUES (?, 'x', 'openai', 'y', 0, 'other')",
-                (user.id,),
-            )
-        (summary,) = await db.transaction(journal.usage_summary, 0)
-        assert {purpose: totals.calls for purpose, totals in summary.total.items()} == {
-            journal.UsagePurpose.DECISION: 1,
-            journal.UsagePurpose.DESCRIBE: 1,
-        }
 
 
 async def test_unanswered_messages_do_not_use_up_history_turns(db: Database) -> None:
@@ -758,44 +709,8 @@ async def test_reply_covers_only_messages_up_to_its_reply_to(db: Database) -> No
     assert [entry.content for entry in pending] == ["问2"]
 
 
-async def test_version_4_database_gets_the_reply_index_and_faces_only(tmp_path: Path) -> None:
-    path = tmp_path / DATABASE_FILENAME
-    async with await Database.open(path, migrations=MIGRATIONS[:4]) as old:
-        user = await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
-
-        def fill(conn: sqlite3.Connection) -> None:
-            # 第 4 版的表还没有 faces_only 列，照当时的写法插入。
-            first = conn.execute(
-                "INSERT INTO messages (user_id, role, content, qq_message_id, created_at)"
-                " VALUES (?, 'user', '问', 'qq-1', 0) RETURNING id",
-                (user.id,),
-            ).fetchone()["id"]
-            conn.execute(
-                "INSERT INTO messages"
-                " (user_id, role, content, reply_to, model, finish, delivery, created_at)"
-                " VALUES (?, 'assistant', '答', ?, 'main', 'completed', 'streamed', 0)",
-                (user.id, first),
-            )
-
-        await old.transaction(fill)
-
-    async with await Database.open(path) as db:
-        index = await db.fetch_one(
-            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'messages_replies'"
-        )
-        assert index is not None
-
-        def query(conn: sqlite3.Connection) -> list[HistoryEntry]:
-            current = journal.add_user_message(conn, user.id, "又问", "qq-2", 0)
-            return journal.recent_history(conn, user.id, current, 10)
-
-        history = await db.transaction(query)
-        assert [entry.content for entry in history] == ["问", "答"]
-        assert not any(entry.faces_only for entry in history)  # 升级前的消息都是 0
-
-
 async def test_journal_keeps_the_original_text_and_skips_faces_only_messages(db: Database) -> None:
-    # 流水保留实际存下的原文（升级前存下的原始标记也原样留着），清洗在组装模型输入时做（见 context.py）。
+    # 流水保留实际存下的原文（早期版本存下的原始标记也原样留着），清洗在组装模型输入时做（见 context.py）。
     # 只由表情组成的消息只留个记录：不进历史，也不并进这一轮。
     alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
     raw = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
@@ -803,7 +718,7 @@ async def test_journal_keeps_the_original_text_and_skips_faces_only_messages(db:
     def fill(conn: sqlite3.Connection) -> int:
         old = journal.add_user_message(conn, alice, f"哈哈{raw}", "qq-1", 0)
         journal.add_user_message(conn, alice, "", "qq-1b", 0, faces_only=True)  # 同一轮里的表情包
-        reply(conn, alice, old + 1, "答")  # 升级前的回复可能挂在表情包上
+        reply(conn, alice, old + 1, "答")  # 早期版本的回复可能挂在表情包上
         journal.add_user_message(conn, alice, "", "qq-2", 0, faces_only=True)
         return journal.add_user_message(conn, alice, "[表情]", "qq-3", 0)  # 用户手打的
 
@@ -831,57 +746,6 @@ async def test_many_stickers_do_not_crowd_out_pending_messages(db: Database) -> 
     question = await db.transaction(fill)
     pending = await db.transaction(journal.pending_messages, alice, question + 100)
     assert [entry.message_id for entry in pending] == [question]
-
-
-async def test_version_5_database_gets_descriptions_and_narrower_faces_only(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / DATABASE_FILENAME
-    async with await Database.open(path, migrations=MIGRATIONS[:5]) as old:
-        user = await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
-
-        def fill(conn: sqlite3.Connection) -> tuple[int, int]:
-            # 第 5 版：表情标记加 PDF 的消息也记成了 faces_only；描述只在 text 里。
-            sticker = journal.add_user_message(conn, user.id, "[表情]", "qq-1", 0, faces_only=True)
-            mixed = journal.add_user_message(
-                conn, user.id, "[表情：捂脸] [表情]", "qq-2", 0, faces_only=True
-            )
-            typed = journal.add_user_message(conn, user.id, "看看[表情]", "qq-3", 0)  # 用户手打的
-            conn.execute(
-                "INSERT INTO attachments (user_id, message_id, position, quoted, kind, status,"
-                " text, created_at) VALUES (?, ?, 0, 0, 'file', 'skipped', '[文件]', 0)",
-                (user.id, typed),
-            )
-            for position, (kind, text, status) in enumerate(
-                [
-                    ("image", "[图片：一只猫]", "done"),
-                    ("image", "[被引用的图片：一条狗]", "done"),
-                    ("image", "[图片]", "failed"),
-                    ("file", "[文件：a.pdf，PDF，8 B]", None),
-                ]
-            ):
-                conn.execute(
-                    "INSERT INTO attachments (user_id, message_id, position, quoted, kind, status,"
-                    " text, describe_status, created_at) VALUES (?, ?, ?, 0, ?, 'skipped', ?, ?, 0)",
-                    (user.id, mixed, position, kind, text, status),
-                )
-            return sticker, mixed
-
-        sticker, mixed = await old.transaction(fill)
-
-    async with await Database.open(path) as db:
-        rows = await db.fetch_all("SELECT id, faces_only, content FROM messages ORDER BY id")
-        # 被改回普通消息的那条去掉第 5 版生成的表情文字；别的行（含手打的）不碰。
-        assert [tuple(row) for row in rows] == [
-            (sticker, 1, "[表情]"),
-            (mixed, 0, ""),
-            (sticker + 2, 0, "看看[表情]"),
-        ]
-        rows = await db.fetch_all(
-            "SELECT description, given FROM attachments WHERE message_id = ? ORDER BY position",
-            (mixed,),
-        )
-        assert [tuple(row) for row in rows] == [("一只猫", 0), ("一条狗", 0), (None, 0), (None, 0)]
 
 
 async def test_set_description_keeps_the_description_apart_from_the_text(db: Database) -> None:
@@ -953,49 +817,6 @@ async def test_set_given_rewrites_the_turns_attachments_for_this_user_only(
     assert await flags() == {a1: 0, a2: 0, ab: 0}
 
 
-async def test_version_4_stickers_are_recognized_again_by_version_6(tmp_path: Path) -> None:
-    path = tmp_path / DATABASE_FILENAME
-    raw = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
-    async with await Database.open(path, migrations=MIGRATIONS[:4]) as old:
-        user = await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
-
-        def fill(conn: sqlite3.Connection) -> list[int]:
-            ids: list[int] = []
-            for index, (content, attachments) in enumerate(
-                [
-                    (raw, [("image", 0)]),  # 第 4 版的表情包：原始标记加表情图片
-                    (f" {raw}{raw} ", []),  # 单独的小黄脸
-                    (f"哈哈{raw}", [("image", 0)]),  # 有别的文字
-                    (raw, [("image", 1)]),  # 被引用的图片不是表情图片
-                    (raw, [("image", 0), ("image", 0)]),  # 图片比标记多
-                    (raw, [("file", 0)]),
-                ]
-            ):
-                message = conn.execute(
-                    "INSERT INTO messages (user_id, role, content, qq_message_id, created_at)"
-                    " VALUES (?, 'user', ?, ?, 0) RETURNING id",
-                    (user.id, content, f"qq-{index}"),
-                ).fetchone()["id"]
-                for position, (kind, quoted) in enumerate(attachments):
-                    conn.execute(
-                        "INSERT INTO attachments (user_id, message_id, position, quoted, kind,"
-                        " status, text, created_at) VALUES (?, ?, ?, ?, ?, 'skipped', '[图片]', 0)",
-                        (user.id, message, position, quoted, kind),
-                    )
-                ids.append(message)
-            return ids
-
-        ids = await old.transaction(fill)
-
-    async with await Database.open(path) as db:
-        rows = await db.fetch_all("SELECT id, faces_only, content FROM messages ORDER BY id")
-        result = {row[0]: (row[1], row[2]) for row in rows}
-        assert result[ids[0]] == (1, "")
-        assert result[ids[1]] == (1, "")
-        assert [result[i][0] for i in ids[2:]] == [0, 0, 0, 0]
-        assert result[ids[2]][1] == f"哈哈{raw}"  # 原文照留，组装时再清洗
-
-
 # ---- 里程碑 7a：联网搜索的次数 ----
 
 
@@ -1045,26 +866,6 @@ async def test_negative_search_count_is_rejected_by_the_table(db: Database) -> N
         )
 
 
-async def test_version_6_database_gets_an_empty_searches_column(tmp_path: Path) -> None:
-    path = tmp_path / DATABASE_FILENAME
-    async with await Database.open(path, migrations=MIGRATIONS[:6]) as old:
-        user = await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
-        await old.execute(
-            "INSERT INTO usage (user_id, model, provider, provider_model, input_tokens,"
-            " output_tokens, created_at) VALUES (?, 'main', 'openai', 'gpt-fake', 5, 6, 7)",
-            (user.id,),
-        )
-
-    async with await Database.open(path) as db:
-        row = await db.fetch_one("SELECT input_tokens, output_tokens, searches FROM usage")
-        assert row is not None
-        assert tuple(row) == (5, 6, None)
-        (summary,) = await db.transaction(journal.usage_summary, 0)
-        assert summary.total == {
-            journal.UsagePurpose.CHAT: UsageTotals(calls=1, input_tokens=5, output_tokens=6)
-        }
-
-
 async def test_message_time_is_read_only_for_this_users_own_messages(db: Database) -> None:
     # 被动回复的截止点从回复所挂的那条消息记进流水的时刻算起；只认这个用户自己的用户消息。
     alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
@@ -1092,65 +893,6 @@ async def test_message_time_is_read_only_for_this_users_own_messages(db: Databas
 
 def drawn(path: str, description: str = "一只橘猫趴在窗台上") -> GeneratedImage:
     return GeneratedImage(path=path, mime_type=PNG, size=123, description=description)
-
-
-async def test_version_10_usage_rows_survive_and_image_is_accepted(tmp_path: Path) -> None:
-    path = tmp_path / DATABASE_FILENAME
-    async with await Database.open(path, migrations=MIGRATIONS[:10]) as old:
-        user = await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
-        await old.execute(
-            "INSERT INTO usage (user_id, model, provider, provider_model, input_tokens,"
-            " output_tokens, created_at, purpose, searches)"
-            " VALUES (?, 'memory', 'openai', 'gpt-fake', 5, 6, 7, 'memory', NULL)",
-            (user.id,),
-        )
-        with pytest.raises(sqlite3.IntegrityError):
-            await old.execute(
-                "INSERT INTO usage (user_id, model, provider, provider_model, created_at, purpose)"
-                " VALUES (?, 'image', 'gemini', 'img', 0, 'image')",
-                (user.id,),
-            )
-
-    async with await Database.open(path) as db:
-        row = await db.fetch_one(
-            "SELECT id, model, input_tokens, output_tokens, created_at, purpose, searches FROM usage"
-        )
-        assert row is not None
-        assert tuple(row) == (1, "memory", 5, 6, 7, "memory", None)
-        await db.transaction(
-            lambda conn: journal.add_image_usage(
-                conn,
-                user_id=user.id,
-                message_id=None,
-                provider=Provider.GEMINI,
-                provider_model="img",
-                now=10,
-            )
-        )
-        image = await db.fetch_one(
-            "SELECT model, provider, provider_model, purpose, input_tokens FROM usage WHERE id = 2"
-        )
-        assert image is not None
-        assert tuple(image) == (journal.IMAGE_USAGE_MODEL, "gemini", "img", "image", None)
-        indexes = {
-            r["name"]
-            for r in await db.fetch_all(
-                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage'"
-            )
-        }
-        assert {"usage_by_user", "usage_images_by_time"} <= indexes
-        plan = await db.fetch_all(
-            "EXPLAIN QUERY PLAN SELECT count(*) FROM usage WHERE purpose = 'image'"
-            " AND created_at >= ?",
-            (0,),
-        )
-        assert any("usage_images_by_time" in r["detail"] for r in plan)
-        # 外键照常生效：用量行仍引用用户。
-        with pytest.raises(sqlite3.IntegrityError):
-            await db.execute(
-                "INSERT INTO usage (user_id, model, provider, provider_model, created_at)"
-                " VALUES (999, 'main', 'openai', 'm', 0)"
-            )
 
 
 async def test_generated_images_hang_on_the_reply_and_come_back_with_the_history(
@@ -1439,39 +1181,7 @@ async def test_usage_summary_counts_images_apart_from_model_calls(db: Database) 
     )
 
 
-# ---- 缓存命中的输入 token（迁移 V12）与按用户、按用途的用量汇总 ----
-
-
-async def test_version_11_usage_rows_survive_with_an_empty_cached_column(tmp_path: Path) -> None:
-    path = tmp_path / DATABASE_FILENAME
-    async with await Database.open(path, migrations=MIGRATIONS[:11]) as old:
-        user = await old.transaction(legacy_user, "FAKE-OPENID-ALICE", "小王", 0)
-        await old.execute(
-            "INSERT INTO usage (user_id, model, provider, provider_model, input_tokens,"
-            " output_tokens, created_at, purpose, searches)"
-            " VALUES (?, 'main', 'openai', 'gpt-fake', 5, 6, 7, 'chat', 2)",
-            (user.id,),
-        )
-
-    async with await Database.open(path) as db:
-        row = await db.fetch_one(
-            "SELECT model, input_tokens, output_tokens, created_at, purpose, searches,"
-            " cached_input_tokens FROM usage"
-        )
-        assert row is not None
-        assert tuple(row) == ("main", 5, 6, 7, "chat", 2, None)
-        with pytest.raises(sqlite3.IntegrityError):
-            await db.execute(
-                "INSERT INTO usage (user_id, model, provider, provider_model, created_at,"
-                " cached_input_tokens) VALUES (?, 'main', 'openai', 'gpt-fake', 0, -1)",
-                (user.id,),
-            )
-        (summary,) = await db.transaction(journal.usage_summary, 0)
-        assert summary.total == {
-            journal.UsagePurpose.CHAT: UsageTotals(
-                calls=1, input_tokens=5, output_tokens=6, searches=2
-            )
-        }
+# ---- 缓存命中的输入 token 与按用户、按用途的用量汇总 ----
 
 
 async def test_cached_input_tokens_are_written_and_summed(db: Database) -> None:

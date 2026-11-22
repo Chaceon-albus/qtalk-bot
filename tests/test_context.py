@@ -523,7 +523,7 @@ RAW_FACE = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
 
 
 async def test_every_text_in_the_request_has_face_markers_cleaned(tmp_path: Path) -> None:
-    # 流水保留原文：升级前的用户消息与回显过标记的助手回复、文件名里的完整标记都可能带原始标记。
+    # 流水保留原文：早期版本的用户消息与回显过标记的助手回复、文件名里的完整标记都可能带原始标记。
     file = record(FILE, AttachmentStatus.FAILED, text=f"[文件：{RAW_FACE}.pdf，没能下载]")
     history = [user(f"早{RAW_FACE}"), reply(f"你也{RAW_FACE}")]
     current = [user("看看", file)]
@@ -545,9 +545,9 @@ def test_decision_input_has_face_markers_cleaned() -> None:
 
 def test_faces_only_entries_never_make_a_turn_answerable() -> None:
     blind_image = record(IMAGE)  # 只收文字的模型看不了
-    sticker = HistoryEntry(Role.USER, "[表情]", faces_only=True)  # 升级前存下的
+    sticker = HistoryEntry(Role.USER, "[表情]", faces_only=True)  # 早期版本存下的
     typed = HistoryEntry(Role.USER, "[表情：你好]")  # 用户手打的，是普通文字
-    raw = HistoryEntry(Role.USER, RAW_FACE)  # 升级前存下的原始标记，去掉后什么都不剩
+    raw = HistoryEntry(Role.USER, RAW_FACE)  # 早期版本存下的原始标记，去掉后什么都不剩
 
     assert not plan_turn([TEXT_ONLY], [sticker, user("", blind_image)], max_size_mb=20).answerable
     assert not plan_turn([TEXT_ONLY], [raw], max_size_mb=20).answerable
