@@ -36,7 +36,7 @@ from httpx2.websockets import ASGIWebSocketTransport
 
 from qtalk_bot import access, commands, texts
 from qtalk_bot import bot as bot_module
-from qtalk_bot.access import User
+from qtalk_bot.access import User, UserStatus
 from qtalk_bot.alerts import AlertGroup, Alerts, AlertSendError, DeliveryCallback
 from qtalk_bot.batching import Batcher
 from qtalk_bot.bot import (
@@ -78,9 +78,11 @@ from qtalk_bot.config import (
     ModelSettings,
     TurnSettings,
 )
+from qtalk_bot.confirmations import BUTTON_PREFIXES
 from qtalk_bot.conversation import (
     TYPING_PULSE_SECONDS,
     ChoiceButton,
+    CommandButton,
     Conversation,
     LibraryImage,
     SendError,
@@ -88,6 +90,7 @@ from qtalk_bot.conversation import (
     SendUncertainError,
 )
 from qtalk_bot.gate import (
+    CAPABILITIES_BUTTON,
     Delivery,
     FriendAdded,
     Gate,
@@ -226,6 +229,34 @@ def text_of(body: Payload) -> str:
 
 def is_markdown(body: Payload) -> bool:
     return "markdown" in body
+
+
+def keyboard_buttons(body: Payload) -> list[tuple[str, str, int]]:
+    """一条消息的键盘里的按钮：按钮上的字、数据与动作类型（1 是回调，2 是指令）；没有键盘时为空。"""
+    keyboard = body.get("keyboard")
+    if keyboard is None:
+        return []
+    buttons: list[tuple[str, str, int]] = []
+    for row in _json_list(_json_object(_json_object(keyboard)["content"])["rows"]):
+        for button in _json_list(_json_object(row)["buttons"]):
+            render, action = _json_object(button)["render_data"], _json_object(button)["action"]
+            label = _json_object(render)["label"]
+            data, kind = _json_object(action)["data"], _json_object(action)["type"]
+            assert isinstance(label, str)
+            assert isinstance(data, str)
+            assert isinstance(kind, int)
+            buttons.append((label, data, kind))
+    return buttons
+
+
+def _json_object(value: object) -> dict[str, object]:
+    assert isinstance(value, dict)
+    return cast(dict[str, object], value)
+
+
+def _json_list(value: object) -> list[object]:
+    assert isinstance(value, list)
+    return cast(list[object], value)
 
 
 def reject_links(body: Payload) -> httpx2.Response | None:
@@ -472,15 +503,12 @@ async def test_friend_add_with_invite_gets_welcome_once(db: Database) -> None:
 
     await run_until_handled(platform, db, RecordingChat(), events=2, sent=1)
 
-    assert platform.sent == [
-        {
-            "path": f"/v2/users/{ALICE}/messages",
-            "msg_type": 0,
-            "content": texts.welcome("小王"),
-            "event_id": "FRIEND_ADD:fake-1",
-            "msg_seq": 1,
-        }
-    ]
+    (body,) = platform.sent
+    assert body["path"] == f"/v2/users/{ALICE}/messages"
+    assert (body["event_id"], body["msg_seq"]) == ("FRIEND_ADD:fake-1", 1)
+    assert is_markdown(body)
+    assert text_of(body) == texts.welcome_message("小王").markdown
+    assert keyboard_buttons(body) == [(texts.CAPABILITIES_LABEL, CAPABILITIES_BUTTON, 1)]
     invite = await db.transaction(access.get_invite_by_code, CODE)
     assert invite is not None
     assert invite.used_count == 1
@@ -537,7 +565,7 @@ async def test_rejected_welcome_is_resent_and_message_does_not_reach_chat(db: Da
     later = Platform([c2c(ALICE, "你好", "ROBOT1.0_fake-1")])
     await run_until_handled(later, db, chat, events=1, sent=1)
 
-    assert [m["content"] for m in later.sent] == [texts.welcome("小王")]
+    assert [text_of(m) for m in later.sent] == [texts.welcome_message("小王").markdown]
     assert chat.users == []
 
 
@@ -698,7 +726,7 @@ async def test_forwarded_invitation_is_redeemed_end_to_end(db: Database) -> None
 
     redeemed = Platform([c2c(ALICE, forwarded, "ROBOT1.0_fake-2")])
     await run_until_handled(redeemed, db, RecordingChat(), events=1, sent=1)
-    assert [m["content"] for m in redeemed.sent] == [texts.welcome("小王")]
+    assert [text_of(m) for m in redeemed.sent] == [texts.welcome_message("小王").markdown]
 
 
 async def test_concurrent_invites_reply_in_groups(db: Database) -> None:
@@ -3734,8 +3762,8 @@ class _FakeButtonMessage:
     def __init__(self) -> None:
         self.replies: list[dict[str, object]] = []
 
-    async def reply(self, **kwargs: object) -> object:
-        self.replies.append(kwargs)
+    async def reply(self, content: str | None = None, **kwargs: object) -> object:
+        self.replies.append(kwargs if content is None else {"content": content, **kwargs})
         return pyqbot.SentMessage(id="sent-1")
 
 
@@ -3790,13 +3818,25 @@ class _FakeInteraction:
             resolved=pyqbot.InteractionResolved(button_data=data, authorize_data=authorize),
         )
         self.failure = failure
+        self.markdown_failure: pyqbot.QQBotError | None = None
         self.timestamp: datetime | None = datetime.fromtimestamp(1794861200, UTC)
         self.replies: list[str] = []
+        self.markdown: list[bool] = []  # 每条回复是不是 Markdown（与 `replies` 一一对应）
 
-    async def reply(self, text: str) -> None:
+    async def reply(
+        self,
+        content: str | None = None,
+        *,
+        markdown: str | None = None,
+        keyboard: pyqbot.Keyboard | None = None,
+    ) -> None:
+        if markdown is not None and self.markdown_failure is not None:
+            raise self.markdown_failure
         if self.failure is not None:
             raise self.failure
-        self.replies.append(text)
+        assert keyboard is None
+        self.replies.append(markdown if markdown is not None else content or "")
+        self.markdown.append(markdown is not None)
 
 
 @pytest.mark.parametrize(
@@ -3829,6 +3869,213 @@ async def test_interactions_go_to_the_button_handler(
     if called:
         assert calls == [(ALICE, data)]
     assert interaction.replies == ([answer] if replied else [])
+
+
+# ---- 欢迎语的「你能做什么」 ----
+
+
+def plain_gate(db: Database) -> Gate:
+    async def no_links(code: str) -> str:
+        raise AssertionError("不生成邀请链接")
+
+    return Gate(
+        db,
+        admin_openid=ADMIN,
+        timezone=ZoneInfo("Asia/Shanghai"),
+        invites=InviteSettings(),
+        share_link=no_links,
+    )
+
+
+def test_capabilities_button_is_not_a_confirmation_button() -> None:
+    assert not CAPABILITIES_BUTTON.startswith(BUTTON_PREFIXES)
+
+
+def test_interactions_are_handled_even_without_buttons_or_reminders() -> None:
+    # 欢迎语下面总有「你能做什么」：注入了别的对话处理器（没有确认按钮）、关掉提醒时也要接互动。
+    registered: list[str] = []
+
+    class RecordingBot:
+        def __getattr__(self, name: str) -> Callable[[object], None]:
+            return lambda handler: registered.append(name)
+
+    register(cast(pyqbot.Bot, RecordingBot()), cast(Gate, None), RecordingChat())
+
+    assert "on_interaction" in registered
+
+
+@pytest.mark.parametrize("with_buttons", [True, False])
+async def test_capabilities_button_answers_an_authorized_user_every_time(
+    db: Database, caplog: pytest.LogCaptureFixture, with_buttons: bool
+) -> None:
+    # 不经确认按钮的处理（没有它也照样回），不交给对话处理器，不调用模型；每次点都回同一段。
+    await welcomed_alice(db)
+    calls: list[str] = []
+
+    async def buttons(openid: str, button: str, reply: Callable[[str], Awaitable[None]]) -> None:
+        calls.append(button)
+
+    chat = RecordingChat()
+    handlers = Handlers(plain_gate(db), chat, buttons=buttons if with_buttons else None)
+    interaction = _FakeInteraction(CAPABILITIES_BUTTON)
+    journal = "SELECT * FROM messages ORDER BY id"
+    before = [tuple(row) for row in await db.fetch_all(journal)]
+
+    with caplog.at_level(logging.INFO):
+        await handlers.on_interaction(cast(pyqbot.Interaction, interaction))
+        await handlers.on_interaction(cast(pyqbot.Interaction, interaction))
+
+    assert interaction.replies == [texts.CAPABILITIES.markdown] * 2
+    assert interaction.markdown == [True, True]
+    assert calls == []
+    assert chat.users == []
+    assert [tuple(row) for row in await db.fetch_all(journal)] == before  # 不写流水
+    assert ALICE not in formatted_logs(caplog)
+
+
+async def test_capabilities_falls_back_to_plain_text_when_markdown_is_rejected(
+    db: Database,
+) -> None:
+    await welcomed_alice(db)
+    handlers = Handlers(plain_gate(db), RecordingChat())
+    interaction = _FakeInteraction(CAPABILITIES_BUTTON)
+    interaction.markdown_failure = api_error(400, 40034006)
+
+    await handlers.on_interaction(cast(pyqbot.Interaction, interaction))
+
+    assert interaction.replies == [texts.CAPABILITIES.plain]
+    assert interaction.markdown == [False]
+
+
+@pytest.mark.parametrize("who", ["stranger", "disabled", "unwelcomed", "paused"])
+async def test_capabilities_button_is_ignored_for_users_who_cannot_chat(
+    db: Database, caplog: pytest.LogCaptureFixture, who: str
+) -> None:
+    alice = await welcomed_alice(db)
+    openid = ALICE
+    match who:
+        case "stranger":
+            openid = STRANGER
+        case "disabled":
+            await db.transaction(access.set_user_status, alice.id, UserStatus.DISABLED)
+        case "unwelcomed":
+            await db.transaction(lambda conn: conn.execute("UPDATE users SET welcomed_at = NULL"))
+        case _:
+            await db.transaction(access.set_paused, True, 0)
+    handlers = Handlers(plain_gate(db), RecordingChat())
+    interaction = _FakeInteraction(CAPABILITIES_BUTTON, openid)
+
+    with caplog.at_level(logging.INFO):
+        await handlers.on_interaction(cast(pyqbot.Interaction, interaction))
+
+    assert interaction.replies == []
+    assert "你能做什么" in caplog.text
+    assert "不回复" in caplog.text
+    logs = formatted_logs(caplog)
+    for secret in (ALICE, STRANGER):
+        assert secret not in logs
+
+
+async def test_capabilities_reply_goes_on_the_message_being_answered(db: Database) -> None:
+    # 这个用户正在回答时，回复挂在那一轮的消息上：回给互动会让平台提前结束正在写的流式回答。
+    await welcomed_alice(db)
+    answering_message = _FakeButtonMessage()
+    channel = bot_module._QQReplyChannel(cast(pyqbot.C2CMessage, answering_message))  # pyright: ignore[reportPrivateUsage]  测接线层的通道本身
+
+    class Answering(RecordingChat):
+        def answering(self, openid: str) -> object:
+            return channel if openid == ALICE else None
+
+    handlers = Handlers(plain_gate(db), Answering())
+    interaction = _FakeInteraction(CAPABILITIES_BUTTON)
+
+    await handlers.on_interaction(cast(pyqbot.Interaction, interaction))
+
+    assert interaction.replies == []
+    assert answering_message.replies == [
+        {"markdown": texts.CAPABILITIES.markdown, "keyboard": None}
+    ]
+    assert channel.budget.replies == 1
+
+
+async def test_welcome_rejected_with_its_button_falls_back_to_plain_text_and_counts(
+    db: Database,
+) -> None:
+    # 加好友事件的被动回复能不能带键盘没有实测：带按钮的 Markdown 被拒时改发纯文本，照样记下已告知。
+    await add_invite(db)
+    settled: list[Delivery] = []
+    platform = Platform([friend_add(ALICE, CODE, "FRIEND_ADD:fake-1")], respond=reject_markdown)
+    await run_until_handled(platform, db, RecordingChat(), events=1, sent=1, settled=settled)
+
+    assert len(platform.attempts) == 2
+    assert keyboard_buttons(platform.attempts[0]) == [
+        (texts.CAPABILITIES_LABEL, CAPABILITIES_BUTTON, 1)
+    ]
+    (body,) = platform.sent
+    assert not is_markdown(body)
+    assert keyboard_buttons(body) == []
+    assert body["content"] == texts.welcome("小王")
+    assert settled == [Delivery.SENT]
+
+    chat = RecordingChat()
+    later = Platform([c2c(ALICE, "你好", "ROBOT1.0_fake-1")])
+    await run_until_handled(later, db, chat, events=1, sent=0)
+    assert [user.name for user in chat.users] == ["小王"]  # 已告知，可以对话了
+
+
+@pytest.mark.parametrize("respond", [garble, server_error])
+async def test_welcome_with_its_button_of_unknown_outcome_is_not_resent_nor_counted(
+    db: Database, respond: Callable[[Payload], httpx2.Response]
+) -> None:
+    # 带键盘的欢迎语说不准有没有送达：不改发纯文本（免得收到两条），也不记已告知；下一条消息补发欢迎语。
+    await add_invite(db)
+    settled: list[Delivery] = []
+
+    def unknown_with_keyboard(body: Payload) -> httpx2.Response | None:
+        return respond(body) if "keyboard" in body else None
+
+    platform = Platform(
+        [friend_add(ALICE, CODE, "FRIEND_ADD:fake-1")], respond=unknown_with_keyboard
+    )
+    await run_until_handled(platform, db, RecordingChat(), events=1, sent=0, settled=settled)
+
+    assert len(platform.attempts) == 1
+    assert keyboard_buttons(platform.attempts[0]) == [
+        (texts.CAPABILITIES_LABEL, CAPABILITIES_BUTTON, 1)
+    ]
+    assert platform.sent == []
+    assert settled == [Delivery.UNKNOWN]
+    user = await db.transaction(access.get_user_by_openid, ALICE)
+    assert user is not None
+    assert user.welcomed_at is None
+
+    chat = RecordingChat()
+    later = Platform([c2c(ALICE, "你好", "ROBOT1.0_fake-1")])
+    await run_until_handled(later, db, chat, events=1, sent=1)
+    assert [text_of(m) for m in later.sent] == [texts.welcome_message("小王").markdown]
+    assert chat.users == []
+
+
+async def test_reply_channel_sends_command_buttons_that_send_their_text() -> None:
+    message = _FakeButtonMessage()
+    channel = bot_module._QQReplyChannel(cast(pyqbot.C2CMessage, message))  # pyright: ignore[reportPrivateUsage]  测接线层的通道本身
+
+    await channel.send_buttons(
+        "收到 1 张图片，想让我帮你看什么？",
+        (CommandButton("提取文字", "把里面的文字提取出来"), CommandButton("翻译", "翻译一下")),
+    )
+
+    (sent,) = message.replies
+    keyboard = sent["keyboard"]
+    assert isinstance(keyboard, pyqbot.Keyboard)
+    assert keyboard.content is not None
+    (row,) = keyboard.content.rows
+    assert [
+        (b.render_data.label, b.action.data, b.action.type, b.action.enter) for b in row.buttons
+    ] == [
+        ("提取文字", "把里面的文字提取出来", pyqbot.ButtonActionType.COMMAND, True),
+        ("翻译", "翻译一下", pyqbot.ButtonActionType.COMMAND, True),
+    ]
 
 
 # ---- 提醒：主动消息开关与好友事件 ----
@@ -3998,7 +4245,7 @@ async def test_friend_events_reach_reminders_and_gate_still_greets(db: Database)
     ]
     # 加好友的回复照旧由 Gate 决定：先是欢迎语，重新加好友时是「欢迎回来」；删好友不回复。
     assert [text_of(body) for body in platform.sent] == [
-        texts.welcome("小王"),
+        texts.welcome_message("小王").markdown,
         texts.welcome_back("小王"),
     ]
 

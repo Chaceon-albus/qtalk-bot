@@ -35,8 +35,10 @@ from qtalk_bot.conversation import (
     TYPING_PULSE_SECONDS,
     ChatInput,
     ChoiceButton,
+    CommandButton,
     Conversation,
     LibraryImage,
+    MessageButton,
     SendError,
     SendRejectedError,
     SendUncertainError,
@@ -246,7 +248,9 @@ class FakeChannel:
         )
         self.images: list[bytes] = []  # 发出的图片
         self.image_failure: SendError | None = None
-        self.buttons: list[tuple[ChoiceButton, ...]] = []  # 发出的按钮消息里的按钮
+        self.buttons: list[tuple[ChoiceButton, ...]] = []  # 发出的按钮消息里的回调按钮
+        self.commands: list[tuple[CommandButton, ...]] = []  # 发出的按钮消息里的指令按钮
+        self.button_attempts = 0  # 试着发按钮消息的次数（含失败的）
         self.buttons_failure: SendError | None = None
         self.markdown_failure: SendError | None = None
         self.image_ref: str | None = None
@@ -344,13 +348,18 @@ class FakeChannel:
             raise self.markdown_failure
         self.log.append(("markdown", markdown))
 
-    async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
-        """发 Markdown 加按钮：记成（`buttons`，Markdown），按钮记进 `buttons`。`buttons_failure` 不为空时抛出它。"""
+    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> None:
+        """发 Markdown 加按钮：记成（`buttons`，Markdown），回调按钮记进 `buttons`、指令按钮记进 `commands`。
+        `buttons_failure` 不为空时抛出它。"""
         await asyncio.sleep(0)
+        self.button_attempts += 1
         if self.buttons_failure is not None:
             raise self.buttons_failure
         self.log.append(("buttons", markdown))
-        self.buttons.append(tuple(buttons))
+        if choices := tuple(b for b in buttons if isinstance(b, ChoiceButton)):
+            self.buttons.append(choices)
+        if commands := tuple(b for b in buttons if isinstance(b, CommandButton)):
+            self.commands.append(commands)
 
     async def upload_image(self, data: bytes, mime_type: str) -> LibraryImage:
         """传到素材库：记成（`upload`，编号），编号是 `img-1`、`img-2`……，地址是 `qqbot-media://image/<编号>`。"""
@@ -4701,8 +4710,13 @@ async def test_ask_about_waiting_attachments_counts_them_and_rechecks_access(
         await db.transaction(access.set_user_status, alice.id, UserStatus.DISABLED)
         await chat.ask(alice, [one.message_id, two.message_id], channel)
 
-    assert channel.sent == [texts.attachments_waiting(2, 1)]
-    assert channel.sent == ["收到 2 张图片和 1 个文件，想让我帮你看什么？"]
+    # 问话带一行快捷的指令按钮，停用之后不再问。
+    assert channel.log == [("buttons", texts.attachments_waiting(2, 1))]
+    assert texts.attachments_waiting(2, 1) == "收到 2 张图片和 1 个文件，想让我帮你看什么？"
+    (shortcuts,) = channel.commands
+    assert [b.label for b in shortcuts] == ["描述一下", "提取文字", "翻译", "总结要点"]
+    assert [b.text for b in shortcuts] == [text for _, text in texts.attachment_shortcuts(2, 1)]
+    assert channel.budget.replies == 1
     assert model.requests == []
     assert await reply_targets(db) == []  # 问话不写进流水，附件仍等着下一条文字
 
@@ -4720,7 +4734,7 @@ async def test_waiting_picture_is_asked_about_then_answered_with_the_next_text(
     await submit(batcher, alice, message(None, image_attachment()), picture_channel)
     await clock.advance_to(60.0)
     await finish(batcher)
-    assert picture_channel.sent == ["收到 1 张图片，想让我帮你看什么？"]
+    assert picture_channel.log == [("buttons", "收到 1 张图片，想让我帮你看什么？")]
     assert model.requests == []
     await submit(batcher, alice, message("这是什么"), text_channel)
     await finish(batcher)
@@ -4728,6 +4742,76 @@ async def test_waiting_picture_is_asked_about_then_answered_with_the_next_text(
     (request,) = model.requests
     assert [type(part) for part in request.messages[0].parts] == [ImagePart, TextPart]
     assert text_channel.streamed == "是猫"
+
+
+async def test_a_shortcut_button_sends_an_ordinary_message_that_takes_the_waiting_picture(
+    db: Database, tmp_path: Path
+) -> None:
+    # 指令按钮点了等于用户自己发出那句话：与等着的图片合成一轮，回答照常流式输出。
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("图里写着“欢迎光临”"))
+    chat = media_chat(db, tmp_path, FakeDownloader({IMAGE_URL: PNG_A}), (model, SEES))
+    clock = ManualClock()
+    batcher = batcher_of(chat, clock)
+    picture_channel, button_channel = FakeChannel(), FakeChannel()
+
+    await submit(batcher, alice, message(None, image_attachment()), picture_channel)
+    await clock.advance_to(60.0)
+    await finish(batcher)
+    (shortcuts,) = picture_channel.commands
+    extract = next(b for b in shortcuts if b.label == "提取文字")
+    await submit(batcher, alice, message(extract.text), button_channel)
+    await finish(batcher)
+
+    (request,) = model.requests
+    image, text = request.messages[0].parts
+    assert isinstance(image, ImagePart)
+    assert isinstance(text, TextPart)
+    assert extract.text in text.text
+    assert button_channel.streamed == "图里写着“欢迎光临”"
+
+
+async def test_rejected_shortcut_buttons_fall_back_to_the_plain_question(
+    db: Database, tmp_path: Path
+) -> None:
+    alice = await invited(db, ALICE, "小王")
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({IMAGE_URL: PNG_A}),
+        (ScriptedModel("main", answer("不该出现")), SEES),
+    )
+    rejected, uncertain = FakeChannel(), FakeChannel()
+    rejected.buttons_failure = SendRejectedError("键盘被拒")
+    uncertain.buttons_failure = SendUncertainError("超时")
+
+    async with asyncio.timeout(HANG_GUARD):
+        one = await chat.receive(alice, message(None, image_attachment()), FakeChannel())
+        assert one is not None
+        await chat.ask(alice, [one.message_id], rejected)
+        await chat.ask(alice, [one.message_id], uncertain)
+
+    assert rejected.button_attempts == 1
+    assert rejected.sent == [texts.attachments_waiting(1, 0)]  # 明确被拒：改发不带按钮的
+    assert uncertain.button_attempts == 1
+    assert uncertain.log == []  # 说不准有没有送达：不再发
+    assert await reply_targets(db) == []
+
+
+def test_attachment_shortcuts_follow_what_is_waiting() -> None:
+    labels = {
+        (images, files): [label for label, _ in texts.attachment_shortcuts(images, files)]
+        for images, files in ((1, 0), (0, 2), (3, 1))
+    }
+    assert labels == {
+        (1, 0): ["描述一下", "提取文字", "翻译"],
+        (0, 2): ["总结要点", "翻译"],
+        (3, 1): ["描述一下", "提取文字", "翻译", "总结要点"],
+    }
+    for label, text in texts.attachment_shortcuts(1, 1):
+        assert len(label) <= 4
+        assert text.strip() == text
+        assert text
 
 
 async def test_shutdown_during_a_judgment_records_it_as_cancelled_and_leaves_no_task(

@@ -24,8 +24,8 @@ from qtalk_bot.batching import (
 from qtalk_bot.config import AttachmentTimeoutAction, TurnSettings
 from qtalk_bot.conversation import (
     ChatInput,
-    ChoiceButton,
     LibraryImage,
+    MessageButton,
     Received,
     ReplyChannel,
     ReplyStream,
@@ -196,7 +196,7 @@ class Channel:
         replying()
         self.sent.append(f"[图片 {mime_type}]")
 
-    async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
+    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> None:
         self.sent.append(f"[按钮] {markdown}")
 
     async def send_markdown(self, markdown: str) -> None:

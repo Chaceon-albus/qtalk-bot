@@ -1,6 +1,6 @@
 """接线层：把 pyqbot 的事件转成普通数据交给 `Gate`，再按结果回复或交给对话处理器。
 
-只注册单聊消息、加好友、删好友与互动（忘掉话题与提醒的确认按钮、资料卡的主动消息开关）的处理函数，群聊明确不做。这里尽量薄，
+只注册单聊消息、加好友、删好友与互动（欢迎语的「你能做什么」、忘掉话题与提醒的确认按钮、资料卡的主动消息开关）的处理函数，群聊明确不做。这里尽量薄，
 判断都在 `gate.py`、`conversation.py` 与 `reminders.py`。
 
 提醒（启用了 `[reminders]` 时）：到点的提醒经 `ProactiveSender` 以纯文本主动消息发出；切换主动消息开关的授权互动
@@ -61,12 +61,23 @@ from .confirmations import BUTTON_PREFIXES
 from .conversation import (
     ChatInput,
     ChoiceButton,
+    CommandButton,
     LibraryImage,
+    MessageButton,
     SendError,
     SendRejectedError,
     SendUncertainError,
 )
-from .gate import Chat, Delivery, FriendAdded, Gate, IncomingMessage, Reply, ShareLinkError
+from .gate import (
+    CAPABILITIES_BUTTON,
+    Chat,
+    Delivery,
+    FriendAdded,
+    Gate,
+    IncomingMessage,
+    Reply,
+    ShareLinkError,
+)
 from .media import (
     CLEANUP_INTERVAL_SECONDS,
     GIF,
@@ -129,8 +140,8 @@ def register(
     buttons: ButtonHandler | None = None,
     reminders: ReminderEvents | None = None,
 ) -> Handlers:
-    """在 `bot` 上注册单聊消息、加好友与（给了 `buttons` 或 `reminders` 时）互动的处理函数，给了 `reminders` 时还有
-    删好友的。关停时要在关数据库之前等返回值的 `drain()`。
+    """在 `bot` 上注册单聊消息、加好友与互动（欢迎语的「你能做什么」、确认按钮、主动消息开关）的处理函数，给了
+    `reminders` 时还有删好友的。关停时要在关数据库之前等返回值的 `drain()`。
 
     `hosts` 是下载白名单（`download_hosts()` 合并后的），形态日志按它决定记不记主机名。`buttons` 处理确认按钮
     （忘掉话题、设置与取消提醒，`conversation.Conversation.press_button()`）；`Bot` 默认先替我们回应按钮的互动（`auto_ack`），这里只管
@@ -141,8 +152,8 @@ def register(
     bot.on_friend_add(handlers.on_friend_add)
     if reminders is not None:
         bot.on_friend_del(handlers.on_friend_del)
-    if buttons is not None or reminders is not None:
-        bot.on_interaction(handlers.on_interaction)
+    # 欢迎语下面总有「你能做什么」按钮，所以互动总要接。
+    bot.on_interaction(handlers.on_interaction)
     return handlers
 
 
@@ -1011,15 +1022,19 @@ class _QQReplyChannel:
     async def send_markdown(self, markdown: str) -> None:
         await _guarded(self._message.reply(markdown=markdown))
 
-    async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
-        """Markdown 加一行回调按钮（键盘只能随 Markdown 发，pyqbot guide 第 3 节；单聊实测可发，errata「键盘」）。"""
-        keyboard = pyqbot.Keyboard.from_rows(
-            [
-                pyqbot.Button.callback(b.label, b.data, visited_label=b.visited_label)
-                for b in buttons
-            ]
-        )
+    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> None:
+        """Markdown 加一行按钮（键盘只能随 Markdown 发，pyqbot guide 第 3 节；单聊实测可发，errata「键盘」）。
+        指令按钮带 `enter`：单聊里点了直接替用户发出那句话。"""
+        keyboard = pyqbot.Keyboard.from_rows([_keyboard_button(b) for b in buttons])
         await _guarded(self._message.reply(markdown=markdown, keyboard=keyboard))
+
+
+def _keyboard_button(button: MessageButton) -> pyqbot.Button:
+    match button:
+        case ChoiceButton(label=label, data=data, visited_label=visited):
+            return pyqbot.Button.callback(label, data, visited_label=visited)
+        case CommandButton(label=label, text=text):
+            return pyqbot.Button.command(label, text, enter=True)
 
 
 class _QQProcessStream:
@@ -1149,6 +1164,8 @@ class Handlers:
 
         - 切换资料卡的主动消息开关（`type` 18，`scope` 为 `c2c_push`）：交给 `reminders`，连同用这条互动被动回复的函数
           （由处理方在这个用户的锁里调用）。
+        - 点了欢迎语下面的「你能做什么」（`gate.CAPABILITIES_BUTTON`）：`Gate.capabilities()` 决定回不回，回复经
+          `interaction.reply()`（这个用户正在回答时挂在那一轮的消息上，同 Gate 的其它回复）。
         - 点了回调按钮：只处理确认按钮（忘掉话题、设置与取消提醒，`confirmations.BUTTON_PREFIXES` 开头），交给 `buttons`，连同一个经
           `interaction.reply()` 回复用户的函数（发送失败只记日志）。互动已由 `Bot` 先回应（`auto_ack`）；回复由处理方
           在这个用户的锁里发，不插进正在写的流式回答。
@@ -1174,6 +1191,14 @@ class Handlers:
                     )
                 return
             data = interaction.button_data or ""
+            if data == CAPABILITIES_BUTTON:
+                # 不经确认按钮的处理（可能没有对话处理器）：Gate 决定回不回；回复同 Gate 的其它回复，正在回答时
+                # 挂在那一轮的消息上，不让平台提前结束正在写的流式回答。
+                examples = await self._gate.capabilities(openid)
+                if examples is not None:
+                    send = _RoutedReply(openid, interaction.reply, self._answering)
+                    await self._deliver(openid, send, examples)
+                return
             if self._buttons is None:
                 return
             if not data.startswith(BUTTON_PREFIXES):
@@ -1218,7 +1243,9 @@ class Handlers:
             raise
         match outcome:
             case Reply() as reply:
-                send = _RoutedReply(message, self._answering)
+                send = _RoutedReply(
+                    message.user_openid, message.reply, self._answering, own=message
+                )
                 await self._deliver(message.user_openid, send, reply)
             case Chat(user=user):
                 _log_shape(user, message, self._hosts)
@@ -1491,53 +1518,79 @@ def is_rejection(exc: pyqbot.QQBotError) -> bool:
 
 
 class _Send(Protocol):
-    """`C2CMessage.reply` 与 `FriendAdd.reply` 里用到的部分。"""
+    """`C2CMessage.reply`、`FriendAdd.reply` 与 `Interaction.reply` 里用到的部分。"""
 
     def __call__(
-        self, content: str | None = None, *, markdown: str | None = None
+        self,
+        content: str | None = None,
+        *,
+        markdown: str | None = None,
+        keyboard: pyqbot.Keyboard | None = None,
     ) -> Awaitable[object]: ...
 
 
 class _RoutedReply:
-    """Gate 的回复的发送函数，符合 `_Send`。
+    """Gate 的回复的发送函数，符合 `_Send`。`default` 是没在回答时的发法：回给新消息（`own` 就是这条消息），
+    或回给一次互动（点了「你能做什么」）。
 
     每发一次（含被拒之后改发的备用文案）都在那一刻问对话处理器：这个用户有一轮回答正在进行时，回在那一轮回复挂
     的那条消息上（`C2CMessage.reply`，与回给新消息是同一个接口），计进它的被动回复次数。流式消息还没结束时，
     回复这个用户的另一条消息会让平台提前结束它（pyqbot errata，40034019），对同一条消息插一条普通回复则不受影响。
-    发完要给那条消息留不足 `ANSWER_RESERVE` 次（兜底的说明要用）时改回给新消息，记一条日志：可能截断正在显示的
-    回答，但管理员命令的回复不能丢。没有在回答时回给新消息。
+    发完要给那条消息留不足 `ANSWER_RESERVE` 次（兜底的说明要用）时改回 `default`，记一条日志：可能截断正在显示的
+    回答，但管理员命令的回复不能丢。没有在回答时用 `default`。
     """
 
-    def __init__(self, message: pyqbot.C2CMessage, answering: _Answering | None) -> None:
-        self._message = message
+    def __init__(
+        self,
+        openid: str,
+        default: _Send,
+        answering: _Answering | None,
+        *,
+        own: pyqbot.C2CMessage | None = None,
+    ) -> None:
+        self._openid = openid
+        self._default = default
         self._answering = answering
+        self._own = own
 
     def __call__(
-        self, content: str | None = None, *, markdown: str | None = None
+        self,
+        content: str | None = None,
+        *,
+        markdown: str | None = None,
+        keyboard: pyqbot.Keyboard | None = None,
     ) -> Awaitable[object]:
         target = None
         if self._answering is not None:
-            found: object = self._answering.answering(self._message.user_openid)
+            found: object = self._answering.answering(self._openid)
             # 运行时协议不检查签名与返回类型：注入的处理器碰巧有个别的 `answering()` 时照旧回给新消息（评审修正）。
             target = found if isinstance(found, _QQReplyChannel) else None
-        if target is not None and target.message is not self._message:
+        if target is not None and target.message is not self._own:
             if target.budget.affords(1):
                 # 发出（或尝试发出）时就计数，与 `conversation` 的做法相同。
                 target.budget.replies += 1
-                return target.message.reply(content, markdown=markdown)
+                return target.message.reply(content, markdown=markdown, keyboard=keyboard)
             logger.info(
                 "回答进行中，那条消息的被动回复次数要留给回答，这条回复改回给新消息，可能截断正在显示的回答"
             )
-        return self._message.reply(content, markdown=markdown)
+        return self._default(content, markdown=markdown, keyboard=keyboard)
 
 
 async def _send(send: _Send, reply: Reply) -> Delivery:
-    """发出 `reply.text`（按 `reply.markdown` 决定用 Markdown 还是纯文本）；平台明确拒绝时依次改发
-    `reply.fallbacks` 里的纯文本，说不准是否送达时就此停下，免得对方收到两条。"""
+    """发出 `reply.text`（按 `reply.markdown` 决定用 Markdown 还是纯文本，`reply.buttons` 随它发出）；平台明确拒绝时
+    依次改发 `reply.fallbacks` 里的纯文本（不带按钮），说不准是否送达时就此停下，免得对方收到两条。"""
     attempts = [(reply.text, reply.markdown), *((text, False) for text in reply.fallbacks)]
+    keyboard = (
+        pyqbot.Keyboard.from_rows([pyqbot.Button.callback(b.label, b.data) for b in reply.buttons])
+        if reply.buttons
+        else None
+    )
     for index, (text, markdown) in enumerate(attempts):
         try:
-            await (send(markdown=text) if markdown else send(text))
+            if markdown:
+                await send(markdown=text, keyboard=keyboard if index == 0 else None)
+            else:
+                await send(text)
         except pyqbot.QQBotError as exc:
             if not is_rejection(exc):
                 logger.warning("回复不确定是否发出：%s", _describe(exc))

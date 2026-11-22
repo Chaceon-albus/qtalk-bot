@@ -581,8 +581,9 @@ class ReplyChannel(Protocol):
         """发一条 Markdown 的普通消息（如程序直接发的提醒列表），算一次被动回复。它不是回答，引用索引不存，不返回。"""
         ...
 
-    async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
-        """发一条 Markdown 加一行回调按钮的消息，算一次被动回复。它不是回答，引用索引不存，不返回。"""
+    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> None:
+        """发一条 Markdown 加一行按钮（回调按钮或指令按钮）的消息，算一次被动回复。它不是回答，引用索引不存，
+        不返回。"""
         ...
 
     async def upload_image(self, data: bytes, mime_type: str) -> LibraryImage:
@@ -623,6 +624,19 @@ class ChoiceButton:
     label: str
     data: str
     visited_label: str
+
+
+@dataclass(frozen=True, slots=True)
+class CommandButton:
+    """指令按钮：`label` 是按钮上的字，点了之后替用户直接发出 `text`（单聊实测：机器人收到的就是 `text` 原文），
+    之后与用户自己打字发来的一样。"""
+
+    label: str
+    text: str
+
+
+type MessageButton = ChoiceButton | CommandButton
+"""随消息发出的一个按钮（`ReplyChannel.send_buttons()`）。"""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1243,6 +1257,10 @@ class Conversation:
 
         `messages` 是这些附件所在的消息，`channel` 回复其中最后一条。先在事务里复查授权、数一数图片和文件。这句
         问话不写进流水：写成回复会结束这一轮，用户接着发来的问题就看不到这些附件了。由 `drain()` 等待。
+
+        问话下面带一行快捷的指令按钮（`texts.attachment_shortcuts()`）：点了等于用户自己发出那句话，与等着的附件
+        合成一轮，这里不用另外处理。键盘只能随 Markdown 发；带按钮的那句被平台明确拒绝时改发不带按钮的纯文本，
+        说不准是否送达时不再发。
         """
         async with self._tracking():
             counts = await self._db.transaction(self._waiting_counts, user, messages)
@@ -1252,9 +1270,22 @@ class Conversation:
             images, files = counts
             if not images and not files:
                 return
-            await _send_notice(
-                _TurnChannel(channel), texts.attachments_waiting(images, files), user
-            )
+            question = texts.attachments_waiting(images, files)
+            buttons = [
+                CommandButton(label, text)
+                for label, text in texts.attachment_shortcuts(images, files)
+            ]
+            turn_channel = _TurnChannel(channel)
+            try:
+                # 问话里只有数字与固定的字，按 Markdown 发也原样显示。
+                await turn_channel.send_buttons(question, buttons)
+            except SendRejectedError as exc:
+                logger.warning("带快捷按钮的问话没能发给用户 %s，改发纯文本：%s", user.label, exc)
+                if not await _send_notice(turn_channel, question, user):
+                    return
+            except SendError as exc:
+                logger.warning("给用户 %s 发带快捷按钮的问话时不确定是否送达：%s", user.label, exc)
+                return
             logger.info("用户 %s 发来的附件等不到下文，问了一句", user.label)
 
     async def acknowledge(self, user: User, message_id: int, channel: ReplyChannel) -> None:
@@ -3730,7 +3761,7 @@ class _TurnChannel:
         self.budget.replies += 1
         await self._channel.send_markdown(markdown)
 
-    async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
+    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> None:
         self._claim()
         self.budget.replies += 1
         await self._channel.send_buttons(markdown, buttons)

@@ -97,21 +97,37 @@ class Delivery(Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class ReplyButton:
+    """随回复发出的一个回调按钮：`label` 是按钮上的字，`data` 是点了之后带回的数据。"""
+
+    label: str
+    data: str
+
+
+CAPABILITIES_BUTTON = "about:capabilities"
+"""欢迎语下面「你能做什么」按钮的数据：固定的，不带令牌，点了由 `Gate.capabilities()` 决定回不回。不以
+`confirmations.BUTTON_PREFIXES` 里的前缀开头，不会交给确认按钮的处理。"""
+
+
+@dataclass(frozen=True, slots=True)
 class Reply:
     """回复一条文字。
 
     Attributes:
         text: 要发的文字。
         markdown: `text` 是不是 Markdown；怎么按 Markdown 发由接线层决定。
+        buttons: 随 `text` 发出的一行回调按钮，只用于 Markdown（键盘只能随 Markdown 发）；改发的 `fallbacks`
+            不带按钮。
         fallbacks: 平台明确拒绝 `text` 后依次改发的纯文本，前一条也被明确拒绝才试下一条；
             不确定是否送达时不再改发。
-        on_sent: 确认发出后要做的收尾。
+        on_sent: 确认发出后要做的收尾（不论发出的是 `text` 还是改发的哪一条）。
         on_not_sent: 确定没有发出时要做的收尾。
         then: 这条之后接着发的下一条，无论这条是否发出都要发。
     """
 
     text: str
     markdown: bool = False
+    buttons: tuple[ReplyButton, ...] = ()
     fallbacks: tuple[str, ...] = ()
     on_sent: Followup | None = None
     on_not_sent: Followup | None = None
@@ -240,6 +256,27 @@ class Gate:
         assert not isinstance(decision, _NewInvite)
         return decision
 
+    async def capabilities(self, openid: str) -> Reply | None:
+        """有人点了欢迎语下面的「你能做什么」（`CAPABILITIES_BUTTON`）：在事务里确认他此刻能使用对话
+        （`access.chat_allowed()`，与对话处理器的复查相同），能就回固定的使用示例（`texts.CAPABILITIES`，Markdown
+        被拒时改发纯文本），否则不回、只记日志。不调用模型，不写流水，不记状态，每次点都回。"""
+
+        def decide(conn: sqlite3.Connection) -> tuple[User | None, bool]:
+            user = access.get_user_by_openid(conn, openid)
+            if user is None:
+                return None, False
+            return user, access.chat_allowed(conn, user.id, self._admin_openid)
+
+        user, allowed = await self._db.transaction(decide)
+        if user is None:
+            logger.info("不认识的人点了「你能做什么」，不回复")
+            return None
+        if not allowed:
+            logger.info("用户 %s 已不能使用对话，点了「你能做什么」不回复", user.label)
+            return None
+        logger.info("用户 %s 点了「你能做什么」，回复使用示例", user.label)
+        return Reply.rich(texts.CAPABILITIES)
+
     async def settle(self, reply: Reply, delivery: Delivery) -> None:
         """按 `reply` 的发送结果做收尾；接线层每发完一条 `Reply` 调用一次。"""
         match delivery:
@@ -331,7 +368,15 @@ class Gate:
                 return self._refuse(conn, openid, now, f"经{via}兑换的邀请码不存在")
 
     def _welcome(self, user: User, why: str) -> _Decision:
-        reply = Reply(texts.welcome(user.name), on_sent=MarkWelcomed(user.id))
+        # 加好友事件的被动回复能不能带键盘没有实测：被拒时改发不带按钮的纯文本，两条路都会记下「已告知」。
+        message = texts.welcome_message(user.name)
+        reply = Reply(
+            message.markdown,
+            markdown=True,
+            buttons=(ReplyButton(texts.CAPABILITIES_LABEL, CAPABILITIES_BUTTON),),
+            fallbacks=(message.plain,),
+            on_sent=MarkWelcomed(user.id),
+        )
         return reply, f"用户 {user.label} {why}"
 
     def _refuse(self, conn: sqlite3.Connection, openid: str, now: int, why: str) -> _Decision:

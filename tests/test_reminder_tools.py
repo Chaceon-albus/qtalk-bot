@@ -39,7 +39,7 @@ from qtalk_bot.config import (
     TopicSettings,
 )
 from qtalk_bot.confirmations import BUTTON_PREFIXES, TOKEN_SECONDS, ButtonKind, parse_click
-from qtalk_bot.conversation import ChoiceButton, Conversation
+from qtalk_bot.conversation import Conversation, MessageButton
 from qtalk_bot.llm import ChatRequest, FunctionResult, Provider, Usage
 from qtalk_bot.media import Fetcher, MediaStore
 from qtalk_bot.memory_tools import FORGET_TOPIC_NAME, VIEW_MEMORY_NAME
@@ -2001,7 +2001,7 @@ class GatedButtons(FakeChannel):
         self.gate = asyncio.Event()
         self.waiting = asyncio.Event()
 
-    async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
+    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> None:
         self.waiting.set()
         await self.gate.wait()
         await super().send_buttons(markdown, buttons)
@@ -2055,7 +2055,7 @@ async def test_unexpected_errors_while_sending_still_record_the_turn(
     db: Database, tmp_path: Path
 ) -> None:
     class Broken(FakeChannel):
-        async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
+        async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> None:
             raise ValueError("意外")
 
     alice = await invited(db, ALICE, "小王")

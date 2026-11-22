@@ -20,13 +20,16 @@ from qtalk_bot import access, commands, journal, media, texts
 from qtalk_bot.access import EVENT_RETENTION_SECONDS, Invite, User, UserStatus
 from qtalk_bot.config import InviteSettings
 from qtalk_bot.gate import (
+    CAPABILITIES_BUTTON,
     Chat,
     Delivery,
     FriendAdded,
     Gate,
     IncomingMessage,
+    MarkWelcomed,
     Outcome,
     Reply,
+    ReplyButton,
     ShareLinkError,
     find_invite_code,
     normalize_invite_code,
@@ -165,6 +168,11 @@ async def h(tmp_path: Path) -> AsyncIterator[Harness]:
 def reply_text(outcome: Outcome) -> str:
     assert isinstance(outcome, Reply)
     return outcome.text
+
+
+def welcome(name: str) -> str:
+    """初次欢迎语的正文（Markdown 版，随「你能做什么」按钮发出）。"""
+    return texts.welcome_message(name).markdown
 
 
 def chat_user(outcome: Outcome) -> User:
@@ -628,7 +636,7 @@ async def test_invite_when_link_generation_fails_sends_invitation_without_link(
     assert texts.LINK_FAILED in status.markdown
     assert "邀请链接" not in invitation
     # 邀请照样建好，邀请码可以直接发给机器人兑换。
-    assert reply_text(await h.message(ALICE, code_for(1))) == texts.welcome("小王")
+    assert reply_text(await h.message(ALICE, code_for(1))) == welcome("小王")
 
 
 # ---- 兑换 ----
@@ -636,7 +644,7 @@ async def test_invite_when_link_generation_fails_sends_invitation_without_link(
 
 async def test_friend_add_with_invite_code_redeems_and_welcomes_by_note(h: Harness) -> None:
     code = await h.invite("小王")
-    assert reply_text(await h.friend_add(ALICE, code)) == texts.welcome("小王")
+    assert reply_text(await h.friend_add(ALICE, code)) == welcome("小王")
     user = await h.user(ALICE)
     assert user is not None
     assert (user.name, user.status, user.joined_at) == ("小王", UserStatus.ACTIVE, START)
@@ -644,8 +652,35 @@ async def test_friend_add_with_invite_code_redeems_and_welcomes_by_note(h: Harne
     assert chat_user(await h.message(ALICE, "你好")) == user
 
 
+async def test_first_welcome_carries_the_capabilities_button_and_a_plain_fallback(
+    h: Harness,
+) -> None:
+    code = await h.invite("小[王]_")
+    outcome = await h.friend_add(ALICE, code)
+
+    assert isinstance(outcome, Reply)
+    assert outcome.markdown
+    assert outcome.text == texts.welcome_message("小[王]_").markdown
+    assert "小［王］\\_" in outcome.text  # 名字进 Markdown 先转义
+    assert outcome.buttons == (ReplyButton(texts.CAPABILITIES_LABEL, CAPABILITIES_BUTTON),)
+    assert outcome.fallbacks == (texts.welcome("小[王]_"),)  # 被拒时改发的纯文本不转义
+    user = await h.user(ALICE)
+    assert user is not None
+    assert outcome.on_sent == MarkWelcomed(user.id)
+
+
+async def test_welcome_back_has_no_button(h: Harness) -> None:
+    code = await h.invite()
+    await h.friend_add(ALICE, code)  # 欢迎语发出了
+    outcome = await h.friend_add(ALICE)
+
+    assert isinstance(outcome, Reply)
+    assert outcome.text == texts.welcome_back("小王")
+    assert outcome.buttons == ()
+
+
 async def test_welcome_mentions_name_capabilities_and_third_party_processing() -> None:
-    text = texts.welcome("小王")
+    text = welcome("小王")
     assert "小王" in text
     assert "第三方大模型" in text
     assert "主动" not in text  # 提醒还没做，先不提「允许主动发送」
@@ -655,7 +690,7 @@ async def test_welcome_mentions_name_capabilities_and_third_party_processing() -
 async def test_message_with_invite_code_redeems(h: Harness, variant: str) -> None:
     code = await h.invite("小李")
     content = {"exact": code, "padded": f"  {code}\n", "upper": code.upper()}[variant]
-    assert reply_text(await h.message(ALICE, content)) == texts.welcome("小李")
+    assert reply_text(await h.message(ALICE, content)) == welcome("小李")
     assert (await h.invite_row(code)).used_count == 1
 
 
@@ -665,7 +700,7 @@ async def test_whole_forwarded_invitation_is_redeemed(h: Harness, with_link: boo
     code = await h.invite("小王")
     link = None if h.links.fail else f"https://links.invalid/s/{len(h.links.codes)}"
     invitation = texts.invitation(bot_name=BOT_NAME, link=link, code=code)
-    assert reply_text(await h.message(ALICE, invitation)) == texts.welcome("小王")
+    assert reply_text(await h.message(ALICE, invitation)) == welcome("小王")
     assert (await h.invite_row(code)).used_count == 1
 
 
@@ -676,7 +711,7 @@ async def test_whole_forwarded_invitation_is_redeemed(h: Harness, with_link: boo
 async def test_code_inside_other_text_is_redeemed(h: Harness, template: str) -> None:
     code = await h.invite()
     content = template.format(code=code.upper() if "吧" in template else code)
-    assert reply_text(await h.message(ALICE, content)) == texts.welcome("小王")
+    assert reply_text(await h.message(ALICE, content)) == welcome("小王")
 
 
 async def test_two_different_codes_are_not_redeemed(h: Harness) -> None:
@@ -685,7 +720,7 @@ async def test_two_different_codes_are_not_redeemed(h: Harness) -> None:
     assert (await h.invite_row(first)).used_count == 0
     assert (await h.invite_row(second)).used_count == 0
     # 同一个码出现两次不算「两个」。
-    assert reply_text(await h.message(BOB, f"{first} {first.upper()}")) == texts.welcome("甲")
+    assert reply_text(await h.message(BOB, f"{first} {first.upper()}")) == welcome("甲")
 
 
 @pytest.mark.parametrize("template", ["x{code}", "{code}0", "1{code}", "{code}abc", "g{code}g"])
@@ -726,19 +761,19 @@ async def test_admin_forwarding_an_invitation_goes_to_chat(h: Harness) -> None:
 async def test_friend_add_scene_param_is_what_counts_not_scene(h: Harness) -> None:
     # FriendAdded 里根本没有 scene：经链接添加时平台给的 scene 是 1000，不可靠。
     code = await h.invite()
-    assert reply_text(await h.friend_add(ALICE, scene_param=code)) == texts.welcome("小王")
+    assert reply_text(await h.friend_add(ALICE, scene_param=code)) == welcome("小王")
 
 
 async def test_refused_stranger_can_still_redeem_later(h: Harness) -> None:
     assert reply_text(await h.message(ALICE, "在吗")) == texts.REFUSAL
     code = await h.invite()
-    assert reply_text(await h.message(ALICE, code)) == texts.welcome("小王")
+    assert reply_text(await h.message(ALICE, code)) == welcome("小王")
     assert await h.count("refusals") == 0
 
 
 async def test_one_time_invite_cannot_be_used_by_a_second_person(h: Harness) -> None:
     code = await h.invite()
-    assert reply_text(await h.friend_add(ALICE, code)) == texts.welcome("小王")
+    assert reply_text(await h.friend_add(ALICE, code)) == welcome("小王")
     assert reply_text(await h.friend_add(BOB, code)) == texts.INVITE_UNUSABLE
     assert await h.user(BOB) is None
     assert (await h.invite_row(code)).used_count == 1
@@ -751,7 +786,7 @@ async def test_one_time_invite_cannot_be_used_by_a_second_person(h: Harness) -> 
 async def test_expired_invite_is_unusable(h: Harness) -> None:
     code = await h.invite()
     h.clock.advance(7 * 24 * HOUR - 1)
-    assert reply_text(await h.message(ALICE, code)) == texts.welcome("小王")
+    assert reply_text(await h.message(ALICE, code)) == welcome("小王")
 
     second = await h.invite("小张")
     h.clock.advance(7 * 24 * HOUR)  # 正好到期的那一秒起就不能用
@@ -775,8 +810,8 @@ async def test_unknown_code_from_friend_add_is_an_ordinary_refusal(h: Harness) -
 async def test_multi_use_invite_counts_down_and_names_everyone_by_note(h: Harness) -> None:
     h.gate = h.build_gate(InviteSettings(max_uses=2))
     code = await h.invite("读书会")
-    assert reply_text(await h.friend_add(ALICE, code)) == texts.welcome("读书会")
-    assert reply_text(await h.message(BOB, code)) == texts.welcome("读书会")
+    assert reply_text(await h.friend_add(ALICE, code)) == welcome("读书会")
+    assert reply_text(await h.message(BOB, code)) == welcome("读书会")
     assert reply_text(await h.message(STRANGER, code)) == texts.INVITE_UNUSABLE
     assert (await h.invite_row(code)).used_count == 2
     users = await h.db.transaction(access.list_users)
@@ -786,7 +821,7 @@ async def test_multi_use_invite_counts_down_and_names_everyone_by_note(h: Harnes
 async def test_redeeming_twice_does_not_use_up_more(h: Harness) -> None:
     h.gate = h.build_gate(InviteSettings(max_uses=5))
     code = await h.invite()
-    assert reply_text(await h.friend_add(ALICE, code)) == texts.welcome("小王")
+    assert reply_text(await h.friend_add(ALICE, code)) == welcome("小王")
     assert reply_text(await h.message(ALICE, code)) == texts.already_authorized("小王")
     assert reply_text(await h.friend_add(ALICE, code)) == texts.welcome_back("小王")
     assert (await h.invite_row(code)).used_count == 1
@@ -808,7 +843,7 @@ async def test_concurrent_redemption_of_one_time_invite_has_one_winner(h: Harnes
         )
     )
     texts_sent = [reply_text(outcome) for outcome in outcomes]
-    assert texts_sent.count(texts.welcome("小王")) == 1
+    assert texts_sent.count(welcome("小王")) == 1
     assert texts_sent.count(texts.INVITE_UNUSABLE) == len(openids) - 1
     assert (await h.invite_row(code)).used_count == 1
     assert await h.count("users") == 2
@@ -826,7 +861,7 @@ async def test_duplicate_message_is_dropped(h: Harness) -> None:
 async def test_duplicate_redemption_message_does_not_redeem_twice(h: Harness) -> None:
     h.gate = h.build_gate(InviteSettings(max_uses=5))
     code = await h.invite()
-    assert reply_text(await h.message(ALICE, code, "ROBOT1.0_dup")) == texts.welcome("小王")
+    assert reply_text(await h.message(ALICE, code, "ROBOT1.0_dup")) == welcome("小王")
     assert await h.message(ALICE, code, "ROBOT1.0_dup") is None
     assert (await h.invite_row(code)).used_count == 1
 
@@ -835,7 +870,7 @@ async def test_duplicate_friend_add_event_is_dropped(h: Harness) -> None:
     h.gate = h.build_gate(InviteSettings(max_uses=5))
     code = await h.invite()
     event_id = "FRIEND_ADD:fake-dup"
-    assert reply_text(await h.friend_add(ALICE, code, event_id)) == texts.welcome("小王")
+    assert reply_text(await h.friend_add(ALICE, code, event_id)) == welcome("小王")
     assert await h.friend_add(ALICE, code, event_id) is None
     assert (await h.invite_row(code)).used_count == 1
 
@@ -843,7 +878,7 @@ async def test_duplicate_friend_add_event_is_dropped(h: Harness) -> None:
 async def test_friend_add_without_event_id_is_still_idempotent(h: Harness) -> None:
     h.gate = h.build_gate(InviteSettings(max_uses=5))
     code = await h.invite()
-    assert reply_text(await h.friend_add(ALICE, code, None)) == texts.welcome("小王")
+    assert reply_text(await h.friend_add(ALICE, code, None)) == welcome("小王")
     assert reply_text(await h.friend_add(ALICE, code, None)) == texts.welcome_back("小王")
     assert (await h.invite_row(code)).used_count == 1
     assert reply_text(await h.friend_add(STRANGER, "", None)) == texts.REFUSAL
@@ -981,7 +1016,7 @@ async def test_pause_only_stops_chat_of_authorized_users(h: Harness) -> None:
     assert reply_text(await h.message(BOB, "你好")) == texts.DISABLED
     assert await h.message(BOB, "你好") is None
     # 兑换不受暂停影响。
-    assert reply_text(await h.message(STRANGER, spare)) == texts.welcome("小张")
+    assert reply_text(await h.message(STRANGER, spare)) == welcome("小张")
     assert reply_text(await h.message(STRANGER, "你好")) == texts.PAUSED
 
     # 管理员照常使用命令与对话。
@@ -1007,7 +1042,7 @@ async def test_pause_survives_restart(tmp_path: Path) -> None:
 async def test_friend_add_during_pause_still_redeems(h: Harness) -> None:
     code = await h.invite()
     await h.admin("/pause")
-    assert reply_text(await h.friend_add(ALICE, code)) == texts.welcome("小王")
+    assert reply_text(await h.friend_add(ALICE, code)) == welcome("小王")
     assert reply_text(await h.message(ALICE, "你好")) == texts.PAUSED
 
 
@@ -1204,7 +1239,7 @@ async def test_former_admin_loses_access_and_can_redeem_into_the_same_row(h: Har
     users_before = await successor.count("users")
 
     code = await successor.invite("老张")
-    assert reply_text(await successor.message(ADMIN, code)) == texts.welcome("老张")
+    assert reply_text(await successor.message(ADMIN, code)) == welcome("老张")
     user = await successor.user(ADMIN)
     assert user is not None
     assert (user.id, user.name, user.status) == (old_admin.id, "老张", UserStatus.ACTIVE)
@@ -1217,7 +1252,7 @@ async def test_former_admin_redeeming_through_link_reuses_the_row(h: Harness) ->
     old_admin = await h.gate.prepare()
     successor = Harness(h.db, admin_openid=NEW_ADMIN)
     code = await successor.invite("老张")
-    assert reply_text(await successor.friend_add(ADMIN, code)) == texts.welcome("老张")
+    assert reply_text(await successor.friend_add(ADMIN, code)) == welcome("老张")
     user = await successor.user(ADMIN)
     assert user is not None
     assert user.id == old_admin.id
@@ -1268,7 +1303,7 @@ async def test_taken_directory_names_are_skipped(h: Harness) -> None:
         dir_taken=taken,
     )
 
-    assert reply_text(await h.friend_add(ALICE, code)) == texts.welcome("小王")
+    assert reply_text(await h.friend_add(ALICE, code)) == welcome("小王")
 
     user = await h.user(ALICE)
     assert user is not None
@@ -1326,7 +1361,7 @@ async def test_missing_attachments_root_still_lets_new_users_in(h: Harness, tmp_
     code = await h.invite("小王")
     h.gate = gate_with_store(h, store)
 
-    assert reply_text(await h.friend_add(ALICE, code)) == texts.welcome("小王")
+    assert reply_text(await h.friend_add(ALICE, code)) == welcome("小王")
 
     user = await h.user(ALICE)
     assert user is not None
@@ -1381,11 +1416,11 @@ async def test_undelivered_welcome_is_resent_before_any_chat(
 ) -> None:
     code = await h.invite()
     h.delivery = delivery
-    assert reply_text(await h.friend_add(ALICE, code)) == texts.welcome("小王")
+    assert reply_text(await h.friend_add(ALICE, code)) == welcome("小王")
     # 下一条消息不进入对话，先补欢迎语。
-    assert reply_text(await h.message(ALICE, "你好")) == texts.welcome("小王")
+    assert reply_text(await h.message(ALICE, "你好")) == welcome("小王")
     h.delivery = Delivery.SENT
-    assert reply_text(await h.message(ALICE, "你好")) == texts.welcome("小王")
+    assert reply_text(await h.message(ALICE, "你好")) == welcome("小王")
     user = chat_user(await h.message(ALICE, "你好"))
     assert user.welcomed_at == START
 
@@ -1395,7 +1430,7 @@ async def test_unwelcomed_user_re_adding_gets_the_welcome_not_welcome_back(h: Ha
     h.delivery = Delivery.UNKNOWN
     await h.message(ALICE, code)
     h.delivery = Delivery.SENT
-    assert reply_text(await h.friend_add(ALICE)) == texts.welcome("小王")
+    assert reply_text(await h.friend_add(ALICE)) == welcome("小王")
     assert reply_text(await h.friend_add(ALICE)) == texts.welcome_back("小王")
 
 
@@ -1460,7 +1495,7 @@ async def test_failed_redemption_rolls_back_count_and_event_mark(h: Harness) -> 
 
     await h.db.execute("DROP TRIGGER fail_user_insert")
     outcome = await h.message(ALICE, code, message_id="ROBOT1.0_fake-retry")
-    assert reply_text(outcome) == texts.welcome("小王")
+    assert reply_text(outcome) == welcome("小王")
     assert (await h.invite_row(code)).used_count == 1
 
 
@@ -1544,4 +1579,4 @@ async def test_bot_name_with_a_code_like_string_is_replaced(
     assert texts.DEFAULT_BOT_NAME in invitation
     assert "e" * 32 not in caplog.text
     # 对方把整段邀请原样贴回来，能兑换。
-    assert reply_text(await h.message(ALICE, invitation)) == texts.welcome("小王")
+    assert reply_text(await h.message(ALICE, invitation)) == welcome("小王")

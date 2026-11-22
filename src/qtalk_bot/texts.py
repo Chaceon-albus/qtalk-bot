@@ -22,12 +22,25 @@ ADMIN_NAME = "管理员"
 # ---- 授权 ----
 
 
+_WELCOME_REST = (
+    "直接给我发消息就行：问问题、查资料、写东西、出主意，或者只是聊聊天都可以。",
+    "提醒一下：聊天内容会发送给第三方大模型服务处理，请不要发送密码、证件号这类敏感信息。",
+)
+
+
 def welcome(name: str) -> str:
-    return (
-        f"你好，{name}！邀请已确认，现在就可以开始用了。\n"
-        "直接给我发消息就行：问问题、查资料、写东西、出主意，或者只是聊聊天都可以。\n"
-        "提醒一下：聊天内容会发送给第三方大模型服务处理，请不要发送密码、证件号这类敏感信息。"
-    )
+    return "\n".join((f"你好，{name}！邀请已确认，现在就可以开始用了。", *_WELCOME_REST))
+
+
+def welcome_message(name: str) -> Rich:
+    """初次的欢迎语：Markdown 版随「你能做什么」按钮（`CAPABILITIES_LABEL`）发出，被拒时改发纯文本版
+    （`welcome()`，不带按钮）。Markdown 里单个换行会被并成一段，所以各句之间空一行。"""
+    first = f"你好，{escape_markdown(name)}！邀请已确认，现在就可以开始用了。"
+    return Rich("\n\n".join((first, *_WELCOME_REST)), welcome(name))
+
+
+CAPABILITIES_LABEL = "你能做什么"
+"""欢迎语下面那个回调按钮上的字；点了回 `CAPABILITIES`。"""
 
 
 def welcome_back(name: str) -> str:
@@ -92,6 +105,24 @@ def attachments_waiting(images: int, files: int) -> str:
     return f"收到 {'和 '.join(parts)}，想让我帮你看什么？"
 
 
+_SHORTCUT_DESCRIBE = ("描述一下", "描述一下图片里的内容")
+_SHORTCUT_EXTRACT = ("提取文字", "把里面的文字提取出来")
+_SHORTCUT_TRANSLATE = ("翻译", "翻译一下")
+_SHORTCUT_SUMMARIZE = ("总结要点", "总结一下要点")
+
+
+def attachment_shortcuts(images: int, files: int) -> tuple[tuple[str, str], ...]:
+    """`attachments_waiting()` 那句问话下面的快捷按钮：每项是按钮上的字与点了之后替用户发出的那句话（指令按钮，
+    之后与用户自己打字的一样）。按钮上的字不超过 4 个汉字。"""
+    if images and files:
+        return (_SHORTCUT_DESCRIBE, _SHORTCUT_EXTRACT, _SHORTCUT_TRANSLATE, _SHORTCUT_SUMMARIZE)
+    if images:
+        return (_SHORTCUT_DESCRIBE, _SHORTCUT_EXTRACT, _SHORTCUT_TRANSLATE)
+    if files:
+        return (_SHORTCUT_SUMMARIZE, _SHORTCUT_TRANSLATE)
+    return ()
+
+
 MODEL_FAILED = "抱歉，刚才没能生成回复，请稍后再试一次。"
 
 REPLY_INTERRUPTED = "（回复中断了，请稍后再试一次。）"
@@ -149,6 +180,28 @@ def escape_markdown(text: str) -> str:
     """
     text = _LINE_BREAKS.sub(" ", text).translate(_MD_FULLWIDTH)
     return _MD_BACKSLASH.sub(r"\\\1", text)
+
+
+# ---- 欢迎语的「你能做什么」 ----
+
+_CAPABILITY_EXAMPLES = (
+    "帮我写一段给妈妈的生日祝福，温馨一点",
+    "用简单的话解释一下什么是通货膨胀",
+    "把这句话翻译成英文：明天下午三点开会",
+    "帮我把下面这段话总结成三点：……",
+    "我在纠结要不要换工作，帮我理一理思路",
+)
+
+CAPABILITIES = Rich(
+    "**可以这样跟我说**\n\n"
+    + "\n".join(f"- {example}" for example in _CAPABILITY_EXAMPLES)
+    + "\n\n直接发消息就行，不用加任何前缀。",
+    "可以这样跟我说：\n"
+    + "\n".join(f"· {example}" for example in _CAPABILITY_EXAMPLES)
+    + "\n直接发消息就行，不用加任何前缀。",
+)
+"""点了「你能做什么」回的使用示例（不调用模型）。只写不取决于配置的能力：联网搜索、看图、读文件、语音、提醒、画图、
+忘掉话题，以及接着上文追问（`[chat].history_turns` 可以是 0）都取决于配置或模型，不写。"""
 
 
 # ---- 管理命令 ----

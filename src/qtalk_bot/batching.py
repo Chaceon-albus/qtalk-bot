@@ -78,8 +78,8 @@ from .access import User
 from .config import AttachmentTimeoutAction, TurnSettings
 from .conversation import (
     ChatInput,
-    ChoiceButton,
     LibraryImage,
+    MessageButton,
     Received,
     ReplyChannel,
     ReplyStream,
@@ -734,7 +734,7 @@ class _RoutedChannel:
         # 收消息时不发列表；为了符合协议照样转发（同 `send_image()`）。
         await self._target().send_markdown(markdown)
 
-    async def send_buttons(self, markdown: str, buttons: Sequence[ChoiceButton]) -> None:
+    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> None:
         # 收消息时不发按钮；为了符合协议照样转发（同 `send_image()`）。
         await self._target().send_buttons(markdown, buttons)
 
