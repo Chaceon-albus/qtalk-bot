@@ -6,7 +6,7 @@
 
 配置的读取与校验在 `src/qtalk_bot/config.py`。
 
-- 只用标准库：`tomllib` 加冻结的 dataclass，手写校验。
+- 只用标准库：`tomllib` 加冻结的 dataclass，手写校验。唯一的例外是地址（各处的 `base_url` 与 `proxy`）：协议与有没有主机名自己查，之后再交给 HTTP 客户端（`httpx2.URL`）解析一遍，解析不了的算非法。主机名合不合法（国际化域名、IP 地址、方括号里的 IPv6）以实际发请求的那个客户端为准，自己另写一套规则会与它有出入。
 - 密钥的环境变量：`APP_ID`、`APP_SECRET`、`ADMIN_OPENID` 必填，`OPENAI_API_KEY`、`GEMINI_API_KEY` 可选。持有它们的对象在 `repr` 里只显示是否已设置。
 - 配置文件的路径由环境变量 `QTALK_CONFIG` 指定，默认是当前目录下的 `config.toml`；文件不存在时报错，不静默用默认值。
 - 根上的两个字段：`timezone`（默认 `Asia/Shanghai`）和 `data_dir`（默认 `data`，相对路径按配置文件所在目录解析）。其它设置都在各自的表里（`[invites]`、`[chat]`、`[[models]]` 等），写在对应模块的文件里。
