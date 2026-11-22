@@ -5,6 +5,7 @@ from pathlib import Path
 from qtalk_bot.config import (
     DEFAULT_DATA_DIR,
     DEFAULT_DECISION_MODELS,
+    DEFAULT_PERSONA_EXTRA,
     DEFAULT_TIMEZONE,
     AlertSettings,
     AttachmentSettings,
@@ -98,9 +99,19 @@ def test_example_config_shows_both_providers_and_a_fallback() -> None:
     assert all(model.web_images for model in example.models)
     # 可选项在示例里是注释掉的，照抄示例不会意外带上代理、改掉端点或指定推理强度。
     assert example.default_model.reasoning is None
-    assert [model.persona_extra for model in example.models] == ["", ""]
+    # 示例里不写 persona_extra：OpenAI 的模型用内置的那一段，Gemini 的不加。
+    assert [model.persona_extra for model in example.models] == [DEFAULT_PERSONA_EXTRA, ""]
     assert example.qq == QQSettings()
     assert example.providers == ProvidersSettings()
+
+
+def test_the_persona_extra_quoted_in_the_comments_is_the_built_in_default() -> None:
+    # 说明里抄了内置的那一段，免得改了一处忘了另一处。
+    lines = EXAMPLE.read_text(encoding="utf-8").splitlines()
+    quoted = [
+        line.removeprefix("#     ") for line in lines if line.startswith("#     写「不能仅凭")
+    ]
+    assert quoted == [DEFAULT_PERSONA_EXTRA]
 
 
 def test_commented_out_examples_are_valid_once_uncommented(tmp_path: Path) -> None:
@@ -116,10 +127,8 @@ def test_commented_out_examples_are_valid_once_uncommented(tmp_path: Path) -> No
     settings = load_settings(config)
 
     assert [model.reasoning for model in settings.models] == ["high", "low"]
-    assert [model.persona_extra for model in settings.models] == [
-        "直接回答用户问的问题，不要为用户没有提出的推论加提醒或纠正。",
-        "",
-    ]
+    # 注释掉的示例是「不要内置的那一段」的写法：去掉注释后 OpenAI 的模型也不加补充提示词。
+    assert [model.persona_extra for model in settings.models] == ["", ""]
     # 对话的输出上限默认不设，注释掉的示例去掉注释后照常生效。
     assert settings.chat.max_output_tokens == 32768
     assert settings.decisions is not None

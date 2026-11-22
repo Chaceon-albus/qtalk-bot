@@ -8,9 +8,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+from tests.test_config import write_config
 
 from qtalk_bot import access, journal, texts
-from qtalk_bot.config import ModelSettings
+from qtalk_bot.config import DEFAULT_PERSONA_EXTRA, ModelSettings, load_settings
 from qtalk_bot.context import (
     MAX_REFERABLE_IMAGES,
     RequestBuilder,
@@ -425,6 +426,28 @@ async def test_consecutive_user_messages_of_a_turn_are_merged(tmp_path: Path) ->
     assert request.messages == (
         Message(Role.USER, (ImagePart(PNG_BYTES, PNG), TextPart("\n这是什么"))),
     )
+
+
+# ---- 模型的补充提示词（经配置解析） ----
+
+
+async def test_a_model_parsed_from_config_carries_the_built_in_persona_extra(
+    tmp_path: Path,
+) -> None:
+    # 不写 persona_extra 的 OpenAI 模型带着内置的那一段（单独一段紧跟在人设之后）；写了空串的不带。
+    text = (
+        '[[models]]\nname = "plain"\nprovider = "openai"\nmodel = "m"\ndefault = true\n'
+        '[[models]]\nname = "bare"\nprovider = "openai"\nmodel = "m"\npersona_extra = ""\n'
+    )
+    plain, bare = load_settings(write_config(tmp_path, text, models=False)).models
+    request = builder(None, [], [user("你好")])
+
+    with_extra = (await request.build(plain)).request.system
+    without = (await request.build(bare)).request.system
+
+    assert with_extra.startswith(f"人设\n\n{DEFAULT_PERSONA_EXTRA}\n\n")
+    assert DEFAULT_PERSONA_EXTRA not in without
+    assert without == with_extra.replace(f"{DEFAULT_PERSONA_EXTRA}\n\n", "", 1)
 
 
 # ---- 历史里的发送时间 ----

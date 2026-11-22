@@ -39,6 +39,10 @@ DEFAULT_PERSONA = """你是一个友善、可靠的聊天助手，在 QQ 上和�
 用户用什么语言提问，就用什么语言回答。
 
 用户流露出伤害自己或他人的念头，或者正处在危险里时：认真对待，先接住对方的感受，不说教、不急着讲道理；问清对方现在是否安全，鼓励他联系身边信得过的人或当地的急救与心理援助热线，并说明你会继续陪着聊。只在这种情况下这样做：平常的倾诉、吐槽和情绪低落照常陪伴，不要动不动就建议就医，也不要加不必要的免责声明。"""
+DEFAULT_PERSONA_EXTRA = "写「不能仅凭……就……」「不是……而是……」这类纠正的话之前，先想两件事：用户是否问到了或流露过这个想法；不说这句，用户是否很可能被你的表述带偏，并因此在他问的这件事上判断错。两样都不是就不写；要写时用一句话直接陈述事实。"
+"""`[[models]]` 里服务商是 OpenAI 的一项没写 `persona_extra` 时用的补充提示词：压一压模型在回答里否定用户并没有
+提出的推论的习惯。只对 OpenAI 的模型默认加，理由是这类句子的实测只在 `gpt-6.2-sol` 上做过（2026-11-22，见
+docs/design/conversation.md「模型一侧的实测」）；别的服务商的模型没写时不加。"""
 DEFAULT_HISTORY_TURNS = 10
 MAX_HISTORY_TURNS = 100
 MAX_MAX_OUTPUT_TOKENS = 131072
@@ -257,7 +261,10 @@ class ModelSettings:
         web_images: 这个模型可以在回答里用 `![说明](地址)` 插网上的图片，机器人下载白名单里图站的图、随回答
             发出（`web_images.py`，规则在 `[web_images]`）。与其它能力开关不同，默认打开。
         persona_extra: 只给这个模型的补充提示词，在系统提示词里紧跟在共用的人设 `[chat].persona` 之后，用来做
-            小幅度的定制（比如压一压某个模型的口癖）；空串表示没有。只用于对话请求，后台调用不带。
+            小幅度的定制（比如压一压某个模型的口癖）；空串表示不加。只用于对话请求，后台调用不带。解析配置时，
+            服务商是 OpenAI、没写这一项的模型用内置的 `DEFAULT_PERSONA_EXTRA`（只对 OpenAI 默认加，理由是这类
+            句子的实测只在 `gpt-6.2-sol` 上做过），别的服务商没写时不加；写了空串或只有空白的都不加，写了非空的
+            照用。这个数据类的字段默认值是空串，直接构造时不带补充。
     """
 
     name: str
@@ -1624,10 +1631,12 @@ def _parse_model(table: _Table) -> _ModelDraft:
     show_process = table.boolean("show_process", False)
     image_generation = table.boolean("image_generation", False)
     web_images = table.boolean("web_images", True)
-    persona_extra = table.string("persona_extra", "")
-    if table.has("persona_extra") and persona_extra is not None and not persona_extra.strip():
-        table.problem("persona_extra", "不能为空")
-        persona_extra = None
+    # 没写时只有 OpenAI 的模型用内置的那一段（实测只在 OpenAI 的模型上做过）；provider 不合法时按没有默认值处理，
+    # 不另报错。
+    built_in = DEFAULT_PERSONA_EXTRA if provider is Provider.OPENAI else ""
+    persona_extra = table.string("persona_extra", built_in)
+    if persona_extra is not None and not persona_extra.strip():
+        persona_extra = ""  # 写了空串或只有空白：这个模型不加补充提示词
     table.finish()
     ok = (
         name is not None

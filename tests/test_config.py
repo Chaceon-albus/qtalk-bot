@@ -10,6 +10,7 @@ from qtalk_bot.config import (
     DEFAULT_FILE_INSTRUCTIONS,
     DEFAULT_MEMORY_INSTRUCTIONS,
     DEFAULT_PERSONA,
+    DEFAULT_PERSONA_EXTRA,
     DEFAULT_PROFILE_INSTRUCTIONS,
     MAX_ATTACHMENT_WAIT_SECONDS,
     AlertSettings,
@@ -373,6 +374,7 @@ def test_models_are_read(tmp_path: Path) -> None:
             model="gpt-6.2-sol",
             default=True,
             fallback="backup",
+            persona_extra=DEFAULT_PERSONA_EXTRA,  # 没写时 OpenAI 的模型带内置的那一段
         ),
         ModelSettings(name="backup", provider=Provider.GEMINI, model="gemini-4-hydrogen"),
     )
@@ -1615,26 +1617,56 @@ def test_model_web_images_switch_defaults_to_on(tmp_path: Path) -> None:
 # ---- 模型的 persona_extra ----
 
 
-def test_model_persona_extra_is_optional_and_kept_out_of_repr(tmp_path: Path) -> None:
-    assert load_settings(write_config(tmp_path, "")).models[0].persona_extra == ""
-    text = MODELS + 'persona_extra = """\n不要加多余的提醒。\n"""\n'
-    model = load_settings(write_config(tmp_path, text, "b.toml", models=False)).models[0]
-    assert model.persona_extra == "不要加多余的提醒。\n"
-    assert "不要加多余的提醒" not in repr(model)
+GEMINI_MODEL = '\n[[models]]\nname = "g"\nprovider = "gemini"\nmodel = "gemini-fake"\n'
+
+
+def test_only_openai_models_default_to_the_built_in_persona_extra(tmp_path: Path) -> None:
+    # 不写：OpenAI 的模型用内置的那一段（实测只在 gpt-6.2-sol 上做过），Gemini 的不加。
+    models = load_settings(write_config(tmp_path, MODELS + GEMINI_MODEL, models=False)).models
+    assert [(m.provider, m.persona_extra) for m in models] == [
+        (Provider.OPENAI, DEFAULT_PERSONA_EXTRA),
+        (Provider.GEMINI, ""),
+    ]
+    assert DEFAULT_PERSONA_EXTRA.strip() == DEFAULT_PERSONA_EXTRA
+    assert "\n" not in DEFAULT_PERSONA_EXTRA
+    # 直接构造数据类时不带补充：默认值只在解析配置时套用。
+    assert ModelSettings(name="a", provider=Provider.OPENAI, model="m").persona_extra == ""
+
+
+@pytest.mark.parametrize("value", ['""', '"  "', '"""\n\n"""'])
+def test_an_empty_persona_extra_means_none_for_both_providers(tmp_path: Path, value: str) -> None:
+    line = f"persona_extra = {value}\n"
+    text = MODELS + line + GEMINI_MODEL + line
+    models = load_settings(write_config(tmp_path, text, models=False)).models
+    assert [model.persona_extra for model in models] == ["", ""]
+
+
+def test_a_custom_persona_extra_is_used_as_written_and_kept_out_of_repr(tmp_path: Path) -> None:
+    line = 'persona_extra = """\n不要加多余的提醒。\n"""\n'
+    models = load_settings(
+        write_config(tmp_path, MODELS + line + GEMINI_MODEL + line, models=False)
+    ).models
+    # Gemini 的模型自己写了也照用。
+    assert [model.persona_extra for model in models] == ["不要加多余的提醒。\n"] * 2
+    assert "不要加多余的提醒" not in repr(models[0])
+
+
+def test_a_bad_provider_adds_no_problem_for_the_persona_extra(tmp_path: Path) -> None:
+    # provider 不合法时取默认值不另报错、不抛异常；只报 provider 那一条。
+    text = '[[models]]\nname = "x"\nprovider = "nope"\nmodel = "m"\ndefault = true\n'
+    problems = config_error(write_config(tmp_path, text, models=False)).problems
+    assert [p for p in problems if "persona_extra" in p] == []
+    assert any(p.startswith("models[0].provider") for p in problems)
 
 
 @pytest.mark.parametrize(
     ("line", "problem"),
     [
-        ('persona_extra = "  "\n', "models[0].persona_extra：不能为空"),
-        ('persona_extra = """\n\n"""\n', "models[0].persona_extra：不能为空"),
         ("persona_extra = 1\n", "models[0].persona_extra：应为字符串，实际是整数"),
         ('persona_extra = ["a"]\n', "models[0].persona_extra：应为字符串，实际是数组"),
     ],
 )
-def test_model_persona_extra_must_be_a_non_blank_string(
-    tmp_path: Path, line: str, problem: str
-) -> None:
+def test_model_persona_extra_must_be_a_string(tmp_path: Path, line: str, problem: str) -> None:
     error = config_error(write_config(tmp_path, MODELS + line, models=False))
     assert error.problems == (problem,)
 
