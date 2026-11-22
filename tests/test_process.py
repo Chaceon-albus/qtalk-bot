@@ -12,6 +12,7 @@ from qtalk_bot.process import (
     ANSWER_RESERVE,
     MAX_PASSIVE_REPLIES,
     MAX_PASSIVE_SENDS,
+    MAX_QUERY_WIDTH,
     MAX_STEP_CHARS,
     MAX_STEPS,
     MAX_TYPINGS,
@@ -22,9 +23,13 @@ from qtalk_bot.process import (
     ProcessPresenter,
     ProcessSendError,
     ReplyBudget,
+    clip_width,
+    display_query,
+    display_width,
     headline,
     render,
     shorten,
+    tidy_query,
 )
 
 HANG_GUARD = 5
@@ -122,7 +127,7 @@ def test_search_start_and_completion_merge_into_one_line() -> None:
     # Gemini：开始时没有查询词，这一行发出之前就有了增量。
     notes.add(SearchProgress("g1", STARTED))
     notes.add(SearchProgress("g1", UPDATED, ("上海 今天 天气", "上海 明天 天气")))
-    assert notes.take() == [Piece("正在搜索🔍 上海 今天 天气、上海 明天 天气")]
+    assert notes.take() == [Piece("正在搜索🔍 上海 今天 天气 等 2 条")]  # 只显示第一个
     notes.add(SearchProgress("g1", COMPLETED, ("上海 今天 天气", "上海 明天 天气")))
     assert notes.take() == []  # 不写「搜索完成」
 
@@ -138,31 +143,53 @@ def test_queries_learned_after_the_line_is_sent_are_appended() -> None:
     assert notes.take() == [joined(" 空气质量"), Piece("接着看"), Piece("最后一段")]
 
 
-def test_gemini_updates_keep_appending_to_the_same_line() -> None:
+def test_gemini_updates_after_the_first_queries_are_only_archived() -> None:
+    # 一次搜索的一行里最多只有一段查询词：写过之后才得知的不再显示，只进存档。
     notes = ProcessNotes()
     notes.add(SearchProgress("g1", STARTED))
     assert notes.take() == [Piece("正在搜索🔍")]
     assert notes.add(SearchProgress("g1", UPDATED, ("上海 今天 天气",)))
     assert notes.take() == [joined(" 上海 今天 天气")]
-    notes.add(SearchProgress("g1", UPDATED, ("上海 今天 天气", "上海 明天 天气")))
-    notes.add(SearchProgress("g1", UPDATED, ("上海 今天 天气", "上海 明天 天气", "风力")))
-    assert notes.take() == [joined("、上海 明天 天气、风力")]
+    assert not notes.add(SearchProgress("g1", UPDATED, ("上海 今天 天气", "上海 明天 天气")))
     assert not notes.add(
         SearchProgress("g1", COMPLETED, ("上海 今天 天气", "上海 明天 天气", "风力"))
     )
     assert notes.take() == []
+    assert notes.transcript() == "[搜索] 上海 今天 天气、上海 明天 天气、风力"
 
 
-def test_queries_after_other_lines_start_a_new_line() -> None:
+def test_two_new_queries_between_two_sends_do_not_join_into_one_line() -> None:
+    # 评审举的情形：这一行已经发出（只有「正在搜索🔍」），两次发送之间先后来了两个新的查询词。
+    notes = ProcessNotes()
+    notes.add(SearchProgress("g1", STARTED))
+    assert notes.take() == [Piece("正在搜索🔍")]
+    notes.add(SearchProgress("g1", UPDATED, ("上海 天气",)))
+    notes.add(SearchProgress("g1", UPDATED, ("上海 天气", "北京 天气")))
+    # 第一次得知时接上的那一段还没交出，第二次的不再接：不会连成「上海 天气、北京 天气」。
+    assert notes.take() == [joined(" 上海 天气")]
+    assert notes.take() == []
+
+
+def test_queries_first_learned_after_other_lines_start_a_new_line() -> None:
+    notes = ProcessNotes()
+    notes.add(SearchProgress("g1", STARTED))
+    assert notes.take() == [Piece("正在搜索🔍")]
+    notes.add(comment("m#0", "顺便看看空气。"))
+    assert notes.take() == [Piece("顺便看看空气")]
+    notes.add(SearchProgress("g1", UPDATED, ("空气质量",)))
+    assert notes.take() == [Piece("正在搜索🔍 空气质量")]  # 退路：另起一行
+    notes.add(SearchProgress("g1", COMPLETED, ("空气质量", "风力")))
+    assert notes.take() == []  # 写过之后才得知的不再显示
+
+
+def test_a_line_with_queries_sent_gets_nothing_more() -> None:
     notes = ProcessNotes()
     notes.add(SearchProgress("g1", STARTED, ("上海天气",)))
     assert notes.take() == [Piece("正在搜索🔍 上海天气")]
     notes.add(comment("m#0", "顺便看看空气。"))
     assert notes.take() == [Piece("顺便看看空气")]
-    notes.add(SearchProgress("g1", UPDATED, ("上海天气", "空气质量")))
-    assert notes.take() == [Piece("正在搜索🔍 空气质量")]  # 退路：另起一行，只写新的查询词
-    notes.add(SearchProgress("g1", COMPLETED, ("上海天气", "空气质量", "风力")))
-    assert notes.take() == [joined("、风力")]  # 新的那一行是最后发出的：接在它后面
+    assert not notes.add(SearchProgress("g1", UPDATED, ("上海天气", "空气质量")))
+    assert notes.take() == []  # 已经写过查询词：不再另起一行
 
 
 def test_completion_without_new_queries_appends_nothing() -> None:
@@ -268,6 +295,192 @@ def test_steps_are_plain_text_without_escaping(text: str, line: str) -> None:
     shown = render(notes.take(), first=True)
     assert shown == f"{line}\n正在搜索🔍 - a_bc"
     assert "\\" not in shown
+
+
+# ---- 搜索词的显示 ----
+
+
+@pytest.mark.parametrize(
+    ("query", "line"),
+    [
+        (
+            "site:synology.cn DS224+ 技术规格 J4125 6 GB 1GbE",
+            "正在搜索🔍 DS224+ 技术规格 J4125 6 GB 1GbE（synology.cn）",
+        ),
+        (
+            "site:qnap.com TS-264 hardware specs 8G 16 GB TS-264-4G soldered",
+            "正在搜索🔍 TS-264 hardware specs 8G 16 GB TS-264-4G soldered（qnap.com）",
+        ),
+        (
+            '"RTL8111H" Realtek official Gigabit Ethernet controller RTL8111H site:realtek.com',
+            "正在搜索🔍 RTL8111H Realtek official Gigabit Ethernet controller…（realtek.com）",
+        ),
+    ],
+)
+def test_measured_queries_are_shown_like_this(query: str, line: str) -> None:
+    notes = ProcessNotes()
+    notes.add(SearchProgress("s", COMPLETED, (query,)))
+    assert notes.take() == [Piece(line)]
+    assert notes.transcript() == f"[搜索] {query}"  # 存档仍是原始的搜索词
+
+
+@pytest.mark.parametrize(
+    ("query", "tidied"),
+    [
+        # 各种操作符整个词去掉，不分大小写；不带 - 的 site: 记下站点。
+        ("NAS 评测 filetype:pdf intitle:对比 inurl:review intext:散热", ("NAS 评测", ())),
+        ("ALLINTITLE:x allinurl:y before:2025-01-01 after:2024 ext:doc 词", ("词", ())),
+        ("Site:Example.COM 规格", ("规格", ("example.com",))),
+        # 前面带 - 的去掉，-site: 的站点不写。
+        ("规格 -site:pinterest.com -filetype:pdf", ("规格", ())),
+        # 两个站点用「、」连；三个只写两个；重复的只写一次。
+        ("规格 site:a.com site:b.org", ("规格", ("a.com", "b.org"))),
+        ("规格 site:a.com site:b.org site:c.net", ("规格", ("a.com", "b.org"))),
+        ("规格 site:a.com site:a.com", ("规格", ("a.com",))),
+        # 带路径的 site: 只取主机名，去掉开头的 www.。
+        ("参数 site:www.Synology.com/zh-cn/products", ("参数", ("synology.com",))),
+        # 不合格的站点不写（下划线、非 ASCII、过长）。
+        ("参数 site:a_b.com site:例子.中国", ("参数", ())),
+        (f"参数 site:{'a' * 41}", ("参数", ())),
+        # 参数带引号、引号里有空格的整个去掉（英文与中文引号）；site: 带引号的去掉引号取主机名。
+        ('intitle:"solid state drive" 评测', ("评测", ())),
+        ('规格 -site:"a b" filetype:"pdf"', ("规格", ())),
+        ("intitle:“固态 硬盘 评测” 对比", ("对比", ())),
+        ('site:"example.com" 参数', ("参数", ("example.com",))),
+        # site: 带协议、端口：取出主机名。
+        ("SSD site:https://www.Example.com/products", ("SSD", ("example.com",))),
+        ("SSD site:http://example.com:8080/a", ("SSD", ("example.com",))),
+        # 先去掉强调与代码标记，再认操作符。
+        ("**site:example.com** NAS", ("NAS", ("example.com",))),
+        ("`site:example.com` NAS", ("NAS", ("example.com",))),
+        # 不可见字符去掉（空白类的当作空格）。
+        ("北京\u200b 天气\x00", ("北京 天气", ())),
+        # 控制类的空白（制表符、换行）当作空格，不直接删掉：词与词之间只有它们时也不会粘在一起。
+        ("北京\t天气\n明天", ("北京 天气 明天", ())),
+        # 只有在行首或空白之后才算操作符。
+        ("foo:site:a.com", ("foo:site:a.com", ())),
+        # 引号去掉、保留里面的字；单独成词的 OR、AND、| 去掉，小写的 or 是普通的词。
+        ('"RTL8111H" OR “千兆” AND 网卡 | 驱动 or 固件', ("RTL8111H 千兆 网卡 驱动 or 固件", ())),
+        # 合并空白、去掉首尾空白。
+        ("  上海   天气 \n 明天 ", ("上海 天气 明天", ())),
+    ],
+)
+def test_query_tidying(query: str, tidied: tuple[str, tuple[str, ...]]) -> None:
+    assert tidy_query(query) == tidied
+
+
+def test_a_query_of_only_operators_shows_its_site_or_nothing() -> None:
+    assert display_query("site:qnap.com") == "qnap.com"
+    assert display_query("site:a.com site:b.org") == "a.com、b.org"
+    assert display_query("filetype:pdf -site:x.com") is None
+    assert display_query('intitle:"solid state drive" filetype:"pdf"') is None  # 只有过滤条件
+    assert display_query("site:http://example.com/") == "example.com"
+    assert display_query("SSD site:https://www.Example.com/products") == "SSD（example.com）"
+    assert display_query('"" OR |') is None
+    # 站点不合格、又没有别的字：当作没有搜索词。
+    assert display_query("site:a_b.com") is None
+
+
+def test_display_width_counts_east_asian_wide_characters_as_two() -> None:
+    assert display_width("abc") == 3
+    assert display_width("技术规格") == 8
+    assert display_width("ＡＢ") == 4  # 全角字母（F）
+    assert display_width("ｱｲ") == 2  # 半角片假名（H）算 1 格
+    assert display_width("DS224+ 规格") == 11
+
+
+def test_clip_width_cuts_at_a_space_or_by_characters() -> None:
+    fits = "a" * MAX_QUERY_WIDTH
+    assert clip_width(fits) == fits  # 正好 60 格不截
+    # 有空格：截在 59 格以内的最长前缀里最后一个空格之前。
+    words = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu"
+    assert display_width(words) > MAX_QUERY_WIDTH
+    assert clip_width(words) == "alpha beta gamma delta epsilon zeta eta theta iota kappa…"
+    # 59 格以内的最长前缀后面紧跟的就是空格：前缀本身以完整的词结尾，直接用它，不再往前退一个词。
+    exact = "NAS " + "x" * 55 + " 规格"
+    assert display_width("NAS " + "x" * 55) == MAX_QUERY_WIDTH - 1
+    assert clip_width(exact) == "NAS " + "x" * 55 + "…"
+    # 没有空格的长中文：按字符截到 59 格以内（29 个字 58 格）。
+    chinese = "字" * 40
+    assert clip_width(chinese) == "字" * 29 + "…"
+    # 截断只看搜索词本身，后面的站点括号不算。
+    long = "规格" * 20 + " site:qnap.com"
+    shown = display_query(long)
+    assert shown == "规格" * 14 + "规…（qnap.com）"
+    assert shown is not None
+    assert display_width(shown.removesuffix("（qnap.com）")) <= MAX_QUERY_WIDTH
+
+
+def test_several_queries_show_the_first_and_a_count() -> None:
+    notes = ProcessNotes()
+    notes.add(SearchProgress("s", COMPLETED, ("site:x.com", "上海 天气", "北京 天气")))
+    # 只显示第一个整理后有内容的；N 是这次写出的总数。
+    assert notes.take() == [Piece("正在搜索🔍 x.com 等 3 条")]
+    notes.add(SearchProgress("t", COMPLETED, ("filetype:pdf", "北京 天气")))
+    assert notes.take() == [Piece("正在搜索🔍 北京 天气 等 2 条")]
+    assert (
+        notes.transcript()
+        == "[搜索] site:x.com、上海 天气、北京 天气\n\n[搜索] filetype:pdf、北京 天气"
+    )
+
+
+def test_the_first_queries_appended_use_the_same_display() -> None:
+    notes = ProcessNotes()
+    notes.add(SearchProgress("g", STARTED))
+    assert notes.take() == [Piece("正在搜索🔍")]
+    # 整理后没有内容的查询词：当作没有，不接，之后仍可以接。
+    assert not notes.add(SearchProgress("g", UPDATED, ("filetype:pdf",)))
+    assert notes.take() == []
+    notes.add(SearchProgress("g", UPDATED, ("filetype:pdf", "site:qnap.com TS-264 规格", "TS-664")))
+    # 接的是第一个有内容的加「 等 N 条」（N 是知道的全部查询词数）。
+    assert notes.take() == [joined(" TS-264 规格（qnap.com） 等 3 条")]
+
+
+WORD_JOINER = chr(0x2060)  # 格式字符（Cf）
+BOM = chr(0xFEFF)  # 零宽不换行空格（Cf）
+
+
+def test_queries_of_only_invisible_characters_have_no_content() -> None:
+    notes = ProcessNotes()
+    notes.add(SearchProgress("s", COMPLETED, ("\x00", "北京 天气")))
+    assert notes.take() == [Piece("正在搜索🔍 北京 天气 等 2 条")]
+    # 全部都是不可见字符：当作没有搜索词，只有「正在搜索🔍」，不出现「等 N 条」或空括号。
+    notes.add(SearchProgress("t", STARTED, ("\x00", "\u200b" + WORD_JOINER, BOM)))
+    assert notes.take() == [Piece("正在搜索🔍")]
+    assert display_query("\x00\u200b") is None
+    # 存档仍是原文。
+    assert (
+        notes.transcript() == f"[搜索] \x00、北京 天气\n\n[搜索] \x00、\u200b{WORD_JOINER}、{BOM}"
+    )
+
+
+def test_queries_learned_before_the_new_line_is_sent_rewrite_it() -> None:
+    # 这一行只有「正在搜索🔍」、已经发出，之后又发出过别的内容；得知查询词时另起了一行，那一行发出之前又得知一个。
+    notes = ProcessNotes()
+    notes.add(SearchProgress("g", STARTED))
+    assert notes.take() == [Piece("正在搜索🔍")]
+    notes.add(comment("m#0", "顺便看看空气。"))
+    assert notes.take() == [Piece("顺便看看空气")]
+    notes.add(SearchProgress("g", UPDATED, ("空气质量",)))
+    notes.add(SearchProgress("g", UPDATED, ("空气质量", "风力")))
+    # 只交出一行，按当时知道的全部查询词改写：N 是 2。
+    assert notes.take() == [Piece("正在搜索🔍 空气质量 等 2 条")]
+    assert notes.take() == []
+
+
+def test_the_unsent_line_is_rewritten_with_all_queries_known_so_far() -> None:
+    notes = ProcessNotes()
+    notes.add(SearchProgress("g", STARTED, ("上海 天气",)))
+    notes.add(SearchProgress("g", UPDATED, ("上海 天气", "北京 天气")))
+    assert notes.take() == [Piece("正在搜索🔍 上海 天气 等 2 条")]
+
+
+def test_unsent_search_whose_queries_tidy_to_nothing_is_dropped_when_completed() -> None:
+    notes = ProcessNotes()
+    notes.add(SearchProgress("s", STARTED, ("filetype:pdf",)))
+    notes.add(SearchProgress("s", COMPLETED, ("filetype:pdf",)))
+    assert notes.take() == []  # 当作没有搜索词：还没发出就完成的一行整行去掉
+    assert notes.transcript() == "[搜索] filetype:pdf"
 
 
 def test_transcript_keeps_everything_and_display_can_be_off() -> None:

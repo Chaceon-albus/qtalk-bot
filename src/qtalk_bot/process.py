@@ -12,12 +12,18 @@
 - 说明的每一段写一行：取开头的 `**标题**`，没有标题时取第一句，截到 `MAX_STEP_CHARS` 个字，去掉 Markdown 的
   强调与代码标记（模型的说明里常带 `**标题**`，纯文本里星号会原样显示）。一段还看不出第一句时先不写，它后面
   的步骤也等着（保持顺序）；下一段（或别的事件）开始时，前一段按已有的文字定下来。
-- 搜索写成一行，像进度条一样往后接：开始时另起一行「正在搜索🔍」，得知查询词后在同一行接一个空格和查询词，多个
-  查询词之间用「、」。这一行发出之前就知道的查询词直接写进去（开始与完成落在同一次更新里，或者 Gemini 先给了
-  增量）；发出之后才知道的（OpenAI 只在完成时给出，Gemini 可能在中途更新），这一行仍是最后发出的内容时接在
-  它后面（第一次是「 查询词」，之后是「、新查询词」），之后已经发出过别的内容时另起一行「正在搜索🔍 新查询词」。
-  不写「搜索完成」：完成时没有新的查询词就什么也不接。还没发出就完成、又始终没有查询词的动作（OpenAI 的打开网页
-  等）整行去掉。每次写出的查询词经 `shorten()` 截断，已经写过的不再写。
+- 搜索写成一行：开始时另起一行「正在搜索🔍」，得知查询词后在同一行接一个空格和查询词，一次搜索的一行里最多
+  只有一段查询词。这一行还没发出时，按当时知道的全部查询词整行改写（开始与完成落在同一次更新里，或者 Gemini
+  先给了增量）；已经发出、还只有「正在搜索🔍」时（OpenAI 只在完成时给出查询词，Gemini 可能在中途给），第一次
+  得知查询词就接上：这一行仍是最后发出的内容时接在它后面，之后已经发出过别的内容时另起一行「正在搜索🔍 查询词」。
+  这一行写过查询词之后（那段文字发没发出都算）才得知的不再显示，只进存档：Gemini 分几次给出查询词时，每次各接
+  一段会在两次发送之间连成一串。不写「搜索完成」。还没发出就完成、又始终没有查询词的动作（OpenAI 的打开网页等）
+  整行去掉。
+- 查询词只改显示，存档里仍是原文。模型写的查询词很长，又常带 `site:` 这类操作符，原样截断几乎每行都截在单词
+  中间，所以显示之前先整理（`display_query()`）：先去掉不可见字符与强调、代码标记，再去掉 `site:`、`filetype:` 等
+  操作符（参数带引号、引号里有空格的整个去掉）、引号与单独成词的 OR、AND、|，不带 `-` 的 `site:` 的站点（主机名，去掉协议、路径与端口，最多两个）
+  写在后面的全角括号里，只有站点时只写站点；再按显示宽度截到 `MAX_QUERY_WIDTH` 格（东亚宽字符算 2 格），优先保留
+  完整的词。一次写出几个查询词时只显示第一个整理后有内容的，后接「 等 N 条」；整理后都没有内容的当作没有查询词。
 - 画图（`Drawing`）每次另起一行「正在绘制🎨」，不接别的文字，也不与上一行去重。
 - 说明与上一行完全相同时不重复写；搜索不去重，每次搜索各占一行（用户 2026-11-19 决定：不要几次搜索挤在一行里）。
   最多 `MAX_STEPS` 行，之后写一行「……」就不再增加。接在行末的文字不算行。
@@ -48,6 +54,7 @@ Markdown 引用块：流式消息还没结束时客户端把 `>` 原样显示出
 import asyncio
 import logging
 import re
+import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -59,7 +66,11 @@ from .llm import Commentary, SearchProgress, SearchStage
 logger = logging.getLogger(__name__)
 
 MAX_STEP_CHARS = 40
-"""一步短句（不含「正在搜索🔍」这类前缀；搜索时指每次写出的查询词串）最多几个字，超过的截断、末尾加「…」。"""
+"""说明的一行（标题或第一句）最多几个字，超过的截断、末尾加「…」。搜索词不归它管，见 `MAX_QUERY_WIDTH`。"""
+
+MAX_QUERY_WIDTH = 60
+"""搜索那一行里一个搜索词（整理之后，不含后面的站点括号）最多占几格显示宽度（东亚宽字符算 2 格），超过的截断、
+末尾加「…」（`clip_width()`）。"""
 
 MAX_STEPS = 12
 """一条过程消息最多写几行（接在行末的文字不算）；再多就写一行「……」，之后的只存档。"""
@@ -190,14 +201,109 @@ def headline(text: str, *, final: bool) -> str | None:
     return None
 
 
-def _queries(queries: tuple[str, ...]) -> str:
-    """查询词写成一串：用「、」连起来，经 `shorten()`。"""
-    return shorten("、".join(queries))
+_OPERATOR = re.compile(
+    r"(?<!\S)(-?)(site|filetype|intitle|inurl|intext|allintitle|allinurl|before|after|ext):"
+    r"((?:\"[^\"]*\"|“[^”]*”|\S)*)",  # 参数可以带引号，引号里可以有空格
+    re.IGNORECASE,
+)
+_QUOTES = str.maketrans("", "", '"“”')
+_CONNECTIVES = frozenset({"OR", "AND", "|"})
+_HOST = re.compile(r"[a-z0-9.-]+")
+_MAX_HOST_CHARS = 40
+_MAX_SITES = 2
 
 
-def _searching(queries: tuple[str, ...]) -> str:
-    """搜索的一行：「正在搜索🔍」，有查询词时接一个空格和查询词。"""
-    return f"{texts.PROCESS_SEARCHING} {_queries(queries)}" if queries else texts.PROCESS_SEARCHING
+def _host(value: str) -> str:
+    """`site:` 的参数里的主机名：去掉引号，转成小写，去掉开头的 `http://`、`https://`，去掉路径与端口，再去掉开头的
+    `www.`。不校验，由调用方校验。"""
+    host = value.translate(_QUOTES).strip().lower()
+    for scheme in ("https://", "http://"):
+        host = host.removeprefix(scheme)
+    return host.split("/", 1)[0].split(":", 1)[0].removeprefix("www.")
+
+
+def tidy_query(query: str) -> tuple[str, tuple[str, ...]]:
+    """整理一个搜索词以便显示：返回（去掉操作符、引号与 OR、AND、| 之后的文字，`site:` 里的站点）。
+
+    先去掉不可见字符（`unicodedata.category()` 以 C 开头的，空白类的当作空格）与强调、代码标记，再去掉前面是行首或
+    空白的 `site:…`、`filetype:…` 等操作符（不分大小写，前面带 `-` 的也去掉，参数可以带引号）；不带 `-` 的
+    `site:` 记下主机名（`_host()`，只要字母、数字、点、连字符、不超过 40 个字符的），最多两个、去重。存档里仍是
+    原始的搜索词，这里只管显示。
+    """
+    sites: list[str] = []
+
+    def operator(match: re.Match[str]) -> str:
+        negated, name, value = match.group(1), match.group(2).lower(), match.group(3)
+        if name == "site" and not negated:
+            host = _host(value)
+            if (
+                host
+                and len(host) <= _MAX_HOST_CHARS
+                and _HOST.fullmatch(host)
+                and host not in sites
+                and len(sites) < _MAX_SITES
+            ):
+                sites.append(host)
+        return " "
+
+    # 先去掉不可见字符（控制、格式字符等；空白类的当作空格），再去掉强调与代码标记（同 `shorten()`：纯文本里会
+    # 原样显示），然后才认操作符：`**site:x.com**` 里的星号会挡住「前面是行首或空白」的判断。
+    visible = "".join(
+        " " if char.isspace() else char
+        for char in query
+        if char.isspace() or not unicodedata.category(char).startswith("C")
+    )
+    text = _OPERATOR.sub(operator, _MARKUP.sub("", visible)).translate(_QUOTES)
+    words = [word for word in text.split() if word not in _CONNECTIVES]
+    return " ".join(words), tuple(sites)
+
+
+def display_width(text: str) -> int:
+    """显示宽度：东亚宽字符（`east_asian_width` 为 W 或 F）算 2 格，其余算 1 格。"""
+    return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
+
+
+def clip_width(text: str, limit: int = MAX_QUERY_WIDTH) -> str:
+    """超过 `limit` 格时截断并加「…」：取宽度不超过 `limit - 1` 格的最长前缀。它后面紧跟的就是空格时，这个前缀本身
+    就以完整的词结尾，直接用它；否则其中有空格时截在最后一个空格之前，没有空格时就截在这个前缀的末尾。"""
+    if display_width(text) <= limit:
+        return text
+    end, width = 0, 0
+    for char in text:
+        width += display_width(char)
+        if width > limit - 1:
+            break
+        end += 1
+    prefix = text[:end]
+    if not text[end].isspace():
+        space = prefix.rfind(" ")
+        if space > 0:
+            prefix = prefix[:space]
+    return prefix.rstrip() + "…"
+
+
+def display_query(query: str) -> str | None:
+    """一个搜索词显示成的样子：整理后的文字（按宽度截断），有站点时后接全角括号里的站点；整理后没有字、但有站点时
+    只写站点；都没有时为 `None`（当作没有搜索词）。"""
+    text, sites = tidy_query(query)
+    where = "、".join(sites)
+    if text:
+        return f"{clip_width(text)}（{where}）" if sites else clip_width(text)
+    return where or None
+
+
+def _queries(queries: tuple[str, ...]) -> str | None:
+    """一次写出的搜索词显示成的样子：只显示第一个整理后有内容的，有几个时后接「 等 N 条」（N 是这次写出的总数）；
+    一个能显示的都没有时为 `None`。"""
+    shown = next((text for text in map(display_query, queries) if text is not None), None)
+    if shown is None:
+        return None
+    return f"{shown} 等 {len(queries)} 条" if len(queries) > 1 else shown
+
+
+def _searching(queries: str | None) -> str:
+    """搜索的一行：「正在搜索🔍」，有能显示的搜索词时接一个空格和它（`_queries()`）。"""
+    return f"{texts.PROCESS_SEARCHING} {queries}" if queries else texts.PROCESS_SEARCHING
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,8 +335,6 @@ class _Step:
     """一次搜索或画图的一行：不与上一行去重，每次各占一行。"""
     tail: str = ""
     """已经定下、还没交出的、要接在这一行末尾的文字。"""
-    queried: bool = False
-    """搜索的一行已经写了查询词：再接时用「、」，否则用空格。"""
 
 
 @dataclass(slots=True)
@@ -253,10 +357,7 @@ class _Search:
 
     queries: tuple[str, ...] = ()
     step: _Step | None = None  # 这次搜索当前的那一行（另起一行的退路之后是新的那一行）
-    before: set[str] = field(default_factory=set[str])  # `step` 那一行开始之前已经写过的查询词
-    displayed: set[str] = field(
-        default_factory=set[str]
-    )  # 已经写进某一行（含未交出的那一行）的查询词
+    queried: bool = False  # 这一行已经写了查询词（含还没交出的）：之后才得知的不再显示
 
 
 class ProcessNotes:
@@ -393,32 +494,29 @@ class ProcessNotes:
         step = search.step
         if not display or step is None:
             return closed
+        shown = _queries(search.queries)
         if not self._shown(step):
             # 这一行还没发出：按现在知道的查询词整行改写；完成时仍没有查询词（打开网页等）的整行去掉。
-            written = tuple(q for q in search.queries if q not in search.before)
-            if written or event.stage is not SearchStage.COMPLETED:
-                step.text = _searching(written)
+            if shown is not None or event.stage is not SearchStage.COMPLETED:
+                step.text = _searching(shown)
             else:
                 step.text = ""
-            step.queried = bool(written)
-            search.displayed = search.before | set(written)
+            search.queried = shown is not None
             return True
-        fresh = tuple(q for q in search.queries if q not in search.displayed)
-        if not fresh:
+        if search.queried or shown is None:
+            # 这一行已经写过查询词（发没发出都算）：之后才得知的只进存档，一行里最多一段查询词。
             return closed
+        # 这一行已经发出、还只有「正在搜索🔍」：第一次得知查询词时接上。
         line = step.line
         if line is not None and line is self._line:
-            line.tail += ("、" if line.queried else " ") + _queries(fresh)
-            line.queried = True
+            line.tail += f" {shown}"
         else:
             # 这一行之后已经发出过别的内容：另起一行。
-            fallback = self._append(_searching(fresh))
+            fallback = self._append(_searching(shown))
             if fallback is not None:
                 fallback.search = True
-                fallback.queried = True
                 search.step = fallback
-                search.before = set(search.displayed)
-        search.displayed.update(fresh)
+        search.queried = True
         return True
 
 
