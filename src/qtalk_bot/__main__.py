@@ -257,7 +257,11 @@ async def run(secrets: Secrets, settings: Settings, *, chat: ChatHandler | None 
                 )
             if memory is not None and models.memorizer is not None:
                 summarizer = Summarizer(
-                    db, models.memorizer, memory, admin_openid=secrets.admin_openid
+                    db,
+                    models.memorizer,
+                    memory,
+                    admin_openid=secrets.admin_openid,
+                    timezone=settings.timezone,
                 )
             if chat is None:
                 fetcher = Fetcher(

@@ -108,7 +108,8 @@ from qtalk_bot.prompt import (
     NO_DRAWING_AT_ALL,
     SUMMARY_FORMAT,
     Memory,
-    memory_section,
+    memory_data,
+    memory_guide,
     system_prompt,
 )
 from qtalk_bot.routing import Router
@@ -244,6 +245,7 @@ def memory_chat(
             writer,
             MemorySettings(provider=writer.provider, model=writer.model),
             admin_openid=ADMIN,
+            timezone=SHANGHAI,
             clock=lambda: START,
         )
     )
@@ -934,6 +936,7 @@ async def test_forget_profile_item_drops_queued_updates_even_if_nothing_is_found
         writer,
         MemorySettings(provider=writer.provider, model=writer.model),
         admin_openid=ADMIN,
+        timezone=SHANGHAI,
         clock=lambda: START,
     )
     first = await db.transaction(lambda conn: _plain_turn(conn, alice.id, "我养了一只猫"))
@@ -963,6 +966,7 @@ async def test_summary_written_during_a_partial_erase_is_discarded(db: Database)
         model,
         MemorySettings(provider=model.provider, model=model.model),
         admin_openid=ADMIN,
+        timezone=SHANGHAI,
         clock=lambda: START,
     )
 
@@ -1022,6 +1026,7 @@ async def test_rewrite_keeping_nothing_of_the_old_profile_is_discarded(
         model,
         MemorySettings(provider=model.provider, model=model.model),
         admin_openid=ADMIN,
+        timezone=SHANGHAI,
         clock=lambda: START,
     )
     message_id, reply_id = await db.transaction(lambda conn: _plain_turn(conn, alice.id, "嗯"))
@@ -1245,6 +1250,7 @@ async def test_background_usage_survives_the_erase_of_its_source(db: Database) -
         model,
         MemorySettings(provider=model.provider, model=model.model),
         admin_openid=ADMIN,
+        timezone=SHANGHAI,
         clock=lambda: START,
     )
     topic_id = await db.transaction(lambda conn: add_turn(conn, alice.id, "话题", "答"))
@@ -1309,6 +1315,7 @@ async def test_forgetting_an_item_drops_queued_profile_updates(db: Database) -> 
         writer,
         MemorySettings(provider=writer.provider, model=writer.model),
         admin_openid=ADMIN,
+        timezone=SHANGHAI,
         clock=lambda: START,
     )
 
@@ -1363,6 +1370,7 @@ async def test_rewrite_is_discarded_when_a_source_message_was_erased(db: Databas
         model,
         MemorySettings(provider=model.provider, model=model.model),
         admin_openid=ADMIN,
+        timezone=SHANGHAI,
         clock=lambda: START,
     )
     worker.schedule_profile(alice, [message_id], reply_id)
@@ -1390,6 +1398,7 @@ async def test_unchanged_with_a_changed_version_is_a_conflict(
         model,
         MemorySettings(provider=model.provider, model=model.model),
         admin_openid=ADMIN,
+        timezone=SHANGHAI,
         clock=lambda: START,
     )
     worker.schedule_profile(alice, [message_id], reply_id)
@@ -1537,14 +1546,14 @@ async def test_ids_are_not_reused_after_deleting_the_largest(db: Database) -> No
 
 
 def test_memory_guide_and_new_topic_note_in_the_prompt() -> None:
-    with_profile = memory_section(Memory(profile_tool=True))
-    assert MEMORY_GUIDE in with_profile
-    assert NEW_TOPIC_NOTE in with_profile
-    without = memory_section(Memory(topic_id=3))
-    assert MEMORY_GUIDE_WITHOUT_PROFILE in without
-    assert "forget_profile_item" not in without
-    assert NEW_TOPIC_NOTE not in without
-    assert "当前话题的编号是 #3。" in without
+    with_profile = Memory(profile_tool=True)
+    assert MEMORY_GUIDE in memory_guide(with_profile)
+    assert NEW_TOPIC_NOTE in memory_data(with_profile)
+    without = Memory(topic_id=3)
+    assert MEMORY_GUIDE_WITHOUT_PROFILE in memory_guide(without)
+    assert "forget_profile_item" not in memory_guide(without) + memory_data(without)
+    assert NEW_TOPIC_NOTE not in memory_data(without)
+    assert "当前话题的编号是 #3。" in memory_data(without)
 
 
 def test_no_drawing_note_only_without_the_drawing_function() -> None:
@@ -1597,6 +1606,7 @@ async def test_queued_updates_are_dropped_before_the_writeback_even_if_cancelled
         writer,
         MemorySettings(provider=writer.provider, model=writer.model),
         admin_openid=ADMIN,
+        timezone=SHANGHAI,
         clock=lambda: START,
     )
     first = await db.transaction(lambda conn: _plain_turn(conn, alice.id, "我养猫"))
@@ -1686,8 +1696,8 @@ async def test_no_drawing_at_all_when_the_deployment_cannot_draw(
 
 
 def test_summary_format_note_only_with_summaries() -> None:
-    assert SUMMARY_FORMAT not in memory_section(Memory(directory=((3, "标题"),)))
-    section = memory_section(Memory(summary="摘要"))
+    assert SUMMARY_FORMAT not in memory_data(Memory(directory=((3, "标题"),)))
+    section = memory_data(Memory(summary="摘要"))
     assert section.index(SUMMARY_FORMAT) < section.index("当前话题此前的摘要：")
     assert "密码、证件号、银行卡号" in MEMORY_GUIDE
 
@@ -1715,6 +1725,7 @@ async def test_rewrites_with_real_changes_are_accepted(db: Database, old: str, n
         model,
         MemorySettings(provider=model.provider, model=model.model),
         admin_openid=ADMIN,
+        timezone=SHANGHAI,
         clock=lambda: START,
     )
     message_id, reply_id = await db.transaction(lambda conn: _plain_turn(conn, alice.id, "嗯"))
@@ -1736,6 +1747,7 @@ async def test_one_new_line_not_kept_from_a_longer_profile_is_discarded(db: Data
         model,
         MemorySettings(provider=model.provider, model=model.model),
         admin_openid=ADMIN,
+        timezone=SHANGHAI,
         clock=lambda: START,
     )
     message_id, reply_id = await db.transaction(lambda conn: _plain_turn(conn, alice.id, "嗯"))
@@ -1758,6 +1770,7 @@ async def test_the_generation_is_taken_when_the_task_is_dequeued(db: Database) -
         writer,
         MemorySettings(provider=writer.provider, model=writer.model),
         admin_openid=ADMIN,
+        timezone=SHANGHAI,
         clock=lambda: START,
     )
     message_id, reply_id = await db.transaction(lambda conn: _plain_turn(conn, alice.id, "我养猫"))

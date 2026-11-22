@@ -99,7 +99,7 @@
 | --- | --- | --- |
 | [storage-and-config.md](storage-and-config.md) | 配置的读取与校验、SQLite 存储与迁移（里程碑 1） | 改配置项、表结构、迁移或数据库的访问方式时 |
 | [access.md](access.md) | 接入与授权：邀请、授权名单、管理员命令、欢迎语与拒绝语、重复推送与回复失败（里程碑 2） | 改邀请、授权、管理员命令或 Gate 的回复时 |
-| [conversation.md](conversation.md) | 一轮对话（里程碑 3、5b、5c）：流程、两家的对话接口、出错时、流水与送达状态、用量、配置、输出上限与时限、长回答分条、收消息与开轮、表情、插话、关停顺序 | 改对话主流程、时限、分条、排队、插话或关停顺序时 |
+| [conversation.md](conversation.md) | 一轮对话（里程碑 3、5b、5c）：流程、上下文与系统提示词（各段的顺序、历史里的发送时间、模型的补充提示词）、两家的对话接口、出错时、流水与送达状态、用量、配置、输出上限与时限、长回答分条、收消息与开轮、表情、插话、关停顺序 | 改对话主流程、系统提示词的组成与顺序、时限、分条、排队、插话或关停顺序时 |
 | [model-routing.md](model-routing.md) | 用 Decisions 选模型（里程碑 4）：选择规则、失败时的退路、坏响应的判定、决策记录 | 改选模型、决策调用或 `[decisions]` 时 |
 | [attachments.md](attachments.md) | 附件与多模态（里程碑 5a）：下载与白名单、识别格式、存放与用户目录、模型的输入能力与候选筛选、交给模型的方式、描述与摘要、清理 | 改附件处理、模型的输入能力或下载白名单时 |
 | [memory.md](memory.md) | 记忆（里程碑 6a、6b）：总体设计、留给以后的口子、话题线、用户档案、查看记忆与遗忘 | 改话题、上下文组装、后台摘要、档案或遗忘时 |
@@ -110,7 +110,7 @@
 | [deployment.md](deployment.md) | 部署（里程碑 9）：数据保护、镜像与 compose、健康检查、备份、告警、关停，给管理员的提醒模块 `alerts.py` | 改部署、备份、告警，或加新的管理员提醒时 |
 | [external-facts.md](external-facts.md) | 查证过的外部事实：Decisions API、模型、内置搜索、思考摘要与过程标记、QQ 平台 | 写调用服务商或 QQ 的代码之前，核对接口与平台的真实行为 |
 | [live-tests.md](live-tests.md) | QQ 端到端实测的各次记录、搜索与过程展示的模型实测、还需要实测的事 | 做实测前后，或想知道某个行为在真实平台上验证过没有时 |
-| [open-questions.md](open-questions.md) | 其它待定的事（配额、时间感、数据去留、pyqbot 可以改进的地方等）与已知的薄弱处 | 动手做一块新功能之前，看有没有相关的待定项 |
+| [open-questions.md](open-questions.md) | 其它待定的事（配额、数据去留、pyqbot 可以改进的地方等）与已知的薄弱处 | 动手做一块新功能之前，看有没有相关的待定项 |
 
 各里程碑在哪个文件：1 → `storage-and-config.md`；2 → `access.md`；3、5b、5c → `conversation.md`；4 → `model-routing.md`；5a → `attachments.md`；6a、6b → `memory.md`；7a、7b → `search-and-process.md`；8 → `reminders.md`；9 → `deployment.md`；10 → `image-generation.md`；11 → `conversation.md` 的「发送记录」与 `storage-and-config.md` 的「存储」。
 

@@ -9,7 +9,8 @@
   编号小）：
   用户消息是正文加附件的文字版，回复是用户实际看到的内容（流水里的 `content`，只发了说明的回复不带）。最多取最近
   `MAX_TURNS` 轮；每条最多 `ENTRY_CHARS` 字，合计最多 `INPUT_CHARS` 字，超出时丢掉更早的。输入写成 JSON（同决策
-  题目的做法），消息里的换行与冒号伪造不出别的轮次。没有新的轮次就不调用。
+  题目的做法），消息里的换行与冒号伪造不出别的轮次。每条带上它的本地日期（`date`，按配置的时区，不计入字数），
+  模型据此把「明天」「下周三」这类相对时间写成具体的日期。没有新的轮次就不调用。
 - **输出**（`parse()`）：约定的两行纯文本「标题：……」「摘要：……」。没有用服务商的结构化输出：对话接口
   （`llm.ChatModel`）没有这个参数，两行的格式也足够简单。解析失败、超过上限（标题 `TITLE_LIMIT`、摘要
   `SUMMARY_LIMIT` 字，是提示词里建议长度的两倍）、空白、模型没有正常写完（达到输出上限等）都按失败处理：只记
@@ -22,7 +23,7 @@
 - **关停**：`stop()` 不再接新的、取消现有的任务；`aclose()` 再等它们与记账结束，不留下任务。
 - **日志**不记标题与摘要的内容，只记字数与话题编号。
 
-摘要由用户的对话生成、之后会进系统提示词，那里把它写成资料而不是指令（见 `prompt.memory_section()`）。它只进
+摘要由用户的对话生成、之后会进系统提示词，那里把它写成资料而不是指令（见 `prompt.memory_data()`）。它只进
 这个用户自己的上下文。
 
 **用户档案**（里程碑 6b）也由这里在后台重写，和话题摘要共用每个用户的队列、并发上限与关停收尾：
@@ -63,8 +64,10 @@ import time
 from collections.abc import Callable, Coroutine, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Self
+from zoneinfo import ZoneInfo
 
 from . import access, faces, journal, profiles, topics
 from .access import User
@@ -145,7 +148,7 @@ class _Source:
 
     title: str = field(repr=False)
     summary: str = field(repr=False)
-    turns: tuple[tuple[str, str], ...] = field(repr=False)  # （角色，文字版）
+    turns: tuple[tuple[str, str, str | None], ...] = field(repr=False)  # （角色，文字版，本地日期）
     through: int
     message_id: int | None
     sources: tuple[int, ...] = ()  # 这次输入用到的全部消息：写回时都还在才写
@@ -340,12 +343,15 @@ def profile_input(source: _ProfileSource) -> str:
 
 
 def source_input(source: _Source) -> str:
-    """输入的 JSON 文本。"""
-    payload = {
-        "title": source.title,
-        "summary": source.summary,
-        "turns": [{"role": role, "text": text} for role, text in source.turns],
-    }
+    """输入的 JSON 文本。`turns` 每项带上那条消息的本地日期（`date`，如 `2026-11-19`），模型据此把对话里的相对
+    时间（「明天」「下周三」）换算成具体的日期；取不到时间的条目不带 `date`。"""
+    turns: list[dict[str, str]] = []
+    for role, text, date in source.turns:
+        turn = {"role": role, "text": text}
+        if date is not None:
+            turn["date"] = date
+        turns.append(turn)
+    payload = {"title": source.title, "summary": source.summary, "turns": turns}
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -360,24 +366,35 @@ def _entry_text(entry: HistoryEntry) -> str:
     return _clip(faces.clean("\n".join(pieces)).strip(), ENTRY_CHARS)
 
 
-def _fit_items(items: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
-    """（角色，文字版）从最新的往前取，合计不超过 `INPUT_CHARS` 字；空白的跳过。"""
-    kept: list[tuple[str, str]] = []
+def _fit_items[T: tuple[str, str] | tuple[str, str, str | None]](items: Sequence[T]) -> list[T]:
+    """（角色，文字版[，其它]）从最新的往前取，文字版合计不超过 `INPUT_CHARS` 字；空白的跳过。只数文字版的字数。"""
+    kept: list[T] = []
     total = 0
-    for role, text in reversed(items):
+    for item in reversed(items):
+        text = item[1]
         if not text:
             continue
         if kept and total + len(text) > INPUT_CHARS:
             break
-        kept.append((role, text))
+        kept.append(item)
         total += len(text)
     kept.reverse()
     return kept
 
 
-def _fit(entries: list[HistoryEntry]) -> list[tuple[str, str]]:
-    """从最新的往前取，合计不超过 `INPUT_CHARS` 字。"""
-    return _fit_items([(entry.role.value, _entry_text(entry)) for entry in entries])
+def _fit(entries: list[HistoryEntry], timezone: ZoneInfo) -> list[tuple[str, str, str | None]]:
+    """（角色，文字版，本地日期）从最新的往前取，合计不超过 `INPUT_CHARS` 字。日期不计入字数，取不到时间时为
+    `None`。"""
+    return _fit_items(
+        [
+            (entry.role.value, _entry_text(entry), _local_date(entry.sent_at, timezone))
+            for entry in entries
+        ]
+    )
+
+
+def _local_date(moment: int | None, timezone: ZoneInfo) -> str | None:
+    return None if moment is None else datetime.fromtimestamp(moment, timezone).date().isoformat()
 
 
 class ProfileOutcome(Enum):
@@ -443,12 +460,14 @@ class Summarizer:
         settings: MemorySettings,
         *,
         admin_openid: str,
+        timezone: ZoneInfo,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._db = db
         self._model = model
         self._settings = settings
         self._admin_openid = admin_openid
+        self._timezone = timezone  # 摘要输入里各条消息的日期按它算
         self._clock = clock
         self._semaphore = asyncio.Semaphore(CONCURRENCY)
         self._queues: dict[int, _UserQueue] = {}
@@ -686,7 +705,7 @@ class Summarizer:
         fresh, through = journal.topic_turns_after(
             conn, user.id, topic_id, topic.summarized_through or 0, MAX_TURNS
         )
-        turns = _fit(fresh)
+        turns = _fit(fresh, self._timezone)
         if through is None or not turns:
             return False
         users = [e.message_id for e in fresh if e.role is Role.USER and e.message_id is not None]

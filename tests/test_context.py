@@ -308,12 +308,13 @@ def builder(
     image_turns: int = 3,
     media_dir: str = D1,
     models: list[ModelSettings] | None = None,
+    now: datetime = NOW,
 ) -> RequestBuilder:
     return RequestBuilder(
         store,
         media_dir=media_dir,
         persona="人设",
-        now=NOW,
+        now=now,
         history=history,
         current=current,
         image_turns=image_turns,
@@ -424,6 +425,90 @@ async def test_consecutive_user_messages_of_a_turn_are_merged(tmp_path: Path) ->
     assert request.messages == (
         Message(Role.USER, (ImagePart(PNG_BYTES, PNG), TextPart("\n这是什么"))),
     )
+
+
+# ---- 历史里的发送时间 ----
+
+T1 = 1_799_761_399  # 上海 2027-01-12 21:43:19 → 只写到分钟
+T2 = 1_799_888_700  # 上海 2027-01-14 09:05:00
+
+
+def at(entry: HistoryEntry, moment: int) -> HistoryEntry:
+    return replace(entry, sent_at=moment)
+
+
+def sent_history() -> list[HistoryEntry]:
+    return [
+        at(user("周末去哪", turns_ago=1), T1),
+        at(reply("去爬山", turns_ago=1), T1 + 60),
+        at(user("", record(IMAGE, text="[图片：一座山]")), T2),
+        at(user("好看吗"), T2 + 30),
+        at(reply("好看"), T2 + 60),
+    ]
+
+
+async def test_history_user_messages_start_with_their_sent_time() -> None:
+    current = [at(user("那下周呢", turns_ago=CURRENT_TURN), T2 + 3600)]
+
+    request = (await builder(None, sent_history(), current).build(TEXT_ONLY)).request
+
+    # 历史里每条用户消息（攒成一批的各条各自标，只有附件的也标在最前面）；助手的与这一轮的不标。
+    assert request.messages == (
+        Message.text(Role.USER, "[发送时间：2027-01-12 21:43 星期二]\n周末去哪"),
+        Message.text(Role.ASSISTANT, "去爬山"),
+        Message.text(
+            Role.USER,
+            "[发送时间：2027-01-14 09:05 星期四]\n[图片：一座山]\n"
+            "[发送时间：2027-01-14 09:05 星期四]\n好看吗",
+        ),
+        Message.text(Role.ASSISTANT, "好看"),
+        Message.text(Role.USER, "那下周呢"),
+    )
+
+
+async def test_the_sent_time_goes_before_an_original_image(tmp_path: Path) -> None:
+    store = MediaStore.under(tmp_path)
+    image = stored_image(store)
+    history = [at(user("", image), T2), reply("一只猫")]
+
+    request = (await builder(store, history, [user("还有呢")]).build(SEES)).request
+
+    assert request.messages[0].parts == (
+        TextPart("[发送时间：2027-01-14 09:05 星期四]\n"),
+        ImagePart(PNG_BYTES, PNG),
+    )
+
+
+async def test_the_sent_time_is_fixed_and_uses_the_configured_zone() -> None:
+    # 只取决于消息自己的时刻与时区，不随当前时间变（不写「几分钟前」）。
+    later = NOW.replace(year=2028)
+    first = (await builder(None, sent_history(), [user("问")]).build(TEXT_ONLY)).request
+    again = (await builder(None, sent_history(), [user("问")], now=later).build(TEXT_ONLY)).request
+    utc = (
+        await builder(
+            None, sent_history(), [user("问")], now=NOW.astimezone(ZoneInfo("UTC"))
+        ).build(TEXT_ONLY)
+    ).request
+
+    assert first.messages == again.messages
+    assert first.system != again.system  # 变的只有系统提示词里的当前时间
+    assert utc.messages[0] == Message.text(
+        Role.USER, "[发送时间：2027-01-12 13:43 星期二]\n周末去哪"
+    )
+
+
+async def test_entries_without_a_time_have_no_mark() -> None:
+    history = [user("周末去哪", turns_ago=0), reply("去爬山")]
+
+    request = (await builder(None, history, [user("问")]).build(TEXT_ONLY)).request
+
+    assert request.messages[0] == Message.text(Role.USER, "周末去哪")
+
+
+def test_decision_input_has_no_sent_time() -> None:
+    entry = at(user("周末去哪"), T1)
+    assert decision_text(entry) == "周末去哪"
+    assert decision_latest([entry], [], 100) == "周末去哪"
 
 
 async def test_one_users_context_never_gets_another_users_file(tmp_path: Path) -> None:

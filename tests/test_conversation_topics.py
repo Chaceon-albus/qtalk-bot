@@ -15,6 +15,7 @@ from tests.test_conversation import (
     BOB,
     DONE,
     HANG_GUARD,
+    SENT,
     SHANGHAI,
     START,
     FakeChannel,
@@ -180,7 +181,8 @@ async def membership(db: Database) -> list[tuple[str, str, int]]:
 
 
 def texts_of(request: ChatRequest) -> list[str]:
-    return [text_of(part) for m in request.messages for part in m.parts]
+    """请求里各条消息的文字，去掉历史里用户消息开头的发送时间标记（标记本身另有测试）。"""
+    return [text_of(part).removeprefix(SENT) for m in request.messages for part in m.parts]
 
 
 def topic_question(decider: FakeDecider, index: int = -1) -> ChoiceQuestion:
@@ -729,6 +731,7 @@ async def test_answer_stopped_by_a_supplement_ends_its_turn_with_a_topic_and_a_s
         writer,
         MemorySettings(provider=writer.provider, model=writer.model),
         admin_openid=ADMIN,
+        timezone=SHANGHAI,
         clock=lambda: START,
     )
     decider = Picker()  # 插话的是非题答「是」0.9：补充
@@ -775,6 +778,7 @@ async def test_ended_turn_schedules_the_summary_which_later_turns_use(db: Databa
         writer,
         MemorySettings(provider=writer.provider, model=writer.model),
         admin_openid=ADMIN,
+        timezone=SHANGHAI,
         clock=lambda: START,
     )
     decider = Picker()
@@ -815,6 +819,7 @@ async def test_turn_that_did_not_end_schedules_no_summary(db: Database) -> None:
         writer,
         MemorySettings(provider=writer.provider, model=writer.model),
         admin_openid=ADMIN,
+        timezone=SHANGHAI,
     )
     chat = topical(db, Picker(), model, summarizer=summarizer)
     await say(chat, alice, "话题一")

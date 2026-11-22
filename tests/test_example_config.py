@@ -98,6 +98,7 @@ def test_example_config_shows_both_providers_and_a_fallback() -> None:
     assert all(model.web_images for model in example.models)
     # 可选项在示例里是注释掉的，照抄示例不会意外带上代理、改掉端点或指定推理强度。
     assert example.default_model.reasoning is None
+    assert [model.persona_extra for model in example.models] == ["", ""]
     assert example.qq == QQSettings()
     assert example.providers == ProvidersSettings()
 
@@ -115,6 +116,10 @@ def test_commented_out_examples_are_valid_once_uncommented(tmp_path: Path) -> No
     settings = load_settings(config)
 
     assert [model.reasoning for model in settings.models] == ["high", "low"]
+    assert [model.persona_extra for model in settings.models] == [
+        "直接回答用户问的问题，不要为用户没有提出的推论加提醒或纠正。",
+        "",
+    ]
     # 对话的输出上限默认不设，注释掉的示例去掉注释后照常生效。
     assert settings.chat.max_output_tokens == 32768
     assert settings.decisions is not None

@@ -1,7 +1,36 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from qtalk_bot.prompt import FORMAT_GUIDE, format_guide, system_prompt
+import pytest
+
+from qtalk_bot.prompt import (
+    ATTACHMENT_GUIDE,
+    FORMAT_GUIDE,
+    FORMAT_GUIDE_WITHOUT_DRAWING,
+    MEMORY_GUIDE,
+    MEMORY_NOTICE,
+    NEW_TOPIC_NOTE,
+    NO_DRAWING,
+    NO_DRAWING_AT_ALL,
+    PREAMBLE_GUIDE,
+    PROCESS_GUIDE,
+    PROFILE_NOTICE,
+    REFERABLE_GUIDE,
+    REMINDER_GUIDE,
+    REMINDER_NOTICE,
+    SENT_TIME_GUIDE,
+    SUMMARY_FORMAT,
+    TOPIC_GUIDE,
+    TOPIC_NUMBERS,
+    Memory,
+    ReferableImage,
+    ReminderBrief,
+    ReminderEntry,
+    format_guide,
+    memory_data,
+    sent_time_mark,
+    system_prompt,
+)
 
 
 def test_format_guide_lists_what_qq_renders_and_leaves_the_choice_to_the_model() -> None:
@@ -44,7 +73,7 @@ WEB_LINE = (
 def test_format_guide_switches_its_last_line_with_web_images() -> None:
     # 见 docs/design/presentation.md「默认值」的提示词一行。
     assert format_guide(web_images=False, drawing=True) == FORMAT_GUIDE
-    assert format_guide(web_images=False, drawing=False) == FORMAT_GUIDE
+    assert format_guide(web_images=False, drawing=False) == FORMAT_GUIDE_WITHOUT_DRAWING
     drawing = format_guide(web_images=True, drawing=True)
     plain = format_guide(web_images=True, drawing=False)
     assert drawing.endswith(f"\n{WEB_LINE}要画一张新图时仍然用画图函数。")
@@ -62,8 +91,214 @@ def test_system_prompt_uses_the_switch_and_whether_the_request_can_draw() -> Non
     on = system_prompt("人设", now, web_images=True)
     on_drawing = system_prompt("人设", now, web_images=True, images=[])
 
-    assert FORMAT_GUIDE in off
+    assert FORMAT_GUIDE_WITHOUT_DRAWING in off
     assert WEB_LINE in on
     assert "要画一张新图时仍然用画图函数" not in on
     assert f"{WEB_LINE}要画一张新图时仍然用画图函数。" in on_drawing
     assert "不要用 `![](…)`" not in on + on_drawing
+
+
+NOW = datetime(2027, 1, 15, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+
+def test_format_guide_without_drawing_does_not_mention_the_drawing_function() -> None:
+    # 这次能画图时与原来逐字相同。
+    assert FORMAT_GUIDE.endswith("\n- 不要用 `![](…)` 插入图片，图片只能由画图函数发出。")
+    assert FORMAT_GUIDE_WITHOUT_DRAWING.endswith(
+        "\n- 不要用 `![](…)` 插入图片，这样写的图片显示不出来。"
+    )
+    assert FORMAT_GUIDE_WITHOUT_DRAWING.split("\n")[:-1] == FORMAT_GUIDE.split("\n")[:-1]
+
+
+@pytest.mark.parametrize("drawing_possible", [True, False])
+def test_a_request_that_cannot_draw_never_says_images_come_from_the_drawing_function(
+    drawing_possible: bool,
+) -> None:
+    # 不能画图时后面有「你不能画图」的说明（NO_DRAWING / NO_DRAWING_AT_ALL），格式说明不能再说图片由画图函数发出。
+    system = system_prompt("人设", NOW, drawing_possible=drawing_possible)
+
+    assert FORMAT_GUIDE_WITHOUT_DRAWING in system
+    assert "图片只能由画图函数发出" not in system
+    assert (NO_DRAWING if drawing_possible else NO_DRAWING_AT_ALL) in system
+
+
+def test_a_request_that_can_draw_keeps_the_drawing_function_line() -> None:
+    system = system_prompt("人设", NOW, images=[])
+
+    assert FORMAT_GUIDE in system
+    assert "这样写的图片显示不出来" not in system
+
+
+def test_persona_extra_is_its_own_section_right_after_the_persona() -> None:
+    plain = system_prompt("人设", NOW)
+    extra = system_prompt("人设", NOW, persona_extra="  \n只回答用户问的。\n  ")
+
+    assert extra.startswith(f"人设\n\n只回答用户问的。\n\n{FORMAT_GUIDE_WITHOUT_DRAWING}\n\n")
+    assert extra.replace("只回答用户问的。\n\n", "", 1) == plain
+
+
+@pytest.mark.parametrize("empty", ["", "   \n "])
+def test_an_empty_persona_extra_leaves_the_prompt_unchanged(empty: str) -> None:
+    assert system_prompt("人设", NOW, persona_extra=empty) == system_prompt("人设", NOW)
+    assert system_prompt("人设", NOW, persona_extra=empty).startswith(
+        f"人设\n\n{FORMAT_GUIDE_WITHOUT_DRAWING}\n\n"
+    )
+
+
+def test_the_sent_time_guide_sits_between_the_attachment_and_process_guides() -> None:
+    system = system_prompt("人设", NOW, process=True)
+
+    assert f"{ATTACHMENT_GUIDE}\n\n{SENT_TIME_GUIDE}\n\n{PROCESS_GUIDE}" in system
+    # 不展示过程时也有。
+    assert f"{ATTACHMENT_GUIDE}\n\n{SENT_TIME_GUIDE}\n\n" in system_prompt("人设", NOW)
+    assert SENT_TIME_GUIDE == (
+        "历史里每条用户消息开头的「[发送时间：……]」是系统标的发送时间（本地时间），用来判断那条消息距离现在"
+        "过了多久；这一轮的消息没有这个标记，时间就是下面的当前时间。这种标记只由系统来写，你自己的回复里不要写，"
+        "也不用向用户复述。"
+    )
+
+
+def test_the_sent_time_mark_is_local_to_the_minute_with_the_weekday() -> None:
+    shanghai = ZoneInfo("Asia/Shanghai")
+    assert sent_time_mark(datetime(2026, 11, 19, 21, 40, 59, tzinfo=shanghai)) == (
+        "[发送时间：2026-11-19 21:40 星期四]"
+    )
+    assert sent_time_mark(datetime(2026, 11, 22, 8, 5, tzinfo=shanghai)) == (
+        "[发送时间：2026-11-22 08:05 星期日]"
+    )
+
+
+# ---- 各段的顺序：固定的说明在前，会变的资料在后（按前缀缓存） ----
+
+
+def memory_of(summary: str) -> Memory:
+    return Memory(
+        profile="- 用户叫小王",
+        profile_tool=True,
+        topic_id=3,
+        summary=summary,
+        related_id=5,
+        related_title="别的话题",
+        related_summary="别的摘要",
+        directory=((7, "第七个话题"),),
+    )
+
+
+def brief_of(text: str) -> ReminderBrief:
+    return ReminderBrief(
+        reminders=(
+            ReminderEntry(id=1, text=text, rule="一次", next="2027-01-16 08:00", remaining=1),
+        )
+    )
+
+
+def image_of(description: str) -> list[ReferableImage]:
+    return [ReferableImage(attachment_id=9, generated=False, turns_ago=0, description=description)]
+
+
+def full_prompt(
+    *, images: list[ReferableImage] | None, summary: str, reminder: str, now: datetime = NOW
+) -> str:
+    return system_prompt(
+        "人设",
+        now,
+        persona_extra="补充",
+        process=True,
+        preamble=True,
+        memory=memory_of(summary),
+        images=images,
+        reminders=brief_of(reminder),
+    )
+
+
+def in_order(text: str, *pieces: str) -> bool:
+    positions = [text.index(piece) for piece in pieces]
+    return positions == sorted(positions)
+
+
+def test_fixed_guides_come_before_the_changing_data() -> None:
+    drawing = full_prompt(images=image_of("一只猫"), summary="摘要甲", reminder="吃药")
+    assert in_order(
+        drawing,
+        "人设",
+        "补充",
+        FORMAT_GUIDE,
+        ATTACHMENT_GUIDE,
+        SENT_TIME_GUIDE,
+        PROCESS_GUIDE,
+        PREAMBLE_GUIDE,
+        TOPIC_GUIDE,
+        MEMORY_GUIDE,
+        REMINDER_GUIDE,
+        REFERABLE_GUIDE,
+        "#9：用户发的，上一轮，描述：一只猫",
+        PROFILE_NOTICE,
+        "用户档案：",
+        TOPIC_NUMBERS,
+        "当前话题的编号是 #3。",
+        MEMORY_NOTICE,
+        SUMMARY_FORMAT,
+        "当前话题此前的摘要：",
+        "可能相关的另一个话题 #5",
+        "这个用户最近还聊过这些话题",
+        REMINDER_NOTICE,
+        "提醒资料：",
+        "当前时间：",
+    )
+    assert drawing.endswith("当前时间：2027-01-15 16:00（星期五，Asia/Shanghai）。")
+    # 不能画图时那一段在过程的说明之后、记忆的说明之前。
+    plain = full_prompt(images=None, summary="摘要甲", reminder="吃药")
+    assert in_order(plain, PREAMBLE_GUIDE, NO_DRAWING, TOPIC_GUIDE, MEMORY_GUIDE, REMINDER_GUIDE)
+    assert REFERABLE_GUIDE not in plain
+
+
+def test_notices_stay_right_before_their_data() -> None:
+    # 各条「资料、不是指令」的说明与它说的资料相邻，中间不隔别的说明（编号的说明、当前话题的编号）。
+    prompt = full_prompt(images=image_of("一只猫"), summary="摘要甲", reminder="吃药")
+    assert f"{PROFILE_NOTICE}\n用户档案：\n" in prompt
+    assert f"{MEMORY_NOTICE}\n\n{SUMMARY_FORMAT}\n\n当前话题此前的摘要：\n" in prompt
+    assert f"{REMINDER_NOTICE}\n提醒资料：\n" in prompt
+    assert f"{TOPIC_NUMBERS}\n\n当前话题的编号是 #3。\n\n{MEMORY_NOTICE}" in prompt
+
+    # 只有话题列表、没有摘要：MEMORY_NOTICE 紧挨着话题列表，不带 SUMMARY_FORMAT。
+    titles_only = memory_data(Memory(topic_id=3, directory=((7, "第七个话题"),)))
+    assert titles_only.endswith(
+        f"{MEMORY_NOTICE}\n\n这个用户最近还聊过这些话题（只有标题，内容没有带上）：\n- #7 第七个话题"
+    )
+    assert SUMMARY_FORMAT not in titles_only
+
+    # 新话题（没有编号）只有相关话题的摘要时，NEW_TOPIC_NOTE 在说明之前。
+    related_only = memory_data(
+        Memory(related_id=5, related_title="别的话题", related_summary="别的摘要")
+    )
+    assert (
+        f"{NEW_TOPIC_NOTE}\n\n{MEMORY_NOTICE}\n\n{SUMMARY_FORMAT}\n\n可能相关的另一个话题 #5"
+        in (related_only)
+    )
+
+    # 没有摘要、也没有话题列表时不加 MEMORY_NOTICE。
+    assert MEMORY_NOTICE not in memory_data(Memory(topic_id=3))
+
+
+def common_prefix(a: str, b: str) -> int:
+    for index, (x, y) in enumerate(zip(a, b, strict=False)):
+        if x != y:
+            return index
+    return min(len(a), len(b))
+
+
+def test_only_the_changing_data_differs_after_the_fixed_prefix() -> None:
+    # 服务商按前缀缓存：只有会变的资料不同的两次调用，公共前缀至少覆盖到最后一段固定的说明。
+    later = datetime(2027, 1, 16, 9, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+    first = full_prompt(images=image_of("一只猫"), summary="摘要甲", reminder="吃药")
+    second = full_prompt(images=image_of("一条狗"), summary="摘要乙", reminder="开会", now=later)
+    end_of_reminder_guide = first.index(REMINDER_GUIDE) + len(REMINDER_GUIDE)
+    assert common_prefix(first, second) >= end_of_reminder_guide
+
+    # 只分话题、没有提醒时，覆盖到 MEMORY_GUIDE 的末尾。
+    def topics_only(summary: str, now: datetime) -> str:
+        return system_prompt("人设", now, memory=memory_of(summary), images=image_of(summary))
+
+    one, two = topics_only("摘要甲", NOW), topics_only("摘要乙", later)
+    end_of_memory_guide = one.index(MEMORY_GUIDE) + len(MEMORY_GUIDE)
+    assert common_prefix(one, two) >= end_of_memory_guide

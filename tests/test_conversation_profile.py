@@ -16,6 +16,7 @@ from tests.test_conversation import (
     START,
     ScriptedModel,
     answer,
+    call_input,
     decision_rows,
     invited,
     text_of,
@@ -84,11 +85,17 @@ def profiled(
     writer: Writer | None,
     *,
     threshold: float | None = 0.5,
+    persona_extra: str = "",
 ) -> Conversation:
-    """启用话题线；`threshold` 不为空时问档案题，`writer` 不为空时在后台写摘要与档案。"""
+    """启用话题线；`threshold` 不为空时问档案题，`writer` 不为空时在后台写摘要与档案。`persona_extra` 是对话模型的
+    补充提示词。"""
     decisions = DecisionSettings(provider=Provider.GEMINI, model="decision-fake")
     settings = ModelSettings(
-        name=model.name, provider=model.provider, model=model.model, default=True
+        name=model.name,
+        provider=model.provider,
+        model=model.model,
+        default=True,
+        persona_extra=persona_extra,
     )
     summarizer = (
         None
@@ -98,6 +105,7 @@ def profiled(
             writer,
             MemorySettings(provider=writer.provider, model=writer.model),
             admin_openid=ADMIN,
+            timezone=SHANGHAI,
             clock=lambda: START,
         )
     )
@@ -185,6 +193,29 @@ async def test_profile_question_rides_along_and_the_rewrite_feeds_later_turns(
         ("decision", DECISION_USAGE_MODEL, 30, 0),
     ]
     assert ("memory", MEMORY_USAGE_MODEL, 7, 3) in usage
+    await summarizer_of(chat).aclose()
+
+
+async def test_background_calls_never_carry_the_models_persona_extra(db: Database) -> None:
+    # persona_extra 只给对话模型：决策（选话题、档案题）、话题摘要、重写档案的输入里都没有它。
+    extra = "只给对话模型的补充-7f3a"
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("好的老王"))
+    decider = Picker()
+    writer = Writer()
+    chat = profiled(db, decider, model, writer, persona_extra=extra)
+
+    await say(chat, alice, "以后叫我老王")
+    await settle(chat)
+    await say(chat, alice, "今天吃什么")
+    await settle(chat)
+
+    assert all(extra in request.system for request in model.requests)
+    background = [*decider.requests, *writer.summaries.requests, *writer.rewrites.requests]
+    assert len(decider.requests) == 2
+    assert writer.summaries.requests
+    assert writer.rewrites.requests
+    assert [request for request in background if extra in call_input(request)] == []
     await summarizer_of(chat).aclose()
 
 

@@ -124,6 +124,9 @@ class HistoryEntry:
     reply_to: int | None = field(default=None, compare=False)
     """回复所回答的用户消息（流水的 `reply_to`）；用户消息为 `None`。合并几段历史时按它排位置（见
     `position()`）。"""
+    sent_at: int | None = field(default=None, compare=False)
+    """记进流水的时刻（流水的 `created_at`，Unix 秒；用户消息即收到它的时刻）；不是取自流水的条目为 `None`。
+    对话请求据此在历史里的用户消息开头标出发送时间（`context.RequestBuilder`）。"""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -584,7 +587,8 @@ def recent_history(
     if boundary is None:
         return []
     users = conn.execute(
-        "SELECT id, role, content, faces_only, NULL AS reply_to, NULL AS delivery FROM messages"
+        "SELECT id, role, content, faces_only, NULL AS reply_to, NULL AS delivery, created_at"
+        " FROM messages"
         " WHERE user_id = ? AND role = 'user' AND faces_only = 0 AND id <= ?"
         " ORDER BY id DESC LIMIT ?",
         (user_id, boundary, turns * ROWS_PER_TURN),
@@ -595,7 +599,7 @@ def recent_history(
     # 回复的编号总比它回答的消息大，所以 `id > oldest` 限定了扫描的范围。不算边界的回复行（正文为空、没给
     # 用户任何东西的）直接排除，几十条这样的行也挤不掉较早的问答；它们回复的用户消息照常留着。
     replies = conn.execute(
-        "SELECT id, role, content, faces_only, reply_to, delivery FROM messages"  # noqa: S608  只拼代码里的常量条件
+        "SELECT id, role, content, faces_only, reply_to, delivery, created_at FROM messages"  # noqa: S608  只拼代码里的常量条件
         " WHERE user_id = ? AND role = 'assistant' AND id > ? AND reply_to >= ? AND reply_to <= ?"
         f" AND {_ENDS_TURN_SQL}",
         (user_id, oldest, oldest, boundary),
@@ -633,6 +637,7 @@ def _entries(
             message_id=row["id"],
             faces_only=bool(row["faces_only"]),
             reply_to=row["reply_to"],
+            sent_at=row["created_at"],
         )
         for row, age in picked
         if row["role"] == Role.USER.value or row["content"] != "" or row["id"] in attachments
@@ -667,7 +672,7 @@ def topic_history(
     if turns <= 0:
         return []
     replies = conn.execute(
-        "SELECT m.id, m.role, m.content, m.faces_only, m.reply_to, m.delivery"  # noqa: S608  只拼代码里的常量条件
+        "SELECT m.id, m.role, m.content, m.faces_only, m.reply_to, m.delivery, m.created_at"  # noqa: S608  只拼代码里的常量条件
         " FROM messages AS m JOIN topic_messages AS t ON t.message_id = m.id"
         " JOIN topics ON topics.id = t.topic_id"
         " WHERE m.user_id = ? AND t.user_id = ? AND topics.user_id = ? AND t.topic_id = ?"
@@ -681,7 +686,8 @@ def topic_history(
     upper = max(row["reply_to"] for row in kept)
     lower = replies[turns]["reply_to"] if len(replies) > turns else 0
     users = conn.execute(
-        "SELECT m.id, m.role, m.content, m.faces_only, NULL AS reply_to, NULL AS delivery"
+        "SELECT m.id, m.role, m.content, m.faces_only, NULL AS reply_to, NULL AS delivery,"
+        " m.created_at"
         " FROM messages AS m JOIN topic_messages AS t ON t.message_id = m.id"
         " WHERE m.user_id = ? AND t.user_id = ? AND t.topic_id = ? AND m.role = 'user'"
         " AND m.faces_only = 0 AND m.id > ? AND m.id <= ?",
@@ -713,7 +719,7 @@ def topic_turns_after(
         return [], None
     # 话题里结束了一轮的回复，按轮次的位置（reply_to）排列。
     boundary_sql = (
-        "SELECT m.id, m.role, m.content, m.faces_only, m.reply_to, m.delivery"  # noqa: S608  只拼代码里的常量条件
+        "SELECT m.id, m.role, m.content, m.faces_only, m.reply_to, m.delivery, m.created_at"  # noqa: S608  只拼代码里的常量条件
         " FROM messages AS m JOIN topic_messages AS t ON t.message_id = m.id"
         " JOIN topics ON topics.id = t.topic_id"
         " WHERE m.user_id = ? AND t.user_id = ? AND topics.user_id = ? AND t.topic_id = ?"
@@ -748,7 +754,8 @@ def topic_turns_after(
     )
     wanted = {int(row["reply_to"]) for row in fresh}
     users = conn.execute(
-        "SELECT m.id, m.role, m.content, m.faces_only, NULL AS reply_to, NULL AS delivery"
+        "SELECT m.id, m.role, m.content, m.faces_only, NULL AS reply_to, NULL AS delivery,"
+        " m.created_at"
         " FROM messages AS m JOIN topic_messages AS t ON t.message_id = m.id"
         " WHERE m.user_id = ? AND t.user_id = ? AND t.topic_id = ? AND m.role = 'user'"
         " AND m.faces_only = 0 AND m.id > ? AND m.id <= ?",
@@ -765,7 +772,7 @@ def reply_entry(conn: sqlite3.Connection, user_id: int, reply_id: int) -> Histor
     """这个用户的一条助手回复（带上那一轮里模型画的图）；不是他的、不是回复，或正文为空又没有画图时返回
     `None`。"""
     row = conn.execute(
-        "SELECT id, role, content, faces_only, reply_to FROM messages"
+        "SELECT id, role, content, faces_only, reply_to, created_at FROM messages"
         " WHERE id = ? AND user_id = ? AND role = 'assistant'",
         (reply_id, user_id),
     ).fetchone()

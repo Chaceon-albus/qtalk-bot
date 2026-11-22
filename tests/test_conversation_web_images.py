@@ -55,7 +55,12 @@ from qtalk_bot.conversation import (
 from qtalk_bot.image_download import ImageDownloader
 from qtalk_bot.llm import ErrorKind, ModelError, Provider, Role, TextDelta, Usage
 from qtalk_bot.process import ReplyBudget
-from qtalk_bot.prompt import NO_IMAGES_LINE, WEB_IMAGES_DRAWING, WEB_IMAGES_LINE
+from qtalk_bot.prompt import (
+    NO_IMAGES_LINE,
+    NO_IMAGES_LINE_WITHOUT_DRAWING,
+    WEB_IMAGES_DRAWING,
+    WEB_IMAGES_LINE,
+)
 from qtalk_bot.routing import Router, SteerJudge
 from qtalk_bot.splitting import SPLIT_HARD_BYTES
 from qtalk_bot.storage import DATABASE_FILENAME, Database
@@ -286,7 +291,9 @@ async def test_with_the_switch_off_the_image_becomes_its_caption(db: Database) -
     assert fetcher.calls == []
     assert channel.uploads == []
     assert (await rows(db))[-1].content == f"看{CAT_RAW}后文"
-    assert NO_IMAGES_LINE in model.requests[0].system
+    # 这次不能画图：不插图的那一行不提画图函数。
+    assert NO_IMAGES_LINE_WITHOUT_DRAWING in model.requests[0].system
+    assert NO_IMAGES_LINE not in model.requests[0].system
     assert WEB_IMAGES_LINE not in model.requests[0].system
 
 
@@ -298,7 +305,7 @@ async def test_without_a_downloader_the_image_becomes_its_caption(db: Database) 
     await answered(web_chat(db, model, None), alice, "猫", channel)
 
     assert channel.streamed == f"看{fallback_text('猫')}"
-    assert NO_IMAGES_LINE in model.requests[0].system
+    assert NO_IMAGES_LINE_WITHOUT_DRAWING in model.requests[0].system
 
 
 @pytest.mark.parametrize(
@@ -1503,6 +1510,7 @@ async def test_the_prompt_allows_web_images_only_for_models_that_can_show_them(
     assert WEB_IMAGES_LINE in system
     assert WEB_IMAGES_DRAWING not in system  # 这次不能画图
     assert NO_IMAGES_LINE not in system
+    assert NO_IMAGES_LINE_WITHOUT_DRAWING not in system
 
 
 # ---- 两条不变量 ----

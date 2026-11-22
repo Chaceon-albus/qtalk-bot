@@ -80,6 +80,28 @@ async def test_recent_history_takes_the_last_n_turns_of_this_user_only(db: Datab
     assert len(everything) == 6
 
 
+async def test_history_entries_carry_the_time_they_were_recorded(db: Database) -> None:
+    # 对话请求据此标出历史里用户消息的发送时间（见 context.RequestBuilder）。
+    alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
+
+    def fill(conn: sqlite3.Connection) -> int:
+        turn(conn, alice, "问1", "答1", now=1000)
+        turn(conn, alice, "问2", "答2", now=2000)
+        return journal.add_user_message(conn, alice, "问3", "qq-3", 3000)
+
+    current = await db.transaction(fill)
+    history = await db.transaction(journal.recent_history, alice, current, 10)
+
+    assert [(entry.content, entry.sent_at) for entry in history] == [
+        ("问1", 1000),
+        ("答1", 1000),
+        ("问2", 2000),
+        ("答2", 2000),
+    ]
+    # 不参与比较：同样的消息不论有没有时间都相等。
+    assert HistoryEntry(Role.USER, "问1", sent_at=1000) == HistoryEntry(Role.USER, "问1")
+
+
 async def test_recent_history_with_zero_turns_or_no_history(db: Database) -> None:
     alice = await new_user(db, "FAKE-OPENID-ALICE", "小王")
 

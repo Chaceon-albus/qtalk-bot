@@ -703,6 +703,7 @@ async def test_summarizer_is_stopped_and_awaited_like_the_describer(
         _FakeModel(),
         MemorySettings(provider=Provider.OPENAI, model="m"),
         admin_openid="FAKE-OPENID-ADMIN",
+        timezone=ZoneInfo("Asia/Shanghai"),
     )
     hanging = asyncio.create_task(_forever())
     queues = summarizer._queues  # pyright: ignore[reportPrivateUsage]  一个还在写摘要的用户

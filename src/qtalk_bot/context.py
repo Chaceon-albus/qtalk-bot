@@ -25,6 +25,11 @@
 只给文字版，免得每轮都重复花 token）。原件按「当前这一轮优先、历史从新到旧」占用服务商的内联上限，放不下的
 退回文字版。连续的同一角色的消息合成一条（攒批后一轮有多条用户消息）。
 
+历史里的每条用户消息最前面加一行发送时间标记（`prompt.sent_time_mark()`：「[发送时间：2026-11-19 21:40 星期四]」，
+按配置的时区、精确到分钟，取自流水的 `created_at`，即 `HistoryEntry.sent_at`），让模型分得清上一轮是刚才还是几天前；
+这一轮的消息与助手的消息不加，取不到时间的条目也不加。标记只加在交给对话模型的请求里，流水、决策与后台调用的输入
+都不带。
+
 历史里的文字版（`media.history_text()`）在原件当时确实交给过模型时（附件表的 `given`，回答那一轮记账时按实际
 的请求记下）写清楚这一点、这里只保留描述、摘要或识别文本，免得模型以为自己从没看过、和它当时的回答自相矛盾；
 没有这个记录的照旧用当时的文字版。本轮的原件与文字版不变。
@@ -77,7 +82,14 @@ from .media import (
     image_label,
     marker,
 )
-from .prompt import Memory, ReferableImage, ReminderBrief, image_reference, system_prompt
+from .prompt import (
+    Memory,
+    ReferableImage,
+    ReminderBrief,
+    image_reference,
+    sent_time_mark,
+    system_prompt,
+)
 
 MAX_REFERABLE_IMAGES = 10
 """系统提示词里「可以引用的图片」最多列几张（从新到旧）。"""
@@ -436,15 +448,18 @@ class RequestBuilder:
             return record.text
 
         messages: list[Message] = []
-        for entry, render in (
-            *((e, history_text) for e in self._history),
-            *((e, in_current) for e in self._current),
+        for entry, render, past in (
+            *((e, history_text, True) for e in self._history),
+            *((e, in_current, False) for e in self._current),
         ):
             if entry.faces_only:
                 continue
             parts = _parts(entry, originals, render, labels)
             if not parts:
                 continue
+            if past and entry.role is Role.USER and entry.sent_at is not None:
+                # 历史里的用户消息最前面标上发送时间（这一轮的不标，助手的不标）；只进请求，流水里存的不变。
+                parts = _merge((TextPart(f"{self._sent_mark(entry.sent_at)}\n"), *parts))
             if messages and messages[-1].role is entry.role:
                 previous = messages.pop()
                 parts = _merge((*previous.parts, TextPart("\n"), *parts))
@@ -453,6 +468,7 @@ class RequestBuilder:
             system=system_prompt(
                 self._persona,
                 self._now,
+                persona_extra=model.persona_extra,
                 process=model.show_process,
                 preamble=model.provider is Provider.OPENAI and model.search,
                 memory=self._memory,
@@ -492,6 +508,10 @@ class RequestBuilder:
             given,
             {record.id: record for record, _ in referable},
         )
+
+    def _sent_mark(self, sent_at: int) -> str:
+        """历史里一条用户消息的发送时间标记，按 `now` 的时区（配置的时区）写本地时间。"""
+        return sent_time_mark(datetime.fromtimestamp(sent_at, self._now.tzinfo))
 
     async def _referable(self) -> list[tuple[AttachmentRecord, int]]:
         """这次上下文里可以引用的图片与它在哪一轮（`turns_ago`），从新到旧最多 `MAX_REFERABLE_IMAGES` 张。

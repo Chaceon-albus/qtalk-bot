@@ -1,6 +1,7 @@
 """一轮对话的核心 `Conversation`：不碰网络，模型与回复都用替身，数据库是真的。"""
 
 import asyncio
+import dataclasses
 import gc
 import json
 import logging
@@ -92,7 +93,7 @@ from qtalk_bot.media import (
 )
 from qtalk_bot.model_watch import ModelObserver, WatchedChatModel
 from qtalk_bot.process import MAX_PASSIVE_REPLIES, ReplyBudget
-from qtalk_bot.prompt import FORMAT_GUIDE
+from qtalk_bot.prompt import FORMAT_GUIDE_WITHOUT_DRAWING
 from qtalk_bot.routing import QUESTION, STEER_QUESTION, Router, SteerJudge
 from qtalk_bot.storage import DATABASE_FILENAME, Database
 
@@ -101,12 +102,19 @@ ALICE = "FAKE-OPENID-ALICE"
 BOB = "FAKE-OPENID-BOB"
 START = 1_800_000_000  # 上海时间 2027-01-15 16:00，星期五
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+SENT = "[发送时间：2027-01-15 16:00 星期五]\n"
+"""历史里每条用户消息开头的发送时间标记（时钟停在 `START` 时）。"""
 HANG_GUARD = 5  # 秒：回归时应失败而不是挂起
 
 
 def text_of(part: Part) -> str:
     assert isinstance(part, TextPart)
     return part.text
+
+
+def call_input(request: ChatRequest | DecisionRequest) -> str:
+    """一次调用交给模型的全部输入写成文字（含 repr 里隐去的字段），用来查某段文字有没有进去。"""
+    return str(dataclasses.asdict(request))
 
 
 DONE = Finished(FinishReason.COMPLETED)
@@ -462,9 +470,11 @@ def conversation(
     timeout_seconds: float = 1800,
     clock: ManualClock | None = None,
     observer: ModelObserver | None = None,
+    persona_extras: tuple[str, str] = ("", ""),
 ) -> Conversation:
     """`clock` 不为空时，模型调用的时限（以及过程消息的节流）按它计时，它也是写进流水的时间（被动回复的截止点
-    从用户消息记进流水的时刻算起）。`observer` 不为空时，模型像 `ChatModels` 给了观察者时那样包一层。"""
+    从用户消息记进流水的时刻算起）。`observer` 不为空时，模型像 `ChatModels` 给了观察者时那样包一层。
+    `persona_extras` 是主模型与备用模型各自的 `persona_extra`。"""
     chat = ChatSettings(
         persona=persona,
         history_turns=history_turns,
@@ -479,6 +489,7 @@ def conversation(
             model=primary.model,
             default=True,
             fallback=None if fallback is None else fallback.name,
+            persona_extra=persona_extras[0],
         )
     ]
 
@@ -488,7 +499,12 @@ def conversation(
     models: dict[str, ChatModel] = {primary.name: watched(primary)}
     if fallback is not None:
         settings.append(
-            ModelSettings(name=fallback.name, provider=fallback.provider, model=fallback.model)
+            ModelSettings(
+                name=fallback.name,
+                provider=fallback.provider,
+                model=fallback.model,
+                persona_extra=persona_extras[1],
+            )
         )
         models[fallback.name] = watched(fallback)
     return Conversation(
@@ -557,14 +573,16 @@ async def test_request_has_system_prompt_history_and_current_message(db: Databas
 
     request = model.requests[-1]
     assert request.system.startswith("你是测试用的人设。")
-    assert FORMAT_GUIDE in request.system
+    assert FORMAT_GUIDE_WITHOUT_DRAWING in request.system
     assert "当前时间：2027-01-15 16:00（星期五，Asia/Shanghai）" in request.system
     assert request.max_output_tokens == 777
+    # 历史里的用户消息开头标着发送时间，这一轮的不标；流水里存的仍是原文。
     assert request.messages == (
-        Message.text(Role.USER, "第一问"),
+        Message.text(Role.USER, f"{SENT}第一问"),
         Message.text(Role.ASSISTANT, "答"),
         Message.text(Role.USER, "第二问"),
     )
+    assert [row.content for row in await rows(db)] == ["第一问", "答", "第二问", "答"]
 
 
 async def test_context_has_only_this_users_last_n_turns(db: Database) -> None:
@@ -582,9 +600,20 @@ async def test_context_has_only_this_users_last_n_turns(db: Database) -> None:
     texts_seen = [
         text_of(part) for message in model.requests[-1].messages for part in message.parts
     ]
-    assert texts_seen == ["小王的第2句", "好的", "小王的第3句", "好的", "小王的第4句"]
+    assert texts_seen == [
+        f"{SENT}小王的第2句",
+        "好的",
+        f"{SENT}小王的第3句",
+        "好的",
+        "小王的第4句",
+    ]
     for request in model.requests:
-        user_texts = [text_of(p) for m in request.messages if m.role is Role.USER for p in m.parts]
+        user_texts = [
+            text_of(p).removeprefix(SENT)
+            for m in request.messages
+            if m.role is Role.USER
+            for p in m.parts
+        ]
         assert len({t[:2] for t in user_texts}) == 1  # 每次请求里只有一个人的话
 
 
@@ -659,7 +688,11 @@ async def test_same_user_is_serialized_but_different_users_run_in_parallel(db: D
     assert order.index("小王二") > order.index("小王一")
     # 第二条是在第一条的回复写入之后才开始的，所以上下文里有第一轮。
     second_request = model.requests[order.index("小王二")]
-    assert [text_of(m.parts[0]) for m in second_request.messages] == ["小王一", "好", "小王二"]
+    assert [text_of(m.parts[0]) for m in second_request.messages] == [
+        f"{SENT}小王一",
+        "好",
+        "小王二",
+    ]
 
 
 # ---- 出错与备用模型 ----
@@ -676,6 +709,27 @@ async def test_fallback_model_is_used_when_primary_fails_before_any_text(db: Dat
     assert fallback.requests == primary.requests
     assert (await rows(db))[-1] == Row("assistant", "备用的回答", "backup", "completed", "streamed")
     assert await usage(db) == [("main", None, None), ("backup", 5, 6)]
+
+
+async def test_each_model_gets_its_own_persona_extra_including_the_fallback(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    primary = ScriptedModel("main", [ModelError(Provider.OPENAI, ErrorKind.CONNECTION)])
+    fallback = ScriptedModel("backup", answer("备用的回答"))
+    chat = conversation(
+        db,
+        primary,
+        fallback,
+        persona="共用的人设。",
+        persona_extras=("主模型的补充。", "备用的补充。"),
+    )
+
+    await say(chat, alice, "你好")
+
+    (first,), (second,) = primary.requests, fallback.requests
+    assert first.system.startswith("共用的人设。\n\n主模型的补充。\n\n回复会显示在 QQ 聊天里")
+    assert second.system.startswith("共用的人设。\n\n备用的补充。\n\n回复会显示在 QQ 聊天里")
+    assert "备用的补充" not in first.system
+    assert "主模型的补充" not in second.system
 
 
 async def test_fallback_model_is_used_on_timeout(db: Database) -> None:
@@ -2170,8 +2224,10 @@ def media_chat(
     history_turns: int = 10,
     fetcher: Fetcher | None = None,
     clock: ManualClock | None = None,
+    persona_extra: str = "",
 ) -> Conversation:
-    """第一个模型是默认模型；每个模型带上它声明的 `inputs`。`clock` 不为空时用作过程消息与「正在输入」的时钟。"""
+    """第一个模型是默认模型；每个模型带上它声明的 `inputs`。`clock` 不为空时用作过程消息与「正在输入」的时钟。
+    `persona_extra` 给每个模型都配上。"""
     fallbacks = fallbacks or {}
     settings = [
         ModelSettings(
@@ -2182,6 +2238,7 @@ def media_chat(
             fallback=fallbacks.get(model.name),
             description=f"{model.name} 的描述",
             inputs=inputs,
+            persona_extra=persona_extra,
         )
         for index, (model, inputs) in enumerate(models)
     ]
@@ -2504,7 +2561,7 @@ async def test_voice_goes_as_audio_when_the_decision_picks_a_model_that_hears(
     # 历史里的语音只给识别文本，并写清楚原声当时给过。
     (later,) = deaf.requests
     assert later.messages[0] == Message.text(
-        Role.USER, "[语音。原声在当时那一轮已经给过你，这里只保留自动识别的文字：明天几点]"
+        Role.USER, f"{SENT}[语音。原声在当时那一轮已经给过你，这里只保留自动识别的文字：明天几点]"
     )
     assert decider.requests[1].media == ()  # 只有文字的一轮不带媒体
 
@@ -2624,10 +2681,73 @@ async def test_description_is_written_in_the_background_and_used_in_later_histor
     (request,) = describing.requests
     assert request.messages[0].parts[0] == ImagePart(PNG_A, "image/png")
     assert model.requests[-1].messages[0] == Message.text(
-        Role.USER, "看我家猫\n[图片：一只橘猫 趴在窗台上]"
+        Role.USER, f"{SENT}看我家猫\n[图片：一只橘猫 趴在窗台上]"
     )
     assert ("describe", "describe", 70, 9) in await usage_by_purpose(db)
     assert ("describe", 50) in await cached_by_purpose(db)
+
+
+async def test_a_description_of_exactly_200_characters_is_kept_whole(
+    db: Database, tmp_path: Path
+) -> None:
+    # 提示词允许写到 200 字：落库的描述与之后历史里的文字版都是完整的 200 字，不被截断。
+    full = "字" * 199 + "尾"
+    describing = ScriptedModel("describe", answer(full))
+    describer = describer_of(db, tmp_path, describing)
+    model = ScriptedModel("main", answer("好"))
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({IMAGE_URL: PNG_A}),
+        (model, BLIND),
+        describer=describer,
+        image_turns=0,
+    )
+
+    await send(chat, alice := await invited(db, ALICE, "小王"), "看这张截图", image_attachment())
+    await describer.wait_idle()
+    await send(chat, alice, "上面写了什么")
+
+    (description,) = [
+        row["description"] for row in await db.fetch_all("SELECT description FROM attachments")
+    ]
+    assert description == full
+    assert len(description) == 200
+    assert model.requests[-1].messages[0] == Message.text(
+        Role.USER, f"{SENT}看这张截图\n[图片：{full}]"
+    )
+
+
+async def test_background_describe_and_decision_never_carry_the_persona_extra(
+    db: Database, tmp_path: Path
+) -> None:
+    # persona_extra 只给对话模型：图片描述与选模型的决策的输入里都没有它。
+    extra = "只给对话模型的补充-9c1e"
+    alice = await invited(db, ALICE, "小王")
+    describing = ScriptedModel("describe", answer("一只橘猫"))
+    describer = describer_of(db, tmp_path, describing)
+    solve, support = ScriptedModel("solve", answer("好")), ScriptedModel("support", answer("好"))
+    decider = FakeDecider(chances(solve=0.9, support=0.1))
+    chat = media_chat(
+        db,
+        tmp_path,
+        FakeDownloader({IMAGE_URL: PNG_A}),
+        (solve, BLIND),
+        (support, BLIND),
+        describer=describer,
+        decider=decider,
+        persona_extra=extra,
+    )
+
+    await send(chat, alice, "看我家猫", image_attachment())
+    await describer.wait_idle()
+
+    assert solve.requests
+    assert all(extra in request.system for request in solve.requests)
+    assert decider.requests
+    assert describing.requests
+    background = [*decider.requests, *describing.requests]
+    assert [request for request in background if extra in call_input(request)] == []
 
 
 async def test_failed_description_does_not_affect_the_reply(db: Database, tmp_path: Path) -> None:
@@ -2802,7 +2922,7 @@ async def test_pdf_summary_is_written_in_the_background_and_used_in_later_histor
     assert FilePart(SUMMARY_PDF, "application/pdf") in first.messages[0].parts
     assert later.messages[0] == Message.text(
         Role.USER,
-        f"总结一下\n[PDF 文件：{SUMMARY_LABEL}。原文在当时那一轮已经给过你，这里只保留摘要："
+        f"{SENT}总结一下\n[PDF 文件：{SUMMARY_LABEL}。原文在当时那一轮已经给过你，这里只保留摘要："
         f"{SUMMARY}]",
     )
     assert ("describe", "describe", 36212, 80) in await usage_by_purpose(db)
@@ -2828,7 +2948,7 @@ async def test_without_a_summary_history_says_to_ask_again(db: Database, tmp_pat
     ]
     assert reader.requests[-1].messages[0] == Message.text(
         Role.USER,
-        f"总结一下\n[PDF 文件：{SUMMARY_LABEL}。原文在当时那一轮已经给过你，这里只保留这条说明，"
+        f"{SENT}总结一下\n[PDF 文件：{SUMMARY_LABEL}。原文在当时那一轮已经给过你，这里只保留这条说明，"
         "细节记不清时如实告诉用户、请对方重新发送]",
     )
     assert ("describe", "describe", None, None) in await usage_by_purpose(db)
@@ -2916,7 +3036,7 @@ async def test_original_given_to_the_chosen_model_is_recorded(db: Database, tmp_
 
     assert await given_flags(db) == [1]
     assert model.requests[-1].messages[0] == Message.text(
-        Role.USER, f"这是什么\n[图片。原图在当时那一轮已经给过你，{GIVEN_NOTE}]"
+        Role.USER, f"{SENT}这是什么\n[图片。原图在当时那一轮已经给过你，{GIVEN_NOTE}]"
     )
 
 
@@ -2939,7 +3059,7 @@ async def test_attachment_left_out_for_the_budget_is_not_claimed_as_given(
     # Gemini 的 19 MiB 只放得下一张：第二张当时给的是文字版。
     assert await given_flags(db) == [1, 0]
     assert model.requests[-1].messages[0] == Message.text(
-        Role.USER, f"看看\n[图片。原图在当时那一轮已经给过你，{GIVEN_NOTE}]\n[图片]"
+        Role.USER, f"{SENT}看看\n[图片。原图在当时那一轮已经给过你，{GIVEN_NOTE}]\n[图片]"
     )
 
 
@@ -2965,7 +3085,7 @@ async def test_after_switching_to_a_fallback_its_request_decides_what_was_given(
     assert channel.streamed == "八点"
     assert hearing.requests[0].messages[-1].parts[-1] == AudioPart(WAV_BYTES, "audio/wav")
     assert await given_flags(db) == [0]
-    assert deaf.requests[-1].messages[0] == Message.text(Role.USER, "[语音] 明天几点")
+    assert deaf.requests[-1].messages[0] == Message.text(Role.USER, f"{SENT}[语音] 明天几点")
 
 
 async def test_cancelled_turn_with_nothing_delivered_is_not_claimed_as_given(
@@ -3011,7 +3131,7 @@ async def test_answer_delivered_before_cancellation_keeps_the_given_record(
     restarted = media_chat(db, tmp_path, FakeDownloader({}), (later, SEES), image_turns=0)
     await send(restarted, alice, "然后呢")
     assert later.requests[0].messages[0] == Message.text(
-        Role.USER, f"这是什么\n[图片。原图在当时那一轮已经给过你，{GIVEN_NOTE}]"
+        Role.USER, f"{SENT}这是什么\n[图片。原图在当时那一轮已经给过你，{GIVEN_NOTE}]"
     )
 
 
@@ -3764,7 +3884,13 @@ async def reply_targets(db: Database) -> list[tuple[int, int]]:
 
 
 def user_texts(request: ChatRequest) -> list[str]:
-    return [text_of(p) for m in request.messages if m.role is Role.USER for p in m.parts]
+    """请求里用户消息的文字，去掉历史里开头的发送时间标记（标记本身另有测试）。"""
+    return [
+        text_of(p).removeprefix(SENT)
+        for m in request.messages
+        if m.role is Role.USER
+        for p in m.parts
+    ]
 
 
 async def test_message_received_while_a_turn_is_generating_stays_pending_for_the_next(
@@ -3796,7 +3922,7 @@ async def test_message_received_while_a_turn_is_generating_stays_pending_for_the
 
     assert channel.streamed == "答二"
     assert model.requests[-1].messages == (
-        Message.text(Role.USER, "问一"),
+        Message.text(Role.USER, f"{SENT}问一"),
         Message.text(Role.ASSISTANT, "答一"),
         Message.text(Role.USER, "问二"),
     )
@@ -3851,7 +3977,7 @@ async def test_messages_after_the_answer_began_showing_are_the_next_turn(db: Dat
     await finish(batcher)
 
     assert model.requests[1].messages == (
-        Message.text(Role.USER, "一"),
+        Message.text(Role.USER, f"{SENT}一"),
         Message.text(Role.ASSISTANT, "答"),
         Message.text(Role.USER, "二\n三"),
     )
@@ -4481,7 +4607,7 @@ async def test_supplement_while_showing_stops_the_answer_and_answers_the_message
     assert second.kinds == ["typing", "stream", "finish"]
     assert second.streamed == "用 Python 的写法"
     assert model.requests[1].messages == (
-        Message.text(Role.USER, "讲讲快排"),
+        Message.text(Role.USER, f"{SENT}讲讲快排"),
         Message.text(Role.ASSISTANT, "第一段"),
         Message.text(Role.USER, "用 Python"),
     )
