@@ -1443,18 +1443,28 @@ def test_prompts_do_not_ask_the_model_to_explain_buttons() -> None:
     ):
         assert "分钟内有效" not in text
         assert "没看到按钮的话再说一次" not in text
+    # 「只给卡片、不写回答」只写在系统提示词的「需要确认的操作」一处，函数的说明不再重复。
+    from qtalk_bot.prompt import confirm_guide
+
+    for text in (
+        confirm_guide(topics=True, reminders=True),
+        confirm_guide(topics=True, reminders=False),
+        confirm_guide(topics=False, reminders=True),
+        forget_result,
+    ):
+        assert "不要再写任何回答文字" in text  # 忘掉话题也统一成「只给卡片」
+        assert "一句话简短说明" not in text
     for text in (
         REMINDER_GUIDE,
         SET_REMINDER.description,
         CANCEL_REMINDER.description,
         LIST_REMINDERS.description,
         FORGET_TOPIC.description,
-        forget_result,
     ):
-        assert "不要再写任何回答文字" in text  # 忘掉话题也统一成「只给卡片」
+        assert "不要再写任何回答文字" not in text
         assert "一句话简短说明" not in text
     assert "1. #12" not in LIST_REMINDERS.description
-    assert "不要写给用户" in CANCEL_REMINDER.description
+    assert "不要写给用户" in REMINDER_GUIDE
 
 
 # ---- 第九次实测后：只发卡片、不写回答 ----
@@ -1890,11 +1900,13 @@ async def test_forget_topic_also_sends_only_the_card(db: Database, tmp_path: Pat
 
 def test_prompts_after_the_users_decisions() -> None:
     from qtalk_bot.memory_tools import FORGET_TOPIC, buttons_coming
-    from qtalk_bot.prompt import MEMORY_GUIDE, MEMORY_GUIDE_WITHOUT_PROFILE
+    from qtalk_bot.prompt import MEMORY_GUIDE, MEMORY_GUIDE_WITHOUT_PROFILE, confirm_guide
 
+    confirming = confirm_guide(topics=True, reminders=True)
     everything = "\n".join(
         (
             REMINDER_GUIDE,
+            confirming,
             SET_REMINDER.description,
             LIST_REMINDERS.description,
             CANCEL_REMINDER.description,
@@ -1907,12 +1919,15 @@ def test_prompts_after_the_users_decisions() -> None:
         assert gone not in everything
     assert "修改提醒：调用 set_reminder 并把 replaces 填成旧提醒的编号" in REMINDER_GUIDE
     assert "replaces" in SET_REMINDER.description
-    # 方括号说明覆盖修改、忘掉话题与列表。
+    # 方括号说明覆盖修改、忘掉话题与列表，写在「需要确认的操作」里；只分话题时那一段同样讲忘掉话题的卡片。
     for note in ("[发了修改提醒的确认卡片：", "[发了忘掉话题的确认卡片：", "[发了提醒列表："):
-        assert note in REMINDER_GUIDE
+        assert note in confirming
+    topics_only = confirm_guide(topics=True, reminders=False)
+    assert "[发了忘掉话题的确认卡片：……]" in topics_only
+    assert "不要再写任何回答文字" in topics_only
     for guide in (MEMORY_GUIDE, MEMORY_GUIDE_WITHOUT_PROFILE):
-        assert "[发了忘掉话题的确认卡片：……]" in guide
-        assert "不要再写任何回答文字" in guide
+        assert "规则见下面的「需要确认的操作」" in guide
+        assert "不要再写任何回答文字" not in guide
     assert "直接发出" in LIST_REMINDERS.description
 
 
@@ -2072,7 +2087,7 @@ async def test_replacing_with_the_remaining_count_keeps_it(db: Database, tmp_pat
     )
     block = json.loads(system_of(model.requests[-1]).split("提醒资料：\n", 1)[1].split("\n", 1)[0])
     assert block["reminders"][0]["remaining"] == 2
-    assert "count 填还剩的次数" in str(SET_REMINDER.parameters)
+    assert "count 填提醒资料里的 remaining" in str(SET_REMINDER.parameters)
 
     reply = await press(chat, ALICE, buttons(channel)[0])
 
@@ -2104,11 +2119,11 @@ async def test_pressing_again_follows_what_was_actually_cancelled(
 
 def test_prompts_after_the_second_review() -> None:
     from qtalk_bot.memory_tools import buttons_coming
-    from qtalk_bot.prompt import MEMORY_GUIDE, MEMORY_GUIDE_WITHOUT_PROFILE
+    from qtalk_bot.prompt import confirm_guide
 
-    assert "只有调用成功时才这样做" in REMINDER_GUIDE
-    for guide in (MEMORY_GUIDE, MEMORY_GUIDE_WITHOUT_PROFILE):
-        assert "调用没成功时照常用文字告诉用户" in guide
+    # 调用没成功时照常用文字回答：三种开关组合下的「需要确认的操作」都写着。
+    for topics, reminders in ((True, True), (True, False), (False, True)):
+        assert "只有调用成功时才这样做" in confirm_guide(topics=topics, reminders=reminders)
     assert "不要只发列表" in REMINDER_NOTICE
     assert "设置或修改的那条" in REMINDER_NOTICE
     assert "remaining" in REMINDER_NOTICE
@@ -2116,7 +2131,8 @@ def test_prompts_after_the_second_review() -> None:
     assert "要等用户点完这次的按钮" not in note
     for text in (CANCEL_REMINDER.description, text_parts(cancel_pending_result())):
         assert "确认消息" not in text
-        assert "确认卡片" in text
+    assert "确认卡片" in text_parts(cancel_pending_result())
+    assert "确认按钮" in CANCEL_REMINDER.description
 
 
 def cancel_pending_result() -> FunctionResult:

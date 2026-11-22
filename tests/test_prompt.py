@@ -26,6 +26,7 @@ from qtalk_bot.prompt import (
     ReferableImage,
     ReminderBrief,
     ReminderEntry,
+    confirm_guide,
     format_guide,
     memory_data,
     sent_time_mark,
@@ -230,6 +231,7 @@ def test_fixed_guides_come_before_the_changing_data() -> None:
         TOPIC_GUIDE,
         MEMORY_GUIDE,
         REMINDER_GUIDE,
+        confirm_guide(topics=True, reminders=True),
         REFERABLE_GUIDE,
         "#9：用户发的，上一轮，描述：一只猫",
         PROFILE_NOTICE,
@@ -248,8 +250,19 @@ def test_fixed_guides_come_before_the_changing_data() -> None:
     assert drawing.endswith("当前时间：2027-01-15 16:00（星期五，Asia/Shanghai）。")
     # 不能画图时那一段在过程的说明之后、记忆的说明之前。
     plain = full_prompt(images=None, summary="摘要甲", reminder="吃药")
-    assert in_order(plain, PREAMBLE_GUIDE, NO_DRAWING, TOPIC_GUIDE, MEMORY_GUIDE, REMINDER_GUIDE)
+    assert in_order(
+        plain,
+        PREAMBLE_GUIDE,
+        NO_DRAWING,
+        TOPIC_GUIDE,
+        MEMORY_GUIDE,
+        REMINDER_GUIDE,
+        confirm_guide(topics=True, reminders=True),
+        PROFILE_NOTICE,
+    )
     assert REFERABLE_GUIDE not in plain
+    # 「需要确认的操作」紧接在 REMINDER_GUIDE 之后。
+    assert f"{REMINDER_GUIDE}\n\n{confirm_guide(topics=True, reminders=True)}\n\n" in drawing
 
 
 def test_notices_stay_right_before_their_data() -> None:
@@ -294,11 +307,16 @@ def test_only_the_changing_data_differs_after_the_fixed_prefix() -> None:
     second = full_prompt(images=image_of("一条狗"), summary="摘要乙", reminder="开会", now=later)
     end_of_reminder_guide = first.index(REMINDER_GUIDE) + len(REMINDER_GUIDE)
     assert common_prefix(first, second) >= end_of_reminder_guide
+    # 「需要确认的操作」也是固定的说明，前缀覆盖到它的末尾。
+    both = confirm_guide(topics=True, reminders=True)
+    assert common_prefix(first, second) >= first.index(both) + len(both)
 
-    # 只分话题、没有提醒时，覆盖到 MEMORY_GUIDE 的末尾。
+    # 只分话题、没有提醒时，覆盖到 MEMORY_GUIDE 与只讲忘掉话题的「需要确认的操作」的末尾。
     def topics_only(summary: str, now: datetime) -> str:
         return system_prompt("人设", now, memory=memory_of(summary), images=image_of(summary))
 
     one, two = topics_only("摘要甲", NOW), topics_only("摘要乙", later)
     end_of_memory_guide = one.index(MEMORY_GUIDE) + len(MEMORY_GUIDE)
     assert common_prefix(one, two) >= end_of_memory_guide
+    forget_only = confirm_guide(topics=True, reminders=False)
+    assert common_prefix(one, two) >= one.index(forget_only) + len(forget_only)
