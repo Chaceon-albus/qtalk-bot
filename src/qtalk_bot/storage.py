@@ -737,6 +737,65 @@ ALTER TABLE reminder_user_state ADD COLUMN pause_ended INTEGER CHECK (pause_ende
 """
 
 
+_V19_SENDS = """
+-- 发送记录（里程碑 11，见 sends.py）：一轮里每条被动回复一行（过程消息、回答的每一条、改发的纯文本、固定说明、
+-- 提醒列表、确认卡片、生成的图），挂在这一轮的回复行上，seq 是在这一轮（含被插话重来的几次）里的顺序。content
+-- 是用户实际看到的正文（流式消息是确认送达的各片连起来），图片没有正文；status 是这条消息自己的结局。只用于按引用
+-- 定位（用户引用这一轮的任何一条气泡都能找到回复与话题）与排查，不进模型的上下文。随回复行删掉：忘掉话题时删用户
+-- 消息，经 reply_to 级联删回复，再级联删这里。主键以 reply_id 开头，删回复时外键要查的就是它。
+CREATE TABLE sends (
+    reply_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL CHECK (seq >= 0),
+    user_id INTEGER NOT NULL REFERENCES users (id),
+    kind TEXT NOT NULL
+        CHECK (kind IN ('process', 'answer', 'plain', 'notice', 'listing', 'card', 'image')),
+    status TEXT NOT NULL
+        CHECK (status IN ('delivered', 'partial', 'unclosed', 'uncertain', 'rejected')),
+    content TEXT,
+    ref_idx TEXT CHECK (ref_idx IS NULL OR length(ref_idx) BETWEEN 1 AND 512),
+    PRIMARY KEY (reply_id, seq),
+    CHECK ((kind = 'image') = (content IS NULL))
+) STRICT;
+-- 按引用定位只在这个用户自己的行里按引用索引找；不做成部分索引，它同时是 user_id 外键要查的索引。
+CREATE INDEX sends_by_user_ref ON sends (user_id, ref_idx);
+-- 旧的回复只记了一个引用索引，搬过来作为这一轮的第 0 条。旧的 delivery 说的是整条回复，不一定是这个索引所指的那条
+-- 气泡，所以从严推断，拿不准的一律记说不准：
+-- - 回复挂着生成的图（attachments 里有行，或 delivery 是 images）：索引可能是图的，也可能是回答的，记 uncertain；正文为空
+--   或 delivery 是 images 时种类记 image，否则记 answer。
+-- - 否则 streamed、interrupted 记 answer delivered，plain 记 plain delivered；其余都记 answer uncertain。
+-- 正文照搬回复行的 content（图片没有正文）。
+INSERT INTO sends (reply_id, seq, user_id, kind, status, content, ref_idx)
+SELECT id, 0, user_id, kind,
+    CASE
+        WHEN imaged THEN 'uncertain'
+        WHEN delivery IN ('streamed', 'interrupted', 'plain') THEN 'delivered'
+        ELSE 'uncertain'
+    END,
+    CASE WHEN kind = 'image' THEN NULL ELSE content END,
+    msg_idx
+FROM (
+    SELECT id, user_id, content, delivery, msg_idx, imaged,
+        CASE
+            WHEN imaged AND (content = '' OR delivery = 'images') THEN 'image'
+            WHEN NOT imaged AND delivery = 'plain' THEN 'plain'
+            ELSE 'answer'
+        END AS kind
+    FROM (
+        SELECT m.id, m.user_id, m.content, m.delivery, m.msg_idx,
+            (m.delivery = 'images' OR EXISTS (
+                SELECT 1 FROM attachments AS a
+                WHERE a.message_id = m.id AND a.user_id = m.user_id
+            )) AS imaged
+        FROM messages AS m
+        WHERE m.role = 'assistant' AND m.msg_idx IS NOT NULL
+            AND length(m.msg_idx) BETWEEN 1 AND 512
+    )
+);
+-- 回复的引用索引从此只在 sends 里；messages.msg_idx 只是用户消息的。
+UPDATE messages SET msg_idx = NULL WHERE role = 'assistant';
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     _V1_ACCESS,
     _V2_CHAT,
@@ -756,6 +815,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     _v16_media_dirs,
     _V17_REMINDERS,
     _V18_REMINDER_STATE,
+    _V19_SENDS,
 )
 """本程序的迁移列表。业务表由各里程碑在末尾追加，已发布的不能修改。"""
 

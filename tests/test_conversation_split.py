@@ -23,9 +23,9 @@ from tests.test_conversation import (
     invited,
     message,
     reject_if,
-    reply_indices,
     rows,
     say,
+    send_rows,
     sources_of,
     steering,
     uncertain_if,
@@ -249,7 +249,8 @@ async def test_failed_closing_chunk_between_streams_does_not_lose_the_rest(db: D
     assert (await rows(db))[-1] == Row("assistant", text, "main", "completed", "unclosed")
 
 
-async def test_reply_index_is_the_one_of_the_first_stream(db: Database) -> None:
+async def test_each_part_is_a_send_record_with_its_own_index(db: Database) -> None:
+    # 分条后每条一行发送记录：正文是那一条用户实际看到的（含补上与重开的围栏），引用索引是它自己的。
     alice = await invited(db, ALICE, "小王")
     pieces = paragraphs(30)
     channel = FakeChannel(stream_ref="REFIDX_first")
@@ -261,8 +262,14 @@ async def test_reply_index_is_the_one_of_the_first_stream(db: Database) -> None:
 
     await say(conversation(db, ScriptedModel("main", script(pieces))), alice, "长文", channel)
 
-    assert len(bubbles(channel)) == 2
-    assert await reply_indices(db) == ["REFIDX_first"]
+    parts = bubbles(channel)
+    assert len(parts) == 2
+    records = await send_rows(db)
+    assert [(r.kind, r.status, r.ref_idx) for r in records] == [
+        ("answer", "delivered", "REFIDX_first"),
+        ("answer", "delivered", "REFIDX_second"),
+    ]
+    assert [r.content for r in records] == parts
 
 
 # ---- 回答的第一片等过程消息结束 ----

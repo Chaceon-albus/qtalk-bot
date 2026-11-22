@@ -26,10 +26,12 @@ from tests.test_conversation import (
     FakeChannel,
     FakeDownloader,
     Row,
+    Sent,
     invited,
     never,
     reject_if,
     rows,
+    send_rows,
     usage,
 )
 
@@ -805,6 +807,11 @@ async def test_sending_the_image_fails(db: Database, tmp_path: Path, uncertain: 
     # 明确被拒的图没发出去，不记；说不准的可能已经送达，记下。
     assert len(await drawn_rows(db)) == (1 if uncertain else 0)
     assert channel.streamed == "图好像没发出去"
+    assert await send_rows(db) == [
+        Sent("process", "delivered", "正在绘制🎨"),
+        Sent("image", "uncertain" if uncertain else "rejected", None),
+        Sent("answer", "delivered", "图好像没发出去"),
+    ]
 
 
 # ---- 一轮的收尾 ----
@@ -818,11 +825,17 @@ async def test_only_an_image_and_no_text_still_answers_the_turn(
     generator = FakeGenerator()
     chat = drawing_chat(db, MediaStore.under(tmp_path), model, generator)
 
-    channel = await say(chat, alice, "画只猫")
+    channel = FakeChannel()
+    channel.image_ref = "REFIDX_image"
+    await say(chat, alice, "画只猫", channel)
 
     assert channel.images == [picture(1)]
     assert texts.MODEL_FAILED not in channel.sent
     assert (await rows(db))[-1] == Row("assistant", "", "main", "empty", "images")
+    assert await send_rows(db) == [
+        Sent("process", "delivered", "正在绘制🎨"),
+        Sent("image", "delivered", None, "REFIDX_image"),
+    ]
     ((attachment_id, *_),) = await drawn_rows(db)
 
     await say(chat, alice, "把刚才那张改一下")
@@ -1110,6 +1123,9 @@ async def test_cancelled_while_the_image_reply_is_in_flight_counts_as_maybe_sent
 
     assert len(await drawn_rows(db)) == 1  # 平台可能已经接受了：记下
     assert (await rows(db))[-1].delivery == "cancelled"
+    assert [r for r in await send_rows(db) if r.kind == "image"] == [
+        Sent("image", "uncertain", None)
+    ]
 
 
 async def test_total_timeout_while_the_image_reply_is_in_flight_does_not_redraw(

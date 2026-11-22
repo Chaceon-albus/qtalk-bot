@@ -95,6 +95,9 @@ async def test_notice_comes_before_typing_and_the_answer(db: Database) -> None:
     assert "爱丽丝的提醒" in notice
     assert "鲍勃" not in notice
     assert channel.budget.replies == 2  # 通知与回答各算一次
+    # 失败通知不属于这一轮的回复，不记发送记录；回答照常记。
+    kinds = await db.fetch_all("SELECT kind FROM sends")
+    assert [row["kind"] for row in kinds] == ["answer"]
     assert await db.transaction(pending_failures, alice.id) == []
     assert len(await db.transaction(pending_failures, bob.id)) == 1
     # 下一轮不再发。

@@ -1114,6 +1114,12 @@ async def test_process_is_a_separate_stream_that_is_kept(db: Database) -> None:
     assert tuple(row) == ("你好，我是助手。", "[搜索] 上海天气")
 
 
+async def sent_refs(db: Database) -> list[tuple[str, str, str | None]]:
+    """全部发送记录的（种类、结局、引用索引），按回复与顺序。"""
+    rows = await db.fetch_all("SELECT kind, status, ref_idx FROM sends ORDER BY reply_id, seq")
+    return [(row["kind"], row["status"], row["ref_idx"]) for row in rows]
+
+
 @pytest.mark.parametrize("ref_at", [0, 1, 2])  # 第一片、中间一片、只有结束分片带
 async def test_streamed_answer_records_the_reference_index_of_the_stream(
     db: Database, ref_at: int
@@ -1125,14 +1131,15 @@ async def test_streamed_answer_records_the_reference_index_of_the_stream(
     await run_until_handled(platform, db, chat, events=1, sent=0, until=lambda: chat.handled == 1)
 
     assert len(platform.streamed) == 3  # 两片正文（模型的两段增量）加结束分片
-    row = await db.fetch_one("SELECT delivery, msg_idx FROM messages WHERE role = 'assistant'")
+    row = await db.fetch_one("SELECT delivery FROM messages WHERE role = 'assistant'")
     assert row is not None
-    assert tuple(row) == ("streamed", "REFIDX_stream")
+    assert row[0] == "streamed"
+    assert await sent_refs(db) == [("answer", "delivered", "REFIDX_stream")]
 
 
 async def test_long_answer_opens_another_stream_after_finishing_the_first(db: Database) -> None:
     # 回答分条：finish 之后再 stream() 对同一条消息另开一条流式消息（msg_seq 递增），先结束前一条再开下一条；
-    # 回复行存第一条的引用索引。
+    # 两条各记一行发送记录，各带自己的引用索引。
     await welcomed_alice(db)
     pieces = [f"段落{i}：" + "字" * 190 + "\n\n" for i in range(30)]
     events: list[ChatEvent] = [TextDelta(piece) for piece in pieces]
@@ -1150,9 +1157,13 @@ async def test_long_answer_opens_another_stream_after_finishing_the_first(db: Da
         assert chunks[-1]["input_state"] == 10  # 每条都有结束分片
         assert [chunk["input_state"] for chunk in chunks[:-1]] == [1] * (len(chunks) - 1)
     assert "".join(chunk["content_raw"] for chunk in platform.streamed) == "".join(pieces)
-    row = await db.fetch_one("SELECT delivery, msg_idx FROM messages WHERE role = 'assistant'")
+    row = await db.fetch_one("SELECT delivery FROM messages WHERE role = 'assistant'")
     assert row is not None
-    assert tuple(row) == ("streamed", "REFIDX_stream-2")
+    assert row[0] == "streamed"
+    assert await sent_refs(db) == [
+        ("answer", "delivered", "REFIDX_stream-2"),
+        ("answer", "delivered", "REFIDX_stream-3"),
+    ]
 
 
 class _FakeStream:
@@ -1213,6 +1224,56 @@ async def test_reply_channel_starts_a_new_stream_even_if_the_finish_failed() -> 
         await channel.finish_stream()
     assert await channel.stream("二") == "REF2"
     assert [stream.chunks for stream in message.streams] == [["一"], ["二"]]
+
+
+class _FakeMarkdownMessage:
+    """回复 Markdown（可带键盘）的替身：发送结果的 `ext_info.ref_idx` 依次取 `refs`（`None` 表示没有 `ext_info`）。"""
+
+    def __init__(self, *refs: str | None) -> None:
+        self.refs = list(refs)
+        self.replies: list[tuple[str | None, bool]] = []
+
+    async def reply(
+        self,
+        content: str | None = None,
+        *,
+        markdown: str | None = None,
+        keyboard: object = None,
+    ) -> object:
+        assert content is None
+        self.replies.append((markdown, keyboard is not None))
+        ref = self.refs.pop(0)
+        if ref is None:
+            return types.SimpleNamespace(ext_info=None)
+        return types.SimpleNamespace(ext_info=types.SimpleNamespace(ref_idx=ref))
+
+
+async def test_reply_channel_returns_the_index_of_markdown_and_button_messages() -> None:
+    message = _FakeMarkdownMessage("REFIDX_list", "REFIDX_card", None, "x" * 513)
+    channel = bot_module._QQReplyChannel(cast(pyqbot.C2CMessage, message))  # pyright: ignore[reportPrivateUsage]  测接线层的通道本身
+    buttons = [ChoiceButton("确认", "forget:yes:t", "已确认")]
+
+    assert await channel.send_markdown("列表") == "REFIDX_list"
+    assert await channel.send_buttons("卡片", buttons) == "REFIDX_card"
+    assert await channel.send_markdown("没有扩展信息") is None
+    assert await channel.send_buttons("太长", buttons) is None  # 超过 512 个字符的当作没有
+
+    assert message.replies == [
+        ("列表", False),
+        ("卡片", True),
+        ("没有扩展信息", False),
+        ("太长", True),
+    ]
+
+
+async def test_process_stream_returns_its_reference_index() -> None:
+    message = _FakeStreamingMessage()
+    process = bot_module._QQProcessStream(cast(pyqbot.C2CMessage, message))  # pyright: ignore[reportPrivateUsage]  测接线层的过程消息本身
+
+    assert await process.finish() is None  # 没开过
+    assert await process.append("正在搜索🔍") == "REF1"
+    assert await process.finish() == "REF1"
+    assert message.coalesce == [False]
 
 
 class _FakeImageMessage:
@@ -2262,9 +2323,7 @@ async def test_reply_without_a_reference_index_leaves_it_empty(db: Database) -> 
 
     await run_until_handled(platform, db, chat, events=1, sent=0, until=lambda: chat.handled == 1)
 
-    row = await db.fetch_one("SELECT msg_idx FROM messages WHERE role = 'assistant'")
-    assert row is not None
-    assert row[0] is None
+    assert await sent_refs(db) == [("answer", "delivered", None)]
 
 
 async def test_rejected_stream_is_resent_as_plain_message(db: Database) -> None:
@@ -2281,12 +2340,14 @@ async def test_rejected_stream_is_resent_as_plain_message(db: Database) -> None:
     assert platform.streamed == []
     plain = [m for m in platform.sent if m["msg_type"] == 0]
     assert [(m["content"], m["msg_seq"]) for m in plain] == [("你好，我是助手。", 3)]
-    row = await db.fetch_one(
-        "SELECT content, delivery, msg_idx FROM messages WHERE role = 'assistant'"
-    )
+    row = await db.fetch_one("SELECT content, delivery FROM messages WHERE role = 'assistant'")
     assert row is not None
-    # 引用索引取改发的那条纯文本（之前一条是「正在输入」）。
-    assert tuple(row) == ("你好，我是助手。", "plain", "REFIDX_sent-2")
+    assert tuple(row) == ("你好，我是助手。", "plain")
+    # 被拒的流式消息与改发的纯文本各记一行；纯文本的引用索引是它自己的（之前一条是「正在输入」）。
+    assert await sent_refs(db) == [
+        ("answer", "rejected", None),
+        ("plain", "delivered", "REFIDX_sent-2"),
+    ]
 
 
 async def test_stream_failing_with_a_server_error_is_not_resent(db: Database) -> None:

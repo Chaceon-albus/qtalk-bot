@@ -730,13 +730,13 @@ class _RoutedChannel:
         # 收消息时不发图；为了符合协议照样转发，计数与发送落在同一个通道上（同 `send()`）。
         return await self._target().send_image(data, mime_type, replying)
 
-    async def send_markdown(self, markdown: str) -> None:
+    async def send_markdown(self, markdown: str) -> str | None:
         # 收消息时不发列表；为了符合协议照样转发（同 `send_image()`）。
-        await self._target().send_markdown(markdown)
+        return await self._target().send_markdown(markdown)
 
-    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> None:
+    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> str | None:
         # 收消息时不发按钮；为了符合协议照样转发（同 `send_image()`）。
-        await self._target().send_buttons(markdown, buttons)
+        return await self._target().send_buttons(markdown, buttons)
 
     async def upload_image(self, data: bytes, mime_type: str) -> LibraryImage:
         raise AssertionError("收消息时不用素材库")

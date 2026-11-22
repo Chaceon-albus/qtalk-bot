@@ -973,10 +973,153 @@ async def test_version_18_adds_pause_and_switch_columns(db_path: Path) -> None:
             (user.id,),
         )
 
-    async with await Database.open(db_path) as db:
+    async with await Database.open(db_path, migrations=MIGRATIONS[:18]) as db:
         assert await db.fetch_all("PRAGMA foreign_key_check") == []
         state = await db.transaction(get_user_state, user.id)
 
-    assert user_version(db_path) == len(MIGRATIONS) == 18
+    assert user_version(db_path) == 18
     assert (state.push, state.push_updated_at, state.push_event_at) == (PushState.OFF, 5, None)
     assert (state.paused_since, state.pause_started, state.pause_ended) == (None, None, None)
+
+
+def _v18_reply(
+    conn: sqlite3.Connection,
+    user_id: int,
+    content: str,
+    delivery: str,
+    msg_idx: str | None,
+    *,
+    image: bool = False,
+) -> int:
+    """在第 18 版的库里写一轮：用户消息加回复，回复行上带 `msg_idx`（那时回复的引用索引存在这里）；`image` 为真时
+    回复挂着一张生成的图。"""
+    count = conn.execute("SELECT count(*) FROM messages").fetchone()[0]
+    question = conn.execute(
+        "INSERT INTO messages (user_id, role, content, qq_message_id, created_at, msg_idx)"
+        " VALUES (?, 'user', '问', ?, 0, ?) RETURNING id",
+        (user_id, f"qq-{count}", f"REFIDX_user_{count}"),
+    ).fetchone()[0]
+    reply = conn.execute(
+        "INSERT INTO messages (user_id, role, content, reply_to, model, finish, delivery,"
+        " created_at, msg_idx) VALUES (?, 'assistant', ?, ?, 'main', 'completed', ?, 0, ?)"
+        " RETURNING id",
+        (user_id, content, question, delivery, msg_idx),
+    ).fetchone()[0]
+    if image:
+        conn.execute(
+            "INSERT INTO attachments (user_id, message_id, position, quoted, kind, status,"
+            " mime_type, size, path, text, created_at)"
+            " VALUES (?, ?, 0, 0, 'image', 'stored', 'image/png', 4, ?, '[图片]', 0)",
+            (user_id, reply, f"drawn-{reply}.png"),
+        )
+    return reply
+
+
+async def test_version_19_moves_reply_indices_into_send_records(db_path: Path) -> None:
+    from qtalk_bot import access
+
+    async with await Database.open(db_path, migrations=MIGRATIONS[:18]) as old:
+        user = await old.transaction(access.ensure_user, "FAKE-OPENID-A", "小王", 0)
+
+        def write(conn: sqlite3.Connection) -> list[int]:
+            uid = user.id
+            return [
+                # 挂着生成的图：索引的来源拿不准，一律说不准。
+                _v18_reply(conn, uid, "", "images", "REFIDX_images"),
+                _v18_reply(conn, uid, "", "failed", "REFIDX_failed_image", image=True),
+                _v18_reply(conn, uid, "看图", "streamed", "REFIDX_text_image", image=True),
+                # 没有图：流式送达与改发纯文本记送达。
+                _v18_reply(conn, uid, "流式", "streamed", "REFIDX_streamed"),
+                _v18_reply(conn, uid, "停下", "interrupted", "REFIDX_interrupted"),
+                _v18_reply(conn, uid, "纯文本", "plain", "REFIDX_plain"),
+                # 其余都说不准，正文照搬（方括号说明也不特别处理）。
+                _v18_reply(conn, uid, "半截", "rejected", "REFIDX_half"),
+                _v18_reply(conn, uid, "[发了提醒列表：1 条提醒]", "card", "REFIDX_card"),
+                # 不搬：没有索引、索引太长。
+                _v18_reply(conn, uid, "没有索引", "streamed", None),
+                _v18_reply(conn, uid, "太长", "streamed", "x" * 513),
+            ]
+
+        replies = await old.transaction(write)
+    before = _schema(db_path)
+
+    async with await Database.open(db_path) as db:
+        assert await db.fetch_all("PRAGMA foreign_key_check") == []
+        sends = await db.fetch_all(
+            "SELECT reply_id, seq, user_id, kind, status, content, ref_idx FROM sends"
+            " ORDER BY reply_id"
+        )
+        indices = await db.fetch_all("SELECT role, msg_idx FROM messages ORDER BY id")
+
+    assert user_version(db_path) == len(MIGRATIONS) == 19
+    assert all((row["seq"], row["user_id"]) == (0, user.id) for row in sends)
+    assert [row["reply_id"] for row in sends] == replies[:8]
+    assert [(r["kind"], r["status"], r["content"], r["ref_idx"]) for r in sends] == [
+        ("image", "uncertain", None, "REFIDX_images"),
+        ("image", "uncertain", None, "REFIDX_failed_image"),
+        ("answer", "uncertain", "看图", "REFIDX_text_image"),
+        ("answer", "delivered", "流式", "REFIDX_streamed"),
+        ("answer", "delivered", "停下", "REFIDX_interrupted"),
+        ("plain", "delivered", "纯文本", "REFIDX_plain"),
+        ("answer", "uncertain", "半截", "REFIDX_half"),
+        ("answer", "uncertain", "[发了提醒列表：1 条提醒]", "REFIDX_card"),
+    ]
+    # 回复行的 msg_idx 清空，用户消息的照旧。
+    assert all(row["msg_idx"] is None for row in indices if row["role"] == "assistant")
+    assert [row["msg_idx"] for row in indices if row["role"] == "user"][:2] == [
+        "REFIDX_user_0",
+        "REFIDX_user_2",
+    ]
+    after = _schema(db_path)
+    assert set(after) - set(before) >= {"sends", "sends_by_user_ref"}
+    assert "ON DELETE CASCADE" in after["sends"]
+
+
+async def test_send_records_reject_bad_rows_and_follow_their_reply(db_path: Path) -> None:
+    async with await Database.open(db_path) as db:
+        await _check_send_rows(db)
+
+
+async def _check_send_rows(db: Database) -> None:
+    from qtalk_bot import access, journal
+    from qtalk_bot.journal import Ending, ReplyDelivery
+
+    user = await db.transaction(access.ensure_user, "FAKE-OPENID-A", "小王", 0)
+
+    def write(conn: sqlite3.Connection) -> tuple[int, int]:
+        question = journal.add_user_message(conn, user.id, "问", "qq-1", 0)
+        reply = journal.add_reply(
+            conn,
+            user_id=user.id,
+            reply_to=question,
+            content="答",
+            model="main",
+            ending=Ending.COMPLETED,
+            delivery=ReplyDelivery.STREAMED,
+            now=0,
+        )
+        return question, reply
+
+    question, reply = await db.transaction(write)
+    insert = (
+        "INSERT INTO sends (reply_id, seq, user_id, kind, status, content, ref_idx)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
+    bad = [
+        (reply, 0, user.id, "video", "delivered", "", None),  # 种类不在取值里
+        (reply, 0, user.id, "answer", "lost", "", None),  # 状态不在取值里
+        (reply, 0, user.id, "image", "delivered", "图", None),  # 图片有正文
+        (reply, 0, user.id, "answer", "delivered", None, None),  # 文字类没有正文
+        (reply, 0, user.id, "answer", "delivered", "", "x" * 513),  # 引用索引太长
+        (reply, -1, user.id, "answer", "delivered", "", None),  # 顺序为负
+    ]
+    for row in bad:
+        with pytest.raises(sqlite3.IntegrityError):
+            await db.execute(insert, row)
+    await db.execute(insert, (reply, 0, user.id, "answer", "delivered", "答", "REFIDX_a"))
+    with pytest.raises(sqlite3.IntegrityError):  # 同一条回复里顺序不能重复
+        await db.execute(insert, (reply, 0, user.id, "notice", "delivered", "说明", None))
+
+    # 删掉回复回答的那条用户消息：回复经 reply_to 级联删掉，发送记录再随回复删掉。
+    await db.execute("DELETE FROM messages WHERE id = ?", (question,))
+    assert await db.fetch_all("SELECT * FROM sends") == []

@@ -270,6 +270,11 @@ def ref_msg_idx(message: pyqbot.C2CMessage) -> str | None:
     return None
 
 
+def _sent_ref(sent: pyqbot.SentMessage) -> str | None:
+    """普通消息的发送结果里的引用索引；没有时为 `None`。"""
+    return None if sent.ext_info is None else _ref_value(sent.ext_info.ref_idx)
+
+
 def _ref_value(value: str | None) -> str | None:
     if value is None:
         return None
@@ -928,8 +933,9 @@ class _QQReplyChannel:
     内容确实送达了。pyqbot 的异常按 `is_rejection()` 分成「确定没发出」与「说不准」。`budget` 由
     `Conversation` 计数，这里只是让它跟着这条消息。
 
-    引用索引：流式回复取当前这条 `StreamMessage.ref_idx`（pyqbot 实测：每个分片的响应，含结束分片，都带同一个
-    `ext_info.ref_idx`），纯文本取发送结果的 `ext_info.ref_idx`；超过 `MAX_REF_LENGTH` 的当作没有。
+    引用索引（记进发送记录，用户引用这条气泡时据此定位话题）：流式回复取当前这条 `StreamMessage.ref_idx`（pyqbot
+    实测：每个分片的响应，含结束分片，都带同一个 `ext_info.ref_idx`），普通消息（纯文本、Markdown、带按钮的
+    Markdown、图片）取发送结果的 `ext_info.ref_idx`；超过 `MAX_REF_LENGTH` 的当作没有。
 
     回答分条：`finish_stream()` 之后（不论成功与否）再调 `stream()`，对同一条消息另开一条流式消息
     （pyqbot 实测同一条消息可以先后回复几条流式消息；前一条要先结束，否则平台会提前结束它）。
@@ -970,7 +976,7 @@ class _QQReplyChannel:
 
     async def send(self, text: str) -> str | None:
         sent = await _guarded(self._message.reply(text))
-        return None if sent.ext_info is None else _ref_value(sent.ext_info.ref_idx)
+        return _sent_ref(sent)
 
     async def send_image(
         self, data: bytes, mime_type: str, replying: Callable[[], None]
@@ -991,7 +997,7 @@ class _QQReplyChannel:
             raise SendRejectedError(f"上传图片失败：{type(exc).__name__}") from None
         replying()
         sent = await _guarded(self._message.reply(media=photo))
-        return None if sent.ext_info is None else _ref_value(sent.ext_info.ref_idx)
+        return _sent_ref(sent)
 
     async def upload_image(self, data: bytes, mime_type: str) -> LibraryImage:
         """传到素材库（不发消息）。失败一律算 `SendRejectedError`（含网络错误）：上传不会把任何东西发给用户；
@@ -1020,14 +1026,16 @@ class _QQReplyChannel:
         except (RuntimeError, ValueError) as exc:  # 客户端已关闭，或编号为空
             raise SendRejectedError(type(exc).__name__) from None
 
-    async def send_markdown(self, markdown: str) -> None:
-        await _guarded(self._message.reply(markdown=markdown))
+    async def send_markdown(self, markdown: str) -> str | None:
+        sent = await _guarded(self._message.reply(markdown=markdown))
+        return _sent_ref(sent)
 
-    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> None:
+    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> str | None:
         """Markdown 加一行按钮（键盘只能随 Markdown 发，pyqbot guide 第 3 节；单聊实测可发，errata「键盘」）。
         指令按钮带 `enter`：单聊里点了直接替用户发出那句话。"""
         keyboard = pyqbot.Keyboard.from_rows([_keyboard_button(b) for b in buttons])
-        await _guarded(self._message.reply(markdown=markdown, keyboard=keyboard))
+        sent = await _guarded(self._message.reply(markdown=markdown, keyboard=keyboard))
+        return _sent_ref(sent)
 
 
 # 单聊实测（2026-11-21）：这三种样式都被接受。
@@ -1059,20 +1067,25 @@ class _QQProcessStream:
 
     pyqbot 实测（`docs/errata.md`）：同一条用户消息可以先后被动回复两条流式消息，两条都正常显示、正常结束；流式
     消息撤回不了，所以过程消息结束后就留着。
+
+    两个方法返回这条流式消息目前已知的引用索引（`StreamMessage.ref_idx`），记进发送记录。
     """
 
     def __init__(self, message: pyqbot.C2CMessage) -> None:
         self._message = message
         self._stream: pyqbot.StreamMessage | None = None
 
-    async def append(self, text: str) -> None:
+    async def append(self, text: str) -> str | None:
         if self._stream is None:
             self._stream = self._message.reply_stream(coalesce=False, markdown=False)
         await _guarded(self._stream.append(text))
+        return _ref_value(self._stream.ref_idx)
 
-    async def finish(self) -> None:
-        if self._stream is not None:
-            await _guarded(self._stream.finish())
+    async def finish(self) -> str | None:
+        if self._stream is None:
+            return None
+        await _guarded(self._stream.finish())
+        return _ref_value(self._stream.ref_idx)
 
 
 async def _guarded[T](call: Awaitable[T]) -> T:

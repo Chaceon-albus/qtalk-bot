@@ -689,6 +689,9 @@ async def test_confirming_by_button_erases_the_topic_and_the_request_turn(
 
     monkeypatch.setattr(Database, "checkpoint", spy)
     confirm, _ = button_data(channel)
+    # 确认卡片记在提出要求的那一轮的发送记录里。
+    kinds = await db.fetch_all("SELECT kind FROM sends WHERE user_id = ?", (alice.id,))
+    assert "card" in [row["kind"] for row in kinds]
 
     reply = await press(chat, ALICE, confirm)
     async with asyncio.timeout(HANG_GUARD):
@@ -710,6 +713,16 @@ async def test_confirming_by_button_erases_the_topic_and_the_request_turn(
     assert await topic_ids(db, bob) == bobs
     usage = await db.fetch_all("SELECT message_id FROM usage")
     assert any(row["message_id"] is None for row in usage)
+    # 被删的回复（含提出要求的那一轮）的发送记录随回复删掉，别的回复的还在。
+    sent = await db.fetch_all(
+        "SELECT s.user_id, m.content FROM sends AS s JOIN messages AS m ON m.id = s.reply_id"
+        " ORDER BY s.reply_id, s.seq"
+    )
+    assert [tuple(row) for row in sent] == [(alice.id, "好"), (bob.id, "好"), (bob.id, "好")]
+    assert (
+        await db.fetch_all("SELECT * FROM sends WHERE reply_id NOT IN (SELECT id FROM messages)")
+        == []
+    )
     # 令牌只能用一次。
     assert await press(chat, ALICE, confirm) == EXPIRED
 
@@ -1736,6 +1749,7 @@ async def test_profiles_from_the_committed_version_13_upgrade(tmp_path: Path) ->
         "SELECT 1 FROM topics WHERE summarized_through = ?",
         "SELECT 1 FROM attachments WHERE message_id = ?",
         "SELECT 1 FROM topic_messages WHERE message_id = ?",
+        "SELECT 1 FROM sends WHERE reply_id = ?",
     ],
 )
 async def test_foreign_key_lookups_of_an_erase_use_indexes(db: Database, query: str) -> None:

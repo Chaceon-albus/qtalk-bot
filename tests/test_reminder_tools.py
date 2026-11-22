@@ -875,9 +875,9 @@ async def test_a_failed_confirmation_leaks_none_of_this_turns_data_into_logs(
     class Wired(FakeChannel):
         """确认消息经真实的接线层通道发出，其余照旧由替身处理。"""
 
-        async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> None:
+        async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> str | None:
             try:
-                await qq.send_buttons(markdown, buttons)
+                return await qq.send_buttons(markdown, buttons)
             except SendError as exc:
                 failures.append(exc)
                 raise
@@ -2139,10 +2139,19 @@ class GatedButtons(FakeChannel):
         self.gate = asyncio.Event()
         self.waiting = asyncio.Event()
 
-    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> None:
+    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> str | None:
         self.waiting.set()
         await self.gate.wait()
-        await super().send_buttons(markdown, buttons)
+        return await super().send_buttons(markdown, buttons)
+
+
+async def last_sends(db: Database) -> list[tuple[str, str]]:
+    """最后一条回复的发送记录（种类、结局），按顺序。"""
+    rows = await db.fetch_all(
+        "SELECT kind, status FROM sends"
+        " WHERE reply_id = (SELECT max(id) FROM messages WHERE role = 'assistant') ORDER BY seq"
+    )
+    return [(row["kind"], row["status"]) for row in rows]
 
 
 async def shut_down_while_sending_the_card(
@@ -2179,6 +2188,8 @@ async def test_shutdown_keeps_what_was_already_delivered(db: Database, tmp_path:
     assert listing_of(channel).startswith("你现在有 1 条提醒")
     assert await last_reply(db) == ("[发了提醒列表：1 条提醒]", "card")
     assert channel.budget.reserved == 0
+    # 记账的兜底：发送记录同样按实际记，在途的卡片说不准。
+    assert await last_sends(db) == [("listing", "delivered"), ("card", "uncertain")]
 
     # 第一项送达的是「列表没能发出来」：按 failed 记，不被 cancelled 盖掉。
     noticed = GatedButtons()
@@ -2187,13 +2198,18 @@ async def test_shutdown_keeps_what_was_already_delivered(db: Database, tmp_path:
     await shut_down_while_sending_the_card(chat, alice, noticed)
     assert noticed.sent == [texts.REMINDER_LIST_FAILED]
     assert await last_reply(db) == ("", "failed")
+    assert await last_sends(db) == [
+        ("listing", "rejected"),
+        ("notice", "delivered"),
+        ("card", "uncertain"),
+    ]
 
 
 async def test_unexpected_errors_while_sending_still_record_the_turn(
     db: Database, tmp_path: Path
 ) -> None:
     class Broken(FakeChannel):
-        async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> None:
+        async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> str | None:
             raise ValueError("意外")
 
     alice = await invited(db, ALICE, "小王")
@@ -2210,6 +2226,11 @@ async def test_unexpected_errors_while_sending_still_record_the_turn(
     assert await last_reply(db) == ("另外，今天天气不错\n[发了提醒列表：1 条提醒]", "streamed")
     assert [r[0] for r in await db.fetch_all("SELECT input_tokens FROM usage")] == [12]
     assert channel.budget.reserved == 0
+    assert await last_sends(db) == [
+        ("answer", "delivered"),
+        ("listing", "delivered"),
+        ("card", "uncertain"),
+    ]
 
 
 async def test_only_the_card_notice_delivered_ends_a_mixed_turn(

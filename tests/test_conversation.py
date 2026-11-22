@@ -254,6 +254,9 @@ class FakeChannel:
         self.buttons_failure: SendError | None = None
         self.markdown_failure: SendError | None = None
         self.image_ref: str | None = None
+        self.markdown_ref: str | None = None  # Markdown 消息（提醒列表）返回的引用索引
+        self.buttons_ref: str | None = None  # 带按钮的消息（确认卡片）返回的引用索引
+        self.process_ref: str | None = None  # 过程消息的各片与结束分片返回的引用索引
         # 素材库：传上去、还没删的图（编号 → 内容）；`uploads` 按先后记下传过的 MIME 类型，`deleted` 记下删掉的编号。
         self.library: dict[str, bytes] = {}
         self.uploads: list[str] = []
@@ -341,16 +344,18 @@ class FakeChannel:
         self.images.append(data)
         return self.image_ref
 
-    async def send_markdown(self, markdown: str) -> None:
-        """发 Markdown（程序直接发的提醒列表）：记成（`markdown`，正文）。`markdown_failure` 不为空时抛出它。"""
+    async def send_markdown(self, markdown: str) -> str | None:
+        """发 Markdown（程序直接发的提醒列表）：记成（`markdown`，正文），返回 `markdown_ref`。`markdown_failure`
+        不为空时抛出它。"""
         await asyncio.sleep(0)
         if self.markdown_failure is not None:
             raise self.markdown_failure
         self.log.append(("markdown", markdown))
+        return self.markdown_ref
 
-    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> None:
-        """发 Markdown 加按钮：记成（`buttons`，Markdown），回调按钮记进 `buttons`、指令按钮记进 `commands`。
-        `buttons_failure` 不为空时抛出它。"""
+    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> str | None:
+        """发 Markdown 加按钮：记成（`buttons`，Markdown），回调按钮记进 `buttons`、指令按钮记进 `commands`，返回
+        `buttons_ref`。`buttons_failure` 不为空时抛出它。"""
         await asyncio.sleep(0)
         self.button_attempts += 1
         if self.buttons_failure is not None:
@@ -360,6 +365,7 @@ class FakeChannel:
             self.buttons.append(choices)
         if commands := tuple(b for b in buttons if isinstance(b, CommandButton)):
             self.commands.append(commands)
+        return self.buttons_ref
 
     async def upload_image(self, data: bytes, mime_type: str) -> LibraryImage:
         """传到素材库：记成（`upload`，编号），编号是 `img-1`、`img-2`……，地址是 `qqbot-media://image/<编号>`。"""
@@ -390,19 +396,21 @@ class FakeProcess:
     def __init__(self, channel: FakeChannel) -> None:
         self.channel = channel
 
-    async def append(self, text: str) -> None:
+    async def append(self, text: str) -> str | None:
         await asyncio.sleep(0)
         if (gate := self.channel.process_gate(text)) is not None:
             await gate.wait()
         if (error := self.channel.process_failure(text)) is not None:
             raise error
         self.channel.log.append(("process", text))
+        return self.channel.process_ref
 
-    async def finish(self) -> None:
+    async def finish(self) -> str | None:
         await asyncio.sleep(0)
         if self.channel.process_finish_gate is not None:
             await self.channel.process_finish_gate.wait()
         self.channel.log.append(("process_finish", ""))
+        return self.channel.process_ref
 
 
 def reject_if(marker: str) -> Failure:
@@ -1123,12 +1131,23 @@ async def test_uncertain_send_stops_waiting_for_the_model_at_once(db: Database) 
     assert (await rows(db))[-1] == Row("assistant", "第一段", "main", "aborted", "uncertain")
 
 
-# ---- 回复的引用索引（用户引用机器人的回复时据此定位话题） ----
+# ---- 发送记录（每条被动回复的种类、结局、正文与引用索引；用户引用机器人的气泡时据此定位话题） ----
 
 
-async def reply_indices(db: Database) -> list[str | None]:
-    result = await db.fetch_all("SELECT msg_idx FROM messages WHERE role = 'assistant' ORDER BY id")
-    return [r["msg_idx"] for r in result]
+@dataclass(frozen=True)
+class Sent:
+    kind: str
+    status: str
+    content: str | None
+    ref_idx: str | None = None
+
+
+async def send_rows(db: Database) -> list[Sent]:
+    """全部发送记录，按回复与顺序排列。"""
+    result = await db.fetch_all(
+        "SELECT kind, status, content, ref_idx FROM sends ORDER BY reply_id, seq"
+    )
+    return [Sent(r["kind"], r["status"], r["content"], r["ref_idx"]) for r in result]
 
 
 async def test_streamed_answer_records_the_index_of_its_stream(db: Database) -> None:
@@ -1137,7 +1156,11 @@ async def test_streamed_answer_records_the_index_of_its_stream(db: Database) -> 
 
     await say(conversation(db, ScriptedModel("main", answer("你好"))), alice, "在吗", channel)
 
-    assert await reply_indices(db) == ["REFIDX_stream"]
+    assert await send_rows(db) == [Sent("answer", "delivered", "你好", "REFIDX_stream")]
+    # 回复行不再写引用索引。
+    reply = await db.fetch_one("SELECT msg_idx FROM messages WHERE role = 'assistant'")
+    assert reply is not None
+    assert reply["msg_idx"] is None
 
 
 async def test_index_given_only_by_the_closing_chunk_is_recorded(db: Database) -> None:
@@ -1146,10 +1169,12 @@ async def test_index_given_only_by_the_closing_chunk_is_recorded(db: Database) -
 
     await say(conversation(db, ScriptedModel("main", answer("你好"))), alice, "在吗", channel)
 
-    assert await reply_indices(db) == ["REFIDX_closing"]
+    assert await send_rows(db) == [Sent("answer", "delivered", "你好", "REFIDX_closing")]
 
 
-async def test_plain_text_resend_records_the_index_of_the_plain_message(db: Database) -> None:
+async def test_plain_text_resend_records_the_rejected_stream_and_the_plain_message(
+    db: Database,
+) -> None:
     alice = await invited(db, ALICE, "小王")
     channel = FakeChannel(
         stream_failure=reject_if("敏感"), stream_ref="REFIDX_stream", send_ref="REFIDX_plain"
@@ -1158,10 +1183,31 @@ async def test_plain_text_resend_records_the_index_of_the_plain_message(db: Data
     await say(conversation(db, ScriptedModel("main", answer("敏感"))), alice, "你好", channel)
 
     assert (await rows(db))[-1].delivery == "plain"
-    assert await reply_indices(db) == ["REFIDX_plain"]
+    assert await send_rows(db) == [
+        Sent("answer", "rejected", ""),
+        Sent("plain", "delivered", "敏感", "REFIDX_plain"),
+    ]
 
 
-async def test_fixed_notice_is_not_recorded_as_the_reply_index(db: Database) -> None:
+async def test_stream_rejected_midway_records_what_was_shown(db: Database) -> None:
+    # 流式回复送达了一部分之后被拒：用户看到过的半截记在发送记录里，流水只记改发的纯文本。
+    alice = await invited(db, ALICE, "小王")
+    channel = FakeChannel(stream_failure=reject_if("敏感"), send_ref="REFIDX_plain")
+    # 第一片送达之后才给出后半段，两段分成两片发。
+    model = ScriptedModel(
+        "main", [TextDelta("前半段。"), channel.delivered, TextDelta("敏感的后半段"), DONE]
+    )
+
+    await say(conversation(db, model), alice, "你好", channel)
+
+    records = await send_rows(db)
+    assert [(r.kind, r.status) for r in records] == [("answer", "partial"), ("plain", "delivered")]
+    assert records[0].content == channel.streamed
+    assert records[0].content
+    assert records[1].content == channel.sent[-1]
+
+
+async def test_fixed_notice_is_recorded_with_its_own_index(db: Database) -> None:
     alice = await invited(db, ALICE, "小王")
     channel = FakeChannel(stream_ref="REFIDX_stream", send_ref="REFIDX_notice")
     primary = ScriptedModel("main", [ModelError(Provider.OPENAI, ErrorKind.SERVER)])
@@ -1169,7 +1215,7 @@ async def test_fixed_notice_is_not_recorded_as_the_reply_index(db: Database) -> 
     await say(conversation(db, primary), alice, "你好", channel)
 
     assert channel.sent == [texts.MODEL_FAILED]
-    assert await reply_indices(db) == [None]
+    assert await send_rows(db) == [Sent("notice", "delivered", texts.MODEL_FAILED, "REFIDX_notice")]
 
 
 async def test_missing_index_is_left_empty(db: Database) -> None:
@@ -1177,7 +1223,55 @@ async def test_missing_index_is_left_empty(db: Database) -> None:
 
     await say(conversation(db, ScriptedModel("main", answer("你好"))), alice, "在吗")
 
-    assert await reply_indices(db) == [None]
+    assert await send_rows(db) == [Sent("answer", "delivered", "你好", None)]
+
+
+async def test_uncertain_chunk_is_recorded_as_uncertain(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    channel = FakeChannel(stream_failure=uncertain_if("后"), stream_ref="REFIDX_stream")
+    model = ScriptedModel(
+        "main", [TextDelta("前半段。"), channel.delivered, TextDelta("后半段"), DONE]
+    )
+
+    await say(conversation(db, model), alice, "你好", channel)
+
+    ((record),) = await send_rows(db)
+    assert (record.kind, record.status, record.ref_idx) == ("answer", "uncertain", "REFIDX_stream")
+    assert record.content == channel.streamed
+
+
+async def test_unclosed_stream_is_recorded_as_unclosed(db: Database) -> None:
+    alice = await invited(db, ALICE, "小王")
+    channel = FakeChannel(finish_failure=SendRejectedError("拒绝"), stream_ref="REFIDX_stream")
+
+    await say(conversation(db, ScriptedModel("main", answer("你好"))), alice, "在吗", channel)
+
+    assert await send_rows(db) == [Sent("answer", "unclosed", "你好", "REFIDX_stream")]
+
+
+async def test_queued_acknowledgement_and_unsupported_notice_are_not_recorded(
+    db: Database,
+) -> None:
+    # 排队时的「收到」与「暂不支持」不属于任何一轮的回复，不记发送记录。
+    alice = await invited(db, ALICE, "小王")
+    chat = conversation(db, ScriptedModel("main", answer("你好")))
+    channel = FakeChannel(send_ref="REFIDX_ack")
+    received = await chat.receive(alice, ChatInput(message_id="qq-1", text="在吗"), channel)
+    assert received is not None
+
+    await chat.acknowledge(alice, received.message_id, channel)
+    await chat.receive(
+        alice,
+        ChatInput(
+            message_id="qq-2",
+            text=None,
+            attachments=(IncomingAttachment(kind=AttachmentKind.VIDEO),),
+        ),
+        channel,
+    )
+
+    assert channel.sent == [texts.QUEUED, texts.UNSUPPORTED]
+    assert await send_rows(db) == []
 
 
 async def test_typing_failure_does_not_stop_the_reply(db: Database) -> None:
@@ -1371,6 +1465,7 @@ async def test_cancellation_records_what_was_delivered_and_the_known_usage(db: D
     assert channel.log[-1] == ("finish", "")  # 流式消息尽量正常结束
     assert (await rows(db))[-1] == Row("assistant", "已经送达", "main", "cancelled", "cancelled")
     assert await usage(db) == [("main", 7, 8)]
+    assert await send_rows(db) == [Sent("answer", "delivered", "已经送达")]
 
 
 async def test_cancellation_waits_briefly_for_the_chunk_in_flight(
@@ -1420,6 +1515,8 @@ async def test_cancellation_gives_up_on_a_chunk_that_never_returns(
     await cancel_when(task, in_flight)
 
     assert (await rows(db))[-1] == Row("assistant", "第一段", "main", "cancelled", "cancelled")
+    # 在途的那片被放弃：这条流式消息说不准，正文是确认送达的部分。
+    assert await send_rows(db) == [Sent("answer", "uncertain", "第一段")]
 
 
 # ---- 第三轮：取消与关停路径上的交错 ----
@@ -1452,6 +1549,7 @@ async def test_record_after_a_normal_end_survives_cancellation(db: Database) -> 
 
     assert (await rows(db))[-1] == Row("assistant", "好", "main", "completed", "streamed")
     assert await usage(db) == [("main", 12, 34)]
+    assert await send_rows(db) == [Sent("answer", "delivered", "好")]  # 只写一次
 
 
 async def test_cancellation_while_the_closing_chunk_is_in_flight_reuses_it(
@@ -1471,6 +1569,53 @@ async def test_cancellation_while_the_closing_chunk_is_in_flight_reuses_it(
     assert channel.finish_calls == 1  # 同一个结束分片接着等，不重发
     assert channel.log[-1] == ("finish", "")
     assert (await rows(db))[-1] == Row("assistant", "完整的回答", "main", "completed", "cancelled")
+
+
+class BreaksWhileFinishing(FakeChannel):
+    """结束分片等 `finish_gate` 放行之后抛出意外的异常（不是 `SendError`）。"""
+
+    async def finish_stream(self) -> str | None:
+        self.finish_calls += 1
+        self.finish_started.set()
+        assert self.finish_gate is not None
+        await self.finish_gate.wait()
+        raise ValueError("意外")
+
+
+async def test_unexpected_error_from_the_closing_chunk_during_shutdown_still_records(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 关停时正文已确认、结束分片还在途，它随后抛出意外的异常：先按已确认送达的记账（回复行与发送记录），再抛出它。
+    monkeypatch.setattr(conversation_module, "GRACE_SECONDS", 1.0)
+    alice = await invited(db, ALICE, "小王")
+    gate = asyncio.Event()
+    channel = BreaksWhileFinishing(stream_ref="REFIDX_stream", finish_gate=gate)
+    task = asyncio.create_task(
+        say(conversation(db, ScriptedModel("main", answer("完整的回答"))), alice, "你好", channel)
+    )
+    await asyncio.wait_for(channel.finish_started.wait(), HANG_GUARD)
+    asyncio.get_running_loop().call_later(0.05, gate.set)
+    task.cancel()
+    with pytest.raises(ValueError, match="意外"):
+        await asyncio.wait_for(task, HANG_GUARD)
+
+    assert (await rows(db))[-1] == Row("assistant", "完整的回答", "main", "completed", "cancelled")
+    assert await usage(db) == [("main", 12, 34)]
+    assert await send_rows(db) == [Sent("answer", "unclosed", "完整的回答", "REFIDX_stream")]
+
+
+async def test_closing_chunk_that_never_returns_leaves_the_stream_unclosed(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(conversation_module, "GRACE_SECONDS", 0.05)
+    alice = await invited(db, ALICE, "小王")
+    channel = FakeChannel(finish_gate=asyncio.Event())  # 结束分片永远不回来
+    task = asyncio.create_task(
+        say(conversation(db, ScriptedModel("main", answer("完整的回答"))), alice, "你好", channel)
+    )
+    await cancel_when(task, channel.finish_started)
+
+    assert await send_rows(db) == [Sent("answer", "unclosed", "完整的回答")]
 
 
 async def test_queued_text_is_dropped_as_soon_as_wind_down_starts(
@@ -2157,6 +2302,11 @@ async def test_failed_download_is_told_and_the_message_is_still_recorded(
     assert len(model.requests) == 1  # 只有一张没下载下来的图：不调用模型
     assert [row.role for row in await rows(db)] == ["user", "assistant", "user"]
     assert [row[2] for row in await attachment_rows(db)] == ["failed", "failed"]
+    # 第一轮的附件说明与回答都记下；第二条只回了说明、没有回复行，不记。
+    assert await send_rows(db) == [
+        Sent("notice", "delivered", texts.ATTACHMENT_FAILED),
+        Sent("answer", "delivered", "好的"),
+    ]
 
 
 async def test_unsupported_only_message_gets_a_fixed_reply(db: Database, tmp_path: Path) -> None:
@@ -3240,6 +3390,7 @@ async def test_request_with_nothing_answerable_only_sends_a_notice(
     assert model.requests == []
     assert channel.sent == [texts.ATTACHMENT_GONE]
     assert (await rows(db))[-1] == Row("assistant", "", "main", "skipped", "failed")
+    assert await send_rows(db) == [Sent("notice", "delivered", texts.ATTACHMENT_GONE)]
     assert await usage(db) == []
 
 
@@ -4719,6 +4870,7 @@ async def test_ask_about_waiting_attachments_counts_them_and_rechecks_access(
     assert channel.budget.replies == 1
     assert model.requests == []
     assert await reply_targets(db) == []  # 问话不写进流水，附件仍等着下一条文字
+    assert await send_rows(db) == []  # 也不记发送记录
 
 
 async def test_waiting_picture_is_asked_about_then_answered_with_the_next_text(

@@ -5,6 +5,7 @@
 
 import asyncio
 import logging
+import threading
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
@@ -23,8 +24,10 @@ from tests.test_conversation import (
     FakeChannel,
     FakeDecider,
     FakeDownloader,
+    FakeProcess,
     GeminiScriptedModel,
     ScriptedModel,
+    Sent,
     Step,
     answer,
     batcher_of,
@@ -35,6 +38,7 @@ from tests.test_conversation import (
     message,
     say,
     send,
+    send_rows,
     set_event,
     started,
     steer_result,
@@ -42,15 +46,15 @@ from tests.test_conversation import (
     text_of,
 )
 
+from qtalk_bot import access, texts
 from qtalk_bot import conversation as conversation_module
-from qtalk_bot import texts
-from qtalk_bot.access import User
+from qtalk_bot.access import User, UserStatus
 from qtalk_bot.config import (
     ChatSettings,
     DecisionSettings,
     ModelSettings,
 )
-from qtalk_bot.conversation import Conversation, SendRejectedError
+from qtalk_bot.conversation import ChatInput, Conversation, SendRejectedError, TurnControl
 from qtalk_bot.llm import (
     Commentary,
     ErrorKind,
@@ -215,6 +219,55 @@ async def test_process_is_shown_then_ended_when_the_answer_starts_and_kept(
     request = model.requests[0]
     assert PROCESS_GUIDE in request.system
     assert PREAMBLE_GUIDE not in request.system  # 没开搜索
+
+
+async def test_process_message_and_answer_are_send_records_in_order(db: Database) -> None:
+    clock = ManualClock()
+    model = ScriptedModel("main", [])
+    chat = process_chat(db, model, clock)
+    channel = FakeChannel(stream_ref="REFIDX_answer")
+    channel.process_ref = "REFIDX_process"
+
+    await run_turn(chat, model, channel, await invited(db, ALICE, "小王"))
+
+    assert await send_rows(db) == [
+        Sent("process", "delivered", channel.process_text, "REFIDX_process"),
+        Sent("answer", "delivered", "今天晴。", "REFIDX_answer"),
+    ]
+
+
+async def test_failed_process_message_is_recorded_without_affecting_the_answer(
+    db: Database,
+) -> None:
+    clock = ManualClock()
+    model = ScriptedModel("main", [])
+    chat = process_chat(db, model, clock)
+    channel = FakeChannel()
+    channel.process_failure = lambda _: SendRejectedError("拒绝")
+
+    await run_turn_without_process(chat, model, channel, await invited(db, ALICE, "小王"))
+
+    assert await send_rows(db) == [
+        Sent("process", "rejected", ""),
+        Sent("answer", "delivered", "今天晴。"),
+    ]
+
+
+async def run_turn_without_process(
+    chat: Conversation, model: ScriptedModel, channel: FakeChannel, user: User
+) -> None:
+    """同 `run_turn()`，但过程消息发不出去：等它试过一次再放模型回答。"""
+    gate, reached = asyncio.Event(), asyncio.Event()
+    model.script = steps(gate, reached)
+    task = asyncio.create_task(say(chat, user, "上海天气怎么样", channel))
+    async with asyncio.timeout(HANG_GUARD):
+        await reached.wait()
+    await wait_for(lambda: bool(channel.processes))
+    for _ in range(50):
+        await asyncio.sleep(0)
+    gate.set()
+    async with asyncio.timeout(HANG_GUARD):
+        await task
 
 
 async def test_process_text_is_archived_but_never_enters_the_context(db: Database) -> None:
@@ -394,6 +447,12 @@ async def test_steer_while_only_the_process_is_shown_restarts_with_a_new_process
     assert second.budget == ReplyBudget(typings=0, replies=2)  # 刚发过「正在输入」，重来时不再发
     (archived,) = await process_column(db)
     assert archived == "[说明] **想想怎么排序**\n\n（插话重来）\n\n[说明] **想想怎么排序**"
+    # 被打断的那次发出的过程消息随最后答完的那一次入账，顺序在前，只记一份。
+    assert await send_rows(db) == [
+        Sent("process", "delivered", "想想怎么排序\n收到补充，重新开始"),
+        Sent("process", "delivered", "想想怎么排序"),
+        Sent("answer", "delivered", "合起来的回答"),
+    ]
 
 
 async def test_steer_after_the_answer_started_cuts_the_answer(db: Database) -> None:
@@ -624,6 +683,30 @@ async def test_fallback_call_counts_as_progress(db: Database) -> None:
     assert channel.streamed == "备用的回答"
 
 
+async def test_process_shown_before_the_fallback_is_recorded_once(db: Database) -> None:
+    # 主模型发过过程消息后失败、换备用模型：过程消息只记一行，写在最后的回复上，排在回答之前。
+    clock = ManualClock()
+    channel = FakeChannel()
+
+    async def shown() -> None:
+        await wait_for(lambda: bool(channel.process_text))
+
+    primary = ScriptedModel(
+        "main",
+        [Commentary("msg_c#0", "先想一想。"), shown, ModelError(Provider.OPENAI, ErrorKind.SERVER)],
+    )
+    backup = ScriptedModel("backup", answer("备用的回答"))
+    chat = process_chat(db, primary, clock, fallback=backup)
+
+    await say(chat, await invited(db, ALICE, "小王"), "问", channel)
+
+    assert channel.streamed == "备用的回答"
+    assert await send_rows(db) == [
+        Sent("process", "delivered", channel.process_text),
+        Sent("answer", "delivered", "备用的回答"),
+    ]
+
+
 @pytest.mark.parametrize(("restart_at", "expected"), [(9.0, 1), (5.0, 0)])
 async def test_restart_typing_follows_the_last_one_actually_sent(
     db: Database, restart_at: float, expected: int
@@ -793,3 +876,132 @@ async def test_stuck_pulse_does_not_hold_up_the_wind_down(
     await settle()
     leftover = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
     assert leftover == []
+
+
+# ---- 发送记录：收尾与记账时的交错 ----
+
+
+async def test_process_whose_finish_never_returns_is_recorded_unclosed(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 过程消息送达、模型没给正文只发了固定说明、过程消息的结束分片一直不回来：取走时它只差结束，记成没结束，而不是
+    # 说不准。
+    monkeypatch.setattr(conversation_module, "GRACE_SECONDS", 0.05)
+    clock = ManualClock()
+    channel = FakeChannel()
+    channel.process_finish_gate = asyncio.Event()
+
+    async def shown() -> None:
+        await wait_for(lambda: bool(channel.process_text))
+
+    model = ScriptedModel(
+        "main",
+        [Commentary("msg_c#0", "先想一想。"), shown, ModelError(Provider.OPENAI, ErrorKind.SERVER)],
+    )
+    chat = process_chat(db, model, clock)
+    try:
+        await say(chat, await invited(db, ALICE, "小王"), "问", channel)
+    finally:
+        channel.process_finish_gate.set()
+
+    assert channel.sent == [texts.MODEL_FAILED]
+    assert await send_rows(db) == [
+        Sent("process", "unclosed", channel.process_text),
+        Sent("notice", "delivered", texts.MODEL_FAILED),
+    ]
+
+
+class _ProcessHook(FakeProcess):
+    """过程消息的替身：结束分片发完时调用 `hook`。"""
+
+    def __init__(self, channel: FakeChannel, hook: Callable[[], None]) -> None:
+        super().__init__(channel)
+        self.hook = hook
+
+    async def finish(self) -> str | None:
+        ref_idx = await super().finish()
+        self.hook()
+        return ref_idx
+
+
+class _HookedChannel(FakeChannel):
+    def __init__(self, hook: Callable[[], None]) -> None:
+        super().__init__()
+        self.hook = hook
+
+    def open_process(self) -> FakeProcess:
+        process = _ProcessHook(self, self.hook)
+        self.processes.append(process)
+        return process
+
+
+async def test_restart_while_recording_does_not_write_the_bubbles_twice(db: Database) -> None:
+    # 只发过过程消息的一轮（复查授权不通过、停下，什么都没显示）在记账时被插话重来：记账照常写完，旧的气泡只挂在原来
+    # 的回复上；重来的那一次拿到的是空的缓冲，不再写一遍。
+    alice = await invited(db, ALICE, "小王")
+    clock = ManualClock()
+    release = threading.Event()
+    occupied = asyncio.Event()
+    blockers: list[asyncio.Task[bool]] = []
+
+    def occupy_database() -> None:
+        # 过程消息在记账之前结束：这时占住数据库线程，记账的事务排在它后面。
+        blockers.append(asyncio.create_task(db.transaction(lambda _: release.wait(HANG_GUARD))))
+        occupied.set()
+
+    channel = _HookedChannel(occupy_database)
+
+    async def shown() -> None:
+        await wait_for(lambda: bool(channel.process_text))
+
+    async def disable() -> None:
+        await db.transaction(access.set_user_status, alice.id, UserStatus.DISABLED)
+
+    primary = ScriptedModel(
+        "main",
+        [
+            Commentary("msg_c#0", "先想一想。"),
+            shown,
+            disable,
+            ModelError(Provider.OPENAI, ErrorKind.SERVER),
+        ],
+    )
+    backup = ScriptedModel("backup", answer("不该出现"))
+    chat = process_chat(db, primary, clock, fallback=backup)
+    received = await chat.receive(alice, ChatInput(message_id="qq-1", text="问"), channel)
+    assert received is not None
+    control = TurnControl()
+    task = asyncio.create_task(chat.respond(alice, [received.message_id], channel, control))
+    async with asyncio.timeout(HANG_GUARD):
+        await occupied.wait()
+        await asyncio.sleep(0.05)  # 让这一轮走到记账，排在占住的事务后面
+        assert control.preempt()  # 什么都没显示：可以重来
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        enabling = asyncio.create_task(
+            db.transaction(access.set_user_status, alice.id, UserStatus.ACTIVE)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)  # 恢复授权排在重来的一轮开轮之前
+        primary.script = answer("重来的回答")
+        again = FakeChannel()
+        restart = asyncio.create_task(
+            chat.respond(alice, [received.message_id], again, TurnControl(previous=control))
+        )
+        release.set()
+        await blockers[0]
+        await enabling
+        await restart
+        await chat.drain()
+
+    assert backup.requests == []
+    assert again.streamed == "重来的回答"
+    rows = await db.fetch_all(
+        "SELECT m.delivery, s.kind, s.content FROM sends AS s"
+        " JOIN messages AS m ON m.id = s.reply_id ORDER BY s.reply_id, s.seq"
+    )
+    assert [tuple(row) for row in rows] == [
+        ("withheld", "process", channel.process_text),
+        ("streamed", "answer", "重来的回答"),
+    ]

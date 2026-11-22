@@ -39,8 +39,8 @@
    时这一条补上闭合围栏、下一条重开同样的围栏。「来源」与固定说明照常接在当前这一条上（也可能跨边界）。每多开
    一条算一次被动回复，开之前给兜底留两次（新的一条被拒时改发纯文本，纯文本也被拒再发固定说明；
    `ReplyBudget.affords_continuation()`），不够就交给平台去拆。
-   流水里存模型的原文（不含补上的围栏行），回复行的引用索引是第一条的（用户引用后面几条时定不到话题）。改发
-   纯文本时不分条。
+   流水里存模型的原文（不含补上的围栏行），每一条的引用索引与用户看到的正文记在发送记录里（见下文「发送记录」）。
+   改发纯文本时不分条。
 6. 出错时：还没有任何内容交给 QQ 发送、选出的模型又配置了备用模型、备用模型也能处理这一轮的附件，就在
    事务里再确认一次授权，然后按备用模型的能力重新组装上下文、重试一次；否则给用户固定的说明。流式回复被平台拒绝时，把全文改用纯文本的普通消息再发一次，
    仍然失败就发固定说明。发送分片时出了说不准是否送达的错误，立刻停止等模型。
@@ -86,9 +86,8 @@
 
 **话题线**（里程碑 6a，`Router.topics` 不为空，即配置了 `[decisions]` 时）：
 - 开轮的事务里取出这个用户最近活跃的 `[topics].candidates` 条话题，并按这一轮消息的引用（`ref_msg_idx`）在这个
-  用户自己的流水里（他的消息与回复他的消息）找被引用消息的话题（`topics.quoted_topic()`）；找到就定下它，话题题
-  不问。回复的引用索引在回答送达后存进回复行（`ReplyChannel` 的发送方法返回它，经 `_Outbox.ref_idx` 与
-  `_Outcome.ref_idx`）。
+  用户自己的流水里（他的消息与机器人回复他的各条气泡的发送记录）找被引用消息的话题（`topics.quoted_topic()`）；
+  找到就定下它，话题题不问。机器人各条气泡的引用索引由 `ReplyChannel` 的发送方法返回，记进发送记录。
 - 选话题与选模型在同一次决策调用里（`routing.Router.select()` 的 `topics`）；启用了档案题时它也在其中（见下文
   「用户档案」）；一道都不问时不调用决策。
 - 决策之后在事务里复查授权，按选中的话题组装上下文（`_topic_context()`）：不分话题的最近 `[topics].recent_turns`
@@ -177,6 +176,20 @@
   补发的说明（「没能发出来」等）确认送达了按 `failed` 记（同其它固定说明，这一轮结束），否则按 `notice_lost`（消息
   留给下一轮）。第一条发出之前（`claim()` 之前）这一轮还没显示任何东西，被插话重来时照常重来（`_restart()`）。
 
+**发送记录**（里程碑 11，`sends.py`）：一轮里每条被动回复（过程消息、回答的每一条、改发的纯文本、固定说明、提醒
+列表、确认卡片、生成的图）各记一行，挂在这一轮的回复行上：种类、在这一轮里的顺序、这条消息自己的结局、用户看到的
+正文与引用索引。
+- 由 `_TurnChannel` 统一记（一轮里的被动回复除「正在输入」外都经过它，它本来就负责计被动回复的次数）：每发一条（流式
+  消息是每开一条）开一项，送达、被拒、说不准、结束分片的结果记在那一项上，记完原样抛出异常。只有给了 `TurnControl`
+  的通道才记，所以排队时的「收到」（`acknowledge()`）、「暂不支持」、附件的询问（`ask()`）不记；轮内的提醒失败通知走
+  原始的通道，也不记：它们不属于这一轮的回复，记进来会让按引用定位定错话题。
+- 缓冲在 `TurnControl.sends`（`sends.SendLog`），插话重来时与 `earlier` 一起传给新的 `TurnControl`：被打断的那几次
+  只可能发过过程消息，它们随最后答完的那一次入账，顺序在前。被打断的那次（`_finish_preempted()`）不写。
+- 记账时在 `asyncio.shield(self._record(...))` 之前同步取走（`SendLog.take()`，还在途的按说不准、开着没结束的流式消息
+  按没结束），与回复行写在同一个事务里（`_finish()`）：记账途中再被取消、又被重来时也只写一次。换备用模型、关停、意外
+  的异常、发列表与卡片时的「记账的兜底」都照常记进同一次记账；没有结束的一轮照样写回复行，记录挂在它上面。
+- 只有说明、没有回复行的那种（这一轮没有能交给模型的内容）不记：没有能挂的回复。
+
 **判断插话**（`judge()`）：在事务里复查授权、取出正在回答的消息与新消息的文字版（只有这个用户自己的），交给
 `routing.SteerJudge`；决策记录与用量挂在新消息里最后一条上，被取消时也照记。
 
@@ -257,6 +270,7 @@ from . import (
     reminder_state,
     reminder_tools,
     reminders,
+    sends,
     texts,
     topics,
 )
@@ -378,6 +392,7 @@ from .routing import (
     TopicOption,
     TopicQuery,
 )
+from .sends import Sending, SendKind, SendLog, SentRecord
 from .splitting import Cut, Piece, StreamSplitter
 from .storage import Database
 from .triggers import Once
@@ -476,7 +491,8 @@ class TurnControl:
       `False`，什么也不做。停下不是重来：新消息不并进这一轮，而是在这一轮结束后自己开一轮。
     - `previous`：重来时传入上一次的 `TurnControl`。被重来的几次的过程消息（`earlier`，与上一次共用同一个
       列表）由最后答完的那一次连同自己的过程一起存档；上次发「正在输入」的时刻（`typed_at`）也接着
-      用，「正在输入」的间隔据此计算。过程消息不算「已开始显示」。
+      用，「正在输入」的间隔据此计算；发送记录的缓冲（`sends`）同样共用，被重来的几次发出的过程消息随最后答完的
+      那一次入账。过程消息不算「已开始显示」。
     """
 
     def __init__(
@@ -493,6 +509,8 @@ class TurnControl:
         self.earlier: list[ProcessPresenter] = [] if previous is None else previous.earlier
         # 这一轮（含被重来的几次）上次发「正在输入」的时刻（`Conversation` 的单调时钟）。
         self.typed_at: float | None = None if previous is None else previous.typed_at
+        # 这一轮（含被重来的几次）的发送记录，记账时取走（见 `sends.py`）。
+        self.sends: SendLog = SendLog() if previous is None else previous.sends
 
     def begin(self, included: Sequence[int]) -> None:
         self.included = tuple(included)
@@ -519,14 +537,17 @@ class TurnControl:
 
 
 class ReplyStream(Protocol):
-    """回复一条消息的另一条流式消息（过程消息）。失败时抛 `SendRejectedError` 或 `SendUncertainError`。"""
+    """回复一条消息的另一条流式消息（过程消息）。失败时抛 `SendRejectedError` 或 `SendUncertainError`。
 
-    async def append(self, text: str) -> None:
+    两个方法成功时返回这条流式消息目前已知的引用索引（同 `ReplyChannel.stream()`），平台还没给出时为 `None`；
+    它记进发送记录。"""
+
+    async def append(self, text: str) -> str | None:
         """把 `text` 作为下一片发出，等它发完才返回。第一次调用时开始这条流式消息。"""
         ...
 
-    async def finish(self) -> None:
-        """结束这条流式消息；一片也没发过时什么也不做。"""
+    async def finish(self) -> str | None:
+        """结束这条流式消息；一片也没发过时什么也不做（返回 `None`）。"""
         ...
 
 
@@ -536,10 +557,10 @@ class ReplyChannel(Protocol):
     一个通道对应一条被回复的消息，`budget` 记着这条消息已用的被动回复次数（由本模块计数，实现方只要提供一个
     长期存在的 `ReplyBudget`）。
 
-    `stream()`、`finish_stream()`、`send()` 成功时返回发出的那条消息的引用索引（用户引用它时平台带回的索引，
-    见 `ChatInput.ref_msg_idx`），平台没有给出时返回 `None`；流式回复返回当前这一条的。回答送达后它存进回复行的
-    `msg_idx`，用户引用机器人的回复时据此定位话题；回答分成几条时只存第一条的；过程消息不是回答，它的引用索引
-    不存。
+    发消息的方法（`stream()`、`finish_stream()`、`send()`、`send_image()`、`send_markdown()`、`send_buttons()`，
+    以及过程消息的 `ReplyStream`）成功时返回发出的那条消息的引用索引（用户引用它时平台带回的索引，见
+    `ChatInput.ref_msg_idx`），平台没有给出时返回 `None`；流式回复返回当前这一条的。它们记进发送记录（`sends.py`），
+    用户引用这一轮的任何一条气泡时据此定位话题。
 
     回答的流式消息可以分成几条（见 `splitting.py`）：`finish_stream()` 返回之后（不论成功与否）再调 `stream()`，
     就对同一条消息开始一条新的流式消息，又是一次被动回复。调用方总是等前一条的 `finish_stream()` 返回之后才开
@@ -581,13 +602,12 @@ class ReplyChannel(Protocol):
         接受了这条回复，调用方按送达说不准处理。"""
         ...
 
-    async def send_markdown(self, markdown: str) -> None:
-        """发一条 Markdown 的普通消息（如程序直接发的提醒列表），算一次被动回复。它不是回答，引用索引不存，不返回。"""
+    async def send_markdown(self, markdown: str) -> str | None:
+        """发一条 Markdown 的普通消息（如程序直接发的提醒列表），算一次被动回复；返回值同 `send()`。"""
         ...
 
-    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> None:
-        """发一条 Markdown 加一行按钮（回调按钮或指令按钮）的消息，算一次被动回复。它不是回答，引用索引不存，
-        不返回。"""
+    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> str | None:
+        """发一条 Markdown 加一行按钮（回调按钮或指令按钮）的消息，算一次被动回复；返回值同 `send()`。"""
         ...
 
     async def upload_image(self, data: bytes, mime_type: str) -> LibraryImage:
@@ -853,8 +873,6 @@ class _Deadlines:
 class _Outcome:
     content: str = field(repr=False)
     delivery: ReplyDelivery
-    # 送达了回答的那条消息（流式或纯文本）的引用索引，存进回复行的 `msg_idx`。
-    ref_idx: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -884,7 +902,7 @@ class _Turn:
 
     def __init__(
         self,
-        channel: ReplyChannel,
+        channel: _TurnChannel,
         user: User,
         selection: Selection,
         *,
@@ -938,7 +956,6 @@ class _Turn:
         ] = []  # 发出去（含说不准是否送达）、存了盘的图，记账时挂到回复上
         self.images_delivered = 0  # 确认发给了用户的图
         self.images_uncertain = 0  # 说不准是否送达的图
-        self.image_ref: str | None = None  # 第一张确认送达的图的引用索引
         # 这一轮待确认的一项（忘掉话题、设置或取消提醒，`confirmations.py`）：回答结束之后发确认按钮（`Conversation._offer()`）。
         self.pending: Pending | None = None
         # 这一轮要由程序直接发给用户的提醒列表（`list_reminders`，只留最后一次的）：回答结束之后、确认卡片之前发。
@@ -1893,7 +1910,20 @@ class Conversation:
                 await self._restart(turn, begun)
                 raise
             cancelled = exc
-            outcome = await self._wind_down(turn)
+            try:
+                outcome = await self._wind_down(turn)
+            except Exception as again:  # noqa: BLE001  先按已确认送达的记账，再抛出
+                # 收尾时出了意外的异常（如结束分片抛出的不是 SendError）：不能跳过记账，已确认送达的正文与发送记录照记，
+                # 记完再抛出它。
+                logger.warning(
+                    "用户 %s 的一轮被取消后收尾出错：%s", user.label, type(again).__name__
+                )
+                failure = again
+                turn.abandon()
+                if turn.run is not None:
+                    turn.attempts.append(turn.run.attempt(Ending.CANCELLED))
+                    turn.run = None
+                outcome = turn.outbox.outcome(ReplyDelivery.CANCELLED)
         except Exception as exc:  # noqa: BLE001  记账之后原样抛出
             # 意外的异常（如复查授权时数据库出错）：像取消那样有时限地收尾（停下模型、等在途的分片、结束已打开的
             # 消息），尽量按已确认送达的部分记账，最后抛出。收尾本身出错也照样记账。
@@ -1952,6 +1982,8 @@ class Conversation:
             entry.message_id for entry in begun.current if entry.message_id is not None
         ]
         processes = [*control.earlier, turn.process]
+        # 发送记录在 shield 之前同步取走：记账途中这里再被取消、这一轮又被重来时，重来的那一次拿到的是空的，不会写两份。
+        sent = control.sends.take()
         attributed = await asyncio.shield(
             self._record(
                 turn,
@@ -1960,12 +1992,14 @@ class Conversation:
                 turn_messages,
                 _transcript(processes),
                 _title_text(begun.current) if begun.topics is not None else None,
+                sent,
             )
         )
-        if cancelled is not None:
-            raise cancelled
+        # 两者都有只会是被取消后收尾又出了意外：抛出那个异常，不让它被取消盖掉。
         if failure is not None:
             raise failure
+        if cancelled is not None:
+            raise cancelled
         if outcome.delivery is not ReplyDelivery.WITHHELD:  # skipped 的也是 withheld
             self._schedule_descriptions(user, begun)
         if attributed is not None and self._summarizer is not None:
@@ -2025,8 +2059,10 @@ class Conversation:
         turn_messages: Sequence[int],
         process: str | None = None,
         title_text: str | None = None,
+        sent: tuple[SentRecord, ...] = (),
     ) -> _Attributed | None:
-        """记账。`turn_messages` 是这一轮的全部用户消息（含并进来的），它们的附件按这一轮重记 `given`。
+        """记账。`turn_messages` 是这一轮的全部用户消息（含并进来的），它们的附件按这一轮重记 `given`；`sent` 是
+        这一轮（含被重来的几次）的发送记录，挂到回复行上。
 
         `title_text` 不为空（分话题）时，这一轮结束了就把它的消息与回复归到选中的话题（新话题以它为临时标题），
         返回实际归到的话题编号与回复编号；没有写归属时返回 `None`。
@@ -2044,8 +2080,6 @@ class Conversation:
             # 文字回答没送达（被取消、复查不通过、说明也没能确认送达等），但画的图确认发给了用户：这一轮已经结束，
             # 图要留在之后的历史里，画图的请求不该在下一轮被重新并入。结局照旧。
             outcome = _Outcome("", ReplyDelivery.IMAGES)
-        if outcome.ref_idx is None and turn.image_ref is not None:
-            outcome = replace(outcome, ref_idx=turn.image_ref)  # 没有文字回答的引用索引时用图的
         if not outcome.content and outcome.delivery not in NOTICE_DELIVERIES and turn.sent_notices:
             # 回答没送达（被取消、复查不通过等），但附件的说明已确认送达：用户实际收到了东西，这一轮已经结束
             # （`journal.ends_turn()`），不该在下一轮被重新并入。结局照旧（如取消）。
@@ -2075,12 +2109,14 @@ class Conversation:
                 process,
                 topic,
                 tuple(turn.images),
+                sent,
             ),
         )
         commentaries, _ = turn.process.notes.counts
         streams = turn.outbox.streams
         logger.info(
-            "回复了用户 %s：模型 %s，结局 %s，送达 %s%s%s，搜索 %d 次，说明 %d 段，过程消息 %d 片",
+            "回复了用户 %s：模型 %s，结局 %s，送达 %s%s%s，搜索 %d 次，说明 %d 段，过程消息 %d 片，"
+            "发送记录 %d 条",
             turn.user.label,
             model,
             ending.value,
@@ -2090,6 +2126,7 @@ class Conversation:
             sum(attempt.searches for attempt in turn.attempts),
             commentaries,
             turn.process.chunks,
+            len(sent),
         )
         return attributed
 
@@ -2347,8 +2384,8 @@ class Conversation:
             delivery=reply.outcome.delivery,
             now=now,
             process=reply.process,
-            msg_idx=reply.outcome.ref_idx,
         )
+        sends.add_sends(conn, user.id, reply_id, reply.sends)
         journal.set_given(conn, user.id, reply.messages, reply.given)
         if reply.images:
             journal.add_generated_images(
@@ -2376,7 +2413,8 @@ class Conversation:
         decisions: Sequence[DecisionRecord],
         attempts: Sequence[_Attempt],
     ) -> None:
-        """被插话打断的一轮：只记决策与各次调用的用量，不写回复行，也不动 `given` 与话题归属。"""
+        """被插话打断的一轮：只记决策与各次调用的用量，不写回复行，也不动 `given` 与话题归属；发送记录留在
+        `TurnControl.sends` 里，随最后答完的那一次入账。"""
         now = int(self._clock())
         _record_decisions(conn, user.id, message_id, decisions, now)
         _record_usage(conn, user.id, message_id, attempts, now)
@@ -3340,7 +3378,7 @@ class Conversation:
                 outbox.discard()
                 if turn.images_delivered and last.ending is Ending.EMPTY:
                     logger.info("模型只给用户 %s 发了图、没有写文字，不发失败说明", user.label)
-                    return _Outcome("", ReplyDelivery.IMAGES, turn.image_ref)
+                    return _Outcome("", ReplyDelivery.IMAGES)
                 if turn.silent_card(last.ending):
                     # 设置、修改、取消提醒，忘掉话题，或列出提醒时模型照提示不写回答文字：不发回答也不发失败说明，
                     # 之后直接发列表与确认卡片（`_send_extras()`）。还没有内容：流水按实际送达的写（`_settle_extras()`）。
@@ -3365,7 +3403,7 @@ class Conversation:
             shown = _without_images(last.text) + sources  # 纯文本里显示不了图，图都写成说明文字
             plain = shown if notice is None else f"{shown}\n\n{notice}"
             try:
-                ref_idx = await channel.send(plain)
+                await channel.send(plain, kind=SendKind.PLAIN)
             except SendRejectedError as exc:
                 logger.warning("用户 %s 的回复改发纯文本也被拒绝：%s", user.label, exc)
             except SendUncertainError as exc:
@@ -3373,7 +3411,7 @@ class Conversation:
                 return outbox.outcome(ReplyDelivery.UNCERTAIN)
             else:
                 logger.info("用户 %s 的流式回复被平台拒绝，已改发纯文本", user.label)
-                return _Outcome(answer, ReplyDelivery.PLAIN, ref_idx)
+                return _Outcome(answer, ReplyDelivery.PLAIN)
         sent = await self._fallback(turn, texts.REPLY_REJECTED)
         delivery = ReplyDelivery.REJECTED if sent else ReplyDelivery.NOTICE_LOST
         return outbox.outcome(delivery)
@@ -3484,6 +3522,7 @@ class _Reply:
     process: str | None = field(default=None, repr=False)  # 处理过程的全文，只存档
     topic: _TopicWrite | None = None  # 分话题、这一轮结束了时要写的话题归属
     images: tuple[DrawnImage, ...] = field(default=(), repr=False)  # 这一轮发出去的图，挂到回复上
+    sends: tuple[SentRecord, ...] = field(default=(), repr=False)  # 这一轮的发送记录，挂到回复上
 
 
 @dataclass(frozen=True, slots=True)
@@ -3750,16 +3789,22 @@ async def _skip() -> None:
 
 class _TurnChannel:
     """本模块经它使用通道：给这条被回复的消息的被动回复计数（`ReplyChannel.budget`，发出之前就计，平台的序号
-    失败也不回退），回答一轮时（给了 `control`）交给 QQ 之前先 `TurnControl.claim()`。
+    失败也不回退），回答一轮时（给了 `control`）交给 QQ 之前先 `TurnControl.claim()`，并把每条被动回复记进发送
+    记录（`TurnControl.sends`，见 `sends.py`）。
 
     回答一轮的任务被 `preempt()` 之后立即被取消，不会再走到发送，所以这里的拒绝只是兜底；流式回复的分片在
     单独的任务里发，由 `_Outbox` 在第一片交出之前自己检查。过程消息不 `claim()`：它不算「已开始显示」。
+
+    发送记录：流式回答每开一条（与计被动回复次数同一个时刻）、其余每发一条开一项，种类按方法定（`send()` 默认是
+    固定说明，改发的纯文本传 `kind`）；送达、被拒、说不准与结束分片的结果记在那一项上，异常原样抛出，调用方照旧
+    处理。没有给 `control` 时（排队时的收到、「暂不支持」、附件的询问）不记：它们不属于一轮的回复。
     """
 
     def __init__(self, channel: ReplyChannel, control: TurnControl | None = None) -> None:
         self._channel = channel
         self._control = control
         self._streamed = False  # 当前这条回答的流式消息已经开始（一条流式消息只算一次被动回复）
+        self._current: Sending | None = None  # 当前这条回答的流式消息的发送记录
 
     @property
     def budget(self) -> ReplyBudget:
@@ -3768,6 +3813,9 @@ class _TurnChannel:
     def _claim(self) -> None:
         if self._control is not None and not self._control.claim():
             raise asyncio.CancelledError
+
+    def _open(self, kind: SendKind) -> Sending | None:
+        return None if self._control is None else self._control.sends.open(kind)
 
     async def typing(self, seconds: int) -> None:
         self.budget.typings += 1
@@ -3778,62 +3826,119 @@ class _TurnChannel:
         if not self._streamed:
             self._streamed = True
             self.budget.replies += 1
-        return await self._channel.stream(text)
+            self._current = self._open(SendKind.ANSWER)
+        return await _sent(self._current, self._channel.stream(text), text)
 
     async def finish_stream(self) -> str | None:
         self._streamed = False  # 之后再 stream() 就是新的一条（分条），另算一次
-        return await self._channel.finish_stream()
+        item, self._current = self._current, None
+        return await _closed(item, self._channel.finish_stream())
 
-    async def send(self, text: str) -> str | None:
+    async def send(self, text: str, *, kind: SendKind = SendKind.NOTICE) -> str | None:
         self._claim()
         self.budget.replies += 1
-        return await self._channel.send(text)
+        return await _sent(self._open(kind), self._channel.send(text), text)
 
     async def send_image(
         self, data: bytes, mime_type: str, replying: Callable[[], None]
     ) -> str | None:
         self._claim()
         self.budget.replies += 1
-        return await self._channel.send_image(data, mime_type, replying)
+        item = self._open(SendKind.IMAGE)
+        handed = False
 
-    async def send_markdown(self, markdown: str) -> None:
+        def mark() -> None:
+            # 准备工作（上传）做完、真正发起回复：从这时起失败的（被拒除外）都按说不准记。
+            nonlocal handed
+            handed = True
+            if item is not None:
+                item.started()
+            replying()
+
+        try:
+            ref_idx = await self._channel.send_image(data, mime_type, mark)
+        except BaseException as exc:
+            if item is not None:
+                item.failed(rejected=not handed or isinstance(exc, SendRejectedError))
+            raise
+        if item is not None:
+            item.confirmed(None, ref_idx)
+        return ref_idx
+
+    async def send_markdown(self, markdown: str) -> str | None:
         self._claim()
         self.budget.replies += 1
-        await self._channel.send_markdown(markdown)
+        item = self._open(SendKind.LISTING)
+        return await _sent(item, self._channel.send_markdown(markdown), markdown)
 
-    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> None:
+    async def send_buttons(self, markdown: str, buttons: Sequence[MessageButton]) -> str | None:
         self._claim()
         self.budget.replies += 1
-        await self._channel.send_buttons(markdown, buttons)
+        item = self._open(SendKind.CARD)
+        # 只记 Markdown，不记按钮：按钮数据里有一次性的令牌。
+        return await _sent(item, self._channel.send_buttons(markdown, buttons), markdown)
 
     async def upload_image(self, data: bytes, mime_type: str) -> LibraryImage:
-        # 传到素材库不发消息：不 claim、不计被动回复。
+        # 传到素材库不发消息：不 claim、不计被动回复、不记发送记录。
         return await self._channel.upload_image(data, mime_type)
 
     async def delete_image(self, image: LibraryImage) -> None:
         await self._channel.delete_image(image)
 
     def open_process(self) -> ProcessStream:
-        """开始一条过程消息（调用方在要发第一片时才调用，所以这时就计数）。"""
+        """开始一条过程消息（调用方在要发第一片时才调用，所以这时就计数、开发送记录）。"""
         self.budget.replies += 1
-        return _ProcessChannel(self._channel.open_process())
+        return _ProcessChannel(self._channel.open_process(), self._open(SendKind.PROCESS))
+
+
+async def _sent(
+    item: Sending | None, call: Coroutine[object, object, str | None], text: str | None
+) -> str | None:
+    """发出一次（一片或一整条），把结果记进发送记录 `item`（为 `None` 时不记）；异常原样抛出。平台明确拒绝的记成
+    被拒，其余（说不准、被取消、意外的异常）记成说不准。"""
+    if item is None:
+        return await call
+    item.started()
+    try:
+        ref_idx = await call
+    except BaseException as exc:
+        item.failed(rejected=isinstance(exc, SendRejectedError))
+        raise
+    item.confirmed(text, ref_idx)
+    return ref_idx
+
+
+async def _closed(item: Sending | None, call: Coroutine[object, object, str | None]) -> str | None:
+    """发出流式消息的结束分片，把结果记进发送记录 `item`（为 `None` 时不记）；异常原样抛出。"""
+    if item is None:
+        return await call
+    item.closing()
+    try:
+        ref_idx = await call
+    except BaseException:
+        item.close_failed()
+        raise
+    item.closed(ref_idx)
+    return ref_idx
 
 
 class _ProcessChannel:
-    """把通道的过程消息转成 `process.ProcessStream`：发送异常换成 `ProcessSendError`（文案本就已脱敏）。"""
+    """把通道的过程消息转成 `process.ProcessStream`：每片与结束分片的结果记进这条过程消息的发送记录（`item`），
+    发送异常换成 `ProcessSendError`（文案本就已脱敏）。"""
 
-    def __init__(self, stream: ReplyStream) -> None:
+    def __init__(self, stream: ReplyStream, item: Sending | None = None) -> None:
         self._stream = stream
+        self._item = item
 
     async def append(self, text: str) -> None:
         try:
-            await self._stream.append(text)
+            await _sent(self._item, self._stream.append(text), text)
         except SendError as exc:
             raise ProcessSendError(str(exc)) from None
 
     async def finish(self) -> None:
         try:
-            await self._stream.finish()
+            await _closed(self._item, self._stream.finish())
         except SendError as exc:
             raise ProcessSendError(str(exc)) from None
 
@@ -4012,7 +4117,7 @@ class _Drawer:
             replying = True
 
         try:
-            ref_idx = await turn.channel.send_image(image.data, image.mime_type, mark)
+            await turn.channel.send_image(image.data, image.mime_type, mark)
         except asyncio.CancelledError:
             if replying:
                 # 回复的请求已经发起：平台可能已经接受了，只是回执还没回来。按送达说不准记下，也不再换备用模型。
@@ -4033,8 +4138,6 @@ class _Drawer:
         turn.images_delivered += 1
         if saved is not None:
             turn.images.append(saved)
-        if turn.image_ref is None:
-            turn.image_ref = ref_idx
         parts: list[TextPart | ImagePart] = [TextPart(drawing.drawn(arguments.references))]
         if image.mime_type in FUNCTION_RESULT_IMAGE_TYPES:
             parts.append(ImagePart(image.data, image.mime_type))
@@ -4613,8 +4716,7 @@ class _Outbox:
     都不算。停下（`stop()`）、出错、开始结束（`close()`）之后不再接受新内容，并置位 `refusing`；`settled` 说明
     开始过的流式消息是不是都确认结束了（素材库的图能不能删）。
 
-    `ref_idx` 记下通道在第一条流式消息的成功分片与结束分片之后报告的引用索引（第一个不为空的为准；pyqbot 实测
-    每个分片的响应都带同一个），回答送达后存进回复行；分条之后的几条不记。
+    各条流式消息的引用索引与用户看到的正文不在这里记：它经过的通道（`_TurnChannel`）把每一条记进发送记录。
 
     没有改用 pyqbot 的 `StreamMessage.sent_text` 记录已送达的内容：本模块不依赖 pyqbot，替身也要同样成立；
     这里仍要自己逐片发送（第一片之前的 `claim()`、送达不明时立即停读），还要把回答与接在后面的固定说明分开
@@ -4662,7 +4764,6 @@ class _Outbox:
         self.pushed_bytes = 0  # 推进来的文字一共多少字节（UTF-8，不含分条时补上的围栏行）
         self.streams = 0  # 开始过几条流式消息（有内容确认送达的）
         self.unclosed = False  # 正文都已确认，但某一条的结束分片失败
-        self.ref_idx: str | None = None  # 第一条流式消息的引用索引，平台给出之后才有
         self.error: SendError | None = None
         self.broken = asyncio.Event()  # 出现说不准是否送达的错误时置位
         # 不再接受新内容（停下、出错、开始结束）时置位：在等的图不必再等（`Conversation._wait_image()`）。
@@ -4728,12 +4829,8 @@ class _Outbox:
         return "".join(parts)
 
     def outcome(self, delivery: ReplyDelivery) -> _Outcome:
-        """以确认送达的回答与第一条流式消息的引用索引写成的结局。"""
-        return _Outcome(self.delivered_answer, delivery, self.ref_idx)
-
-    def _note_ref(self, ref_idx: str | None) -> None:
-        if self.ref_idx is None and self.streams <= 1:
-            self.ref_idx = ref_idx
+        """以确认送达的回答写成的结局。"""
+        return _Outcome(self.delivered_answer, delivery)
 
     def _queued_text(self) -> str:
         return "".join(piece for piece in self._queue if isinstance(piece, str))
@@ -4855,7 +4952,6 @@ class _Outbox:
             raise exc
         else:
             self._open = False
-            self._note_ref(finishing.result())
 
     def _take(self) -> tuple[str, Cut | None]:
         """取出下一个切点之前的文字与这个切点（没有切点时为 `None`）。被动回复的次数不够时不再分条：这个与之后的
@@ -4931,7 +5027,7 @@ class _Outbox:
             if chunk:
                 self.handed = True
                 try:
-                    ref_idx = await self._hand(self._channel.stream(chunk))
+                    await self._hand(self._channel.stream(chunk))
                 except SendError as exc:
                     self.error = exc
                     self._refuse()
@@ -4944,7 +5040,6 @@ class _Outbox:
                 if not self._open:
                     self._open = True
                     self.streams += 1
-                self._note_ref(ref_idx)
             if cut is not None:
                 await self._finish_part()
                 self._prefix = cut.reopen
@@ -4953,12 +5048,10 @@ class _Outbox:
         """分条：结束当前这一条，等结束分片返回之后才开下一条（平台会提前结束还没结束的那条）。失败时记下
         `unclosed`，照样开下一条。"""
         try:
-            ref_idx = await self._hand(self._channel.finish_stream())
+            await self._hand(self._channel.finish_stream())
         except SendError as exc:
             logger.warning("分条时流式回复的结束分片没能送达：%s", exc)
             self.unclosed = True
-        else:
-            self._note_ref(ref_idx)
         self._open = False
 
 

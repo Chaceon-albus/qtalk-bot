@@ -419,6 +419,55 @@ async def test_quoting_a_reply_to_another_user_does_not_reach_their_topic(db: Da
     assert "小王的秘密" not in "".join(texts_of(model.requests[-1]))
 
 
+async def test_quoting_the_second_part_of_a_long_reply_settles_its_topic(db: Database) -> None:
+    # 回答分条后，引用第二条及以后的气泡同样定到那一轮的话题（每条都有自己的发送记录）。
+    from tests.test_conversation_split import paragraphs, script
+
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", script(paragraphs(30)))
+    decider = Picker()
+    chat = topical(db, decider, model)
+    long = FakeChannel(stream_ref="REFIDX_part_one")
+
+    def second_part() -> None:
+        long.stream_ref = "REFIDX_part_two"
+
+    long.on_finish = second_part
+    await say(chat, alice, "写一篇长文", channel=long)
+    model.script = answer("好的")
+    await say(chat, alice, "另一个话题", channel=FakeChannel(stream_ref="REFIDX_other"))
+    first, _ = (row[0] for row in await topic_rows(db))
+    asked = len(decider.requests)
+
+    await say(chat, alice, "第二条里说的", ref="REFIDX_part_two")
+
+    assert len(decider.requests) == asked  # 一个模型、话题已被引用定下：不调用决策
+    assert (await membership(db))[-2:] == [
+        ("user", "第二条里说的", first),
+        ("assistant", "好的", first),
+    ]
+
+
+async def test_quoting_a_fixed_notice_settles_the_topic_of_that_turn(db: Database) -> None:
+    # 固定说明也有发送记录：引用「没能回答」那句同样定到那一轮的话题。
+    from qtalk_bot import texts
+    from qtalk_bot.llm import ErrorKind, ModelError
+
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", [ModelError(Provider.OPENAI, ErrorKind.SERVER)])
+    decider = Picker()
+    chat = topical(db, decider, model)
+    failed = await say(chat, alice, "话题一", channel=FakeChannel(send_ref="REFIDX_notice"))
+    assert failed.sent == [texts.MODEL_FAILED]
+    model.script = answer("好的")
+    await say(chat, alice, "话题二")
+    first, _ = (row[0] for row in await topic_rows(db))
+
+    await say(chat, alice, "刚才怎么了", ref="REFIDX_notice")
+
+    assert (await membership(db))[-1] == ("assistant", "好的", first)
+
+
 # ---- 不变量：只来自这个用户 ----
 
 
@@ -459,6 +508,22 @@ async def test_disabled_user_triggers_no_topic_decision(db: Database) -> None:
     assert decider.requests == []
     assert len(model.requests) == 1
     assert len(await membership(db)) == 2
+
+
+async def test_disabled_user_quoting_an_old_reply_triggers_nothing(db: Database) -> None:
+    # AGENTS.md 的第一条不变量：引用自己旧的气泡也绕不过授权，开轮时就被挡下，不调用决策与模型。
+    alice = await invited(db, ALICE, "小王")
+    model = ScriptedModel("main", answer("好的"))
+    decider = Picker()
+    chat = topical(db, decider, model)
+    await say(chat, alice, "话题一", channel=FakeChannel(stream_ref="REFIDX_reply_one"))
+    await db.transaction(access.set_user_status, alice.id, UserStatus.DISABLED)
+    asked = len(decider.requests)
+
+    await say(chat, alice, "你刚才说的", ref="REFIDX_reply_one")
+
+    assert len(decider.requests) == asked
+    assert len(model.requests) == 1
 
 
 async def test_access_lost_during_the_topic_decision_stops_before_the_model(

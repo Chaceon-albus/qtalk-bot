@@ -2,7 +2,8 @@
 
 与 `journal.py` 一样，函数都是同步的，第一个参数是连接，由调用方放进 `Database.transaction()`；时间是 Unix 秒。
 查询一律按 `user_id` 过滤（话题、消息、归属三处都带）：一个用户的话题、标题、摘要与话题里的消息不会进入另一个
-用户的上下文，别人的话题编号或引用索引查不出任何东西。话题里各轮的原文由 `journal.topic_history()` 取。
+用户的上下文，别人的话题编号或引用索引查不出任何东西。话题里各轮的原文由 `journal.topic_history()` 取。按引用
+定位（`quoted_topic()`）查用户消息的 `msg_idx` 与发送记录（`sends.py`）的引用索引。
 
 - 话题归属是派生数据（`topic_messages`），流水 `messages` 仍只追加；只在一轮结束（`journal.ends_turn()`）时与
   回复写在同一个事务里（`attribute()`），被插话打断的那次不写。
@@ -95,28 +96,48 @@ def get_topic(conn: sqlite3.Connection, user_id: int, topic_id: int) -> Topic | 
 
 
 def quoted_topic(conn: sqlite3.Connection, user_id: int, message_ids: Iterable[int]) -> int | None:
-    """这些用户消息（这一轮的）引用了这个用户自己的哪条旧消息、那条消息所在的话题；从最新的一条消息看起，
-    第一个找得到话题的引用为准。都找不到时返回 `None`。
+    """这些用户消息（这一轮的）引用了这个用户自己的哪条旧消息或机器人回复他的哪条气泡、它所在的话题；从最新的
+    一条消息看起，第一个找得到话题的引用为准。都找不到时返回 `None`。
 
-    只在这个用户自己的流水里按 `msg_idx` 找，含他自己的消息与机器人回复他的消息（回复行的 `msg_idx` 是送达
-    回答的那条消息的引用索引，见 `journal.add_reply()`）：引用别人的消息或机器人回复别人的消息，索引都找不到
+    被引用的索引（`ref_msg_idx`）分两路找，都只在这个用户自己的行里：
+    - 他自己的消息：按用户消息的 `msg_idx`。
+    - 机器人回复他的气泡：按发送记录的引用索引（`sends.ref_idx`，过程消息、回答的每一条、改发的纯文本、说明、
+      列表、卡片、图片都有），找到它所属的回复行，取回复行的话题；回复行没有归属（没有结束的一轮，消息并进了
+      下一轮）时取它回答的那条用户消息的话题。
+    同一个索引两路都对上时（不应发生）取编号大的那一行。引用别人的消息或机器人回复别人的气泡，索引都找不到
     任何东西。
     """
-    ids = sorted(set(message_ids))
-    if not ids:
-        return None
-    placeholders = ", ".join("?" * len(ids))
-    row = conn.execute(
-        "SELECT t.topic_id FROM messages AS q"  # noqa: S608  只拼 ? 占位符
-        " JOIN messages AS m ON m.user_id = q.user_id AND m.msg_idx = q.ref_msg_idx"
-        " JOIN topic_messages AS t ON t.message_id = m.id AND t.user_id = q.user_id"
-        " JOIN topics ON topics.id = t.topic_id AND topics.user_id = q.user_id"
-        f" WHERE q.user_id = ? AND q.role = 'user' AND q.id IN ({placeholders})"
-        " AND q.ref_msg_idx IS NOT NULL AND m.id != q.id"
-        " ORDER BY q.id DESC, m.id DESC LIMIT 1",
-        (user_id, *ids),
-    ).fetchone()
-    return None if row is None else int(row["topic_id"])
+    for message_id in sorted(set(message_ids), reverse=True):
+        row = conn.execute(
+            "SELECT ref_msg_idx FROM messages"
+            " WHERE id = ? AND user_id = ? AND role = 'user' AND ref_msg_idx IS NOT NULL",
+            (message_id, user_id),
+        ).fetchone()
+        if row is None:
+            continue
+        ref = row["ref_msg_idx"]
+        found = conn.execute(
+            "SELECT topic_id FROM ("
+            " SELECT t.topic_id AS topic_id, m.id AS position FROM messages AS m"
+            " JOIN topic_messages AS t ON t.message_id = m.id AND t.user_id = m.user_id"
+            " JOIN topics ON topics.id = t.topic_id AND topics.user_id = m.user_id"
+            " WHERE m.user_id = ? AND m.role = 'user' AND m.msg_idx = ? AND m.id != ?"
+            " UNION ALL"
+            " SELECT topics.id AS topic_id, s.reply_id AS position FROM sends AS s"
+            " JOIN messages AS r ON r.id = s.reply_id AND r.user_id = s.user_id"
+            " AND r.role = 'assistant'"
+            " LEFT JOIN topic_messages AS tr ON tr.message_id = r.id AND tr.user_id = s.user_id"
+            " LEFT JOIN topic_messages AS tq ON tq.message_id = r.reply_to"
+            " AND tq.user_id = s.user_id"
+            " JOIN topics ON topics.id = coalesce(tr.topic_id, tq.topic_id)"
+            " AND topics.user_id = s.user_id"
+            " WHERE s.user_id = ? AND s.ref_idx = ?"
+            ") ORDER BY position DESC LIMIT 1",
+            (user_id, ref, message_id, user_id, ref),
+        ).fetchone()
+        if found is not None:
+            return int(found["topic_id"])
+    return None
 
 
 def attribute(

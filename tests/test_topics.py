@@ -1,15 +1,16 @@
 """话题线的数据层（`topics.py`）、话题里的历史（`journal.topic_history()`）与迁移 V9。"""
 
 import sqlite3
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
 import pytest
 from tests.test_storage import legacy_user
 
-from qtalk_bot import access, journal, topics
+from qtalk_bot import access, journal, sends, topics
 from qtalk_bot.journal import Ending, HistoryEntry, ReplyDelivery
 from qtalk_bot.llm import Role
+from qtalk_bot.sends import SendKind, SendStatus, SentRecord
 from qtalk_bot.storage import DATABASE_FILENAME, MIGRATIONS, Database
 
 ALICE = "FAKE-OPENID-ALICE"
@@ -37,11 +38,12 @@ def turn(
     msg_idx: str | None = None,
     ref: str | None = None,
     reply_idx: str | None = None,
+    sent: Sequence[SentRecord] = (),
     delivery: ReplyDelivery = ReplyDelivery.STREAMED,
     now: int = 0,
 ) -> tuple[int, int]:
-    """写一轮并归到话题 `topic`（`None` 时建新话题），返回（话题编号，用户消息编号）。`reply_idx` 是回复的
-    引用索引。"""
+    """写一轮并归到话题 `topic`（`None` 时建新话题），返回（话题编号，用户消息编号）。`reply_idx` 是回答那条
+    流式消息的引用索引（记成第 0 条发送记录），`sent` 是另外的发送记录。"""
     message_id = journal.add_user_message(
         conn, user_id, question, f"qq-{question}", now, msg_idx=msg_idx, ref_msg_idx=ref
     )
@@ -54,8 +56,13 @@ def turn(
         ending=Ending.COMPLETED,
         delivery=delivery,
         now=now,
-        msg_idx=reply_idx,
     )
+    records = list(sent)
+    if reply_idx is not None:
+        records.insert(
+            0, SentRecord(len(sent), SendKind.ANSWER, SendStatus.DELIVERED, answer, reply_idx)
+        )
+    sends.add_sends(conn, user_id, reply_id, records)
     topic_id = topics.attribute(
         conn, user_id, topic, [message_id], title_text=question, reply_id=reply_id, now=now
     )
@@ -324,6 +331,128 @@ async def test_quote_of_a_reply_to_another_user_finds_nothing(db: Database) -> N
 
     assert await db.transaction(topics.quoted_topic, alice, [quoting]) is None
     assert await db.transaction(topics.quoted_topic, bob, [bob_quoting]) is None
+
+
+def record(seq: int, kind: SendKind, ref: str | None) -> SentRecord:
+    content = None if kind is SendKind.IMAGE else f"第 {seq} 条"
+    return SentRecord(seq, kind, SendStatus.DELIVERED, content, ref)
+
+
+async def test_quote_of_any_bubble_of_a_turn_finds_its_topic(db: Database) -> None:
+    # 过程消息、回答的第二条、改发的纯文本、说明、列表、卡片、图片：引用这一轮的任何一条气泡都定到这一轮的话题。
+    alice = await new_user(db, ALICE, "小王")
+    bubbles = [
+        record(0, SendKind.PROCESS, "REFIDX_process"),
+        record(1, SendKind.ANSWER, "REFIDX_first"),
+        record(2, SendKind.ANSWER, "REFIDX_second"),
+        record(3, SendKind.PLAIN, "REFIDX_plain"),
+        record(4, SendKind.NOTICE, "REFIDX_notice"),
+        record(5, SendKind.LISTING, "REFIDX_listing"),
+        record(6, SendKind.CARD, "REFIDX_card"),
+        record(7, SendKind.IMAGE, "REFIDX_image"),
+        record(8, SendKind.NOTICE, None),
+    ]
+
+    def write(conn: sqlite3.Connection) -> tuple[int, list[int]]:
+        a, _ = turn(conn, alice, "话题甲", "答甲", sent=bubbles)
+        turn(conn, alice, "话题乙", "答乙", reply_idx="REFIDX_other")
+        quoting = [
+            journal.add_user_message(conn, alice, "引用", f"qq-{b.seq}", 0, ref_msg_idx=b.ref_idx)
+            for b in bubbles
+            if b.ref_idx is not None
+        ]
+        return a, quoting
+
+    a, quoting = await db.transaction(write)
+
+    for message_id in quoting:
+        assert await db.transaction(topics.quoted_topic, alice, [message_id]) == a
+
+
+async def test_quote_of_a_turn_that_did_not_end_finds_the_topic_of_its_question(
+    db: Database,
+) -> None:
+    # 没有结束的一轮（例如只显示了过程消息就关停）：回复行不写归属，它的用户消息并进下一轮、归进那一轮的话题。
+    alice = await new_user(db, ALICE, "小王")
+
+    def write(conn: sqlite3.Connection) -> tuple[int, int]:
+        question = journal.add_user_message(conn, alice, "问题", "qq-1", 0)
+        cancelled = journal.add_reply(
+            conn,
+            user_id=alice,
+            reply_to=question,
+            content="",
+            model="main",
+            ending=Ending.CANCELLED,
+            delivery=ReplyDelivery.CANCELLED,
+            now=0,
+        )
+        sends.add_sends(conn, alice, cancelled, [record(0, SendKind.PROCESS, "REFIDX_process")])
+        again = journal.add_user_message(conn, alice, "再问一次", "qq-2", 0)
+        reply = journal.add_reply(
+            conn,
+            user_id=alice,
+            reply_to=again,
+            content="答",
+            model="main",
+            ending=Ending.COMPLETED,
+            delivery=ReplyDelivery.STREAMED,
+            now=0,
+        )
+        topic = topics.attribute(
+            conn, alice, None, [question, again], title_text="问题", reply_id=reply, now=0
+        )
+        quoting = journal.add_user_message(
+            conn, alice, "引用", "qq-3", 0, ref_msg_idx="REFIDX_process"
+        )
+        return topic, quoting
+
+    topic, quoting = await db.transaction(write)
+
+    assert await db.transaction(topics.quoted_topic, alice, [quoting]) == topic
+
+
+async def test_quote_ignores_a_leftover_index_on_a_reply_row(db: Database) -> None:
+    # 回复的引用索引只在发送记录里；回复行上残留的 msg_idx（不应再有）不再被认。
+    alice = await new_user(db, ALICE, "小王")
+
+    def write(conn: sqlite3.Connection) -> int:
+        _, question = turn(conn, alice, "话题甲", "答甲")
+        conn.execute(
+            "UPDATE messages SET msg_idx = 'REFIDX_leftover' WHERE reply_to = ?", (question,)
+        )
+        return journal.add_user_message(
+            conn, alice, "引用", "qq-q", 0, ref_msg_idx="REFIDX_leftover"
+        )
+
+    quoting = await db.transaction(write)
+
+    assert await db.transaction(topics.quoted_topic, alice, [quoting]) is None
+
+
+async def test_same_index_in_two_users_send_records_resolves_to_each_ones_own_topic(
+    db: Database,
+) -> None:
+    # AGENTS.md 的第二条不变量：同一个引用索引字符串出现在两个人的发送记录里时，各自只定到自己的话题。
+    alice = await new_user(db, ALICE, "小王")
+    bob = await new_user(db, BOB, "小李")
+
+    def write(conn: sqlite3.Connection) -> tuple[int, int, int, int]:
+        bobs, _ = turn(conn, bob, "小李的秘密", "答小李", reply_idx="REFIDX_same")
+        alices, _ = turn(conn, alice, "小王的话题", "答小王", reply_idx="REFIDX_same")
+        quoting = journal.add_user_message(
+            conn, alice, "引用", "qq-a", 0, ref_msg_idx="REFIDX_same"
+        )
+        bob_quoting = journal.add_user_message(
+            conn, bob, "引用", "qq-b", 0, ref_msg_idx="REFIDX_same"
+        )
+        return alices, bobs, quoting, bob_quoting
+
+    alices, bobs, quoting, bob_quoting = await db.transaction(write)
+
+    assert await db.transaction(topics.quoted_topic, alice, [quoting]) == alices
+    assert await db.transaction(topics.quoted_topic, bob, [bob_quoting]) == bobs
+    assert await db.transaction(topics.quoted_topic, alice, [bob_quoting]) is None
 
 
 # ---- 话题里的历史 ----
