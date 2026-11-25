@@ -1,7 +1,8 @@
 """按配置创建对话模型：不发请求，只看创建与关闭。"""
 
 import pytest
-from tests.test_llm_claude import clear_proxy_environment, proxy_of
+from tests.proxies import clear_gemini_http_variables, clear_proxy_environment
+from tests.test_llm_claude import proxy_of
 
 from qtalk_bot.config import (
     DecisionSettings,
@@ -21,6 +22,14 @@ from qtalk_bot.llm.gemini_interactions import GeminiChatModel
 from qtalk_bot.llm.openai_decisions import OpenAIDecisionModel
 from qtalk_bot.llm.openai_responses import OpenAIChatModel
 from qtalk_bot.llm.providers import ChatModels
+
+
+@pytest.fixture(autouse=True)
+def fixed_gemini_http_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """宿主的 `GOOGLE_GENAI_HTTP_CLIENT`、`SSL_CERT_FILE` 等会改变 Gemini 的 SDK 建的 HTTP 客户端（指定了没装的 httpx
+    时构造就抛 `ImportError`），测试不受它们影响（`clear_gemini_http_variables()`）。"""
+    clear_gemini_http_variables(monkeypatch)
+
 
 SECRETS = Secrets(
     app_id="fake-app-id",

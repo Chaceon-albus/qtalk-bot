@@ -7,6 +7,7 @@
 import asyncio
 import base64
 import dataclasses
+import gc
 import json
 import logging
 import traceback
@@ -17,6 +18,12 @@ from typing import Any
 import httpx2
 import openai
 import pytest
+from tests.proxies import (
+    PROXY_SECRETS,
+    UNSUPPORTED_SYSTEM_PROXY,
+    capture_all_logs,
+    clear_proxy_environment,
+)
 
 from qtalk_bot.llm import (
     INPUT_LIMITS,
@@ -28,6 +35,7 @@ from qtalk_bot.llm import (
     ChatRequest,
     Citation,
     CitationFilter,
+    ClientSetupError,
     Commentary,
     ErrorKind,
     FilePart,
@@ -665,6 +673,73 @@ async def test_proxy_is_set_on_the_sdk_http_client(proxy: str) -> None:
     assert proxy_url.port == expected.port  # pyright: ignore[reportUnknownMemberType]
     assert http_client.timeout == openai.DefaultAsyncHttpxClient().timeout  # 其余保持 SDK 默认
     await client.close()
+
+
+def proxy_of(client: openai.AsyncOpenAI) -> tuple[str, int | None] | None:
+    """httpx2 给官方端点选的连接池所用的代理（主机，端口）；不走代理时是 `None`。读 SDK 与 httpx2 的私有属性，只在
+    测试里用：不联网没法验证真的走了代理。"""
+    http_client = client._client  # pyright: ignore[reportPrivateUsage]  见 docstring
+    transport = http_client._transport_for_url(httpx2.URL(OFFICIAL_BASE_URL))  # pyright: ignore[reportPrivateUsage]  见 docstring
+    proxy_url: object = getattr(getattr(transport, "_pool", None), "_proxy_url", None)
+    if proxy_url is None:
+        return None
+    host: object = getattr(proxy_url, "host", None)
+    port: object = getattr(proxy_url, "port", None)
+    assert isinstance(host, bytes)
+    assert port is None or isinstance(port, int)
+    return host.decode(), port
+
+
+async def test_without_a_proxy_setting_the_system_proxy_applies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_proxy_environment(monkeypatch)
+    client = create_client(FAKE_KEY)
+    assert proxy_of(client) is None
+    assert client.timeout == openai.DefaultAsyncHttpxClient().timeout  # 其余保持 SDK 默认
+    await client.close()
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:3128")
+    client = create_client(FAKE_KEY)
+    assert proxy_of(client) == ("127.0.0.1", 3128)
+    await client.close()
+
+
+async def test_an_explicit_proxy_ignores_the_system_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 配了 proxy 时不读系统的代理变量：它们用了不支持的协议也不影响。
+    clear_proxy_environment(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", UNSUPPORTED_SYSTEM_PROXY)
+    monkeypatch.setenv("ALL_PROXY", UNSUPPORTED_SYSTEM_PROXY)
+    client = create_client(FAKE_KEY, proxy="http://127.0.0.1:7890")
+    assert proxy_of(client) == ("127.0.0.1", 7890)
+    await client.close()
+
+
+@pytest.mark.parametrize("variable", ["HTTPS_PROXY", "ALL_PROXY"])
+async def test_an_unsupported_system_proxy_fails_without_showing_it(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, variable: str
+) -> None:
+    # 没配 proxy 时系统代理照常生效；它的协议 SDK 不支持时，构造客户端就抛 ValueError，原文里有代理的用户名与主机。
+    # 换成不带原文、不带异常链的 ClientSetupError；也不留下 SDK 自建的客户端在事件循环里的关闭任务（它失败时会往
+    # stderr 打「Task exception was never retrieved」）。日志里也不留原文。
+    clear_proxy_environment(monkeypatch)
+    monkeypatch.setenv(variable, UNSUPPORTED_SYSTEM_PROXY)
+    capture_all_logs(caplog)
+
+    with pytest.raises(ClientSetupError) as info:
+        create_client(FAKE_KEY)
+    gc.collect()
+    await asyncio.sleep(0)
+    gc.collect()
+
+    error = info.value
+    assert error.provider is Provider.OPENAI
+    assert "[providers.openai]" in str(error)
+    for text in (str(error), repr(error), "".join(traceback.format_exception(error)), caplog.text):
+        for secret in (*PROXY_SECRETS, FAKE_KEY):
+            assert secret not in text
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert not [record for record in caplog.records if record.name == "asyncio"]
 
 
 class BadClose(httpx2.AsyncByteStream):

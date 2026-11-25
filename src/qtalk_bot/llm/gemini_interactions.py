@@ -66,7 +66,10 @@
 环境变量：SDK 会读 `GOOGLE_GEMINI_BASE_URL`（端点）、`GOOGLE_GENAI_USE_VERTEXAI` /
 `GOOGLE_GENAI_USE_ENTERPRISE`（改走 Vertex AI）、`GOOGLE_GENAI_API_VERSION`（接口版本）、
 `GOOGLE_GENAI_CLIENT_MODE` 等（录制回放）。`create_client()` 明确传入端点、版本、`vertexai=False` 与空的
-调试配置，使它们不起作用。
+调试配置，使它们不起作用。系统级的代理变量照常生效：没配 `proxy` 时由它们决定。
+
+SDK 构造客户端时出错（如没配 `proxy`、SDK 又解析到了协议不支持的系统代理，原文里有代理的用户名与主机），
+`create_client()` 抛不带原文、不带异常链的 `ClientSetupError`。
 
 出错：SDK 把交互相关的异常类放在私有模块里，所以这里接住 SDK 调用与读流时的一切 `Exception`（取消是
 `BaseException`，不拦），只取数字状态码（`status_code` 或 `code` 属性），映射到本地的 `ErrorKind`；
@@ -95,6 +98,7 @@ from . import (
     ChatEvent,
     ChatRequest,
     CitationFilter,
+    ClientSetupError,
     ErrorKind,
     FilePart,
     Finished,
@@ -163,6 +167,10 @@ def create_client(
     `proxy` 不为空时放进 `client_args` 与 `async_client_args`：SDK 总会建一个同步客户端和一个异步客户端，
     两边都带上，其余参数（TLS、超时）仍由 SDK 补齐。为空时不设，系统级的代理环境变量照常生效。
     `http_options` 只给测试注入替身用。
+
+    Raises:
+        ClientSetupError: SDK 构造客户端时出错（如系统的代理环境变量用了 SDK 不支持的协议，SDK 的原文里有代理的
+            用户名与主机）。换成不带原文、不带异常链的异常。
     """
     options = http_options or types.HttpOptions()
     options.base_url = base_url or OFFICIAL_BASE_URL
@@ -173,13 +181,30 @@ def create_client(
         masked = Masked(proxy)
         options.client_args = {**(options.client_args or {}), "proxy": masked}
         options.async_client_args = {**(options.async_client_args or {}), "proxy": masked}
-    return genai.Client(
-        vertexai=False,
-        api_key=api_key,
-        http_options=options,
-        # 默认值来自 GOOGLE_GENAI_CLIENT_MODE 等环境变量，会把客户端换成录制回放用的。
-        debug_config=DebugConfig(client_mode=None, replays_directory=None, replay_id=None),
-    )
+    return new_client(api_key, options)
+
+
+def new_client(api_key: str, options: types.HttpOptions) -> genai.Client:
+    """按 `options` 构造 SDK 的客户端，不采用 Vertex AI 与录制回放的环境变量；出图专用的客户端也用它。
+
+    Raises:
+        ClientSetupError: SDK 构造客户端时出错。SDK 在这时建同步、异步两个 httpx2 客户端，系统的代理变量用了
+            不支持的协议时抛出的原文里有代理的用户名与主机，所以换成不带原文、不带异常链的异常。
+    """
+    client: genai.Client | None = None
+    try:
+        client = genai.Client(
+            vertexai=False,
+            api_key=api_key,
+            http_options=options,
+            # 默认值来自 GOOGLE_GENAI_CLIENT_MODE 等环境变量，会把客户端换成录制回放用的。
+            debug_config=DebugConfig(client_mode=None, replays_directory=None, replay_id=None),
+        )
+    except Exception:  # noqa: BLE001  原文可能带代理地址，下面换成脱敏的异常
+        client = None
+    if client is None:
+        raise ClientSetupError(Provider.GEMINI)  # 在 except 之外抛：异常链里不留 SDK 的原文
+    return client
 
 
 class GeminiChatModel:

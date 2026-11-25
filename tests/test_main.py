@@ -24,7 +24,11 @@ from zoneinfo import ZoneInfo
 import httpx2
 import pyqbot
 import pytest
-from tests.test_llm_claude import clear_proxy_environment
+from tests.proxies import (
+    PROXY_SECRETS,
+    UNSUPPORTED_SYSTEM_PROXY,
+    clear_gemini_http_environment,
+)
 
 from qtalk_bot import __main__ as entry
 from qtalk_bot import memory, texts
@@ -313,26 +317,39 @@ def test_missing_provider_key_exits_nonzero_naming_the_variable(
     assert FAKE_ENV["OPENAI_API_KEY"] not in err
 
 
+@pytest.mark.parametrize("variable", ["HTTPS_PROXY", "ALL_PROXY"])
+@pytest.mark.parametrize("provider", ["openai", "gemini", "claude"])
 def test_a_model_client_that_cannot_be_created_exits_with_a_clear_message(
-    config: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    provider: str,
+    variable: str,
 ) -> None:
-    # 没配 [providers.claude].proxy，系统代理用了 SDK 不支持的协议：SDK 的原文里有代理的用户名与主机，不能打出来。
+    # 没配 [providers.<服务商>].proxy，系统代理用了 SDK 不支持的协议：SDK 的原文里有代理的用户名与主机，不能打出来。
     config.write_text(
-        'timezone = "UTC"\n' + MODELS.replace('"openai"', '"claude"'), encoding="utf-8"
+        'timezone = "UTC"\n' + MODELS.replace('"openai"', f'"{provider}"'), encoding="utf-8"
     )
-    monkeypatch.setenv("CLAUDE_API_KEY", "fake-claude-key-never-shown")
-    clear_proxy_environment(
-        monkeypatch
-    )  # 含 NO_PROXY：宿主设了 NO_PROXY=* 时系统代理不生效，进不了这个分支
-    monkeypatch.setenv("HTTPS_PROXY", "socks4://alice-proxy-user:hunter2@proxy-host.invalid:1080")
+    key = f"fake-{provider}-key-never-shown"
+    monkeypatch.setenv(f"{provider.upper()}_API_KEY", key)
+    # 含 NO_PROXY：宿主设了 NO_PROXY=* 时系统代理不生效，进不了这个分支。
+    clear_gemini_http_environment(monkeypatch)
+    monkeypatch.setenv(variable, UNSUPPORTED_SYSTEM_PROXY)
+    # 根日志器调到 DEBUG（比真实启动的 INFO 还宽）；SDK 与 HTTP 库的日志器由 main() 照真实启动压在 WARNING，不在这里
+    # 调开：断言的就是真实启动时会写到 stderr 的那些日志。
+    caplog.set_level(logging.DEBUG)
 
     assert entry.main() == entry.EXIT_CONFIG_ERROR
 
     err = capsys.readouterr().err
-    assert "创建 claude 的客户端失败" in err
+    assert f"创建 {provider} 的客户端失败" in err
+    assert f"[providers.{provider}]" in err
     assert "Traceback" not in err
-    for secret in ("alice-proxy-user", "proxy-host.invalid", "hunter2", "fake-claude-key"):
+    # 测试里日志由 pytest 的处理器接着、不进 stderr；真实启动时日志写到 stderr，所以日志里也要干净（含 traceback）。
+    for secret in (*PROXY_SECRETS, key):
         assert secret not in err
+        assert secret not in caplog.text
 
 
 def test_main_configures_logging_first(

@@ -19,6 +19,13 @@ import openai
 import pytest
 from google.genai import types
 from tests.live.conftest import QUIET_LOGGERS, quieted_sdk_loggers
+from tests.proxies import (
+    UNSUPPORTED_SYSTEM_PROXY,
+    capture_all_logs,
+    clear_gemini_http_environment,
+    clear_gemini_http_variables,
+)
+from tests.test_llm_gemini import assert_setup_error_is_clean, proxies_of
 
 from qtalk_bot.config import GeminiImageSize, OpenAIImageQuality
 from qtalk_bot.imagegen import (
@@ -29,13 +36,29 @@ from qtalk_bot.imagegen import (
     OpenAIImageGenerator,
     create_gemini_client,
 )
-from qtalk_bot.llm import INPUT_LIMITS, ErrorKind, ImagePart, ModelError, Provider
+from qtalk_bot.llm import (
+    INPUT_LIMITS,
+    ClientSetupError,
+    ErrorKind,
+    ImagePart,
+    ModelError,
+    Provider,
+)
 from qtalk_bot.media import GIF, JPEG, PNG
 
 type Payload = dict[str, Any]
 type Handler = Callable[[httpx2.Request], httpx2.Response | Awaitable[httpx2.Response]]
 
 FAKE_KEY = "fake-image-key-never-shown"
+
+
+@pytest.fixture(autouse=True)
+def fixed_gemini_http_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """宿主的 `GOOGLE_GENAI_HTTP_CLIENT`、`SSL_CERT_FILE` 等会改变 Gemini 的 SDK 建的 HTTP 客户端（指定了没装的 httpx
+    时构造就抛 `ImportError`），测试不受它们影响（`clear_gemini_http_variables()`）。"""
+    clear_gemini_http_variables(monkeypatch)
+
+
 PROMPT = "画一只秘密的猫-PROMPT-7f3a"
 SECRET_TEXT = "上游的错误文案-SECRET-91b2"
 JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"fake-jpeg-body"
@@ -580,6 +603,46 @@ def test_gemini_image_client_keeps_endpoint_and_masked_proxy() -> None:
     assert options.async_client_args == {"proxy": "http://user:pw@127.0.0.1:7890"}
     assert "pw@" not in repr(options)
     client.close()
+
+
+async def test_gemini_image_client_uses_the_system_proxy_without_a_proxy_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_gemini_http_environment(monkeypatch)
+    client = create_gemini_client(FAKE_KEY)
+    assert proxies_of(client) == [None, None]
+    await client.aio.aclose()
+    client.close()
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:3128")
+    client = create_gemini_client(FAKE_KEY)
+    assert proxies_of(client) == [("127.0.0.1", 3128)] * 2
+    await client.aio.aclose()
+    client.close()
+
+
+async def test_gemini_image_client_with_a_proxy_ignores_the_system_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_gemini_http_environment(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", UNSUPPORTED_SYSTEM_PROXY)
+    monkeypatch.setenv("ALL_PROXY", UNSUPPORTED_SYSTEM_PROXY)
+    client = create_gemini_client(FAKE_KEY, proxy="http://127.0.0.1:7890")
+    assert proxies_of(client) == [("127.0.0.1", 7890)] * 2
+    await client.aio.aclose()
+    client.close()
+
+
+@pytest.mark.parametrize("variable", ["HTTPS_PROXY", "ALL_PROXY"])
+def test_gemini_image_client_with_an_unsupported_system_proxy_fails_cleanly(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, variable: str
+) -> None:
+    # 同对话的客户端：SDK 的原文里有代理的用户名与主机，换成不带原文、不带异常链的 ClientSetupError，日志里也不留。
+    clear_gemini_http_environment(monkeypatch)
+    monkeypatch.setenv(variable, UNSUPPORTED_SYSTEM_PROXY)
+    capture_all_logs(caplog)
+    with pytest.raises(ClientSetupError) as info:
+        create_gemini_client(FAKE_KEY)
+    assert_setup_error_is_clean(info.value, caplog, FAKE_KEY)
 
 
 def continuation(token: str = "token-1") -> Handler:

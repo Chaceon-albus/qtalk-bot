@@ -663,6 +663,8 @@ class ClientSetupError(Exception):
     不支持的协议。
 
     SDK 的原文可能带着代理地址里的用户名与主机，所以文案只有服务商与固定的提示，也不带异常链（在 `except` 之外抛出）。
+    三家适配器的 `create_client()` 与出图专用的 Gemini 客户端（`imagegen.create_gemini_client()`）都这样处理；文案里
+    的配置表 `[providers.<服务商>]` 三家都有。
     """
 
     def __init__(self, provider: Provider) -> None:

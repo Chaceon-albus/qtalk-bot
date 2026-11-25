@@ -68,7 +68,14 @@ Responses API 不接受音频（文档只在 Chat Completions 里写了音频输
 环境变量：SDK 构造客户端时会读 `OPENAI_BASE_URL`（端点）、`OPENAI_ORG_ID`、`OPENAI_PROJECT_ID`（请求头）、
 `OPENAI_ADMIN_KEY`、`OPENAI_CUSTOM_HEADERS`（附加请求头，其中的 `Authorization` 会顶替 key 生成的鉴权头）
 等。`create_client()` 明确传入端点，清掉组织、项目与管理 key；`OPENAI_CUSTOM_HEADERS` 没有公开的参数能关掉，
-所以在创建客户端之前把它从本进程的环境里去掉，并记一条 WARNING（只说变量名）。
+所以在创建客户端之前把它从本进程的环境里去掉，并记一条 WARNING（只说变量名）。系统级的代理变量照常生效：
+没配 `proxy` 时由它们决定。
+
+创建客户端出错：SDK 构造客户端时出错（如没配 `proxy`、SDK 又解析到了协议不支持的系统代理，原文里有代理的用户名
+与主机），`create_client()` 抛不带原文、不带异常链的 `ClientSetupError`。HTTP 客户端总是自己建（SDK 的
+`DefaultAsyncHttpxClient`，保留 SDK 默认的超时、连接上限与跟随重定向；它不带 `base_url`，请求的绝对地址仍由 SDK
+按自己的 `base_url` 拼出，端点不变）：SDK 自建的那个构造失败时，它的 `__del__` 还会在事件循环里排一个关闭任务，
+往 stderr 打一段「Task exception was never retrieved」。
 
 出错：SDK 的异常文案可能带响应体（如 401 时带着打了码的 key），流里的错误码字段也可能回显正文，所以
 `ModelError` 只用本地的 `ErrorKind` 与数字状态码。读流时 SDK 之外的异常（如 SSE 帧的 JSON 解析不了）
@@ -119,6 +126,7 @@ from . import (
     ChatEvent,
     ChatRequest,
     CitationFilter,
+    ClientSetupError,
     Commentary,
     ErrorKind,
     FilePart,
@@ -214,24 +222,37 @@ def create_client(
 ) -> openai.AsyncOpenAI:
     """创建客户端。端点只取 `base_url`，没有时用官方端点，不采用 `OPENAI_BASE_URL`。
 
-    `proxy` 不为空时，用 SDK 的 `DefaultAsyncHttpxClient`（保持 SDK 默认的超时、连接上限与跟随重定向）
-    加上这个代理；为空时由 SDK 自建客户端，系统级的代理环境变量照常生效。`http_client` 只给测试注入
-    替身用，与 `proxy` 不能同时给。
+    HTTP 客户端是 SDK 的 `DefaultAsyncHttpxClient`（保持 SDK 默认的超时、连接上限与跟随重定向）：`proxy` 不为空时
+    加上这个代理；为空时系统级的代理环境变量照常生效。`http_client` 只给测试注入替身用，与 `proxy` 不能同时给。
+
+    Raises:
+        ClientSetupError: SDK 构造客户端时出错（如系统的代理环境变量用了 SDK 不支持的协议，SDK 的原文里有代理的
+            用户名与主机）。换成不带原文、不带异常链的异常。
     """
     if os.environ.pop(CUSTOM_HEADERS_ENV, None) is not None:
         # SDK 构造客户端时把它的每行并进默认请求头，其中的 Authorization 还会顶替 key 生成的鉴权头；
         # 除了 provider 模式，没有公开的参数能关掉，只好从本进程的环境里去掉。
         logger.warning("已忽略环境变量 %s：大模型请求不采用环境里的附加请求头", CUSTOM_HEADERS_ENV)
-    if proxy is not None:
-        assert http_client is None, "proxy 与 http_client 不能同时给"
-        # 代理地址可能带口令：用 repr 被遮住的字符串交给 SDK。
-        http_client = openai.DefaultAsyncHttpxClient(proxy=Masked(proxy))
-    client = openai.AsyncOpenAI(
-        api_key=api_key,
-        base_url=base_url or OFFICIAL_BASE_URL,
-        max_retries=MAX_RETRIES,
-        http_client=http_client,
-    )
+    assert proxy is None or http_client is None, "proxy 与 http_client 不能同时给"
+    client: openai.AsyncOpenAI | None = None
+    try:
+        if http_client is None:
+            # 总是自己建 SDK 的默认客户端（不设 proxy 时它按系统的代理变量走），不让 SDK 自建：SDK 自建的那个构造
+            # 失败时，它的 __del__ 还会在事件循环里排一个关闭任务，往 stderr 多打一段 traceback。代理地址可能带
+            # 口令：用 repr 被遮住的字符串交给 SDK。
+            http_client = openai.DefaultAsyncHttpxClient(
+                proxy=None if proxy is None else Masked(proxy)
+            )
+        client = openai.AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url or OFFICIAL_BASE_URL,
+            max_retries=MAX_RETRIES,
+            http_client=http_client,
+        )
+    except Exception:  # noqa: BLE001  原文可能带代理地址，下面换成脱敏的异常
+        client = None
+    if client is None:
+        raise ClientSetupError(Provider.OPENAI)  # 在 except 之外抛：异常链里不留 SDK 的原文
     # 传 None 会让 SDK 去读 OPENAI_ORG_ID / OPENAI_PROJECT_ID / OPENAI_ADMIN_KEY，只能构造后再清掉
     # （都是公开属性，请求时才读）。
     client.organization = None

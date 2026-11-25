@@ -19,6 +19,12 @@ import anthropic
 import httpx2
 import pytest
 from tests.live.conftest import QUIET_LOGGERS, quieted_sdk_loggers
+from tests.proxies import (
+    PROXY_SECRETS,
+    UNSUPPORTED_SYSTEM_PROXY,
+    capture_all_logs,
+    clear_proxy_environment,
+)
 
 from qtalk_bot import __main__ as entry
 from qtalk_bot.llm import (
@@ -70,13 +76,6 @@ SECRET_TEXT = "用户的秘密正文"
 
 # SSE 帧与请求体是任意的 JSON 对象：值有字符串、数字、列表、嵌套的对象，写成精确的类型对测试没有帮助，用 Any。
 type Payload = dict[str, Any]
-
-
-def clear_proxy_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    """去掉系统的代理变量：名字转成小写后以 `_proxy` 结尾的都算。httpx2 经 `urllib.request.getproxies()` 读它们，
-    名字不分大小写（`No_Proxy=*` 也认）；宿主设了 `NO_PROXY=*` 时用例设的代理会被忽略。"""
-    for name in [name for name in os.environ if name.lower().endswith("_proxy")]:
-        monkeypatch.delenv(name)
 
 
 @pytest.fixture(autouse=True)
@@ -1113,11 +1112,12 @@ def test_without_a_proxy_setting_the_system_proxy_applies(monkeypatch: pytest.Mo
 
 @pytest.mark.parametrize("variable", ["HTTPS_PROXY", "ALL_PROXY"])
 def test_an_unsupported_system_proxy_fails_without_showing_it(
-    monkeypatch: pytest.MonkeyPatch, variable: str
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, variable: str
 ) -> None:
     # 没配 proxy 时系统代理照常生效；它的协议 SDK 不支持时，SDK 构造客户端就抛 ValueError，原文里有代理的用户名
     # 与主机（口令已被 httpx2 遮住）。换成不带原文、不带异常链的 ClientSetupError。
-    monkeypatch.setenv(variable, "socks4://alice-proxy-user:hunter2@proxy-host.invalid:1080")
+    monkeypatch.setenv(variable, UNSUPPORTED_SYSTEM_PROXY)
+    capture_all_logs(caplog)
 
     with pytest.raises(ClientSetupError) as info:
         create_client(FAKE_KEY)
@@ -1125,8 +1125,9 @@ def test_an_unsupported_system_proxy_fails_without_showing_it(
     error = info.value
     assert error.provider is Provider.CLAUDE
     assert "[providers.claude]" in str(error)
-    for text in (str(error), repr(error), "".join(traceback.format_exception(error))):
-        for secret in ("alice-proxy-user", "proxy-host.invalid", "hunter2", FAKE_KEY):
+    # 日志里也不留原文（含异常的 traceback）。
+    for text in (str(error), repr(error), "".join(traceback.format_exception(error)), caplog.text):
+        for secret in (*PROXY_SECRETS, FAKE_KEY):
             assert secret not in text
     assert error.__cause__ is None
     assert error.__context__ is None

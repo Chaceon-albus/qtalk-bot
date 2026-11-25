@@ -53,7 +53,6 @@ from typing import Literal, Protocol, cast
 import openai
 from google import genai
 from google.genai import errors, interactions, types
-from google.genai.client import DebugConfig
 from openai.types import ImagesResponse
 
 from .config import GeminiImageSize, OpenAIImageQuality
@@ -72,6 +71,7 @@ from .llm import (
 )
 from .llm.gemini_interactions import API_VERSION as GEMINI_API_VERSION
 from .llm.gemini_interactions import OFFICIAL_BASE_URL as GEMINI_OFFICIAL_BASE_URL
+from .llm.gemini_interactions import new_client as new_gemini_client
 from .llm.openai_responses import is_quota_exhausted
 from .media import EXTENSIONS, detect_format
 
@@ -322,7 +322,11 @@ def create_gemini_client(
     http_options: types.HttpOptions | None = None,
 ) -> genai.Client:
     """出图专用的 Gemini 客户端：端点、接口版本、代理与对环境变量的防护同
-    `llm.gemini_interactions.create_client()`，只是只试一次、不自动重试。`http_options` 只给测试注入替身用。"""
+    `llm.gemini_interactions.create_client()`，只是只试一次、不自动重试。`http_options` 只给测试注入替身用。
+
+    Raises:
+        ClientSetupError: SDK 构造客户端时出错（同 `llm.gemini_interactions.new_client()`）。
+    """
     options = http_options or types.HttpOptions()
     options.base_url = base_url or GEMINI_OFFICIAL_BASE_URL
     options.api_version = GEMINI_API_VERSION
@@ -331,12 +335,7 @@ def create_gemini_client(
         masked = Masked(proxy)  # 代理地址可能带口令，SDK 的 HttpOptions 打印出来也不回显
         options.client_args = {**(options.client_args or {}), "proxy": masked}
         options.async_client_args = {**(options.async_client_args or {}), "proxy": masked}
-    return genai.Client(
-        vertexai=False,
-        api_key=api_key,
-        http_options=options,
-        debug_config=DebugConfig(client_mode=None, replays_directory=None, replay_id=None),
-    )
+    return new_gemini_client(api_key, options)
 
 
 def _without_retries(client: openai.AsyncOpenAI) -> openai.AsyncOpenAI:
