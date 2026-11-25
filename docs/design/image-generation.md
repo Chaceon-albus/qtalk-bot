@@ -34,7 +34,7 @@ image_generation = true         # 可选，默认关：这个模型能用画图�
 
 - 通用类型 `FunctionTool`、`FunctionCall`（参数是 JSON 文本，Gemini 与 Claude 给的对象序列化成文本）、`FunctionResult`（文字与图片，图片限 png、jpeg、webp）、`ToolRunner`；`ChatRequest.tools` 与 `ChatRequest.tool_runner`，`ChatModel.stream()` 的签名不变。新事件 `FunctionCallStarted`。
 - 适配器在内部执行多跳：模型调用函数时 `await tool_runner(call)`，把结果交回、再发下一跳，对调用方仍是同一次 `stream()`，用量与搜索次数跨跳累计。函数执行时上一跳的连接已经释放，执行前后各交一个 `Heartbeat`；`tool_runner` 的异常（含取消）原样往外抛。
-- 下一跳带回上一跳的全部输出、按原顺序。OpenAI 与 Gemini 关着服务端存储（`store=False`）：OpenAI 是全部输出项（`item.to_dict(mode="json", warnings=False)`，含推理项的 `encrypted_content`、消息的 `phase`、`web_search_call`、`function_call`），带函数的各跳显式传 `include=["reasoning.encrypted_content"]`；Gemini 是从流里重建、再用完成快照补全的全部模型步骤（带签名的 thought、搜索步骤、`function_call`），排除快照里回显的输入步骤；两家回放前去掉无法编码的孤立代理码位（签名、密文、参数原样保留）。Claude 带回什么、怎样清理与校验、函数怎样声明，见[「各家的对话接口」](conversation.md#各家的对话接口)。
+- 下一跳带回上一跳的全部输出、按原顺序。OpenAI 与 Gemini 关着服务端存储（`store=False`）：OpenAI 是全部输出项（`item.to_dict(mode="json", warnings=False)`，含推理项的 `encrypted_content`、消息的 `phase`、`web_search_call`、`function_call`），带函数的各跳显式传 `include=["reasoning.encrypted_content"]`；Gemini 是从流里重建、再用完成快照补全的全部模型步骤（带签名的 thought、搜索步骤、`function_call`），排除快照里回显的输入步骤，回放前去掉无法编码的孤立代理码位（签名、参数原样保留）。OpenAI 与 Claude 带回时哪些字段原样、执行函数之前怎样确认下一跳发得出去，以及 Claude 的函数怎样声明，见[「各家的对话接口」](conversation.md#各家的对话接口)。
 - 函数调用最多 5 轮（`MAX_FUNCTION_ROUNDS`），之后的一跳要求不再调用：OpenAI 开着内置搜索时用 `allowed_tools` 只放行 `web_search`，否则 `tool_choice: "none"`；Gemini 用 `"none"`（SDK 的 `allowed_tools` 只能列函数名，内置搜索放不进去，所以这一跳连搜索也关了）；Claude 用 `tool_choice: {"type": "none"}`，这一跳同样搜不了。
 - 续发时按服务商的内联上限累计原附件与函数结果图（`InlineBudget`），放不下的结果图换成一句说明；超过单张图片上限的（只有 Claude 有，见[「模型的输入能力」](attachments.md#模型的输入能力)）同样换成说明。
 - Gemini 等待函数结果时的状态按 `requires_action` 处理（文档没写，按 SDK 的自动续写推断）。
