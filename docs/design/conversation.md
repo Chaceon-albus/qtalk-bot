@@ -172,6 +172,8 @@ Claude 的 `usage.input_tokens` 不含缓存的部分，所以输入取 `input_t
 
 环境变量的影响：端点只有两个来源，配置里的 `base_url` 或官方默认值；`OPENAI_BASE_URL`、`GOOGLE_GEMINI_BASE_URL` 这类变量不采用，改走 Vertex、改接口版本的变量也都压住了。`OPENAI_CUSTOM_HEADERS`（SDK 会把它的内容作为附加请求头，还可能顶替鉴权头）没有对应的参数可以关掉，所以程序在创建 OpenAI 客户端之前把它从本进程的环境里去掉，并记一条日志。唯一照常生效的是系统级的代理变量：没配 `proxy` 时由它们决定。
 
+没配显式的 `proxy`、SDK 又实际解析到了协议不支持的系统代理时（如 `socks4://`；配了有效的显式 `proxy` 时 SDK 不读系统代理），三家的 `create_client()` 与出图专用的 Gemini 客户端在构造这一步就会出错，SDK 的原文里有代理的用户名与主机：构造客户端的异常换成不带 SDK 原文、不带异常链的 `llm.ClientSetupError`，`main()` 打印它的固定提示（只有服务商与要检查的设置）并以配置错误的状态退出。OpenAI 与 Claude 的 HTTP 客户端由程序自己用 SDK 的 `DefaultAsyncHttpxClient` 建（保留 SDK 默认的超时、连接上限与跟随重定向，系统代理照常生效；请求的地址仍由 SDK 按 `base_url` 拼出），免得 SDK 自建的客户端在构造失败后往 stderr 多打一段 traceback。
+
 Claude 一侧（`llm/claude_messages.py` 的 `create_client()`）：
 
 - 凭证：显式传了 API key，SDK 就不读 `ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`，也不走 profile 文件与联合身份的自动发现（`ANTHROPIC_PROFILE`、`ANTHROPIC_CONFIG_DIR`、`ANTHROPIC_IDENTITY_TOKEN*` 等），profile 里的端点与附加请求头也就带不进来。
@@ -179,7 +181,6 @@ Claude 一侧（`llm/claude_messages.py` 的 `create_client()`）：
 - `ANTHROPIC_CUSTOM_HEADERS` 同 `OPENAI_CUSTOM_HEADERS`：没有参数能关掉，创建客户端之前从本进程的环境里去掉，并记一条日志。
 - `ANTHROPIC_OPEN_TELEMETRY*`：不显式配置时 SDK 按它们决定是否给每次调用建 span、是否把请求与响应的正文写进 span、是否在请求头里带追踪上下文；客户端显式关掉 span 与传播，SDK 就不读这些变量。
 - `ANTHROPIC_LOG`（以及 OpenAI 的 `OPENAI_LOG`）设成 `debug` 或 `info` 时，导入 SDK 就抢先调用一次 `logging.basicConfig()` 并调低 SDK 与 `httpx2` 日志器的级别。`__main__.configure_logging()` 以 `force=True` 重新配置根日志器，随后照旧把这些日志器压回 WARNING，否则程序自己的日志格式与 INFO 级别会丢。
-- SDK 构造客户端时出错（如没配 `proxy`、系统的代理变量又用了 SDK 不支持的协议，SDK 的原文里有代理的用户名与主机），`create_client()` 换成不带原文、不带异常链的 `llm.ClientSetupError`，`main()` 打印它的文案（只有服务商与固定的提示）并以配置错误的状态退出。
 
 两个要留意的地方：`base_url` 不能带查询串或片段，SDK 和 pyqbot 都是在它后面直接拼路径；Gemini SDK 的配置对象（`HttpOptions`）的 `repr` 里有明文的 API key，那是 SDK 自己放进请求头的，诊断时不要打印它。代理地址交给 SDK 之前包了一层，不会出现在这些 `repr` 里。
 

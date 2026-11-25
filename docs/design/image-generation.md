@@ -43,7 +43,7 @@ image_generation = true         # 可选，默认关：这个模型能用画图�
 
 - OpenAI 用 Images API：没有参考图时 `images.generate`，有参考图时 `images.edit`（多张 `image[]`）；`n=1`、`output_format="jpeg"`，配置了 `openai_quality` 才传 `quality`。内容审核拒绝认 `error.code == "moderation_blocked"`。
 - Gemini 用 Interactions 非流式：`response_format` 带方向与（配置了时）分辨率，参考图放在输入里；先判最终状态再取 `output_image`。安全拦截优先看结构化的原因（`interaction.errors[].code`、HTTP 错误体的 `error.details[].reason`），文案兜底只限 HTTP 400（文档没写拦截时的表现，属于推断）。参考图按内联上限累计。
-- 参考图最多 4 张。时限在模块内部；失败一律抛脱敏的 `ModelError`。出图请求**不自动重试**（OpenAI 用 `max_retries=0` 的客户端副本，Gemini 另建一个 `attempts=1` 的客户端），免得结果不明时出两张、扣两张的钱；对话的重试策略不变。
+- 参考图最多 4 张。时限在模块内部；失败一律抛脱敏的 `ModelError`。出图请求**不自动重试**（OpenAI 用 `max_retries=0` 的客户端副本，Gemini 另建一个 `attempts=1` 的客户端，构造失败同样换成 `ClientSetupError`，见[「配置与环境变量」](conversation.md#配置与环境变量)），免得结果不明时出两张、扣两张的钱；对话的重试策略不变。
 - 用量记进用量表，`purpose` 为 `image`，一次出图（含改图）一行；限额按这种行的行数算张数。
 
 ## 一次画图调用
