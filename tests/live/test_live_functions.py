@@ -1,14 +1,19 @@
-"""对两家服务商的对话模型各走一遍我们自己声明的函数调用：访问真实网络、会计费，默认不运行。
+"""对各家服务商的对话模型各走一遍我们自己声明的函数调用：访问真实网络、会计费，默认不运行。
 
 征得同意后这样运行（密钥从 `.env` 读，不会被打印）：
 
     uv run --env-file .env pytest -m live -s tests/live/test_live_functions.py
 
-模型名同 `test_live_models.py`，可以用 `QTALK_LIVE_OPENAI_MODEL`、`QTALK_LIVE_GEMINI_MODEL` 改。每家两个用例：
+模型名同 `test_live_models.py`，可以用 `QTALK_LIVE_OPENAI_MODEL`、`QTALK_LIVE_GEMINI_MODEL`、
+`QTALK_LIVE_CLAUDE_OPUS_MODEL`、`QTALK_LIVE_CLAUDE_SONNET_MODEL` 改（Claude 两个模型各跑一遍）。每家两个用例：
 一个只返回固定文字的假函数（查询当前日期），一个返回一张代码里生成的纯红小图的假函数，确认模型调用函数、拿到
 结果后能接着写回答。两个用例都同时打开内置搜索，确认函数能与搜索同时开着。打印事件的种类、函数调用的名字、
 用量与回答原文（提示词与函数结果都是固定的，没有用户数据）。断言调用了函数、以 `COMPLETED` 结束，并且最后一次
 函数调用之后的回答里有只能从函数结果得出的内容：故意给的假日期（3 月 7 日），或只在图片里的颜色（红）。
+
+Claude 另有一个用例：把项目里真实的 7 个函数连同搜索工具一起声明（都带 `strict: true`），问一句不需要调用函数的
+话，确认接口接受这些声明、正常写完；被调用就失败。连发两次，第二次的用量里应当有命中缓存的输入（函数声明这一段
+带着缓存断点）。只打印事件的种类与用量，不打印回答。
 """
 
 import os
@@ -19,6 +24,7 @@ from collections import Counter
 
 import pytest
 
+from qtalk_bot.drawing import GENERATE_IMAGE
 from qtalk_bot.llm import (
     ChatModel,
     ChatRequest,
@@ -35,11 +41,15 @@ from qtalk_bot.llm import (
     TextPart,
     Usage,
 )
+from qtalk_bot.llm.claude_messages import ClaudeChatModel
+from qtalk_bot.llm.claude_messages import create_client as create_claude_client
 from qtalk_bot.llm.gemini_interactions import GeminiChatModel
 from qtalk_bot.llm.gemini_interactions import create_client as create_gemini_client
 from qtalk_bot.llm.openai_responses import OpenAIChatModel
 from qtalk_bot.llm.openai_responses import create_client as create_openai_client
 from qtalk_bot.media import PNG, detect_format
+from qtalk_bot.memory_tools import FORGET_PROFILE_ITEM, FORGET_TOPIC, VIEW_MEMORY
+from qtalk_bot.reminder_tools import CANCEL_REMINDER, LIST_REMINDERS, SET_REMINDER
 
 pytestmark = pytest.mark.live
 
@@ -116,13 +126,18 @@ def test_sample_image_is_a_png() -> None:
 
 
 async def run(
-    model: ChatModel, tool: FunctionTool, question: str, expected: re.Pattern[str]
+    model: ChatModel,
+    tool: FunctionTool,
+    question: str,
+    expected: re.Pattern[str],
+    *,
+    max_output_tokens: int | None = 2048,
 ) -> None:
     runner = Runner()
     request = ChatRequest(
         system="你是一个简洁的助手。能用提供的函数回答时就调用函数，不要猜。",
         messages=(Message.text(Role.USER, question),),
-        max_output_tokens=2048,
+        max_output_tokens=max_output_tokens,
         tools=(tool,),
         tool_runner=runner,
     )
@@ -193,3 +208,87 @@ async def test_gemini_calls_our_function(
     finally:
         await client.aio.aclose()
         client.close()
+
+
+CLAUDE_MODELS = [
+    ("QTALK_LIVE_CLAUDE_OPUS_MODEL", "claude-opus-5-5"),
+    ("QTALK_LIVE_CLAUDE_SONNET_MODEL", "claude-sonnet-5-5"),
+]
+
+
+@pytest.mark.parametrize(("variable", "default"), CLAUDE_MODELS, ids=["opus", "sonnet"])
+@pytest.mark.parametrize(("tool", "question", "expected"), QUESTIONS, ids=["text", "image"])
+async def test_claude_calls_our_function(
+    tool: FunctionTool, question: str, expected: re.Pattern[str], variable: str, default: str
+) -> None:
+    key = os.environ.get("CLAUDE_API_KEY")
+    if not key:
+        pytest.skip("没有设置 CLAUDE_API_KEY")
+    client = create_claude_client(key)
+    try:
+        name = os.environ.get(variable, default)
+        model = ClaudeChatModel(client, name=f"claude:{name}", model=name, search=True)
+        # 不设输出上限（按 64000 传）：思考也算在上限里。
+        await run(model, tool, question, expected, max_output_tokens=None)
+    finally:
+        await client.close()
+
+
+REAL_TOOLS = (
+    SET_REMINDER,
+    LIST_REMINDERS,
+    CANCEL_REMINDER,
+    VIEW_MEMORY,
+    FORGET_TOPIC,
+    FORGET_PROFILE_ITEM,
+    GENERATE_IMAGE,
+)
+
+
+async def refuse(call: FunctionCall) -> FunctionResult:
+    raise AssertionError(f"这句话不该调用函数：{call.name}")
+
+
+@pytest.mark.parametrize(("variable", "default"), CLAUDE_MODELS, ids=["opus", "sonnet"])
+async def test_claude_accepts_the_real_function_declarations(variable: str, default: str) -> None:
+    key = os.environ.get("CLAUDE_API_KEY")
+    if not key:
+        pytest.skip("没有设置 CLAUDE_API_KEY")
+    client = create_claude_client(key)
+    try:
+        name = os.environ.get(variable, default)
+        model = ClaudeChatModel(client, name=f"claude:{name}", model=name, search=True)
+        request = ChatRequest(
+            system="你是一个简洁的助手。",
+            messages=(Message.text(Role.USER, "你好"),),
+            max_output_tokens=None,
+            tools=REAL_TOOLS,
+            tool_runner=refuse,
+        )
+        # 连发两次：函数声明这一段带着缓存断点，第二次应当命中缓存。
+        usages: list[Usage | None] = []
+        for attempt in (1, 2):
+            kinds: Counter[str] = Counter()
+            usage: Usage | None = None
+            finished: Finished | None = None
+            async for event in model.stream(request):
+                kinds[type(event).__name__] += 1
+                match event:
+                    case Usage():
+                        usage = event
+                    case Finished():
+                        finished = event
+                    case _:
+                        pass
+            print(  # noqa: T201
+                f"\n{model.name}（真实的函数声明，第 {attempt} 次）：事件 {dict(kinds)}，用量 {usage}，"
+                f"{finished}"
+            )
+            assert finished == Finished(FinishReason.COMPLETED)
+            usages.append(usage)
+        second = usages[-1]
+        assert second is not None
+        assert second.cached_input_tokens is not None
+        assert second.cached_input_tokens > 0
+    finally:
+        await client.close()

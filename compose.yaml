@@ -27,6 +27,7 @@ services:
       ADMIN_OPENID: ${ADMIN_OPENID:?请在 .env 里填写 ADMIN_OPENID}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      CLAUDE_API_KEY: ${CLAUDE_API_KEY:-}
     volumes:
       # 镜像里的 QTALK_CONFIG 指向 /app/config.toml；data_dir = "data" 按配置文件所在目录解析成 /app/data。
       - ./config.toml:/app/config.toml:ro

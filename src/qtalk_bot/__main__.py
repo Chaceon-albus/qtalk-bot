@@ -16,7 +16,8 @@
 的锁 `Conversation.user_lock()`）。备份、磁盘、网关与模型的告警都经 `alerts.Alerts` 发给管理员。
 
 退出时按 `_shut_down()` 的顺序先停收事件、等前台与对话收尾，再停后台的任务，最后关闭模型的客户端与数据库。配置
-或数据库有误（含迁移前的备份失败）、连不上平台时打印原因并以非零状态退出，不打印 traceback。
+或数据库有误（含迁移前的备份失败）、建不了模型的客户端（`llm.ClientSetupError`）、连不上平台时打印原因并以非零状态
+退出，不打印 traceback。
 """
 
 import asyncio
@@ -67,6 +68,7 @@ from .gateway_watch import GatewayWatch
 from .health import GatewayReading, Heartbeat, clear_heartbeat
 from .image_download import CLOSE_TIMEOUT_SECONDS as IMAGE_CLOSE_SECONDS
 from .image_download import ImageDownloader
+from .llm import ClientSetupError
 from .llm.providers import ChatModels
 from .maintenance import (
     BackupScheduler,
@@ -612,23 +614,33 @@ async def _supervise(
             signals.uninstall(loop)
 
 
-QUIET_LOGGERS = ("httpx2", "httpcore2", "openai", "google_genai", "google.genai")
+QUIET_LOGGERS = ("httpx2", "httpcore2", "openai", "google_genai", "google.genai", "anthropic")
 """压到 WARNING 的第三方日志器，见 `quiet_third_party_logs()`。"""
 
 
 def quiet_third_party_logs() -> None:
     """把 `QUIET_LOGGERS` 压到 WARNING。httpx2 在 INFO 级别记录每个请求的完整地址：单聊接口的路径里有 openid，
-    回答里网上的图片的地址属于聊天内容。两家大模型 SDK 的 DEBUG 日志里有请求体（聊天内容），也压住，免得有人把根
+    回答里网上的图片的地址属于聊天内容。各家大模型 SDK 的 DEBUG 日志里有请求体（聊天内容），也压住，免得有人把根
     日志级别调到 DEBUG。`main()` 与 `run()` 都调用它，直接调用 `run()` 时也在第一个请求之前生效。"""
     for name in QUIET_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
-def main() -> int:
+def configure_logging() -> None:
+    """配置根日志器（INFO，本项目的格式），再压住 `QUIET_LOGGERS`。
+
+    `force=True`：环境里设了 `ANTHROPIC_LOG` 或 `OPENAI_LOG` 时，SDK 在导入时就抢先调用过 `logging.basicConfig()`，
+    不强制的话这里的设置不生效（根日志器停在 WARNING，格式也是 SDK 的）。SDK 同时调低了自己与 `httpx2` 日志器的
+    级别，随后的 `quiet_third_party_logs()` 把它们压回 WARNING。
+    """
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", force=True
     )
     quiet_third_party_logs()
+
+
+def main() -> int:
+    configure_logging()
     try:
         secrets = load_secrets()
         settings = load_settings()
@@ -642,6 +654,10 @@ def main() -> int:
     except StorageError as exc:
         sys.stderr.write(f"数据库有误：{exc}\n")
         return EXIT_RUNTIME_ERROR
+    except ClientSetupError as exc:
+        # 文案里只有服务商与固定的提示（见 `llm.ClientSetupError`）。
+        sys.stderr.write(f"{exc}\n")
+        return EXIT_CONFIG_ERROR
     except pyqbot.QQBotError as exc:
         # pyqbot 保证异常文案里没有 AppSecret 与 access_token。
         sys.stderr.write(f"无法连接 QQ 平台：{exc}\n")

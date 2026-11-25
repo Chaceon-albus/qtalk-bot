@@ -1,13 +1,13 @@
-"""对两家服务商的对话模型各发一张图片、一个 PDF（Gemini 再加一段 WAV）的实测：访问真实网络、会计费，默认不运行。
+"""对各家服务商的对话模型各发一张图片、一个 PDF（Gemini 再加一段 WAV）的实测：访问真实网络、会计费，默认不运行。
 
 征得同意后这样运行（密钥从 `.env` 读，不会被打印）：
 
     uv run --env-file .env pytest -m live -s tests/live/test_live_media.py
 
-模型名同 `test_live_models.py`，可以用 `QTALK_LIVE_OPENAI_MODEL`、`QTALK_LIVE_GEMINI_MODEL` 改。图片、音频、PDF
-都在代码里生成，不读任何文件。OpenAI 的 Responses API 不接受音频，所以只对 Gemini 发 WAV。打印事件的种类、
-字数、用量与回答原文（样本都是生成的，没有用户数据）；PDF 的回答里要有 `42`，图片与音频的回答措辞不固定，
-只打印、不断言。
+模型名同 `test_live_models.py`，可以用 `QTALK_LIVE_OPENAI_MODEL`、`QTALK_LIVE_GEMINI_MODEL`、
+`QTALK_LIVE_CLAUDE_OPUS_MODEL` 改。图片、音频、PDF 都在代码里生成，不读任何文件。OpenAI 的 Responses API 与
+Claude 的 Messages API 不接受音频，所以只对 Gemini 发 WAV。打印事件的种类、字数、用量与回答原文（样本都是生成
+的，没有用户数据；Claude 的用例不打印原文）；PDF 的回答里要有 `42`，图片与音频的回答措辞不固定，只打印、不断言。
 """
 
 import math
@@ -32,6 +32,8 @@ from qtalk_bot.llm import (
     TextPart,
     Usage,
 )
+from qtalk_bot.llm.claude_messages import ClaudeChatModel
+from qtalk_bot.llm.claude_messages import create_client as create_claude_client
 from qtalk_bot.llm.gemini_interactions import GeminiChatModel
 from qtalk_bot.llm.gemini_interactions import create_client as create_gemini_client
 from qtalk_bot.llm.openai_responses import OpenAIChatModel
@@ -117,11 +119,17 @@ def test_generated_samples_are_recognized() -> None:
     assert detect_format(pdf()) == PDF
 
 
-async def run(model: ChatModel, label: str, *parts: Part) -> str:
+async def run(
+    model: ChatModel,
+    label: str,
+    *parts: Part,
+    max_output_tokens: int | None = 512,
+    show_answer: bool = True,
+) -> str:
     request = ChatRequest(
         system="你是一个简洁的助手。",
         messages=(Message(Role.USER, parts),),
-        max_output_tokens=512,
+        max_output_tokens=max_output_tokens,
     )
     kinds: Counter[str] = Counter()
     pieces: list[str] = []
@@ -141,7 +149,7 @@ async def run(model: ChatModel, label: str, *parts: Part) -> str:
     answer = "".join(pieces)
     print(  # noqa: T201
         f"\n{model.name} {label}：事件 {dict(kinds)}，文字 {len(answer)} 字，{usage}，{finished}"
-        f"\n回答：{answer}"
+        + (f"\n回答：{answer}" if show_answer else "")
     )
     assert answer.strip()
     assert finished is not None
@@ -181,3 +189,21 @@ async def test_gemini_sees_hears_and_reads() -> None:
     finally:
         await client.aio.aclose()
         client.close()
+
+
+async def test_claude_sees_an_image_and_reads_a_pdf() -> None:
+    key = os.environ.get("CLAUDE_API_KEY")
+    if not key:
+        pytest.skip("没有设置 CLAUDE_API_KEY")
+    client = create_claude_client(key)
+    try:
+        name = os.environ.get("QTALK_LIVE_CLAUDE_OPUS_MODEL", "claude-opus-5-5")
+        model = ClaudeChatModel(client, name=f"claude:{name}", model=name)
+        # 不设输出上限（按 64000 传）：思考也算在上限里。
+        await run(model, "图片", *IMAGE, max_output_tokens=None, show_answer=False)
+        answer = await run(model, "PDF", *DOCUMENT, max_output_tokens=None, show_answer=False)
+        found = "42" in answer
+        if not found:
+            pytest.fail("PDF 的回答里没有 42")  # 不用 assert：断言失败时 pytest 会把回答原文打出来
+    finally:
+        await client.close()

@@ -25,7 +25,8 @@ install -m 600 .env.example .env
 install -m 600 config.example.toml config.toml   # 填之前就收紧：代理地址里可能带账号密码
 ```
 
-- `.env` 只放密钥：`APP_ID`、`APP_SECRET`、`ADMIN_OPENID` 必填，`OPENAI_API_KEY`、`GEMINI_API_KEY` 用到哪家填哪家。compose 把它们逐项注入容器（见 `compose.yaml` 的 `environment:`），不会进镜像。`.env` 不要提交，也不要复制到别处。
+- `.env` 只放密钥：`APP_ID`、`APP_SECRET`、`ADMIN_OPENID` 必填，`OPENAI_API_KEY`、`GEMINI_API_KEY`、`CLAUDE_API_KEY` 用到哪家填哪家。compose 把它们逐项注入容器（见 `compose.yaml` 的 `environment:`），不会进镜像。`.env` 不要提交，也不要复制到别处。
+- 大模型的服务商（各表的 `provider`）可以是 `openai`、`gemini`、`claude`，但 `[decisions]` 与 `[image_generation]` 只能是 OpenAI 或 Gemini（Claude 没有 Decisions 接口，也不出图）：只用 Claude 时，删掉这两个表，或者为它们另配一家的密钥。
 - `config.toml` 放其余的设置，说明都在文件的注释里。容器里的配置路径固定是 `/app/config.toml`，**`data_dir` 保持 `"data"`**（它按配置文件所在的目录解析成 `/app/data`，正好是挂进来的 `./data`）。
 - 告警与备份的阈值在 `[backup]`、`[alerts]` 两个表里，不写就用默认值：每 24 小时备份一次、留 7 份；模型连续失败 5 次、磁盘剩余不到 1024 MB、QQ 网关断开超过 10 分钟时告警。
 
@@ -87,7 +88,7 @@ docker **不会**因为不健康而重启容器，这个状态只供查看与外
 
 以下情况机器人会主动给管理员发 QQ 消息，同一件事 24 小时内只发一次，恢复后补一条「已恢复」：
 
-- 模型鉴权失败（401、403）或 OpenAI 额度用尽：立即发。
+- 模型鉴权失败（401、403）或 OpenAI、Claude 额度用尽：立即发。
 - 同一个模型连续失败 `[alerts].model_failures` 次（连接失败、超时、限流、服务端出错等）。
 - 定时备份失败（1 小时后会再试）。
 - 清理旧备份失败（比如某份超龄的备份删不掉）：新的备份照常做，清理 1 小时后再试；超龄的备份里可能有用户要求忘掉的内容，请检查 `data/backups/` 的权限。

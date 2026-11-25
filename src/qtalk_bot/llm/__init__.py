@@ -1,7 +1,7 @@
 """与服务商无关的对话模型接口。
 
-调用方只认这里的类型；各家 SDK 的类型留在适配器（`openai_responses.py`、`gemini_interactions.py`）里，
-不出现在接口上。
+调用方只认这里的类型；各家 SDK 的类型留在适配器（`openai_responses.py`、`gemini_interactions.py`、
+`claude_messages.py`）里，不出现在接口上。
 
 - 请求是 `ChatRequest`：系统提示词、按时间排列的消息、输出上限。消息的内容是若干段 `Part`：文字
   （`TextPart`）、图片（`ImagePart`）、音频（`AudioPart`）、文件（`FilePart`），后三种带字节与按文件头判断出的
@@ -9,10 +9,11 @@
   调用方已按 `INPUT_LIMITS` 与模型声明的输入能力挡在前面。
 - 输出是一串 `ChatEvent`，是带标签的联合类型。现在有文字增量（`TextDelta`）、用量（`Usage`）、结束
   （`Finished`），开了服务商内置搜索时的搜索进展（`SearchProgress`）与引用（`Citation`），以及处理过程：
-  思考摘要（`ThoughtSummary`，请求了才有）与调用工具前的说明（`Commentary`，OpenAI 的 `phase` 为
-  `commentary` 的消息）。后两者不是回答的正文。此外，适配器每从 SDK 收到一个流式事件（不论认不认识）就先交出一个
-  `Heartbeat`，调用方据此判断流是否还有动静（对话的空闲时限）。**调用方必须忽略不认识的事件**（`match` 里留一个
-  `case _: pass`），这样加事件时不必改已有的调用方。
+  思考摘要（`ThoughtSummary`，什么时候有见它的 docstring）与调用工具前的说明（`Commentary`，OpenAI 的 `phase` 为
+  `commentary` 的消息）。后两者不是回答的正文。此外，适配器每从 SDK 收到一个流式事件（不论认不认识）就交出一个
+  `Heartbeat`，调用方据此判断流是否还有动静（对话的空闲时限）。它与 `Usage` 的先后不固定（见 `Heartbeat`），
+  调用方不能依赖。**调用方必须忽略不认识的事件**（`match` 里留一个 `case _: pass`），这样加事件时不必改已有的
+  调用方。
 - 函数调用：请求里的 `tools` 是我们自己声明的函数（`FunctionTool`），`tool_runner` 执行它们。模型调用函数时，
   适配器在同一次 `stream()` 里交出 `FunctionCallStarted`、调用 `tool_runner`、把结果（`FunctionResult`）连同
   上一跳的输出交回，再发下一跳请求，事件照常连续交出，`Usage` 是各跳之和，最后一个事件仍是 `Finished`。
@@ -30,6 +31,7 @@ from typing import Protocol, cast
 class Provider(StrEnum):
     OPENAI = "openai"
     GEMINI = "gemini"
+    CLAUDE = "claude"
 
 
 class Role(StrEnum):
@@ -105,12 +107,15 @@ class InputLimits:
         audio_types: 接受的音频 MIME 类型；为空表示不接受音频。
         file_types: 接受的文件 MIME 类型。
         max_inline_bytes: 一次请求里所有内联附件按 base64 编码后的总字节数上限；单个附件也不能超过它。
+        max_image_bytes: 单张图片按 base64 编码后的字节数上限；`None` 表示单张图片只受 `max_inline_bytes` 限制。
+            判断单个附件放不放得下时用 `item_limit()`，它把两个上限合在一起。
     """
 
     image_types: frozenset[str]
     audio_types: frozenset[str]
     file_types: frozenset[str]
     max_inline_bytes: int
+    max_image_bytes: int | None = None
 
     def accepts(self, modality: Modality, mime_type: str) -> bool:
         match modality:
@@ -120,6 +125,12 @@ class InputLimits:
                 return mime_type in self.audio_types
             case Modality.FILE:
                 return mime_type in self.file_types
+
+    def item_limit(self, modality: Modality) -> int:
+        """这种输入的单个附件按 base64 编码后最多多少字节：内联合计的上限，图片再取它与单图上限中小的那个。"""
+        if modality is Modality.IMAGE and self.max_image_bytes is not None:
+            return min(self.max_inline_bytes, self.max_image_bytes)
+        return self.max_inline_bytes
 
 
 _MIB = 1024 * 1024
@@ -143,6 +154,16 @@ INPUT_LIMITS: Mapping[Provider, InputLimits] = {
         audio_types=frozenset(("audio/wav",)),
         file_types=frozenset(("application/pdf",)),
         max_inline_bytes=19 * _MIB,
+    ),
+    # Messages API：图片是 `image` 块（base64 的 JPEG、PNG、GIF、WEBP；GIF 同样一律不给），单张按 base64 计不超过
+    # 10 MB（文档写的是 10 MB，取十进制的 10_000_000 字节）；PDF 是 `document` 块；不接受音频（SDK 的消息内容
+    # 类型里没有音频块）。整个请求的官方上限是 128 MB，取与 OpenAI 相同的 50 MiB，免得同时在途的请求超出内存估算。
+    Provider.CLAUDE: InputLimits(
+        image_types=frozenset(("image/png", "image/jpeg", "image/webp")),
+        audio_types=frozenset(),
+        file_types=frozenset(("application/pdf",)),
+        max_inline_bytes=50 * _MIB,
+        max_image_bytes=10_000_000,
     ),
 }
 """各家对话接口对内联附件的限制。"""
@@ -175,7 +196,7 @@ class FunctionTool:
         description: 给模型看的说明：什么时候该调用、调用了会怎样。
         parameters: 参数的 JSON Schema（顶层是 object）。按 OpenAI 严格模式的要求写：每个 object 都
             `additionalProperties: false`，所有字段都列在 `required` 里（可缺省的字段用可为 null 的类型表示）。
-            OpenAI 以 `strict: true` 声明；Gemini 原样交出，它不认的约束会被忽略。
+            OpenAI 与 Claude 以 `strict: true` 声明；Gemini 原样交出，它不认的约束会被忽略。
     """
 
     name: str
@@ -187,8 +208,8 @@ class FunctionTool:
 class FunctionCall:
     """模型要求执行的一次函数调用。
 
-    `call_id` 是服务商给的调用编号，结果按它对应回去；`arguments` 是参数的 JSON 文本（Gemini 给的是对象，由
-    适配器序列化），模型给出的内容未经校验，调用方自己解析、校验。参数可能带出用户说的内容，不进 `repr`，也不要
+    `call_id` 是服务商给的调用编号，结果按它对应回去；`arguments` 是参数的 JSON 文本（Gemini 与 Claude 给的是
+    对象，由适配器序列化），模型给出的内容未经校验，调用方自己解析、校验。参数可能带出用户说的内容，不进 `repr`，也不要
     记日志。
     """
 
@@ -201,10 +222,11 @@ class FunctionCall:
 class FunctionResult:
     """一次函数调用的结果，交回给模型。
 
-    `parts` 是文字与图片（图片的类型要在两家函数结果都接受的 PNG、JPEG、WEBP 之内，否则适配器抛
-    `ModelError(UNSUPPORTED)`）；连同对话里已有的附件放不进一次请求的图片，适配器换成 `OVERSIZED_IMAGE_NOTE`。
-    `is_error` 表示执行失败、`parts` 里是失败的说明：Gemini 以 `is_error` 交给模型，OpenAI 的函数结果没有这个
-    字段，只靠说明的文字。
+    `parts` 是文字与图片（图片的类型要在各家函数结果都接受的 PNG、JPEG、WEBP 之内，否则适配器抛
+    `ModelError(UNSUPPORTED)`）；连同对话里已有的附件放不进一次请求的图片（Claude 另有单张图片的上限，超过的也
+    算），适配器换成 `OVERSIZED_IMAGE_NOTE`。
+    `is_error` 表示执行失败、`parts` 里是失败的说明：Gemini 与 Claude 以 `is_error` 交给模型，OpenAI 的函数结果
+    没有这个字段，只靠说明的文字。
     """
 
     parts: tuple[TextPart | ImagePart, ...]
@@ -226,7 +248,7 @@ MAX_FUNCTION_ROUNDS = 5
 直接回答；它仍然调用时按坏响应处理（`ModelError(MALFORMED)`）。"""
 
 FUNCTION_RESULT_IMAGE_TYPES = frozenset(("image/png", "image/jpeg", "image/webp"))
-"""函数结果里的图片两家都接受的类型（Gemini 的文档只列了这三种）。"""
+"""函数结果里的图片各家都接受的类型（Gemini 的文档只列了这三种）。"""
 
 OVERSIZED_IMAGE_NOTE = (
     "（这张图片太大：连同对话里已有的附件，超出了一次请求能带的附件大小，没有交回给你。"
@@ -267,7 +289,9 @@ class ChatRequest:
         system: 系统提示词。
         messages: 按时间排列的消息，最后一条是用户这次说的话。
         max_output_tokens: 输出上限；含推理的模型里也包括推理所用的 token。为 `None` 时不向服务商传这个参数，
-            由模型自己的上限兜底（后台任务用；失控时由调用方的时限兜底）。每一跳请求各自适用。
+            由模型自己的上限兜底（后台任务用；失控时由调用方的时限兜底）。例外是 Claude：它的接口必须给上限，
+            `None` 时每一跳都传 `max_tokens=64000`（`claude_messages.DEFAULT_MAX_TOKENS`），后台的描述与记忆调用
+            也一样。每一跳请求各自适用。
         tools: 声明给模型的函数，与模型配置里的内置搜索同时生效。为空时请求与没有函数调用支持时完全一样。
         tool_runner: 执行函数调用的一方。`tools` 不为空时必须给，否则适配器不发请求，抛
             `ModelError(UNSUPPORTED)`。
@@ -294,20 +318,21 @@ class TextDelta:
 class Usage:
     """这次调用到目前为止的累计用量；服务商没给的项是 `None`。
 
-    可能出现多次（例如 Gemini 自动续写或函数调用的每一跳结束时、每执行一次搜索之后），后一次覆盖前一次：调用方取最后
-    一次，不要相加。这样调用中途被打断时，已经报告的部分不会丢。`output_tokens` 包括推理（思考）所用的
+    可能出现多次（例如 Gemini 自动续写、Claude 的 `pause_turn` 续写或函数调用的每一跳结束时、每执行一次搜索
+    之后），后一次覆盖前一次：调用方取最后一次，不要相加。这样调用中途被打断时，已经报告的部分不会丢。`output_tokens` 包括推理（思考）所用的
     token，它们也按输出计费。
 
     `searches` 是这次调用里服务商实际执行、按它的口径计费的搜索次数（OpenAI 按 `action` 为 `search` 的调用数，
-    Gemini 按执行的不重复的非空查询数）：带了搜索工具的调用总是整数（没有搜索就是 0），没带搜索工具的是
+    Gemini 按执行的不重复的非空查询数，Claude 每一跳以 `message_delta` 报告的 `server_tool_use.web_search_requests`
+    为准，没报告时取 `message_start` 报告的与成功的搜索结果数中较大的那个）：带了搜索工具的调用总是整数（没有搜索就是 0），没带搜索工具的是
     `None`。搜索执行之后、token 用量出来之前给出的 `Usage` 里 token 数是 `None`（还不知道）。
 
     构造时把不可信的计数（不是整数、布尔值、负数、超过 `MAX_TOKENS_PER_CALL`）换成 `None`，当作服务商没有
-    报告：两家 SDK 都不校验响应，原样留下的超大整数在 SQLite 绑定时会抛 `OverflowError`，让整轮记账一起回滚。
+    报告：各家 SDK 都不校验响应，原样留下的超大整数在 SQLite 绑定时会抛 `OverflowError`，让整轮记账一起回滚。
     要把几项相加的地方（如 Gemini 的思考用量、各跳的累计）先用 `token_count()` 逐项校验再加，这里只能拦住
     最后交进来的值。
 
-    `cached_input_tokens` 是 `input_tokens` 里命中服务商缓存的部分（两家对它大幅打折），服务商没有报告时是
+    `cached_input_tokens` 是 `input_tokens` 里命中服务商缓存的部分（各家对它大幅打折），服务商没有报告时是
     `None`。各跳累加的方式与 `input_tokens` 相同，但每一跳的缓存数先经 `cached_count()` 按这一跳的输入校验
     （只看合计会被别的跳掩盖）；构造时再兜一次底：输入没有报告或缓存数超过输入时也换成 `None`。
     """
@@ -359,7 +384,7 @@ def add_tokens(total: int | None, value: int | None) -> int | None:
 
 
 MAX_SEARCHES_PER_CALL = 10_000
-"""单次调用的搜索次数的可信上限。两家一次回答一般只搜几次到几十次，超过一万一定是上游或计数出错。"""
+"""单次调用的搜索次数的可信上限。各家一次回答一般只搜几次到几十次，超过一万一定是上游或计数出错。"""
 
 
 def search_count(value: object) -> int | None:
@@ -377,7 +402,7 @@ class SearchStage(StrEnum):
     """一次内置搜索进行到哪一步。"""
 
     STARTED = "started"  # 开始了；查询词可能还不知道
-    UPDATED = "updated"  # 还在进行，得知了（更多的）查询词（Gemini 在搜索过程中给出查询词）
+    UPDATED = "updated"  # 还在进行，得知了（更多的）查询词（Gemini、Claude 在搜索过程中给出查询词）
     COMPLETED = "completed"  # 完成了；`queries` 是能拿到的全部查询词（OpenAI 只在这时给出）
 
 
@@ -387,8 +412,9 @@ class SearchProgress:
 
     同一次搜索的几个事件 `call_id` 相同（服务商给的调用编号；没有时由适配器按位置生成），依次是 STARTED、
     零到多个 UPDATED、COMPLETED；流中途结束时可能没有 COMPLETED。`queries` 是到目前为止得知的这次搜索的全部
-    查询词（不是增量），可能为空（如 OpenAI 打开网页、在页面里查找的动作）。查询词可能带出用户问的内容，不进
-    `repr`，也不要记日志。
+    查询词（不是增量），可能为空（如 OpenAI 打开网页、在页面里查找的动作）。查询词何时得知各家不同：OpenAI 在
+    完成时，Gemini 在搜索过程中，Claude 在搜索块开始时（块上已带参数时）或参数拼完整时（`UPDATED`）。搜索失败（如 Claude 的结果是错误对象）
+    也照常以 COMPLETED 结束。查询词可能带出用户问的内容，不进 `repr`，也不要记日志。
 
     计费的搜索次数不从这里数，以 `Usage.searches` 为准。
     """
@@ -400,11 +426,12 @@ class SearchProgress:
 
 @dataclass(frozen=True, slots=True)
 class Citation:
-    """回答里引用的一个来源（服务商的 `url_citation` 标注）。
+    """回答里引用的一个来源（OpenAI 与 Gemini 的 `url_citation` 标注，Claude 的 `web_search_result_location` 引用）。
 
     `url` 与 `title` 原样来自服务商，没有校验，展示前要经 `citations.py` 处理；`title` 可能为空。同一个来源
     可能出现多次，由使用方去重。它们可能带出用户问的内容，不进 `repr`，也不要记日志。没有带标注在正文里的
-    位置：两家的下标单位不同（OpenAI 是字符，Gemini 的 SDK 写的是字节），现在也用不上。
+    位置：各家的标法不同（OpenAI 是字符下标，Gemini 的 SDK 写的是字节下标，Claude 的引用跟在它所在的文本块上），
+    现在也用不上。
     """
 
     url: str = field(repr=False)
@@ -441,19 +468,21 @@ def items(value: object) -> list[object]:
 
 
 class CitationFilter:
-    """适配器共用：把服务商的 `url_citation` 标注转成 `Citation`，同一次调用里同一个来源只给一次。
+    """适配器共用：把服务商的引用标注转成 `Citation`，同一次调用里同一个来源只给一次。
 
-    两家的标注都是 `type == "url_citation"`、带 `url` 与 `title` 的对象。SDK 在流式解析时不校验，字段一律按
-    `getattr` 取、检查类型。
+    标注是 `type` 在 `kinds` 里、带 `url` 与 `title` 的对象：OpenAI 与 Gemini 是 `url_citation`（默认），Claude 是
+    `web_search_result_location`。SDK 在流式解析时不校验，字段一律按 `getattr` 取、检查类型。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, kinds: frozenset[str] = frozenset(("url_citation",))) -> None:
+        self._kinds = kinds
         self._seen: set[tuple[str, str | None]] = set()
 
     def __call__(self, annotation: object) -> Citation | None:
         """别的标注、没有链接的、给过的同一个来源返回 `None`。"""
-        if getattr(annotation, "type", None) != "url_citation":
-            return None
+        kind: object = getattr(annotation, "type", None)
+        if not isinstance(kind, str) or kind not in self._kinds:
+            return None  # 先确认是字符串：畸形的标注（如 `type` 是列表）只忽略这一条，不能抛异常
         url: object = getattr(annotation, "url", None)
         title: object = getattr(annotation, "title", None)
         if not isinstance(url, str) or not url:
@@ -467,7 +496,11 @@ class CitationFilter:
 
 @dataclass(frozen=True, slots=True)
 class ThoughtSummary:
-    """思考摘要的一段增量（只在请求了思考摘要时出现）。
+    """思考摘要的一段增量。
+
+    什么时候有，各家不同：OpenAI 与 Gemini 的适配器构造时 `summaries` 为真才请求摘要，`summaries` 只决定请不请求，
+    适配器处理的摘要事件不再按它过滤（各自处理哪些事件、要不要按完成时的快照补发，见各适配器的模块 docstring）；
+    Claude 的适配器每次都请求（思考期间流里才有事件），构造时 `summaries` 为真才交出。
 
     `segment` 区分同一次调用里的各段摘要（由适配器生成，如 OpenAI 的推理项编号加 `summary_index`）：同一段的
     增量按顺序拼起来是这一段的全文，一段开始之后前面的段不会再有增量。摘要只用于展示处理过程，不是回答的
@@ -500,9 +533,10 @@ class FinishReason(StrEnum):
 class Finished:
     """模型正常结束（不是出错）。之后不会再有事件。
 
-    `refused` 表示服务商明确标出这次的回答只是拒答（OpenAI 的消息里只有 `refusal` 内容块、没有正文），这时
-    `reason` 照旧是 `COMPLETED`，拒答的说明照常作为 `TextDelta` 交出。只用于统计模型的成败，不影响回复；认不出
-    拒答的服务商（Gemini）总是 `False`。
+    `refused` 表示服务商明确标出这次的回答只是拒答：OpenAI 的消息里只有 `refusal` 内容块、没有正文，这时
+    `reason` 照旧是 `COMPLETED`，拒答的说明照常作为 `TextDelta` 交出；Claude 以 `refusal` 结束、此前已经交出过
+    正文时，`reason` 是 `OTHER`（还没交出正文就拒答的，Claude 的适配器抛 `ModelError(BLOCKED)`）。只用于统计
+    模型的成败，不影响回复；认不出拒答的服务商（Gemini）总是 `False`。
     """
 
     reason: FinishReason
@@ -513,8 +547,10 @@ class Finished:
 class Heartbeat:
     """流还有动静：适配器从 SDK 收到了一个流式事件，不论本项目认不认识它、它带没带出别的 `ChatEvent`。
 
-    每个 SDK 事件之前交出一个。它不带任何内容，只用来计算空闲时限：OpenAI 的模型推理时可能很久只有本项目
-    不关心的事件（甚至什么都没有），不能只看认识的那几种事件。不关心空闲的调用方照常忽略它。
+    每个 SDK 事件交出一个，通常排在这个事件带出的其它事件之前。例外在 Claude 的适配器：`message_start` 这一帧总是
+    先交出 `Usage`（即使累计的用量没变），其它帧让累计用量变了时也把新的 `Usage` 放在最前，免得调用方拿到心跳就
+    停读时丢掉它。调用方不能依赖 `Heartbeat` 与 `Usage` 的先后。它不带任何内容，只用来计算空闲时限：OpenAI 的模型推理时可能很久只有本项目不关心的事件（甚至什么都没有），不能只看认识的那几种事件。不关心空闲
+    的调用方照常忽略它。
     """
 
 
@@ -600,7 +636,8 @@ class ModelError(Exception):
     文案只含服务商、`ErrorKind` 与 HTTP 状态码（100–599 的整数，其余不要）。
 
     `quota_exhausted` 表示服务商明确说额度用尽（OpenAI 错误体的 `code` 是 `insufficient_quota`，HTTP 状态通常是
-    429，`kind` 照旧按状态码分类）。只用于给管理员告警，不影响面向用户的回复；Gemini 分辨不出，总是 `False`。
+    429；Claude 是 HTTP 402 或错误体的 `type` 是 `billing_error`；`kind` 照旧按状态码分类）。只用于给管理员告警，
+    不影响面向用户的回复；Gemini 分辨不出，总是 `False`。
     """
 
     def __init__(
@@ -619,6 +656,21 @@ class ModelError(Exception):
         self.quota_exhausted = quota_exhausted
         status = "" if status_code is None else f"，状态码 {status_code}"
         super().__init__(f"{provider.value} 调用失败：{_ERROR_LABELS[kind]}{status}")
+
+
+class ClientSetupError(Exception):
+    """创建服务商的 SDK 客户端失败，例如没配代理时系统的代理环境变量（`HTTPS_PROXY`、`ALL_PROXY` 等）用了 SDK
+    不支持的协议。
+
+    SDK 的原文可能带着代理地址里的用户名与主机，所以文案只有服务商与固定的提示，也不带异常链（在 `except` 之外抛出）。
+    """
+
+    def __init__(self, provider: Provider) -> None:
+        self.provider = provider
+        super().__init__(
+            f"创建 {provider.value} 的客户端失败：请检查 [providers.{provider.value}] 的设置，以及系统的代理"
+            "环境变量（HTTPS_PROXY、ALL_PROXY 等）的协议是否为 http、https、socks5、socks5h 之一"
+        )
 
 
 class ChatModel(Protocol):

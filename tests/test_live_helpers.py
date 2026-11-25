@@ -1,8 +1,9 @@
-"""实测用例里的统计逻辑：用决策模型的替身跑一遍，不访问网络（实测用例本身默认不运行）。"""
+"""实测用例里的统计与记录逻辑：用替身跑一遍，不访问网络（实测用例本身默认不运行）。"""
 
 import math
 
 import pytest
+from tests.live import test_live_conversation as conversation
 from tests.live import test_live_decisions as live
 
 from qtalk_bot.llm import ErrorKind, Provider, Usage, decisions
@@ -76,3 +77,24 @@ async def test_refusals_are_not_counted_as_latency_samples(
     assert "超出容差 0.02 的：1 次" in out
     # 测量期间放开适配器的容差，好看清真实的和（monkeypatch 在测试结束时还原）。
     assert math.inf == decisions.PROBABILITY_SUM_TOLERANCE
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("见 https://example.com/a?b=c 吧", "见 <链接：example.com> 吧"),
+        ("见 HTTPS://Example.COM/private/path?q=1 吧", "见 <链接：example.com> 吧"),
+        ("见 https://[2001:db8::1]:8443/x?y=1 吧", "见 <链接：2001:db8::1> 吧"),
+        ("见 https://[not-ipv6]/x 吧", "见 <链接> 吧"),
+        ("见 https://[2001:db8::1 吧", "见 <链接> 吧"),
+        (
+            "（https://a.example/x）与「http://b.example」",
+            "（<链接：a.example>）与「<链接：b.example>」",
+        ),
+    ],
+    ids=["plain", "upper_case", "ipv6", "bad_ipv6", "unclosed_bracket", "brackets_around"],
+)
+def test_conversation_report_shortens_common_links(text: str, expected: str) -> None:
+    # Claude 对话全流程实测的记录为了好读，把常见写法的链接缩成主机名（启发式的，不保证所有写法都缩干净）；
+    # 解析不了的不抛异常，写「<链接>」。
+    assert conversation.hosts_only(text) == expected

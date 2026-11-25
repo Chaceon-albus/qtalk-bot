@@ -169,9 +169,10 @@ CREATE INDEX messages_by_reply_to ON messages (reply_to);
 -- memory；image 是出图（含改图），一次出图一行，model 列是固定的 image，provider 与 provider_model 是实际的图片
 -- 服务商与模型名，限额按这种行的行数算张数。
 -- searches：这次调用里服务商内置的联网搜索实际执行的次数（按服务商的计费口径：OpenAI 是 action 为 search 的调用数，
--- Gemini 是不重复的非空查询数）。带了搜索工具的调用是整数（没搜就是 0）；没带搜索工具、没有报告用量的调用为空。
+-- Gemini 是不重复的非空查询数，Claude 是接口报告的 web_search_requests）。带了搜索工具的调用是整数（没搜就是 0）；
+-- 没带搜索工具、没有报告用量的调用为空。
 -- cached_input_tokens：input_tokens 里命中服务商缓存的部分（OpenAI 的 input_tokens_details.cached_tokens，Gemini 的
--- total_cached_tokens），两家对它大幅打折。服务商没有报告的为空。
+-- total_cached_tokens，Claude 的 cache_read_input_tokens），各家对它大幅打折。服务商没有报告的为空。
 CREATE TABLE usage (
     id INTEGER PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users (id),

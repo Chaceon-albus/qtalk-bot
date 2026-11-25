@@ -48,6 +48,7 @@ FAKE_SECRETS = {
     "ADMIN_OPENID": "fake-admin-openid-ABCDEF",
     "OPENAI_API_KEY": "fake-openai-key-never-shown",
     "GEMINI_API_KEY": "fake-gemini-key-never-shown",
+    "CLAUDE_API_KEY": "fake-claude-key-never-shown",
 }
 
 
@@ -87,15 +88,18 @@ def test_secrets_are_read_from_mapping() -> None:
         admin_openid=FAKE_SECRETS["ADMIN_OPENID"],
         openai_api_key=FAKE_SECRETS["OPENAI_API_KEY"],
         gemini_api_key=FAKE_SECRETS["GEMINI_API_KEY"],
+        claude_api_key=FAKE_SECRETS["CLAUDE_API_KEY"],
     )
 
 
 def test_optional_secrets_missing_or_empty_are_none() -> None:
     env = {name: FAKE_SECRETS[name] for name in ("APP_ID", "APP_SECRET", "ADMIN_OPENID")}
     env["GEMINI_API_KEY"] = ""  # compose 注入未定义的变量时得到空串
+    env["CLAUDE_API_KEY"] = "  "
     secrets = load_secrets(env)
     assert secrets.openai_api_key is None
     assert secrets.gemini_api_key is None
+    assert secrets.claude_api_key is None
 
 
 def test_secrets_default_to_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -130,6 +134,9 @@ def test_secret_values_never_appear_in_repr_str_or_errors() -> None:
     assert "app_secret=<已设置>" in repr(secrets)
     without_openai = {k: v for k, v in FAKE_SECRETS.items() if k != "OPENAI_API_KEY"}
     assert "openai_api_key=<未设置>" in repr(load_secrets(without_openai))
+    assert "claude_api_key=<已设置>" in repr(secrets)
+    without_claude = {k: v for k, v in FAKE_SECRETS.items() if k != "CLAUDE_API_KEY"}
+    assert "claude_api_key=<未设置>" in repr(load_secrets(without_claude))
 
 
 # ---- 配置文件 ----
@@ -412,10 +419,10 @@ def test_models_are_read(tmp_path: Path) -> None:
             ("models[0].fallback：引用的模型不存在",),
         ),
         (
-            [model_block(provider="claude", model="", default="yes", extra=1)],
+            [model_block(provider="mistral", model="", default="yes", extra=1)],
             (
                 "models[0].name：缺少这个键",
-                "models[0].provider：应为 openai、gemini 之一",
+                "models[0].provider：应为 openai、gemini、claude 之一",
                 "models[0].model：不能为空",
                 "models[0].default：应为布尔值，实际是字符串",
                 "models[0].extra：未知的键",
@@ -624,11 +631,20 @@ def test_used_providers_need_their_keys() -> None:
         "配置里用到了 gemini 的模型，但环境变量 GEMINI_API_KEY 未设置",
         "配置里用到了 openai 的模型，但环境变量 OPENAI_API_KEY 未设置",
     )
+    with pytest.raises(ConfigError) as info:
+        check_provider_secrets(settings_with(Provider.CLAUDE), secrets)
+    assert info.value.problems == ("配置里用到了 claude 的模型，但环境变量 CLAUDE_API_KEY 未设置",)
 
 
 def test_unused_provider_needs_no_key() -> None:
-    only_openai = {k: v for k, v in FAKE_SECRETS.items() if k != "GEMINI_API_KEY"}
+    only_openai = {
+        k: v for k, v in FAKE_SECRETS.items() if k not in ("GEMINI_API_KEY", "CLAUDE_API_KEY")
+    }
     check_provider_secrets(settings_with(Provider.OPENAI), load_secrets(only_openai))
+    only_claude = {
+        k: v for k, v in FAKE_SECRETS.items() if k not in ("OPENAI_API_KEY", "GEMINI_API_KEY")
+    }
+    check_provider_secrets(settings_with(Provider.CLAUDE), load_secrets(only_claude))
 
 
 # ---- 模型配置的校验一次列全（评审修正 15） ----
@@ -639,10 +655,10 @@ def test_model_problems_are_all_reported_even_if_one_item_is_invalid(tmp_path: P
         tmp_path,
         model_block(name="a", provider="openai", model="m", default=True),
         model_block(name="a", provider="openai", model="m", fallback="zz"),
-        model_block(name="c", provider="claude", model="m", default=True),
+        model_block(name="c", provider="mistral", model="m", default=True),
     )
     assert config_error(path).problems == (
-        "models[2].provider：应为 openai、gemini 之一",
+        "models[2].provider：应为 openai、gemini、claude 之一",
         "models[1].name：与 models[0] 重名",
         "models[1].fallback：引用的模型不存在",
         "models：应恰好有一个 default = true 的模型，实际有 2 个",
@@ -765,6 +781,21 @@ def test_providers_are_read(tmp_path: Path) -> None:
         base_url="https://gateway.example.com/v1", proxy="socks5h://user:pass@127.0.0.1:1080"
     )
     assert providers[Provider.GEMINI] == ProviderSettings(proxy="http://127.0.0.1:7890")
+    assert providers[Provider.CLAUDE] == ProviderSettings()
+
+
+def test_claude_endpoint_and_proxy_are_read(tmp_path: Path) -> None:
+    text = (
+        '[providers.claude]\nbase_url = "https://gateway.example.com/anthropic"\n'
+        'proxy = "socks5h://user:pass@127.0.0.1:1080"\n'
+    )
+    providers = load_settings(write_config(tmp_path, text)).providers
+    assert providers[Provider.CLAUDE] == ProviderSettings(
+        base_url="https://gateway.example.com/anthropic", proxy="socks5h://user:pass@127.0.0.1:1080"
+    )
+    assert providers.claude is providers[Provider.CLAUDE]
+    assert providers[Provider.OPENAI] == ProviderSettings()
+    assert "pass@" not in repr(providers)
 
 
 @pytest.mark.parametrize(
@@ -804,7 +835,15 @@ SECRET_PROXY = "socks4://user:hunter2-never-shown@127.0.0.1:1080"
         ),
         ('[providers.gemini]\nbase_url = ""\n', "providers.gemini.base_url：不能为空"),
         ("[providers.gemini]\nproxy = 1\n", "providers.gemini.proxy：应为字符串，实际是整数"),
-        ('[providers.claude]\nbase_url = "https://x"\n', "providers.claude：未知的键"),
+        ('[providers.mistral]\nbase_url = "https://x"\n', "providers.mistral：未知的键"),
+        (
+            '[providers.claude]\nbase_url = "https://x/?v=1"\n',
+            "providers.claude.base_url：不能带查询串（?）或片段（#）",
+        ),
+        (
+            f'[providers.claude]\nproxy = "{SECRET_PROXY}"\n',
+            "providers.claude.proxy：应为完整的地址，协议是 http、https、socks5、socks5h 之一",
+        ),
         ('[providers.openai]\nurl = "https://x"\n', "providers.openai.url：未知的键"),
         ('providers = "x"\n', "providers：应为表，实际是字符串"),
     ],
@@ -986,7 +1025,11 @@ def test_description_is_not_required_for_a_single_model(tmp_path: Path) -> None:
     ("text", "problem"),
     [
         ("", "decisions.provider：缺少这个键"),
-        ('provider = "claude"', "decisions.provider：应为 openai、gemini 之一"),
+        ('provider = "mistral"', "decisions.provider：应为 openai、gemini 之一"),
+        (
+            'provider = "claude"',
+            "decisions.provider：这一项只能是 openai、gemini 之一，claude 不支持",
+        ),
         ('provider = "openai"\nmodel = ""', "decisions.model：不能为空"),
         ('provider = "openai"\ninstructions = "  "', "decisions.instructions：不能为空"),
         (
@@ -1120,6 +1163,21 @@ def test_invalid_inputs(tmp_path: Path, inputs: str, problem: str) -> None:
     assert config_error(write_config(tmp_path, text, models=False)).problems == (problem,)
 
 
+def test_claude_models_take_images_and_pdfs_but_not_audio(tmp_path: Path) -> None:
+    block = model_block(
+        name="c", provider="claude", model="m", default=True, inputs=["image", "file"]
+    )
+    (model,) = load_settings(models_config(tmp_path, block)).models
+    assert (model.provider, model.inputs) == (
+        Provider.CLAUDE,
+        frozenset({Modality.IMAGE, Modality.FILE}),
+    )
+    block = model_block(name="c", provider="claude", model="m", default=True, inputs=["audio"])
+    assert config_error(models_config(tmp_path, block)).problems == (
+        "models[0].inputs：claude 的对话接口不接受音频，不能声明 audio",
+    )
+
+
 def test_attachments_defaults_and_values(tmp_path: Path) -> None:
     assert load_settings(write_config(tmp_path, "")).attachments == AttachmentSettings(
         max_size_mb=20, download_timeout_seconds=30, retention_days=30, history_turns=3
@@ -1167,6 +1225,19 @@ def test_describe_is_optional_and_read(tmp_path: Path) -> None:
     assert describe.max_output_tokens is None
     assert describe.file_instructions == DEFAULT_FILE_INSTRUCTIONS
     assert describe.file_max_output_tokens is None
+
+
+def test_describe_and_memory_can_use_claude(tmp_path: Path) -> None:
+    # 图片描述与话题摘要走通用的对话接口，Claude 也可以。
+    text = (
+        '[describe]\nprovider = "claude"\nmodel = "claude-fake"\n'
+        '[memory]\nprovider = "claude"\nmodel = "claude-fake"\nreasoning = "low"\n'
+    )
+    settings = load_settings(write_config(tmp_path, text))
+    assert settings.describe == DescribeSettings(provider=Provider.CLAUDE, model="claude-fake")
+    assert settings.memory == MemorySettings(
+        provider=Provider.CLAUDE, model="claude-fake", reasoning="low"
+    )
 
 
 def test_describe_file_fields_can_be_overridden(tmp_path: Path) -> None:
@@ -1490,7 +1561,14 @@ def test_every_openai_quality_is_accepted(tmp_path: Path, quality: str) -> None:
     ("text", "problem"),
     [
         ('model = "m"', "image_generation.provider：缺少这个键"),
-        ('provider = "claude"\nmodel = "m"', "image_generation.provider：应为 openai、gemini 之一"),
+        (
+            'provider = "mistral"\nmodel = "m"',
+            "image_generation.provider：应为 openai、gemini 之一",
+        ),
+        (
+            'provider = "claude"\nmodel = "m"',
+            "image_generation.provider：这一项只能是 openai、gemini 之一，claude 不支持",
+        ),
         ('provider = "openai"', "image_generation.model：缺少这个键"),
         ('provider = "openai"\nmodel = " "', "image_generation.model：不能为空"),
         (
@@ -1649,6 +1727,20 @@ def test_a_custom_persona_extra_is_used_as_written_and_kept_out_of_repr(tmp_path
     # Gemini 的模型自己写了也照用。
     assert [model.persona_extra for model in models] == ["不要加多余的提醒。\n"] * 2
     assert "不要加多余的提醒" not in repr(models[0])
+
+
+def test_claude_models_get_no_built_in_persona_extra(tmp_path: Path) -> None:
+    # 内置的那一段只对 OpenAI 默认加；Claude 的模型没写时不加，写了照用。
+    claude = '\n[[models]]\nname = "c"\nprovider = "claude"\nmodel = "claude-fake"\n'
+    line = 'persona_extra = "少用列表。"\n'
+    models = load_settings(
+        write_config(tmp_path, MODELS + claude + claude.replace('"c"', '"d"') + line, models=False)
+    ).models
+    assert [(m.provider, m.persona_extra) for m in models] == [
+        (Provider.OPENAI, DEFAULT_PERSONA_EXTRA),
+        (Provider.CLAUDE, ""),
+        (Provider.CLAUDE, "少用列表。"),
+    ]
 
 
 def test_a_bad_provider_adds_no_problem_for_the_persona_extra(tmp_path: Path) -> None:

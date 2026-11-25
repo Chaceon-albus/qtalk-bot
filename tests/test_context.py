@@ -147,6 +147,49 @@ def test_accepts_needs_the_declared_input_a_stored_file_and_a_type_the_provider_
     assert not accepts(READS, record(FILE, mime=WAV))
 
 
+CLAUDE = ModelSettings(
+    name="claude",
+    provider=Provider.CLAUDE,
+    model="c",
+    inputs=frozenset({Modality.IMAGE, Modality.FILE}),
+)
+LARGEST_CLAUDE_IMAGE = 7_500_000  # base64 后正好 10_000_000 字节，Claude 的单图上限
+
+
+def test_claude_takes_images_and_pdfs_within_the_single_image_limit() -> None:
+    assert accepts(CLAUDE, record(IMAGE, size=LARGEST_CLAUDE_IMAGE))
+    assert accepts(CLAUDE, record(IMAGE, mime="image/webp"))
+    assert not accepts(CLAUDE, record(IMAGE, size=LARGEST_CLAUDE_IMAGE + 1))  # 单张图片太大
+    assert not accepts(CLAUDE, record(IMAGE, mime=GIF))
+    assert accepts(CLAUDE, record(FILE, size=LARGEST_CLAUDE_IMAGE + 1))  # PDF 只受内联合计的上限
+    assert not accepts(CLAUDE, record(FILE, size=40 * 1024 * 1024))  # base64 后超过 50 MiB
+    assert not accepts(replace(CLAUDE, inputs=frozenset({Modality.AUDIO})), record(VOICE))
+
+
+def test_an_image_over_the_single_image_limit_is_too_large_for_claude() -> None:
+    # 8 MB 的 PNG：OpenAI 的内联上限放得下，Claude 的单图上限放不下。说明里给的上限按单图上限折算。
+    big = record(IMAGE, size=8_000_000)
+    assert accepts(SEES, big)
+    plan = plan_turn([CLAUDE], [user("", big)], max_size_mb=20)
+    assert plan.notices == (texts.attachment_too_large_for_model(7),)
+    plan = plan_turn([CLAUDE, SEES], [user("", big)], max_size_mb=20)
+    assert plan.candidates == ("sees",)
+    assert not fallback_allowed(CLAUDE, SEES, [user("", big)])
+
+
+async def test_claude_gets_no_original_bigger_than_the_single_image_limit(
+    tmp_path: Path,
+) -> None:
+    # 记录的大小放得下、实际读到的文件超过单图上限（如恢复了备份）：不给原件，免得请求整个被拒。
+    store = MediaStore.under(tmp_path)
+    data = b"\x89PNG\r\n\x1a\n" + b"\0" * LARGEST_CLAUDE_IMAGE
+    stale = record(IMAGE, path=store.save(D1, data, PNG), size=100, text="[图片]")
+
+    built = await builder(store, [], [user("看看", stale)], models=[CLAUDE]).build(CLAUDE)
+
+    assert not any(isinstance(p, ImagePart) for m in built.request.messages for p in m.parts)
+
+
 # ---- 候选 ----
 
 

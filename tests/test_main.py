@@ -14,6 +14,7 @@ from collections.abc import (
     Callable,
     Coroutine,
     Iterable,
+    Iterator,
     Sequence,
 )
 from pathlib import Path
@@ -23,6 +24,7 @@ from zoneinfo import ZoneInfo
 import httpx2
 import pyqbot
 import pytest
+from tests.test_llm_claude import clear_proxy_environment
 
 from qtalk_bot import __main__ as entry
 from qtalk_bot import memory, texts
@@ -37,6 +39,7 @@ from qtalk_bot.config import (
     ImageGenerationSettings,
     MemorySettings,
     ModelSettings,
+    Secrets,
     Settings,
     WebImageSettings,
     load_secrets,
@@ -85,6 +88,44 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for name, value in FAKE_ENV.items():
         monkeypatch.setenv(name, value)
     return path
+
+
+REAL_CONFIGURE_LOGGING = entry.configure_logging
+"""真的 `configure_logging()`：下面的夹具在每条测试里把它换掉，专门测它的那条直接调用这个引用。"""
+
+
+@pytest.fixture(autouse=True)
+def logging_configured(monkeypatch: pytest.MonkeyPatch) -> list[None]:
+    """把 `main()` 调用的 `configure_logging()` 换成只压住第三方日志器的替身，返回每调用一次记一项的列表。
+
+    真的那个以 `force=True` 重新配置根日志器，会换掉 pytest 挂上的处理器、把根级别定成 INFO，用 caplog 的测试就
+    抓不到 `main()` 之后的日志（DEBUG 级别的泄漏更照不到）。这个替身正是改用 `force=True` 之前在 pytest 下的实际
+    效果：根日志器已经有 pytest 的处理器，`basicConfig()` 什么都不做。
+    """
+    calls: list[None] = []
+
+    def configure() -> None:
+        calls.append(None)
+        entry.quiet_third_party_logs()
+
+    monkeypatch.setattr(entry, "configure_logging", configure)
+    return calls
+
+
+@pytest.fixture
+def restore_root_logging() -> Iterator[None]:
+    """真的 `configure_logging()` 会重新配置根日志器（换掉处理器、改级别）：测完恢复原样。"""
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    yield
+    for handler in root.handlers[:]:
+        if handler not in handlers:
+            root.removeHandler(handler)
+            handler.close()
+    for handler in handlers:
+        if handler not in root.handlers:
+            root.addHandler(handler)
+    root.setLevel(level)
 
 
 @pytest.fixture(autouse=True)
@@ -270,6 +311,79 @@ def test_missing_provider_key_exits_nonzero_naming_the_variable(
     err = capsys.readouterr().err
     assert "GEMINI_API_KEY" in err
     assert FAKE_ENV["OPENAI_API_KEY"] not in err
+
+
+def test_a_model_client_that_cannot_be_created_exits_with_a_clear_message(
+    config: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 没配 [providers.claude].proxy，系统代理用了 SDK 不支持的协议：SDK 的原文里有代理的用户名与主机，不能打出来。
+    config.write_text(
+        'timezone = "UTC"\n' + MODELS.replace('"openai"', '"claude"'), encoding="utf-8"
+    )
+    monkeypatch.setenv("CLAUDE_API_KEY", "fake-claude-key-never-shown")
+    clear_proxy_environment(
+        monkeypatch
+    )  # 含 NO_PROXY：宿主设了 NO_PROXY=* 时系统代理不生效，进不了这个分支
+    monkeypatch.setenv("HTTPS_PROXY", "socks4://alice-proxy-user:hunter2@proxy-host.invalid:1080")
+
+    assert entry.main() == entry.EXIT_CONFIG_ERROR
+
+    err = capsys.readouterr().err
+    assert "创建 claude 的客户端失败" in err
+    assert "Traceback" not in err
+    for secret in ("alice-proxy-user", "proxy-host.invalid", "hunter2", "fake-claude-key"):
+        assert secret not in err
+
+
+def test_main_configures_logging_first(
+    config: Path, monkeypatch: pytest.MonkeyPatch, logging_configured: list[None]
+) -> None:
+    # 在读密钥的那一刻，日志就要已经配置好了：之后的每一步（含读配置出错的那条说明）都要按配置的日志走。
+    seen: list[list[None]] = []
+    read = entry.load_secrets
+
+    def load_secrets() -> Secrets:
+        seen.append(list(logging_configured))
+        return read()
+
+    monkeypatch.setattr(entry, "load_secrets", load_secrets)
+    monkeypatch.delenv("ADMIN_OPENID")  # 读完密钥就退出
+    assert entry.main() == entry.EXIT_CONFIG_ERROR
+    assert seen == [[None]]
+    assert logging_configured == [None]
+
+
+@pytest.mark.usefixtures("restore_root_logging")
+def test_logging_is_configured_even_after_an_sdk_configured_it_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 设了 ANTHROPIC_LOG（或 OPENAI_LOG）时，SDK 在导入时就调用过 basicConfig() 并调低了自己与 httpx2 的日志器；
+    # 不强制的话程序自己的设置不生效。这里照 SDK 的做法先来一遍，再看程序的设置。
+    from anthropic._utils._logs import setup_logging  # pyright: ignore[reportPrivateUsage]  SDK 导入时调用的就是它
+
+    root = logging.getLogger()
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)  # 不让 force=True 关掉 pytest 的处理器；测完由夹具恢复
+    root.setLevel(logging.WARNING)
+    loggers = [logging.getLogger(name) for name in entry.QUIET_LOGGERS]
+    saved = [logger.level for logger in loggers]
+    monkeypatch.setenv("ANTHROPIC_LOG", "debug")
+    try:
+        setup_logging()
+        assert root.handlers  # SDK 已经装上了自己的处理器
+        assert logging.getLogger("anthropic").level == logging.DEBUG
+
+        REAL_CONFIGURE_LOGGING()
+
+        assert root.level == logging.INFO
+        (handler,) = root.handlers
+        assert handler.formatter is not None
+        assert handler.formatter._fmt == "%(asctime)s %(levelname)s %(name)s: %(message)s"  # pyright: ignore[reportPrivateUsage]  格式只存在这里
+        for logger in loggers:
+            assert logger.level == logging.WARNING  # SDK 调低的级别又压了回来
+    finally:
+        for logger, level in zip(loggers, saved, strict=True):
+            logger.setLevel(level)
 
 
 def test_missing_config_file_exits_nonzero(

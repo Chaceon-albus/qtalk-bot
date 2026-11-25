@@ -1,14 +1,15 @@
-"""对两家服务商各问一个需要联网的问题，打开内置搜索：访问真实网络、会计费（搜索另外计费），默认不运行。
+"""对各家服务商各问一个需要联网的问题，打开内置搜索：访问真实网络、会计费（搜索另外计费），默认不运行。
 
 征得同意后这样运行（密钥从 `.env` 读，不会被打印）：
 
     uv run --env-file .env pytest -m live -s tests/live/test_live_search.py
 
 模型名默认取 `docs/design/external-facts.md` 里的候选，可以用环境变量 `QTALK_LIVE_OPENAI_MODEL`、
-`QTALK_LIVE_GEMINI_MODEL` 改。缺少某家的密钥时跳过那一家。打印搜索的进展与次数、查询词、引用的条数与链接的
+`QTALK_LIVE_GEMINI_MODEL`、`QTALK_LIVE_CLAUDE_OPUS_MODEL` 改。缺少某家的密钥时跳过那一家。打印搜索的进展与次数、查询词、引用的条数与链接的
 主机名、整理后「来源」的条数、用量；不打印回答的正文与完整链接。
 """
 
+import dataclasses
 import os
 from collections import Counter
 from urllib.parse import urlsplit
@@ -27,6 +28,8 @@ from qtalk_bot.llm import (
     TextDelta,
     Usage,
 )
+from qtalk_bot.llm.claude_messages import ClaudeChatModel
+from qtalk_bot.llm.claude_messages import create_client as create_claude_client
 from qtalk_bot.llm.gemini_interactions import GeminiChatModel
 from qtalk_bot.llm.gemini_interactions import create_client as create_gemini_client
 from qtalk_bot.llm.openai_responses import OpenAIChatModel
@@ -41,14 +44,14 @@ REQUEST = ChatRequest(
 )
 
 
-async def run(model: ChatModel) -> None:
+async def run(model: ChatModel, request: ChatRequest = REQUEST) -> None:
     kinds: Counter[str] = Counter()
     characters = 0
     progress: list[SearchProgress] = []
     cited: list[Citation] = []
     usage: Usage | None = None
     finished: Finished | None = None
-    async for event in model.stream(REQUEST):
+    async for event in model.stream(request):
         kinds[type(event).__name__] += 1
         match event:
             case TextDelta(text=text):
@@ -99,3 +102,17 @@ async def test_gemini_searches_the_web() -> None:
     finally:
         await client.aio.aclose()
         client.close()
+
+
+async def test_claude_searches_the_web() -> None:
+    key = os.environ.get("CLAUDE_API_KEY")
+    if not key:
+        pytest.skip("没有设置 CLAUDE_API_KEY")
+    client = create_claude_client(key)
+    try:
+        name = os.environ.get("QTALK_LIVE_CLAUDE_OPUS_MODEL", "claude-opus-5-5")
+        model = ClaudeChatModel(client, name=f"claude:{name}", model=name, search=True)
+        # 不设输出上限（按 64000 传）：思考也算在上限里。
+        await run(model, dataclasses.replace(REQUEST, max_output_tokens=None))
+    finally:
+        await client.close()

@@ -16,7 +16,7 @@
 
 `ModelWatch` 按服务商加服务商那边的模型名统计（同一个模型被几个用途共用时合在一起），规则：
 
-- 鉴权失败（`ErrorKind.AUTH`，即 401、403）与额度用尽（`ModelError.quota_exhausted`，只有 OpenAI 认得出）立即告警。
+- 鉴权失败（`ErrorKind.AUTH`，即 401、403）与额度用尽（`ModelError.quota_exhausted`，OpenAI 与 Claude 认得出）立即告警。
 - 连接失败或超时、限流、服务端出错、生成失败、响应不完整、其它，连续 `threshold` 次、中间没有一次成功时告警。
 - 被安全策略拦截（含出图被内容审核拦下）、拒答、不支持的输入、其它 4xx 不计入，也不清零连续的次数。
 - 成功一次就清零；这个模型的告警发出去了的话，补一条「已恢复」（见 `alerts.Incident`）。

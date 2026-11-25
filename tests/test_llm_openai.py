@@ -27,6 +27,7 @@ from qtalk_bot.llm import (
     ChatEvent,
     ChatRequest,
     Citation,
+    CitationFilter,
     Commentary,
     ErrorKind,
     FilePart,
@@ -1098,6 +1099,41 @@ async def test_citations_from_the_content_part_done_frame_before_a_break() -> No
             ITEM_ADDED,
             text_delta(3, "今天晴。"),
             content_part_done(4, url_citation(SHANGHAI, "上海天气")),
+        ]
+    )
+
+    events, _ = await failure(model_on(server, search=True))
+
+    assert events == [TextDelta("今天晴。"), Citation(SHANGHAI, "上海天气")]
+
+
+def test_the_citation_filter_ignores_annotations_whose_type_is_not_a_string() -> None:
+    @dataclasses.dataclass
+    class Annotation:
+        type: object
+        url: str = SHANGHAI
+        title: str = "上海天气"
+
+    default = CitationFilter()
+    assert default(Annotation([])) is None  # 不可哈希的 type：忽略，不抛异常
+    assert default(Annotation(None)) is None
+    assert default(Annotation("web_search_result_location")) is None  # 默认只认 url_citation
+    assert default(Annotation("url_citation")) == Citation(SHANGHAI, "上海天气")
+    claude = CitationFilter(kinds=frozenset(("web_search_result_location",)))
+    assert claude(Annotation({"a": 1})) is None
+    assert claude(Annotation("url_citation")) is None
+    assert claude(Annotation("web_search_result_location")) == Citation(SHANGHAI, "上海天气")
+
+
+async def test_a_malformed_annotation_does_not_drop_the_good_ones_of_its_frame() -> None:
+    # 标注的 type 不是字符串（如列表）时只忽略这一条：判断它是不是认得的类型之前先确认是字符串，不能抛 TypeError
+    # 让整帧的引用都被跳过。
+    server = streaming(
+        [
+            CREATED,
+            ITEM_ADDED,
+            text_delta(3, "今天晴。"),
+            content_part_done(4, url_citation(SHANGHAI, "上海天气"), {"type": [], "url": SHANGHAI}),
         ]
     )
 

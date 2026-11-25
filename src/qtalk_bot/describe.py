@@ -97,7 +97,7 @@ class Describer:
 
     def accepts(self, kind: AttachmentKind, mime_type: str | None, size: int | None) -> bool:
         """这个描述模型能不能看这个附件：图片，或 PDF（这家服务商的接口收 PDF 时）；按 base64 计的大小也要在
-        内联上限之内。"""
+        单个附件的上限之内（`InputLimits.item_limit()`：内联合计的上限，图片还有单图上限）。"""
         match kind:
             case AttachmentKind.IMAGE:
                 modality = Modality.IMAGE
@@ -108,7 +108,7 @@ class Describer:
         return (
             mime_type is not None
             and self._limits.accepts(modality, mime_type)
-            and inline_size(size or 0) <= self._limits.max_inline_bytes
+            and inline_size(size or 0) <= self._limits.item_limit(modality)
         )
 
     def describable(self, record: AttachmentRecord) -> bool:

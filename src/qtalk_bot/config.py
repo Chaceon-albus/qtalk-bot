@@ -185,10 +185,17 @@ _DOMAIN = re.compile(r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+
 _MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 _REASONING = re.compile(r"[a-z][a-z0-9_]{0,31}")
 _PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
-_PROVIDER_SECRETS = {Provider.OPENAI: "OPENAI_API_KEY", Provider.GEMINI: "GEMINI_API_KEY"}
+_PROVIDER_SECRETS = {
+    Provider.OPENAI: "OPENAI_API_KEY",
+    Provider.GEMINI: "GEMINI_API_KEY",
+    Provider.CLAUDE: "CLAUDE_API_KEY",
+}
+# 有 Decisions 接口、能出图的服务商：Claude 两样都没有，`[decisions]` 与 `[image_generation]` 不能写它。
+_DECISION_PROVIDERS = frozenset((Provider.OPENAI, Provider.GEMINI))
+_IMAGE_PROVIDERS = frozenset((Provider.OPENAI, Provider.GEMINI))
 
 _REQUIRED_SECRETS = ("APP_ID", "APP_SECRET", "ADMIN_OPENID")
-_OPTIONAL_SECRETS = ("OPENAI_API_KEY", "GEMINI_API_KEY")
+_OPTIONAL_SECRETS = ("OPENAI_API_KEY", "GEMINI_API_KEY", "CLAUDE_API_KEY")
 _SECRET_NAMES = frozenset(name.lower() for name in (*_REQUIRED_SECRETS, *_OPTIONAL_SECRETS))
 
 
@@ -214,11 +221,19 @@ class Secrets:
     admin_openid: str
     openai_api_key: str | None = None
     gemini_api_key: str | None = None
+    claude_api_key: str | None = None
 
     def __repr__(self) -> str:
         shown = ", ".join(
             f"{name}={'<已设置>' if getattr(self, name) is not None else '<未设置>'}"
-            for name in ("app_id", "app_secret", "admin_openid", "openai_api_key", "gemini_api_key")
+            for name in (
+                "app_id",
+                "app_secret",
+                "admin_openid",
+                "openai_api_key",
+                "gemini_api_key",
+                "claude_api_key",
+            )
         )
         return f"Secrets({shown})"
 
@@ -242,18 +257,20 @@ class ModelSettings:
         default: 是否是默认模型；恰好有一项是。
         fallback: 调用失败时改用的模型（另一项的 `name`），没有时为 `None`。
         reasoning: 推理强度，原样透传给服务商（OpenAI 的 `reasoning.effort`，Gemini 的
-            `generation_config.thinking_level`）；`None` 时不传，用服务商的默认值。两家、各款模型接受的
-            取值不同（如有的不接受 `none`、`minimal`），且随新模型变化，所以本地只校验它是非空的小写
-            标识符，不维护取值表；服务商拒绝时按普通的模型调用失败处理（会换备用模型）。
+            `generation_config.thinking_level`，Claude 的 `output_config.effort`）；`None` 时不传，用服务商的
+            默认值。各家、各款模型接受的取值不同（如有的不接受 `none`、`minimal`），且随新模型变化，所以本地
+            只校验它是非空的小写标识符，不维护取值表；服务商拒绝时按普通的模型调用失败处理（会换备用模型）。
         description: 一句话说明这个模型适合回答什么样的消息，是选模型那道选择题里这个选项的描述。
             配置了 `[decisions]` 且模型多于一个时必填，否则可以不写（写了也不用）。
         inputs: 文字之外这个模型能直接接收的输入；空集表示只接收文字。带附件的消息只在能处理它们的模型
-            里选。OpenAI 的模型不能声明 `audio`（Responses API 不接受音频）。
-        search: 调用时带上服务商内置的联网搜索工具（OpenAI 的 `web_search`，Gemini 的 `google_search`）。
+            里选。OpenAI 与 Claude 的模型不能声明 `audio`（两家的对话接口都不接受音频）。
+        search: 调用时带上服务商内置的联网搜索工具（OpenAI 的 `web_search`，Gemini 的 `google_search`，Claude 的
+            `web_search_20250305`）。
             模型不支持或服务商拒绝时按普通的模型调用失败处理（会换备用模型）。
         show_process: 把处理过程（调用工具前的说明、搜索进展）以单独的一条消息展示给用户，回答之后留着
-            （QQ 的流式消息撤回不了），见 `process.py`。不请求思考摘要（用户 2026-11-19 决定：实测里摘要稀疏
-            且总是英文），服务商仍给了也不展示。
+            （QQ 的流式消息撤回不了），见 `process.py`。思考摘要不论这个开关都不展示（用户 2026-11-19 决定：实测
+            里摘要稀疏且总是英文）：OpenAI 与 Gemini 的模型不请求；Claude 的适配器每次都请求（思考期间流里才有
+            事件，见 `claude_messages.py`），但不交给调用方。
         image_generation: 这个模型能用画图函数（出图由 `[image_generation]` 配置的图片模型完成）。没有
             `[image_generation]` 时不起作用，启动时记一条警告。
         web_images: 这个模型可以在回答里用 `![说明](地址)` 插网上的图片，机器人下载白名单里图站的图、随回答
@@ -285,7 +302,8 @@ class DecisionSettings:
     """`[decisions]` 表：用 Decisions API 按消息选模型。不写这个表就不做决策，始终用默认模型。
 
     Attributes:
-        provider: 决策调用的服务商；它的客户端与对话模型共用，`[providers.<服务商>]` 同样生效。
+        provider: 决策调用的服务商，只能是 OpenAI 或 Gemini（Claude 没有 Decisions 接口）；它的客户端与对话
+            模型共用，`[providers.<服务商>]` 同样生效。
         model: 服务商那边的决策模型名；不写时按服务商取 `DEFAULT_DECISION_MODELS`。
         instructions: 选模型那道选择题的题面。
         timeout_seconds: 一次决策调用的硬时限（秒）。它是用户等待时间的一部分，超时就退回不选。
@@ -397,7 +415,8 @@ class DescribeSettings:
         reasoning: 推理强度，规则同 `[[models]]` 的 `reasoning`。
         instructions: 写图片描述的提示词（作为系统提示词）。
         timeout_seconds: 一次描述或摘要调用的时限（秒）；不设输出上限时，失控的调用靠它兜底。
-        max_output_tokens: 一次图片描述的输出上限（含推理）；`None` 时不向服务商传，由模型自己的上限兜底。
+        max_output_tokens: 一次图片描述的输出上限（含推理）；`None` 时不向服务商传，由模型自己的上限兜底
+            （Claude 的接口必须给上限，这时传 64000，见 `llm.ChatRequest`）。
         file_instructions: 写 PDF 摘要的提示词（作为系统提示词）。
         file_max_output_tokens: 一次 PDF 摘要的输出上限（含推理）；`None` 时同上。
 
@@ -426,7 +445,7 @@ class MemorySettings:
         instructions: 写标题与摘要的提示词（作为系统提示词），要求按 `memory.py` 约定的两行格式输出。
         timeout_seconds: 一次调用的时限（秒）；不设输出上限时，失控的调用靠它兜底。
         max_output_tokens: 一次调用的输出上限（含推理所用的 token）；`None`（默认）时不向服务商传，由模型自己的
-            上限兜底（用户 2026-11-19 决定：后台用 gpt-6-luna 的任务默认不设输出上限）。
+            上限兜底（用户 2026-11-19 决定：后台用 gpt-6-luna 的任务默认不设输出上限；Claude 的接口必须给上限，这时传 64000，见 `llm.ChatRequest`）。
         profile_threshold: 用户档案（里程碑 6b）：每轮的决策里「最新消息有没有值得记进档案的新信息」那道是非题，
             概率不低于它时，回复之后在后台重写档案。
         profile_instructions: 重写档案的提示词（作为系统提示词），要求输出完整的新档案或固定的「不变」（见
@@ -448,7 +467,8 @@ class ImageGenerationSettings:
     """`[image_generation]` 表：对话模型调用画图函数时出图用的图片模型。不写这个表就不出图。
 
     Attributes:
-        provider: 服务商，与对话模型是哪家无关；客户端与同一家的对话模型共用。
+        provider: 服务商，与对话模型是哪家无关，只能是 OpenAI 或 Gemini（Claude 不出图）；客户端与同一家的
+            对话模型共用。
         model: 服务商那边的图片模型名。
         timeout_seconds: 一次出图（含改图）的时限（秒）。
         daily_limit: 每个用户每天最多几张（改图也算）；0 表示只有管理员能用。管理员不受限。
@@ -498,9 +518,9 @@ class ProviderSettings:
 
     Attributes:
         base_url: 端点；`None` 时用官方端点。端点只有这两个来源，`OPENAI_BASE_URL`、
-            `GOOGLE_GEMINI_BASE_URL` 这类环境变量一律不采用。OpenAI 的写法含版本号（如
+            `GOOGLE_GEMINI_BASE_URL`、`ANTHROPIC_BASE_URL` 这类环境变量一律不采用。OpenAI 的写法含版本号（如
             `https://api.openai.com/v1`），Gemini 的不含（如 `https://generativelanguage.googleapis.com/`，
-            版本号由程序固定）。
+            版本号由程序固定），Claude 的也不含（如 `https://api.anthropic.com`，SDK 自己拼上 `/v1/messages`）。
         proxy: 代理地址，`http`、`https`、`socks5`、`socks5h` 之一（SOCKS 由依赖 `socksio` 提供支持）。
             `None` 时不设代理，系统级的 `HTTPS_PROXY` 等环境变量照常生效。地址里可能带用户名和密码，
             所以不进 `repr`、日志与报错。
@@ -516,6 +536,7 @@ class ProvidersSettings:
 
     openai: ProviderSettings = ProviderSettings()
     gemini: ProviderSettings = ProviderSettings()
+    claude: ProviderSettings = ProviderSettings()
 
     def __getitem__(self, provider: Provider) -> ProviderSettings:
         match provider:
@@ -523,6 +544,8 @@ class ProvidersSettings:
                 return self.openai
             case Provider.GEMINI:
                 return self.gemini
+            case Provider.CLAUDE:
+                return self.claude
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -551,7 +574,7 @@ class ChatSettings:
             聊天助手」）之后。身份是事实，由程序填；人设里只留可以调的部分，不再写「你是……」。
         history_turns: 上下文里带最近几轮（一问一答算一轮）。
         max_output_tokens: 单次回复的输出上限（含推理所用的 token）；`None`（默认）时不向服务商传，由模型自己的
-            上限兜底，同 ChatGPT app 的做法。
+            上限兜底，同 ChatGPT app 的做法（Claude 的接口必须给上限，这时传 64000，见 `llm.ChatRequest`）。
         idle_timeout_seconds: 空闲时限：模型流这么久没有任何动静（适配器从 SDK 收到的任何事件都算）就放弃。
         timeout_seconds: 总时限：一次模型调用从发出请求到写完最多这么久。
         两个时限在换备用模型重试时都重新计时。
@@ -582,8 +605,8 @@ class AlertSettings:
     """`[alerts]` 表：给管理员的告警的阈值。
 
     Attributes:
-        model_failures: 同一个服务商的同一个模型连续失败这么多次（中间没有成功）时告警；鉴权失败与 OpenAI 的
-            额度用尽不等，立即告警。
+        model_failures: 同一个服务商的同一个模型连续失败这么多次（中间没有成功）时告警；鉴权失败与 OpenAI、
+            Claude 的额度用尽不等，立即告警。
         disk_free_min_mb: 数据目录所在文件系统的剩余空间低于这么多 MB 时告警；0 就是不告警。
         gateway_down_minutes: QQ 网关断开超过这么多分钟时告警；健康检查也用它（断开或启动卡住超过它算不健康）。
     """
@@ -654,7 +677,11 @@ def check_provider_secrets(settings: Settings, secrets: Secrets) -> None:
     Raises:
         ConfigError: 有服务商缺少密钥；只说变量名。
     """
-    keys = {Provider.OPENAI: secrets.openai_api_key, Provider.GEMINI: secrets.gemini_api_key}
+    keys = {
+        Provider.OPENAI: secrets.openai_api_key,
+        Provider.GEMINI: secrets.gemini_api_key,
+        Provider.CLAUDE: secrets.claude_api_key,
+    }
     used = {model.provider for model in settings.models}
     if settings.decisions is not None:
         used.add(settings.decisions.provider)
@@ -705,6 +732,7 @@ def load_secrets(environ: Mapping[str, str] | None = None) -> Secrets:
         admin_openid=required["ADMIN_OPENID"],
         openai_api_key=optional("OPENAI_API_KEY"),
         gemini_api_key=optional("GEMINI_API_KEY"),
+        claude_api_key=optional("CLAUDE_API_KEY"),
     )
 
 
@@ -1294,7 +1322,7 @@ def _parse_image_generation(root: _Table) -> tuple[bool, ImageGenerationSettings
     table = root.table("image_generation")
     if table is None:
         return False, None
-    provider = _parse_provider_name(table)
+    provider = _parse_provider_name(table, _IMAGE_PROVIDERS)
     model = table.required_string("model")
     timeout = table.number("timeout_seconds", DEFAULT_IMAGE_TIMEOUT_SECONDS)
     if timeout is not None and not 0 < timeout <= MAX_IMAGE_TIMEOUT_SECONDS:
@@ -1377,7 +1405,7 @@ def _parse_decisions(root: _Table) -> tuple[bool, DecisionSettings | None]:
     table = root.table("decisions")
     if table is None:
         return False, None
-    provider = _parse_provider_name(table)
+    provider = _parse_provider_name(table, _DECISION_PROVIDERS)
     model: str | None = None
     model_ok = True
     if table.has("model"):
@@ -1439,17 +1467,23 @@ def _parse_topics(table: _Table) -> TopicSettings | None:
     )
 
 
-def _parse_provider_name(table: _Table) -> Provider | None:
-    """必填的 `provider`：`openai` 或 `gemini`。"""
+def _parse_provider_name(
+    table: _Table, allowed: frozenset[Provider] = frozenset(Provider)
+) -> Provider | None:
+    """必填的 `provider`：`allowed` 里的一家（默认是全部服务商）。"""
     name = table.required_string("provider")
     if name is None:
         return None
+    choices = "、".join(p.value for p in Provider if p in allowed)
     try:
-        return Provider(name)
+        provider = Provider(name)
     except ValueError:
-        choices = "、".join(p.value for p in Provider)
         table.problem("provider", f"应为 {choices} 之一")
         return None
+    if provider not in allowed:
+        table.problem("provider", f"这一项只能是 {choices} 之一，{provider.value} 不支持")
+        return None
+    return provider
 
 
 def _parse_providers(table: _Table) -> ProvidersSettings | None:
@@ -1458,10 +1492,14 @@ def _parse_providers(table: _Table) -> ProvidersSettings | None:
         sub = table.table(provider.value)
         parsed[provider] = None if sub is None else _parse_provider(sub)
     table.finish()
-    openai, gemini = parsed[Provider.OPENAI], parsed[Provider.GEMINI]
-    if openai is None or gemini is None:
+    openai, gemini, claude = (
+        parsed[Provider.OPENAI],
+        parsed[Provider.GEMINI],
+        parsed[Provider.CLAUDE],
+    )
+    if openai is None or gemini is None or claude is None:
         return None
-    return ProvidersSettings(openai=openai, gemini=gemini)
+    return ProvidersSettings(openai=openai, gemini=gemini, claude=claude)
 
 
 def _parse_provider(table: _Table) -> ProviderSettings | None:

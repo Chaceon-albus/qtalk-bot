@@ -4,10 +4,10 @@ from collections.abc import Generator, Iterator
 
 import pytest
 
-# 同 `__main__.main()` 的名单：httpx2 在 INFO 级别记录请求地址；两家 SDK 的 DEBUG 日志里有请求头（含 key）、
+# 同 `__main__.main()` 的名单：httpx2 在 INFO 级别记录请求地址；各家 SDK 的 DEBUG 日志里有请求头（含 key）、
 # 提示词与响应体（含图片的 base64）。设了 GOOGLE_GENAI_DEBUG 时 Gemini SDK 会自己把根日志调到 DEBUG，实测不经过
 # `main()`，在这里同样压住。
-QUIET_LOGGERS = ("httpx2", "httpcore2", "openai", "google_genai", "google.genai")
+QUIET_LOGGERS = ("httpx2", "httpcore2", "openai", "google_genai", "google.genai", "anthropic")
 
 
 @contextlib.contextmanager

@@ -152,4 +152,25 @@ def test_commented_out_examples_are_valid_once_uncommented(tmp_path: Path) -> No
     assert settings.providers.openai.proxy == "socks5://127.0.0.1:1080"
     assert settings.providers.gemini.base_url == "https://generativelanguage.googleapis.com/"
     assert settings.providers.gemini.proxy == "http://127.0.0.1:7890"
+    assert settings.providers.claude.base_url == "https://api.anthropic.com"
+    assert settings.providers.claude.proxy == "socks5h://127.0.0.1:1080"
     assert settings.web_images.proxy == "socks5h://127.0.0.1:1080"
+
+
+def test_the_commented_claude_model_is_valid_once_uncommented(tmp_path: Path) -> None:
+    # 注释掉的 Claude 模型示例去掉行首的 "#   " 后要能通过校验：provider 与密钥名都对得上，也没有写 audio。
+    lines = EXAMPLE.read_text(encoding="utf-8").splitlines()
+    (start,) = [index for index, line in enumerate(lines) if line == "#   [[models]]"]
+    block: list[str] = []
+    for line in lines[start:]:
+        if not line.startswith("#   "):
+            break
+        block.append(line.removeprefix("#   "))
+    config = tmp_path / "config.toml"
+    config.write_text("\n".join([*block, "default = true"]), encoding="utf-8")
+
+    (model,) = load_settings(config).models
+
+    assert model.provider is Provider.CLAUDE
+    assert model.model in ("claude-opus-5-5", "claude-sonnet-5-5")
+    assert model.persona_extra == ""  # 内置的那一段只对 OpenAI 默认加

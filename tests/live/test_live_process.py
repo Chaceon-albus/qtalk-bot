@@ -1,11 +1,12 @@
-"""处理过程的实测：对两家各问一个需要思考和搜索的固定问题，请求思考摘要、带上内置搜索。访问真实网络、会计费，
+"""处理过程的实测：对各家各问一个需要思考和搜索的固定问题，请求思考摘要、带上内置搜索。访问真实网络、会计费，
 默认不运行。
 
 征得同意后这样运行（密钥从 `.env` 读，不会被打印）：
 
     uv run --env-file .env pytest -m live -s tests/live/test_live_process.py
 
-模型名同 `test_live_models.py`，可以用 `QTALK_LIVE_OPENAI_MODEL`、`QTALK_LIVE_GEMINI_MODEL` 改。打印收到的思考
+模型名同 `test_live_models.py`，可以用 `QTALK_LIVE_OPENAI_MODEL`、`QTALK_LIVE_GEMINI_MODEL`、
+`QTALK_LIVE_CLAUDE_OPUS_MODEL` 改。打印收到的思考
 摘要段数、调用工具前的说明（commentary）段数、搜索次数、回答的字数，以及每段摘要的前 30 个字（问题是固定的，
 不涉及用户数据）。OpenAI 带摘要的请求被拒（组织未验证）时适配器会不带摘要重试，日志里有一条 WARNING。
 
@@ -13,6 +14,7 @@
 `output_item.done` 时 `phase` 是什么，用来决定要不要暂存还没分类的消息项。
 """
 
+import dataclasses
 import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -37,6 +39,8 @@ from qtalk_bot.llm import (
     ThoughtSummary,
     Usage,
 )
+from qtalk_bot.llm.claude_messages import ClaudeChatModel
+from qtalk_bot.llm.claude_messages import create_client as create_claude_client
 from qtalk_bot.llm.gemini_interactions import GeminiChatModel
 from qtalk_bot.llm.gemini_interactions import create_client as create_gemini_client
 from qtalk_bot.llm.openai_responses import OpenAIChatModel
@@ -171,3 +175,19 @@ async def test_gemini_process() -> None:
     finally:
         await client.aio.aclose()
         client.close()
+
+
+async def test_claude_process() -> None:
+    key = os.environ.get("CLAUDE_API_KEY")
+    if not key:
+        pytest.skip("没有设置 CLAUDE_API_KEY")
+    client = create_claude_client(key)
+    try:
+        name = os.environ.get("QTALK_LIVE_CLAUDE_OPUS_MODEL", "claude-opus-5-5")
+        model = ClaudeChatModel(
+            client, name=f"claude:{name}", model=name, search=True, summaries=True
+        )
+        # 不设输出上限（按 64000 传）：思考也算在上限里。Claude 没有调用工具前的说明，不加那句提示词。
+        await run(model, dataclasses.replace(request(preamble=False), max_output_tokens=None))
+    finally:
+        await client.close()

@@ -1,5 +1,8 @@
 """按配置创建对话模型：不发请求，只看创建与关闭。"""
 
+import pytest
+from tests.test_llm_claude import clear_proxy_environment, proxy_of
+
 from qtalk_bot.config import (
     DecisionSettings,
     DescribeSettings,
@@ -12,6 +15,7 @@ from qtalk_bot.config import (
 )
 from qtalk_bot.imagegen import GeminiImageGenerator, OpenAIImageGenerator
 from qtalk_bot.llm import Provider
+from qtalk_bot.llm.claude_messages import ClaudeChatModel
 from qtalk_bot.llm.gemini_decisions import GeminiDecisionModel
 from qtalk_bot.llm.gemini_interactions import GeminiChatModel
 from qtalk_bot.llm.openai_decisions import OpenAIDecisionModel
@@ -24,6 +28,7 @@ SECRETS = Secrets(
     admin_openid="FAKE-OPENID-ADMIN",
     openai_api_key="fake-openai-key-never-shown",
     gemini_api_key="fake-gemini-key-never-shown",
+    claude_api_key="fake-claude-key-never-shown",
 )
 
 
@@ -251,3 +256,61 @@ async def test_no_image_generator_without_the_table() -> None:
     settings = (ModelSettings(name="main", provider=Provider.OPENAI, model="m", default=True),)
     async with ChatModels(settings, SECRETS) as models:
         assert models.image_generator is None
+
+
+async def test_claude_models_share_one_configured_client_that_is_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_proxy_environment(monkeypatch)  # 只看配置的代理，不受宿主的系统代理变量影响
+    settings = (
+        ModelSettings(
+            name="opus", provider=Provider.CLAUDE, model="c-a", default=True, reasoning="max"
+        ),
+        ModelSettings(name="sonnet", provider=Provider.CLAUDE, model="c-b", search=True),
+    )
+    providers = ProvidersSettings(
+        claude=ProviderSettings(
+            base_url="https://cl.example.com/anthropic", proxy="http://127.0.0.1:7890"
+        )
+    )
+    describe = DescribeSettings(provider=Provider.CLAUDE, model="c-d")
+    memory = MemorySettings(provider=Provider.CLAUDE, model="c-m")
+    models = ChatModels(settings, SECRETS, providers, describe=describe, memory=memory)
+    opus, sonnet = models["opus"], models["sonnet"]
+    describer, memorizer = models.describer, models.memorizer
+    assert isinstance(opus, ClaudeChatModel)
+    assert isinstance(sonnet, ClaudeChatModel)
+    assert isinstance(describer, ClaudeChatModel)
+    assert isinstance(memorizer, ClaudeChatModel)
+    # 下面读适配器的私有属性，只为确认接线：同一家共用一个客户端，配置原样传到了模型与客户端。
+    clients = [
+        model._client  # pyright: ignore[reportPrivateUsage]  见上
+        for model in (opus, sonnet, describer, memorizer)
+    ]
+    client = clients[0]
+    assert all(other is client for other in clients)
+    assert str(client.base_url) == "https://cl.example.com/anthropic/"
+    assert proxy_of(client) == ("127.0.0.1", 7890)
+    assert client.api_key == "fake-claude-key-never-shown"
+    assert opus._reasoning == "max"  # pyright: ignore[reportPrivateUsage]  见上
+    assert sonnet._search  # pyright: ignore[reportPrivateUsage]  见上
+    assert (opus.provider, opus.model, opus.name) == (Provider.CLAUDE, "c-a", "opus")
+    assert "fake-" not in repr(opus)
+    http_client = client._client  # pyright: ignore[reportPrivateUsage]  确认关闭了底层的连接
+    await models.aclose()
+    assert http_client.is_closed
+
+
+async def test_claude_never_backs_decisions_or_image_generation() -> None:
+    # 读配置时已经拦下；万一绕过了配置直接构造，也不会悄悄换成别家。
+    settings = (ModelSettings(name="main", provider=Provider.CLAUDE, model="c", default=True),)
+    with pytest.raises(AssertionError):
+        ChatModels(
+            settings, SECRETS, decisions=DecisionSettings(provider=Provider.CLAUDE, model="x")
+        )
+    with pytest.raises(AssertionError):
+        ChatModels(
+            settings,
+            SECRETS,
+            image_generation=ImageGenerationSettings(provider=Provider.CLAUDE, model="x"),
+        )

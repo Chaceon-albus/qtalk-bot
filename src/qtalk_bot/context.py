@@ -3,8 +3,8 @@
 不碰网络、不依赖 pyqbot 与 SDK：读附件文件经 `MediaStore`（在线程里读），其余都是纯函数。
 
 **能处理吗**（`accepts()`）：原件已存到本地，模型的 `inputs` 声明了这种输入，服务商接口接受这种实际的 MIME
-类型（`llm.INPUT_LIMITS`），按 base64 计的大小也在它的内联上限之内。图片要 `image`，PDF 要 `file`，语音的 WAV
-要 `audio`。
+类型（`llm.INPUT_LIMITS`），按 base64 计的大小也在它对单个附件的上限之内（`InputLimits.item_limit()`：内联合计的
+上限，图片还有单图上限）。图片要 `image`，PDF 要 `file`，语音的 WAV 要 `audio`。
 
 **放得进**（`fit()`）：一个模型按这一轮附件的顺序，把能接收的原件依次放进服务商的内联预算，放不下的跳过。
 下面说的「能处理」都指放得进，而不是单件能接收。
@@ -115,9 +115,15 @@ def takes(model: ModelSettings, record: AttachmentRecord) -> bool:
 
 
 def accepts(model: ModelSettings, record: AttachmentRecord) -> bool:
-    """`model` 能否直接接收这个附件的原件：收这种附件，大小（按 base64 计）也在服务商的内联上限之内。"""
-    limit = INPUT_LIMITS[model.provider].max_inline_bytes
-    return takes(model, record) and inline_size(record.size or 0) <= limit
+    """`model` 能否直接接收这个附件的原件：收这种附件，大小（按 base64 计）也在服务商对单个附件的上限之内。"""
+    return takes(model, record) and inline_size(record.size or 0) <= _item_limit(model, record)
+
+
+def _item_limit(model: ModelSettings, record: AttachmentRecord) -> int:
+    """`model` 的服务商对这个附件这种输入的单件上限（按 base64 计）；不是图片、语音、文件的按内联合计的上限。"""
+    limits = INPUT_LIMITS[model.provider]
+    modality = _MODALITIES.get(record.kind)
+    return limits.max_inline_bytes if modality is None else limits.item_limit(modality)
 
 
 def _required(current: Sequence[AttachmentRecord]) -> list[AttachmentRecord]:
@@ -221,8 +227,8 @@ def _why_not_given(
     takers = [v for v in viewers if takes(v, record)]
     if takers:
         if not any(accepts(v, record) for v in takers):
-            # 单件就超过了内联上限：说太大、要缩小，而不是格式不支持。
-            limit = max(INPUT_LIMITS[v.provider].max_inline_bytes for v in takers) * 3 // 4
+            # 单件就超过了单个附件的上限：说太大、要缩小，而不是格式不支持。
+            limit = max(_item_limit(v, record) for v in takers) * 3 // 4
             return texts.attachment_too_large_for_model(limit // (1024 * 1024))
         return texts.ATTACHMENTS_OVER_BUDGET
     if record.kind is AttachmentKind.IMAGE:
@@ -601,8 +607,8 @@ class RequestBuilder:
                     missing.add(record.id)
                 continue
             cost = inline_size(len(data))
-            if cost > budget:
-                continue
+            if cost > budget or cost > _item_limit(model, record):
+                continue  # 文件比记录的大（如恢复了备份），单件就超过了上限
             budget -= cost
             originals[record.id] = data
         return originals, missing

@@ -1,8 +1,8 @@
 """按配置创建对话模型、决策模型、写图片描述的模型与出图的图片模型。每家服务商一个 SDK 客户端（带上 `[providers.<服务商>]` 的
 端点与代理），由用到它的模型共用，`ChatModels.aclose()` 时关闭。
 
-对话模型不请求思考摘要（适配器保留了这个能力）：`[[models]].show_process` 只决定展示调用工具前的说明与搜索
-进展，见 `process.py`。
+对话模型都不要思考摘要（适配器保留了这个能力；Claude 的请求为了思考期间流里有动静总是要摘要，但不交给调用方）：
+`[[models]].show_process` 只决定展示调用工具前的说明与搜索进展，见 `process.py`。
 
 这里也是模型调用成败的集中观察点：给了 `observer` 时，创建的每个模型都包一层（`model_watch.py`），调用方不必在
 各个调用点各自统计。"""
@@ -11,6 +11,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from types import TracebackType
 from typing import Self
 
+import anthropic
 import openai
 from google import genai
 
@@ -32,6 +33,8 @@ from ..model_watch import (
     WatchedImageGenerator,
 )
 from . import ChatModel, Provider
+from .claude_messages import ClaudeChatModel
+from .claude_messages import create_client as create_claude_client
 from .decisions import DecisionModel
 from .gemini_decisions import GeminiDecisionModel
 from .gemini_interactions import GeminiChatModel
@@ -73,6 +76,7 @@ class ChatModels(Mapping[str, ChatModel]):
         self._openai: openai.AsyncOpenAI | None = None
         self._gemini: genai.Client | None = None
         self._gemini_images: genai.Client | None = None  # 出图专用：不自动重试，见 `imagegen.py`
+        self._claude: anthropic.AsyncAnthropic | None = None
         self._models: dict[str, ChatModel] = {}
         for settings in models:
             self._models[settings.name] = self._create(settings)
@@ -121,6 +125,8 @@ class ChatModels(Mapping[str, ChatModel]):
         if self._gemini_images is not None:
             await self._gemini_images.aio.aclose()
             self._gemini_images.close()
+        if self._claude is not None:
+            await self._claude.close()
 
     async def __aenter__(self) -> Self:
         return self
@@ -151,6 +157,15 @@ class ChatModels(Mapping[str, ChatModel]):
             )
         return self._gemini
 
+    def _claude_client(self) -> anthropic.AsyncAnthropic:
+        if self._claude is None:
+            assert self._secrets.claude_api_key is not None, "应先检查密钥"
+            endpoint = self._providers.claude
+            self._claude = create_claude_client(
+                self._secrets.claude_api_key, base_url=endpoint.base_url, proxy=endpoint.proxy
+            )
+        return self._claude
+
     def _create(self, settings: ModelSettings) -> ChatModel:
         model = self._create_chat(settings)
         return model if self._observer is None else WatchedChatModel(model, self._observer)
@@ -173,6 +188,14 @@ class ChatModels(Mapping[str, ChatModel]):
                     reasoning=settings.reasoning,
                     search=settings.search,
                 )
+            case Provider.CLAUDE:
+                return ClaudeChatModel(
+                    self._claude_client(),
+                    name=settings.name,
+                    model=settings.model,
+                    reasoning=settings.reasoning,
+                    search=settings.search,
+                )
 
     def _create_decider(self, settings: DecisionSettings) -> DecisionModel:
         decider = self._create_raw_decider(settings)
@@ -184,6 +207,9 @@ class ChatModels(Mapping[str, ChatModel]):
                 return OpenAIDecisionModel(self._openai_client(), model=settings.model)
             case Provider.GEMINI:
                 return GeminiDecisionModel(self._gemini_client(), model=settings.model)
+            case Provider.CLAUDE:
+                # Claude 没有 Decisions 接口，读配置时已经拦下（`config._parse_decisions()`）。
+                raise AssertionError("[decisions] 的服务商不会是 claude")
 
     def _create_image_generator(self, settings: ImageGenerationSettings) -> ImageGenerator:
         generator = self._create_raw_image_generator(settings)
@@ -213,3 +239,6 @@ class ChatModels(Mapping[str, ChatModel]):
                     timeout_seconds=settings.timeout_seconds,
                     image_size=settings.gemini_image_size,
                 )
+            case Provider.CLAUDE:
+                # Claude 不出图，读配置时已经拦下（`config._parse_image_generation()`）。
+                raise AssertionError("[image_generation] 的服务商不会是 claude")

@@ -2665,6 +2665,22 @@ def describer_of(
     )
 
 
+class ClaudeScriptedModel(ScriptedModel):
+    @property
+    def provider(self) -> Provider:
+        return Provider.CLAUDE
+
+
+async def test_describer_keeps_to_the_single_image_limit(db: Database, tmp_path: Path) -> None:
+    # Claude 单张图片按 base64 计不超过 10 MB；PDF 只受内联合计的上限。
+    describer = describer_of(db, tmp_path, ClaudeScriptedModel("describe", answer("x")))
+    largest = 7_500_000  # base64 后正好 10_000_000 字节
+    assert describer.accepts(AttachmentKind.IMAGE, "image/png", largest)
+    assert not describer.accepts(AttachmentKind.IMAGE, "image/png", largest + 1)
+    assert describer.accepts(AttachmentKind.FILE, "application/pdf", largest + 1)
+    assert not describer.accepts(AttachmentKind.IMAGE, "image/gif", 100)
+
+
 async def test_description_is_written_in_the_background_and_used_in_later_history(
     db: Database, tmp_path: Path
 ) -> None:

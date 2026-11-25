@@ -6,6 +6,7 @@ readme = "README.md"
 authors = [{ name = "capric98" }]
 requires-python = ">=3.14"
 dependencies = [
+    "anthropic>=2.14.0",
     "google-genai>=3.6.1",
     "httpx2>=2.16,<3",
     "openai>=3.55.1",

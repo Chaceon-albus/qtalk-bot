@@ -50,6 +50,7 @@ persona = """
 用户流露出伤害自己或他人的念头，或者正处在危险里时：认真对待，先接住对方的感受，不说教、不急着讲道理；问清对方现在是否安全，鼓励他联系身边信得过的人或当地的急救与心理援助热线，并说明你会继续陪着聊。只在这种情况下这样做：平常的倾诉、吐槽和情绪低落照常陪伴，不要动不动就建议就医，也不要加不必要的免责声明。"""
 history_turns = 10        # 上下文里带最近几轮（一问一答算一轮），0 到 100；分话题时是当前话题的最近几轮
 # max_output_tokens = 32768  # 可选：单次回复的输出上限，含推理所用的 token；不写就不设上限，由模型自己的上限兜底
+#                            # （Claude 的接口每次都要给上限，不写时按 64000 传；[memory]、[describe] 的同理）
 # 一次模型调用的两段时限，单位秒，都不能大于 3600；换备用模型重试时两个都重新计时
 idle_timeout_seconds = 300   # 空闲时限：模型流这么久没有任何动静就放弃（推理时可能好几分钟不出字，但流里仍有动静）
 timeout_seconds = 1800       # 总时限：从发出请求到写完最多这么久。QQ 被动回复的有效期是从用户那条消息算起的
@@ -58,20 +59,22 @@ timeout_seconds = 1800       # 总时限：从发出请求到写完最多这么�
 
 # 模型列表：至少一项，恰好一项 default = true。只用一家时，删掉另一项和 fallback 那一行。
 # 每一项先写「是谁」（name、provider、model、default、fallback、reasoning），再写「适合什么、能做什么」：
-# - provider 是 "openai" 或 "gemini"；用到哪家，对应的密钥（OPENAI_API_KEY / GEMINI_API_KEY）
-#   就必须在环境变量里，否则启动时报错。
+# - provider 是 "openai"、"gemini" 或 "claude"；用到哪家，对应的密钥（OPENAI_API_KEY / GEMINI_API_KEY /
+#   CLAUDE_API_KEY）就必须在环境变量里，否则启动时报错。
 # - description 说明这个模型适合回答什么样的消息，按消息选模型时用它做选项的描述；
 #   配置了 [decisions] 且模型多于一个时必填。
 # - inputs 是这个模型除文字外还能直接接收的输入："image"（图片）、"audio"（语音）、"file"（PDF），
 #   不写就是只收文字。带附件的消息只在能处理它们的模型之间选。
-#   OpenAI 的模型不能写 "audio"：Responses API 不接受音频输入，语音会改用 QQ 自带的识别文本。
-# - 打开 search 后，调用这个模型会带上服务商内置的联网搜索（OpenAI 的 web_search、Gemini 的 google_search），
-#   回答末尾会列出引用的来源；搜索按次计费，次数记在用量里。
+#   OpenAI 与 Claude 的模型不能写 "audio"：这两家的对话接口不接受音频输入，语音会改用 QQ 自带的识别文本。
+# - 打开 search 后，调用这个模型会带上服务商内置的联网搜索（OpenAI 的 web_search、Gemini 的 google_search、
+#   Claude 的 web_search），回答末尾会列出引用的来源；搜索按次计费，次数记在用量里。Claude 的搜索每千次 10 美元，
+#   搜到的内容另按输入 token 计费。
 #   Gemini 的条款要求同时展示它给的「搜索建议」（一段 HTML），QQ 显示不了，这里没有展示。
 # - 打开 show_process 后，这个模型调用工具前的说明与搜索的进展会以简短的步骤另发一条消息显示给用户，回答之后
 #   留着（QQ 的流式消息撤回不了）；思考摘要不展示。调用工具前的说明目前只有 OpenAI 的模型会给。偏闲聊、陪伴的模型建议关掉。
 # - 打开 image_generation 后，这个模型能调用画图函数：用户想要一张图或想改一张图时由模型自己决定画，出图用
-#   「五、图片」里 [image_generation] 配置的图片模型（两家可以不同）。没有 [image_generation] 时这一项不起作用
+#   「五、图片」里 [image_generation] 配置的图片模型（可以与这个模型不是同一家；Claude 的模型也能用画图函数，出图
+#   只能是 OpenAI 或 Gemini）。没有 [image_generation] 时这一项不起作用
 #   （启动时记一条警告）。
 # - web_images 默认打开（与上面几项不同）：这个模型可以在回答里用 ![说明](地址) 插网上的图片，机器人只下载
 #   白名单里图站的图、随回答显示，规则见「五、图片」里的 [web_images]。不想要时写 web_images = false。
@@ -106,6 +109,16 @@ description = "用户在倾诉、闲聊，或需要情感上的支持与陪伴"
 inputs = ["image", "audio", "file"]
 search = true
 
+# 用 Claude 的模型时照下面这样加一项（去掉行首的 "#   "），密钥是 CLAUDE_API_KEY。需要 Claude 4.6 及之后的
+# 模型（请求总是带着自适应思考，更早的模型不接受）。reasoning 可以写 low、medium、high、xhigh、max；不写用服务商
+# 的默认值。也可以用 claude-sonnet-5-5。
+#   [[models]]
+#   name = "opus"
+#   provider = "claude"
+#   model = "claude-opus-5-5"
+#   description = "用户要深入分析一个复杂的问题"
+#   inputs = ["image", "file"]
+
 
 # ============================================================================
 # 三、选模型与记忆：每条消息先做一次决策，定下由哪个模型答、属于哪个话题
@@ -114,6 +127,7 @@ search = true
 # 按消息选模型：每条消息先用 Decisions API 做一道选择题，选项就是上面的模型列表。
 # 整个表可以删掉，删掉后始终用默认模型。provider 必填，它的密钥必须在环境变量里。
 # 语音不影响候选：决策用 Gemini 时它能直接听原声，用 OpenAI 时只看 QQ 自带的识别文字。
+# provider 只能是 "openai" 或 "gemini"：Claude 没有 Decisions 接口。
 [decisions]
 provider = "openai"       # "openai" 或 "gemini"
 # model = "gpt-6-luna"    # 不写时 openai 用 gpt-6-luna，gemini 用 gemini-decision-1
@@ -144,7 +158,7 @@ second_threshold = 0.25   # 第二可能的已有话题的概率不低于它时�
 # 也不要求它的服务商的密钥。整个表删掉就只有临时标题（每个话题第一轮消息的开头），没有摘要，也不记用户档案。
 # 它的服务商的密钥必须在环境变量里。
 [memory]
-provider = "openai"             # "openai" 或 "gemini"
+provider = "openai"             # "openai"、"gemini" 或 "claude"
 model = "gpt-6-luna"            # 必填，没有默认值
 # reasoning = "high"            # 可选，规则同 [[models]]；不写用服务商的默认值（gpt-6-luna 是 medium）。
 #                               # 这一项在后台运行，调高不占用户等待的时间，但费用更高、新话题的摘要来得更晚；
@@ -219,7 +233,7 @@ extra_download_hosts = []
 # 这个模型要能接收图片；能接收 PDF 时才写 PDF 摘要。它的服务商的密钥必须在环境变量里。
 # 以后有了新的小模型，改 model 这一行即可。
 [describe]
-provider = "openai"             # "openai" 或 "gemini"
+provider = "openai"             # "openai"、"gemini" 或 "claude"
 model = "gpt-6-luna"            # 必填，没有默认值
 # reasoning = "low"             # 可选，规则同 [[models]]；不写用服务商的默认值（gpt-6-luna 是 medium）。
 #                               # 描述在后台运行，调高不占用户等待的时间，但费用更高、写得更慢
@@ -241,7 +255,8 @@ file_instructions = """
 # ============================================================================
 
 # 打开了 image_generation 的模型（见「二、对话」）调用画图函数时，用这里的图片模型画图或改图。
-# provider 与对话模型是哪家无关，它的密钥必须在环境变量里。整个表删掉就不出图。
+# provider 与对话模型是哪家无关，只能是 "openai" 或 "gemini"（Claude 不出图），它的密钥必须在环境变量里。
+# 整个表删掉就不出图。
 # 出图按张计费，比一次对话贵得多（低质量的一张约几美分，高质量或大图更贵），用下面的限额控制花费；
 # 每张图还算一次被动回复，计进 QQ 的回复预算。
 # 两个键只对一家有效，写了另一家的会报错：
@@ -302,7 +317,7 @@ keep = 7              # 保留最新的几份定时备份，1 到 365；只认�
 # 一直失败也会删掉。
 
 # 给管理员的告警（发到 ADMIN_OPENID）。同一件事 24 小时内只发一次，情况恢复后补一条「已恢复」。
-# 模型：鉴权失败与 OpenAI 的额度用尽立即告警；连接失败、超时、限流、服务端出错等连续失败 model_failures 次
+# 模型：鉴权失败与 OpenAI、Claude 的额度用尽立即告警；连接失败、超时、限流、服务端出错等连续失败 model_failures 次
 # （中间没有一次成功）时告警。被安全策略拦截、拒答、其它 4xx 多半是输入的问题，不计入。
 # 磁盘：启动 5 分钟后开始，每 10 分钟看一次数据目录所在文件系统的剩余空间。定时备份失败也会告警。
 [alerts]
@@ -335,3 +350,7 @@ gateway_down_minutes = 10
 # [providers.gemini]
 # base_url = "https://generativelanguage.googleapis.com/"   # 不带版本号
 # proxy = "http://127.0.0.1:7890"
+#
+# [providers.claude]
+# base_url = "https://api.anthropic.com"                    # 不带版本号
+# proxy = "socks5h://127.0.0.1:1080"
