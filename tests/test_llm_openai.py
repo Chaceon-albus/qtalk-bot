@@ -6,6 +6,7 @@
 
 import asyncio
 import base64
+import copy
 import dataclasses
 import gc
 import json
@@ -1913,6 +1914,278 @@ async def test_cached_input_tokens_stay_partial_when_one_hop_does_not_report_the
 
     usages = [e for e in events if isinstance(e, Usage)]
     assert usages == [Usage(50, 5), Usage(130, 15, cached_input_tokens=48)]
+
+
+def calling_with(
+    arguments: str, call_id: str = "call_1", *, others: tuple[Payload, ...] = ()
+) -> list[Payload]:
+    """只调用一次函数的一跳：参数文本是 `arguments`，调用编号是 `call_id`；输出项的 `id` 固定是合法的 `fc_1`，
+    这样一条用例里只有给定的那一处是坏的。`others` 是同一跳里排在调用之前的别的输出项（只放进完成帧的快照）。"""
+    call = {**call_item(call_id, arguments), "id": "fc_1"}
+    added = {**call_item(call_id, "", "in_progress"), "id": "fc_1"}
+    done: Payload = {
+        "type": "response.function_call_arguments.done",
+        "sequence_number": 2,
+        "item_id": "fc_1",
+        "output_index": len(others),
+        "arguments": arguments,
+        "name": "get_date",
+    }
+    return [
+        CREATED,
+        item_event("added", 1, len(others), added),
+        done,
+        item_event("done", 3, len(others), call),
+        completed_with(4, [*others, call], (50, 20)),
+    ]
+
+
+async def assert_runs_no_function(hop: list[Payload]) -> None:
+    """这一跳带不回去：坏响应，一个函数都不执行、不交出 `FunctionCallStarted`，这一跳的用量照常先交出，只发了
+    一个请求。"""
+    server = hopping(hop, ANSWER_HOP)
+    runner = Runner()
+    events: list[ChatEvent] = []
+    with pytest.raises(ModelError) as info:
+        await drain_request(model_on(server), with_tools(runner), events)
+    assert info.value.kind is ErrorKind.MALFORMED
+    assert runner.calls == []
+    assert not any(isinstance(event, FunctionCallStarted) for event in events)
+    assert events[-1] == Usage(50, 20, None, None)
+    assert len(server.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("arguments", "call_id"),
+    [
+        ('{"zone":"\ud800x"}', "call_1"),
+        ('{"\ud800k":"x"}', "call_1"),
+        ('{"zone":null}', "call_\ud800"),
+    ],
+    ids=["value", "key", "call_id"],
+)
+async def test_a_hop_that_cannot_be_sent_back_runs_no_function(
+    arguments: str, call_id: str
+) -> None:
+    # 参数文本或调用编号里直接有孤立代理码位（每条用例只有这一处是坏的）：它们要原样带回（改了就与服务端那边对不上），
+    # 下一跳编码不成 UTF-8。执行任何函数之前先确认下一跳发得出去。
+    await assert_runs_no_function(calling_with(arguments, call_id))
+
+
+async def test_an_item_that_cannot_be_serialized_runs_no_function() -> None:
+    # 同一跳里另一个输出项（工具搜索的参数是对象）的键里有孤立代理码位：SDK 的 to_dict() 自己就抛异常，与校验不过
+    # 走同一条路。
+    tool_search: Payload = {
+        "id": "ts_1",
+        "type": "tool_search_call",
+        "call_id": "call_ts",
+        "arguments": {"\ud800k": 1},
+        "execution": "server",
+        "status": "completed",
+    }
+    await assert_runs_no_function(calling_with('{"zone":null}', others=(tool_search,)))
+
+
+async def test_escaped_surrogates_in_the_arguments_are_plain_ascii() -> None:
+    # 参数文本里是 JSON 转义写法（纯 ASCII 的 \ud800）：文本本身编码得了，照常执行、原样带回。
+    arguments = '{"zone":"\\ud800x"}'
+    server = hopping(calling_with(arguments), ANSWER_HOP)
+    runner = Runner()
+    await collect_request(model_on(server), with_tools(runner))
+    assert runner.calls == [FunctionCall("call_1", "get_date", arguments)]
+    second = bodies(server)[1]["input"]
+    assert second[-2] == {**call_item("call_1", arguments), "id": "fc_1"}
+    assert second[-1]["call_id"] == "call_1"
+
+
+async def test_result_text_loses_lone_surrogates() -> None:
+    # 函数已经执行完，只能尽量把结果交回去：文字里的孤立代理码位去掉，第二跳照常发出。
+    runner = Runner(FunctionResult((TextPart("晴\ud800天"), TextPart("\udc00"))))
+    server = hopping(calling_with('{"zone":null}'), ANSWER_HOP)
+    events = await collect_request(model_on(server), with_tools(runner))
+    assert isinstance(events[-1], Finished)
+    output = bodies(server)[1]["input"][-1]
+    assert output == {
+        "type": "function_call_output",
+        "call_id": "call_1",
+        "output": [{"type": "input_text", "text": "晴天"}, {"type": "input_text", "text": ""}],
+    }
+
+
+async def test_arguments_named_like_opaque_fields_are_replayed_as_they_are() -> None:
+    # 参数名恰好是 encrypted_content、arguments：带回的 function_call 项与收到的一字不差，交给执行方的也一样。
+    arguments = '{"encrypted_content":"甲","arguments":"乙","call_id":"丙"}'
+    server = hopping(calling_with(arguments), ANSWER_HOP)
+    runner = Runner()
+    await collect_request(model_on(server), with_tools(runner))
+    assert runner.calls == [FunctionCall("call_1", "get_date", arguments)]
+    assert bodies(server)[1]["input"][-2] == {**call_item("call_1", arguments), "id": "fc_1"}
+
+
+LONE = "\ud800"
+
+
+@pytest.mark.parametrize(
+    ("item", "expected"),
+    [
+        (
+            {
+                "id": "rs" + LONE,
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "想" + LONE}],
+                "encrypted_content": "ENC" + LONE,
+            },
+            {
+                "id": "rs" + LONE,
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "想"}],
+                "encrypted_content": "ENC" + LONE,
+            },
+        ),
+        (
+            {
+                "id": "fc" + LONE,
+                "type": "function_call",
+                "call_id": "call" + LONE,
+                "name": "get_date" + LONE,
+                "arguments": '{"zone":"' + LONE + '"}',
+                "namespace": "ns" + LONE,
+                "caller": {"type": "program", "caller_id": "p" + LONE},
+                "status": "completed" + LONE,
+            },
+            {
+                "id": "fc" + LONE,
+                "type": "function_call",
+                "call_id": "call" + LONE,
+                "name": "get_date" + LONE,
+                "arguments": '{"zone":"' + LONE + '"}',
+                "namespace": "ns" + LONE,
+                "caller": {"type": "program", "caller_id": "p" + LONE},
+                "status": "completed",
+            },
+        ),
+        (
+            {
+                "id": "cc" + LONE,
+                "type": "custom_tool_call",
+                "call_id": "call" + LONE,
+                "name": "n" + LONE,
+                "input": "in" + LONE,
+                "namespace": "ns" + LONE,
+                "caller": {"type": "program", "caller_id": "p" + LONE},
+            },
+            None,
+        ),
+        (
+            {
+                "id": "pg" + LONE,
+                "type": "program",
+                "call_id": "call" + LONE,
+                "code": "run()" + LONE,
+                "fingerprint": "FP" + LONE,
+            },
+            {
+                "id": "pg" + LONE,
+                "type": "program",
+                "call_id": "call",
+                "code": "run()",
+                "fingerprint": "FP" + LONE,
+            },
+        ),
+        ({"id": "ct" + LONE, "type": "compaction", "encrypted_content": "CMP" + LONE}, None),
+        (
+            {
+                "id": "msg" + LONE,
+                "type": "message",
+                "content": [
+                    {"type": "output_text", "text": "晴" + LONE, "encrypted_content": "x" + LONE}
+                ],
+                "arguments": "a" + LONE,
+            },
+            {
+                "id": "msg" + LONE,
+                "type": "message",
+                "content": [{"type": "output_text", "text": "晴", "encrypted_content": "x"}],
+                "arguments": "a",
+            },
+        ),
+    ],
+    ids=["reasoning", "function_call", "custom_tool_call", "program", "compaction", "message"],
+)
+def test_only_the_opaque_fields_of_each_item_type_are_kept_verbatim(
+    item: Payload, expected: Payload | None
+) -> None:
+    # 清单里的字段按输出项的类型原样（带着孤立代理码位时由执行前的校验拦下）；其余的字符串都清理，不按同名的键
+    # 跳过。`expected` 为 None 表示整项都原样。期望值在带回之前就拷贝好：实现若就地改了传入的项，也能发现。
+    want = copy.deepcopy(item if expected is None else expected)
+    original = copy.deepcopy(item)
+    result = openai_responses.for_replay(item)
+    # 两种比较都要：`==` 比结构（列表与元组不相等），JSON 文本比每一层的键序（`==` 不管键序）。
+    assert result == want
+    assert ordered(result) == ordered(want)
+    assert item == original  # 不改动传入的项
+    assert ordered(item) == ordered(original)
+
+
+def ordered(value: object) -> str:
+    """按键的原有顺序序列化（不排序），用来做对任何一层键序都敏感的比较。`ensure_ascii` 把孤立代理码位写成转义，
+    不会编码失败。"""
+    return json.dumps(value, ensure_ascii=True)
+
+
+@pytest.mark.parametrize(
+    ("other", "cleaned"),
+    [
+        (
+            {
+                "id": "ts_1",
+                "type": "tool_search_call",
+                "call_id": "call_ts",
+                "arguments": {"paths": ["docs/\ud800a"]},
+                "execution": "server",
+                "status": "completed",
+            },
+            {
+                "id": "ts_1",
+                "type": "tool_search_call",
+                "call_id": "call_ts",
+                "arguments": {"paths": ["docs/a"]},
+                "execution": "server",
+                "status": "completed",
+            },
+        ),
+        (
+            {
+                "id": "cu_1",
+                "type": "computer_call",
+                "call_id": "call_cu",
+                "pending_safety_checks": [{"id": "sc_1", "code": "c", "message": "小心\ud800"}],
+                "status": "completed",
+                "actions": [],
+            },
+            {
+                "id": "cu_1",
+                "type": "computer_call",
+                "call_id": "call_cu",
+                "pending_safety_checks": [{"id": "sc_1", "code": "c", "message": "小心"}],
+                "status": "completed",
+                "actions": [],
+            },
+        ),
+    ],
+    ids=["tool_search_paths", "safety_check_message"],
+)
+async def test_other_items_are_cleaned_and_do_not_stop_the_call(
+    other: Payload, cleaned: Payload
+) -> None:
+    # 本项目不会收到的输出项里的普通文字带着孤立代理码位：照旧清理后带回，同一跳的函数照常执行、第二跳照常发出。
+    server = hopping(calling_with('{"zone":null}', others=(other,)), ANSWER_HOP)
+    runner = Runner()
+    events = await collect_request(model_on(server), with_tools(runner))
+    assert isinstance(events[-1], Finished)
+    assert runner.calls == [FunctionCall("call_1", "get_date", '{"zone":null}')]
+    assert len(server.requests) == 2
+    assert bodies(server)[1]["input"][-3] == cleaned
 
 
 async def test_several_calls_in_one_hop_run_in_order() -> None:

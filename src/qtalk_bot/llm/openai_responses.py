@@ -23,14 +23,33 @@ Responses API 不接受音频（文档只在 Chat Completions 里写了音频输
 "strict": true}`，与内置搜索放在同一个 `tools` 里。一跳的 `response.completed` 里有 `function_call` 输出项时
 （`output_item.added` → 若干 `function_call_arguments.delta` → `.done` → `output_item.done`；这些事件只交出
 `Heartbeat`，调用取自完整的输出项），交出累计的 `Usage` 但不交出 `Finished`，逐个调用 `tool_runner`（前后各一个
-`Heartbeat`），然后发下一跳：`input` = 上一跳的全部输入 + 上一跳的全部输出项（按原顺序原样，见 `_Turn`）+ 每个
+`Heartbeat`），然后发下一跳：`input` = 上一跳的全部输入 + 上一跳的全部输出项（按原顺序，见 `_Turn` 与下面的带回规则）+ 每个
 调用对应的 `function_call_output`（文字是 `input_text`，图片是 data URL 的 `input_image`）。`parallel_tool_calls`
 保持默认；带函数的请求显式带 `include: ["reasoning.encrypted_content"]`。执行过 `MAX_FUNCTION_ROUNDS` 轮后的
 那一跳不再允许调用函数（`tool_choice: "none"`；开着搜索时是只允许 `web_search` 的 `allowed_tools`），模型仍然
 调用时抛 `ModelError(MALFORMED)`。`response.incomplete` 里的函数调用不执行（参数可能被截断），照常以 `Finished`
-结束。带回的输出项只去掉文字里的孤立代理码位，密文与参数不动。交回的图片按整次调用累计的附件体积校验
-（`InlineBudget`），放不下的换成一句说明。各跳共用搜索计数与引用去重，`Usage` 是各跳之和（中途的搜索也给出
-已结束各跳的 token 累计）。
+结束。函数结果的文字先去掉孤立的代理码位（函数这时已经执行完，只能尽量把结果交回去）。交回的图片按整次调用
+累计的附件体积校验（`InlineBudget`），放不下的换成一句说明。各跳共用搜索计数与引用去重，`Usage` 是各跳之和（中途
+的搜索也给出已结束各跳的 token 累计）。
+
+带回（下一跳的输入里上一跳的全部输出项，`for_replay()`）：每个输出项按它的 `type` 认哪些字段原样
+（`_REPLAY_OPAQUE`），原样的字段整个不动，其余字段的字符串去掉孤立的代理码位；不按同名的键认。清单里只放「改了就
+一定对不上或被拒绝」的字段：
+- 所有输出项的 `id`（服务端给的编号）；
+- `reasoning` 与 `compaction` 的 `encrypted_content`（密文）；
+- `function_call` 与 `custom_tool_call` 的 `call_id`、`name`、参数（`arguments` / `input`）、`namespace`、
+  `caller`（整块）：调用的身份与内容，`function_call_output` 的 `call_id` 也要与调用项的逐个相同；
+- `program` 的 `fingerprint`（SDK 3.55.1 的 `types/responses/response_output_item.py` 里注释写着必须原样带回）。
+本项目不会收到的输出项类型（工具搜索、计算机操作、MCP、代码执行等）不为它们扩充清单：它们除 `id` 以外字符串的
+值（含其中的编号与说明文字）都清理，带着孤立代理码位时清理后照常带回、不会因此被预检拦下。只清理值，不清理对象的
+键：键里有孤立代理码位时，SDK 的 `to_dict()` 可能在清理之前就失败（例如 `tool_search_call.arguments` 的键），那时按
+下面「构造不出带回的项」处理。
+校验（`_Turn.complete()`）：一跳里有函数调用时，执行任何函数之前（这时还没交出 `FunctionCallStarted`）先把要带回
+的全部输出项构造好，确认它们能写成合法的 JSON（`allow_nan=False`）并编码成 UTF-8，与 HTTP 客户端编码请求体的方式
+相同；要执行的调用（`call_id`、`name`、`arguments`）都取自这些带回的项，所以交给执行方的、`function_call_output`
+的 `call_id` 与带回的 `function_call` 项逐个相同，也都过了这次校验。构造不出带回的项（如 SDK 的 `to_dict()` 遇到
+键里的孤立代理码位自己就抛异常）或校验不过（如参数文本或调用编号里有孤立代理码位）时，先交出这一跳的用量，再按
+`MALFORMED` 结束，一个函数都不执行。
 
 处理的流式事件：
 - `response.output_text.delta`、`response.refusal.delta`：回答（或拒答说明）的文字，转成 `TextDelta`；所在的
@@ -91,6 +110,7 @@ import asyncio
 import base64
 import contextlib
 import itertools
+import json
 import logging
 import os
 from collections.abc import AsyncGenerator, Callable
@@ -608,9 +628,9 @@ class _Turn:
     """一跳请求里的函数调用。
 
     `output_item.done` 的输出项按 `output_index` 记下；跳结束（`response.completed`）时，快照 `response.output`
-    不为空就以它为准，否则用记下的输出项。模型调用了函数时，这一跳的**全部**输出项按原顺序原样（`to_dict()`：
-    只含服务商实际给出的字段）留作下一跳的输入：`store=False` 时服务端不保存上下文，推理项（带
-    `encrypted_content`）、带 `phase` 的消息、`web_search_call` 与 `function_call` 都要带回。
+    不为空就以它为准，否则用记下的输出项。模型调用了函数时，这一跳的**全部**输出项按原顺序（`to_dict()`：
+    只含服务商实际给出的字段，再经 `for_replay()`）留作下一跳的输入：`store=False` 时服务端不保存上下文，推理项
+    （带 `encrypted_content`）、带 `phase` 的消息、`web_search_call` 与 `function_call` 都要带回。
 
     `final` 为真表示已到轮数上限，这一跳要求模型不再调用函数。
     """
@@ -626,21 +646,26 @@ class _Turn:
             self._done[index] = item
 
     def complete(self, snapshot: object) -> list[FunctionCall] | None:
-        """这一跳里的函数调用（没有时是空列表），并备好要带回的输出项；函数调用或输出项的形状不对时返回 `None`。"""
+        """这一跳里的函数调用（没有时是空列表），并备好要带回的输出项；函数调用或输出项的形状不对、要带回的
+        输出项写不成合法的 JSON 或编码不成 UTF-8 时返回 `None`，这时一个调用都不该执行。调用的 `call_id`、`name`、
+        `arguments` 都取自要带回的项（它们原样带回），所以与带回的 `function_call` 项逐个相同、也都过了校验。"""
         source = items(snapshot) or [self._done[index] for index in sorted(self._done)]
         if not any(getattr(item, "type", None) == "function_call" for item in source):
             return []
-        calls: list[FunctionCall] = []
-        replay: list[ResponseInputItemParam] = []
+        replay: list[dict[str, object]] = []
         for item in source:
             if not isinstance(item, openai.BaseModel):
                 return None
-            # 关掉 Pydantic 的序列化警告：字段类型不对时（如参数给成了对象）它会把原值写进警告，参数可能带出
-            # 用户说的内容；类型由下面显式检查。
-            data = item.to_dict(mode="json", warnings=False)
-            # 原样带回服务商给的输出项：Responses API 接受把输出项直接作为输入，形状由它保证。只去掉文字里的
-            # 孤立代理码位（否则下一跳编码不成 UTF-8），密文与参数不动。
-            replay.append(cast(ResponseInputItemParam, clean_json(data, keep=_REPLAY_KEEP)))
+            try:
+                # 关掉 Pydantic 的序列化警告：字段类型不对时（如参数给成了对象）它会把原值写进警告，参数可能带出
+                # 用户说的内容；类型由下面显式检查。对象里的键有孤立代理码位时它自己就抛 UnicodeEncodeError：与下面的
+                # 校验不过一样，这一跳带不回去。
+                data = item.to_dict(mode="json", warnings=False)
+            except Exception:  # noqa: BLE001  构造不出带回项一律当作带不回去，由调用方交出用量后报坏响应
+                return None
+            replay.append(for_replay(data))
+        calls: list[FunctionCall] = []
+        for data in replay:
             if data.get("type") != "function_call":
                 continue
             call_id, name, arguments = data.get("call_id"), data.get("name"), data.get("arguments")
@@ -652,7 +677,13 @@ class _Turn:
             ):
                 return None
             calls.append(FunctionCall(call_id, name, arguments))
-        self.replay = replay
+        try:
+            # 原样的字段（参数文本、调用编号）里的孤立代理码位编码不成 UTF-8（UnicodeEncodeError 也是 ValueError）。
+            json.dumps(replay, ensure_ascii=False, allow_nan=False).encode()
+        except ValueError:
+            return None
+        # 原样带回服务商给的输出项：Responses API 接受把输出项直接作为输入，形状由它保证。
+        self.replay = [cast(ResponseInputItemParam, data) for data in replay]
         return calls
 
 
@@ -666,20 +697,38 @@ def _function_tool(tool: FunctionTool) -> FunctionToolParam:
     }
 
 
-_REPLAY_KEEP = frozenset(("encrypted_content", "arguments"))
+# 带回时原样的字段，按输出项的 `type` 认（没列出的类型只有 `id`）。取舍与依据见模块 docstring 的「带回」。
+_ITEM_ID = frozenset(("id",))
+_REPLAY_OPAQUE: dict[str, frozenset[str]] = {
+    "reasoning": frozenset(("id", "encrypted_content")),
+    "compaction": frozenset(("id", "encrypted_content")),
+    "function_call": frozenset(("id", "call_id", "name", "arguments", "namespace", "caller")),
+    "custom_tool_call": frozenset(("id", "call_id", "name", "input", "namespace", "caller")),
+    "program": frozenset(("id", "fingerprint")),
+}
+
+
+def for_replay(data: dict[str, object]) -> dict[str, object]:
+    """一个要带回的输出项：`_REPLAY_OPAQUE` 里这一类的字段（没列出的类型是 `id`）整个原样，其余字段的字符串去掉孤立
+    的代理码位。返回新的字典，不改动传入的；键的顺序不变，所以正常输入下带回的内容与这次改动之前发出的请求体相同
+    （发请求时 SDK 还会重新编码 JSON，这里不保证与收到的响应逐字节相同）。"""
+    kind = data.get("type")
+    opaque = _REPLAY_OPAQUE.get(kind, _ITEM_ID) if isinstance(kind, str) else _ITEM_ID
+    return {key: value if key in opaque else clean_json(value) for key, value in data.items()}
 
 
 def _function_output(
     call: FunctionCall, result: FunctionResult, budget: InlineBudget
 ) -> FunctionCallOutput:
-    """函数结果：文字是 `input_text`，图片是 `input_image`（data URL）；没有内容时是空串。OpenAI 的函数结果没有
-    表示出错的字段，`is_error` 只能靠结果里的说明文字。图片连同已有的附件放不进一次请求时换成
-    `OVERSIZED_IMAGE_NOTE`，不发必然超限的请求。"""
+    """函数结果：文字是 `input_text`，图片是 `input_image`（data URL）；没有内容时是空串。文字先去掉孤立的代理码位
+    （函数已经执行完，只能尽量把结果交回去，不能因为一个孤立代理码位让下一跳编码失败）；清理后是空串的文字与原本
+    就是空串的一样照常放（`input_text` 的 `text` 可以是空串）。OpenAI 的函数结果没有表示出错的字段，`is_error`
+    只能靠结果里的说明文字。图片连同已有的附件放不进一次请求时换成 `OVERSIZED_IMAGE_NOTE`，不发必然超限的请求。"""
     content: ResponseFunctionCallOutputItemListParam = []
     for part in result.parts:
         match part:
             case TextPart(text=text):
-                content.append({"type": "input_text", "text": text})
+                content.append({"type": "input_text", "text": clean_text(text)})
             case ImagePart(data=data, mime_type=mime):
                 if mime not in FUNCTION_RESULT_IMAGE_TYPES:
                     raise ModelError(Provider.OPENAI, ErrorKind.UNSUPPORTED)
