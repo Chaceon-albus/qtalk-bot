@@ -64,9 +64,10 @@
 `[[models]].inputs`：
 
 - 取值是 `image`、`audio`、`file` 的子集，不写就是只收文字。
-- OpenAI 的模型不能写 `audio`：Responses API 不接受音频输入（SDK 与文档一致），所以语音对 OpenAI 的模型一律用 QQ 的识别文本，「模型支持音频就原样给」只对 Gemini 成立。
-- 两家对格式与大小的限制写在 `llm.INPUT_LIMITS`：OpenAI 收 PNG、JPEG、WebP 和 PDF，内联合计 50 MB；Gemini 收 PNG、JPEG、WebP、HEIC、HEIF、WAV 和 PDF，整个请求 20 MB（留 1 MB 给文字）。
-- GIF 一律不给模型：OpenAI 只收非动图，本地判断不了是不是动图。
+- OpenAI 与 Claude 的模型不能写 `audio`：Responses API 不接受音频输入（SDK 与文档一致），Claude 的 Messages API 也没有音频的内容块（SDK 的类型里没有），所以语音对这两家的模型一律用 QQ 的识别文本，「模型支持音频就原样给」只对 Gemini 成立。
+- 各家对格式与大小的限制写在 `llm.INPUT_LIMITS`：OpenAI 收 PNG、JPEG、WebP 和 PDF，内联合计 50 MiB；Gemini 收 PNG、JPEG、WebP、HEIC、HEIF、WAV 和 PDF，整个请求 20 MB（取 19 MiB，留 1 MB 给文字）；Claude 收 PNG、JPEG、WebP 和 PDF，单张图片按 base64 计取 10,000,000 字节，内联合计取与 OpenAI 相同的 50 MiB（接口的上限见[「查证过的外部事实」的「Claude」](external-facts.md#claude)；合计取保守值是为了让同时在途的请求不超出内存的估算）。
+- 单张图片的上限写在 `InputLimits.max_image_bytes`（只有 Claude 有），判断单个附件放不放得下时用 `InputLimits.item_limit()`：内联合计的上限，图片再取它与单图上限中小的那个。候选筛选（`context.accepts()` 与 `fit()`）、实际读到原件时、给用户的「太大」说明（按单件上限折算）、写描述与摘要的模型（`describe.accepts()`）都按它判断；Claude 的适配器自己也兜底，超过单图上限或类型不在 `INPUT_LIMITS` 里时不发请求。
+- GIF 一律不给模型：OpenAI 只收非动图，Claude 的动图只取第一帧（见[「查证过的外部事实」的「Claude」](external-facts.md#claude)），本地判断不了是不是动图。
 
 ## 候选筛选
 

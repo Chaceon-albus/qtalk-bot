@@ -4,7 +4,7 @@
 
 ## 做法
 
-- 给打开了 `image_generation` 的对话模型声明一个我们自己的画图函数（`generate_image`）。用户想要一张图或想改一张图时由模型自己决定调用，不用说命令。程序复查授权与限额后调用图片模型，把图回复给用户，再把图作为函数结果交回给对话模型（OpenAI 的 `function_call_output` 可以是含 `input_image` 的数组；Gemini 3 及以后的模型可以在函数结果里带图片），模型接着写回答。
+- 给打开了 `image_generation` 的对话模型声明一个我们自己的画图函数（`generate_image`）。用户想要一张图或想改一张图时由模型自己决定调用，不用说命令。程序复查授权与限额后调用图片模型，把图回复给用户，再把图作为函数结果交回给对话模型（OpenAI 的 `function_call_output` 可以是含 `input_image` 的数组；Gemini 3 及以后的模型可以在函数结果里带图片；Claude 的 `tool_result` 里放 base64 的 `image` 块），模型接着写回答。三家的对话模型都可以调用画图函数。
 - 不用 OpenAI 内置的 `image_generation` 工具：用户感受一样，但内置工具只能配 OpenAI 的对话模型与图片模型；自己的函数让对话与出图可以是不同的服务商，授权复查、限额、记账都在本地。Gemini 的 Interactions API 没有内置的出图工具（SDK 里的工具只有搜索、代码执行、文件检索、函数等）。
 - 以后的「按需看原图」也用同一套函数调用。
 
@@ -12,7 +12,7 @@
 
 ```toml
 [image_generation]
-provider = "openai"             # "openai" 或 "gemini"，与对话模型是哪家无关
+provider = "openai"             # "openai" 或 "gemini"（Claude 不出图），与对话模型是哪家无关
 model = "gpt-image-2.6-flare"   # 必填，没有默认值；Gemini 可以用 gemini-nano-banana-2.1
 timeout_seconds = 120           # 一次出图（含改图）的时限，最大 600
 daily_limit = 10                # 每个用户每天最多几张（改图也算），0 到 1000；0 就是只有管理员能用。管理员不受限
@@ -24,19 +24,19 @@ daily_limit = 10                # 每个用户每天最多几张（改图也算�
 image_generation = true         # 可选，默认关：这个模型能用画图函数（需要 [image_generation]）
 ```
 
-- 整个 `[image_generation]` 表删掉就不出图。不新增密钥，用对应服务商已有的 key。写了另一家才有的那项（如 `provider = "openai"` 却写了 `gemini_image_size`）报错；两项都不写时用服务商的默认值。
+- 整个 `[image_generation]` 表删掉就不出图。`provider` 只能是 `openai` 或 `gemini`：Claude 没有出图的接口，写了在读配置时报错。不新增密钥，用对应服务商已有的 key。写了另一家才有的那项（如 `provider = "openai"` 却写了 `gemini_image_size`）报错；两项都不写时用服务商的默认值。
 - 图的方向由模型在函数参数里选（方图、竖图、横图），程序换成各家的写法：Gemini 的 `1:1`、`2:3`、`3:2`，OpenAI 的 1024×1024、1024×1536、1536×1024（两家比例一致）。
 - 每天的次数按配置的时区算日。
 
 ## 模型层的函数调用
 
-在 `llm/`，两家对话适配器通用，不限于画图：
+在 `llm/`，各家对话适配器通用，不限于画图：
 
-- 通用类型 `FunctionTool`、`FunctionCall`（参数是 JSON 文本，Gemini 给的对象序列化成文本）、`FunctionResult`（文字与图片，图片限 png、jpeg、webp）、`ToolRunner`；`ChatRequest.tools` 与 `ChatRequest.tool_runner`，`ChatModel.stream()` 的签名不变。新事件 `FunctionCallStarted`。
+- 通用类型 `FunctionTool`、`FunctionCall`（参数是 JSON 文本，Gemini 与 Claude 给的对象序列化成文本）、`FunctionResult`（文字与图片，图片限 png、jpeg、webp）、`ToolRunner`；`ChatRequest.tools` 与 `ChatRequest.tool_runner`，`ChatModel.stream()` 的签名不变。新事件 `FunctionCallStarted`。
 - 适配器在内部执行多跳：模型调用函数时 `await tool_runner(call)`，把结果交回、再发下一跳，对调用方仍是同一次 `stream()`，用量与搜索次数跨跳累计。函数执行时上一跳的连接已经释放，执行前后各交一个 `Heartbeat`；`tool_runner` 的异常（含取消）原样往外抛。
-- `store=False` 下下一跳带回上一跳的全部输出、按原顺序：OpenAI 是全部输出项（`item.to_dict(mode="json", warnings=False)`，含推理项的 `encrypted_content`、消息的 `phase`、`web_search_call`、`function_call`），带函数的各跳显式传 `include=["reasoning.encrypted_content"]`；Gemini 是从流里重建、再用完成快照补全的全部模型步骤（带签名的 thought、搜索步骤、`function_call`），排除快照里回显的输入步骤。回放前去掉无法编码的孤立代理码位（签名、密文、参数原样保留）。
-- 函数调用最多 5 轮（`MAX_FUNCTION_ROUNDS`），之后的一跳要求不再调用：OpenAI 开着内置搜索时用 `allowed_tools` 只放行 `web_search`，否则 `tool_choice: "none"`；Gemini 用 `"none"`（SDK 的 `allowed_tools` 只能列函数名，内置搜索放不进去，所以这一跳连搜索也关了）。
-- 续发时按服务商的内联上限累计原附件与函数结果图（`InlineBudget`），放不下的结果图换成一句说明。
+- 下一跳带回上一跳的全部输出、按原顺序。OpenAI 与 Gemini 关着服务端存储（`store=False`）：OpenAI 是全部输出项（`item.to_dict(mode="json", warnings=False)`，含推理项的 `encrypted_content`、消息的 `phase`、`web_search_call`、`function_call`），带函数的各跳显式传 `include=["reasoning.encrypted_content"]`；Gemini 是从流里重建、再用完成快照补全的全部模型步骤（带签名的 thought、搜索步骤、`function_call`），排除快照里回显的输入步骤；两家回放前去掉无法编码的孤立代理码位（签名、密文、参数原样保留）。Claude 带回什么、怎样清理与校验、函数怎样声明，见[「各家的对话接口」](conversation.md#各家的对话接口)。
+- 函数调用最多 5 轮（`MAX_FUNCTION_ROUNDS`），之后的一跳要求不再调用：OpenAI 开着内置搜索时用 `allowed_tools` 只放行 `web_search`，否则 `tool_choice: "none"`；Gemini 用 `"none"`（SDK 的 `allowed_tools` 只能列函数名，内置搜索放不进去，所以这一跳连搜索也关了）；Claude 用 `tool_choice: {"type": "none"}`，这一跳同样搜不了。
+- 续发时按服务商的内联上限累计原附件与函数结果图（`InlineBudget`），放不下的结果图换成一句说明；超过单张图片上限的（只有 Claude 有，见[「模型的输入能力」](attachments.md#模型的输入能力)）同样换成说明。
 - Gemini 等待函数结果时的状态按 `requires_action` 处理（文档没写，按 SDK 的自动续写推断）。
 
 ## 出图模块（`imagegen.py`）

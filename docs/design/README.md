@@ -32,14 +32,14 @@
 | 密钥 | 环境变量，由 `.env` 经 compose 的 `environment:` 逐项注入，每个服务只拿自己需要的 |
 | 静态设置 | TOML 配置文件：模型列表、决策提示、各种时长与配额 |
 | 运行时会变的数据 | 数据库：授权名单、邀请令牌、对话与记忆 |
-| 大模型调用 | 官方 SDK：`openai`、`google-genai`（这两个依赖已获同意）；每个模型可以配置推理强度 |
-| 代理与端点 | 模型侧按服务商配置接口地址与代理（http、https、socks5、socks5h），为此加了依赖 `socksio`；QQ 侧同样可以配接口地址与代理（`[qq]`，代理经 `pyqbot.Bot(proxy=...)`，作用于接口、网关与附件下载） |
-| 选模型 | Decisions API；OpenAI 与 Gemini 两家都适配，配置里固定选一家 |
+| 大模型调用 | 官方 SDK：`openai`、`google-genai`、`anthropic`（这三个依赖已获同意），对话模型可以是 OpenAI、Gemini 或 Claude；每个模型可以配置推理强度。各家接口的写法见[「各家的对话接口」](conversation.md#各家的对话接口) |
+| 代理与端点 | 模型侧按服务商（`[providers.openai]`、`[providers.gemini]`、`[providers.claude]`）配置接口地址与代理（http、https、socks5、socks5h），为此加了依赖 `socksio`；QQ 侧同样可以配接口地址与代理（`[qq]`，代理经 `pyqbot.Bot(proxy=...)`，作用于接口、网关与附件下载） |
+| 选模型 | Decisions API；OpenAI 与 Gemini 两家都适配，配置里固定选一家。Claude 不能做决策的服务商：它没有 Decisions 接口。候选的对话模型可以是任何一家 |
 | 记忆 | 自己做「话题线加一次决策调用」，见[「记忆」](memory.md)；暂时不引入 Hindsight、mem0 这类外部记忆服务 |
-| 联网搜索 | 只用服务商内置的搜索工具，OpenAI 与 Gemini 都打开，见[「内置搜索与来源」](search-and-process.md#内置搜索与来源) |
+| 联网搜索 | 只用服务商内置的搜索工具，OpenAI、Gemini 与 Claude 都打开，见[「内置搜索与来源」](search-and-process.md#内置搜索与来源) |
 | 表情 | 一律忽略：表情标记从文字里去掉，只由表情组成的消息只记进流水，不进模型的输入、不影响轮次 |
 | 处理过程的展示 | 过程一条消息，回答另起一条；过程消息回答之后留着，不撤回：QQ 的流式消息撤回不了。过程消息用纯文本发、每步一行，搜索写成进度式的一行。见[「展示处理过程」](search-and-process.md#展示处理过程) |
-| 生成图片 | 对话模型调用我们自己声明的画图函数，由程序调用可配置的图片模型出图，两家都适配；不用 OpenAI 内置的 `image_generation` 工具。配置是 `[image_generation]` 表与 `[[models]].image_generation` 开关，细节见[里程碑 10](image-generation.md) |
+| 生成图片 | 对话模型调用我们自己声明的画图函数（三家的对话模型都可以），由程序调用可配置的图片模型出图，图片模型 OpenAI 与 Gemini 两家都适配（Claude 不出图）；不用 OpenAI 内置的 `image_generation` 工具。配置是 `[image_generation]` 表与 `[[models]].image_generation` 开关，细节见[里程碑 10](image-generation.md) |
 
 同一个值只有一个来源：密钥不进配置文件，配置文件里的设置不再从环境变量覆盖。
 
@@ -92,6 +92,7 @@
 | 9 | 部署：镜像与 compose、健康检查、定时备份、管理员告警 | 已完成（Docker 构建待在 VPS 上实测） |
 | 10 | 生成图片：自己的画图函数与可配置的图片模型 | 已完成 |
 | 11 | 发送记录；迁移合并回 V1 | 已完成 |
+| 12 | 接入 Claude：对话、附件、内置搜索与引用、函数调用 | 已完成（直接调接口与走对话流程实测过，没有在真实 QQ 上实测，见[「Claude 接口的实测」](live-tests.md#claude-接口的实测2026-11-24)） |
 
 ## 文件索引
 
@@ -99,7 +100,7 @@
 | --- | --- | --- |
 | [storage-and-config.md](storage-and-config.md) | 配置的读取与校验、SQLite 存储与迁移（里程碑 1） | 改配置项、表结构、迁移或数据库的访问方式时 |
 | [access.md](access.md) | 接入与授权：邀请、授权名单、管理员命令、欢迎语与拒绝语、重复推送与回复失败（里程碑 2） | 改邀请、授权、管理员命令或 Gate 的回复时 |
-| [conversation.md](conversation.md) | 一轮对话（里程碑 3、5b、5c）：流程、上下文与系统提示词（各段的顺序、历史里的发送时间、模型的补充提示词）、两家的对话接口、出错时、流水与送达状态、用量、配置、输出上限与时限、长回答分条、收消息与开轮、表情、插话、关停顺序 | 改对话主流程、系统提示词的组成与顺序、时限、分条、排队、插话或关停顺序时 |
+| [conversation.md](conversation.md) | 一轮对话（里程碑 3、5b、5c）：流程、上下文与系统提示词（各段的顺序、历史里的发送时间、模型的补充提示词）、各家的对话接口、出错时、流水与送达状态、用量、配置、输出上限与时限、长回答分条、收消息与开轮、表情、插话、关停顺序 | 改对话主流程、系统提示词的组成与顺序、时限、分条、排队、插话或关停顺序时 |
 | [model-routing.md](model-routing.md) | 用 Decisions 选模型（里程碑 4）：选择规则、失败时的退路、坏响应的判定、决策记录 | 改选模型、决策调用或 `[decisions]` 时 |
 | [attachments.md](attachments.md) | 附件与多模态（里程碑 5a）：下载与白名单、识别格式、存放与用户目录、模型的输入能力与候选筛选、交给模型的方式、描述与摘要、清理 | 改附件处理、模型的输入能力或下载白名单时 |
 | [memory.md](memory.md) | 记忆（里程碑 6a、6b）：总体设计、留给以后的口子、话题线、用户档案、查看记忆与遗忘 | 改话题、上下文组装、后台摘要、档案或遗忘时 |
@@ -108,11 +109,11 @@
 | [image-generation.md](image-generation.md) | 生成图片（里程碑 10）：做法、配置、函数调用、出图模块、一次画图调用、生成的图在之后的轮次、试调用 | 改画图函数、图片模型或出图限额时 |
 | [reminders.md](reminders.md) | 提醒事项（里程碑 8）：触发器、频率与上限、设置 / 修改 / 取消与确认卡片、列表、到点发送、失败通知、提醒资料、时区、存储与配置、待定 | 改提醒时 |
 | [deployment.md](deployment.md) | 部署（里程碑 9）：数据保护、镜像与 compose、健康检查、备份、告警、关停，给管理员的提醒模块 `alerts.py` | 改部署、备份、告警，或加新的管理员提醒时 |
-| [external-facts.md](external-facts.md) | 查证过的外部事实：Decisions API、模型、内置搜索、思考摘要与过程标记、QQ 平台 | 写调用服务商或 QQ 的代码之前，核对接口与平台的真实行为 |
-| [live-tests.md](live-tests.md) | QQ 端到端实测的各次记录、搜索与过程展示的模型实测、还需要实测的事 | 做实测前后，或想知道某个行为在真实平台上验证过没有时 |
+| [external-facts.md](external-facts.md) | 查证过的外部事实：Decisions API、模型、内置搜索、思考摘要与过程标记、Claude、QQ 平台 | 写调用服务商或 QQ 的代码之前，核对接口与平台的真实行为 |
+| [live-tests.md](live-tests.md) | QQ 端到端实测的各次记录、搜索与过程展示的模型实测、Claude 接口的实测、还需要实测的事 | 做实测前后，或想知道某个行为在真实平台上验证过没有时 |
 | [open-questions.md](open-questions.md) | 其它待定的事（配额、数据去留、pyqbot 可以改进的地方等）与已知的薄弱处 | 动手做一块新功能之前，看有没有相关的待定项 |
 
-各里程碑在哪个文件：1 → `storage-and-config.md`；2 → `access.md`；3、5b、5c → `conversation.md`；4 → `model-routing.md`；5a → `attachments.md`；6a、6b → `memory.md`；7a、7b → `search-and-process.md`；8 → `reminders.md`；9 → `deployment.md`；10 → `image-generation.md`；11 → `conversation.md` 的「发送记录」与 `storage-and-config.md` 的「存储」。
+各里程碑在哪个文件：1 → `storage-and-config.md`；2 → `access.md`；3、5b、5c → `conversation.md`；4 → `model-routing.md`；5a → `attachments.md`；6a、6b → `memory.md`；7a、7b → `search-and-process.md`；8 → `reminders.md`；9 → `deployment.md`；10 → `image-generation.md`；11 → `conversation.md` 的「发送记录」与 `storage-and-config.md` 的「存储」；12 → `conversation.md` 的「各家的对话接口」，外部事实在 `external-facts.md` 的「Claude」，实测在 `live-tests.md`。
 
 ## 使用约定
 

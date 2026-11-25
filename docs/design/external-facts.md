@@ -2,7 +2,7 @@
 
 写代码时依赖的服务商接口、模型与 QQ 平台的行为，各条注明了出处与查证的时间。
 
-Decisions API、模型、内置搜索、思考摘要与过程标记这四节里没有另注日期的条目是 2026-11-18 查自官方文档，经摘要工具读取，当时没有实际调用过；QQ 平台一节的出处写在那一节里。之后的实际调用见 [live-tests.md](live-tests.md) 与各模块的文件。这些接口都很新，写代码前以官方文档为准。
+Decisions API、模型、内置搜索、思考摘要与过程标记这四节里没有另注日期的条目是 2026-11-18 查自官方文档，经摘要工具读取，当时没有实际调用过；Claude 一节是 2026-11-24 查自官方文档的原文；QQ 平台一节的出处写在那一节里。之后的实际调用见 [live-tests.md](live-tests.md) 与各模块的文件。这些接口都很新，写代码前以官方文档为准。
 
 ## Decisions API
 
@@ -64,6 +64,26 @@ Gemini 的「搜索建议」在搜索结果的单独字段里，不在回答正�
 `gpt-6.2-sol` 对思考摘要和 `phase` 的支持，官方文档只是暗示，没有明说；2026-11-19 实测两者都有（摘要很稀疏，没有遇到组织验证的拒绝），见[「搜索与过程展示的模型实测」](live-tests.md#搜索与过程展示的模型实测2026-11-19)。
 
 文档：[OpenAI 推理指南](https://developers.openai.com/api/docs/guides/reasoning)、[Gemini 思考](https://aistudio.google.com/docs/thinking)、[Gemini 函数调用](https://aistudio.google.com/docs/function-calling)。
+
+## Claude
+
+2026-11-24 查自官方文档，SDK 是 `anthropic` 2.14.0。实际调用见[「Claude 接口的实测」](live-tests.md#claude-接口的实测2026-11-24)，适配器的做法见[「各家的对话接口」](conversation.md#各家的对话接口)。
+
+- **没有的能力**：没有 Decisions 接口，没有出图的接口，对话接口不收音频（SDK 里没有对应的资源与内容块类型）。
+- **流式事件**：`message_start`（带 `content` 为空的 `Message`）→ 每个内容块的 `content_block_start`、若干 `content_block_delta`、`content_block_stop` → 一到多个 `message_delta` → `message_stop`；中间可以有任意多个 `ping`。`redacted_thinking`、`web_search_tool_result` 等块整块到达、没有 delta。`message_delta` 的 `usage` 是累计值。流里可能出现 `error` 事件（如 `overloaded_error`），这时 HTTP 状态已经是 200。
+- **结束原因**：`end_turn`、`max_tokens`、`stop_sequence`、`tool_use`、`pause_turn`（服务端工具的循环到了次数上限，把这一跳的助手内容原样带回再发一次即可接着做）、`refusal`、`model_context_window_exceeded`（回答占满了上下文窗口，按被截断处理）。同一组并行调用里既有服务端工具又有要自己执行的函数时，接口先以 `tool_use` 结束、不执行服务端工具，交回函数结果后再执行。
+- **拒答**：Opus 5.5、Sonnet 5.5 等模型带安全分类器，拒答是正常响应，`stop_reason` 为 `refusal`，`stop_details` 里有 `category` 与 `explanation`（不对应具体类别时两者都是 `null`）；别的结束原因下 `stop_details` 是 `null`。还没有输出就拒答时，`bio`、`frontier_llm`、`reasoning_extraction` 三类照常计费，其它类别与 `null` 不计费。
+- **用量**：输入的 token 总数是 `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`，`input_tokens` 只是最后一个缓存断点之后的部分。搜索次数在 `usage.server_tool_use.web_search_requests`。
+- **错误**：400 `invalid_request_error`（组织或工作区达到自己设的花费上限时也是 400），401 `authentication_error`，402 `billing_error`（账单或付款信息有问题），403 `permission_error`，404 `not_found_error`，413 `request_too_large`，429 `rate_limit_error`（也可能是月度花费上限），500 `api_error`，504 `timeout_error`（也可能以别的状态码出现），529 `overloaded_error`。SDK 默认对连接错误、限流与 5xx 重试两次。
+- **图片**：JPEG、PNG、GIF、WebP；动图只用第一帧。每张图 base64 后最多 10 MB（Claude API），边长最多 8000 像素；一次请求超过 20 张图时每张图的边长有更严的上限。
+- **PDF**：每次请求最多 600 页（上下文窗口小于 100 万 token 时 100 页），不能加密。
+- **请求大小**：Messages API 每次请求最多 128 MB，含所有内容。
+- **思考**：Claude 5 及之后的模型默认就开着自适应思考；Opus 5.5 传 `thinking: {"type": "disabled"}` 返回 400，Sonnet 5.5 也不收 `disabled`（最低是只在工具调用之间思考的 `between_tools`）。`display` 决定思考块里有没有文字：`"summarized"` 给思考的摘要（摘要由另一个模型生成）；`"omitted"` 只给空的 `thinking` 与签名，这是 Claude 5 系列的默认值；`"updates"`（beta，要带 `thinking-display-updates-2026-08-18`）只给某些模型在工具调用之间写的简短进度。多轮对话里思考块要原样带回。
+- **内置搜索**：三个版本：`web_search_20250305` 是基础版；`web_search_20260209` 加了动态筛选（模型写代码筛选结果，默认经代码执行来调用搜索，`allowed_callers` 默认是 `["code_execution_20260120"]`）；`web_search_20260318` 另加 `response_inclusion`。组织可以在控制台关闭搜索，关闭后带这个工具的请求返回 400。每千次搜索 10 美元，另计搜索内容的 token：结果计入输入的 token，这一轮里继续搜索时与之后各轮都算；一次搜索不论返回几条结果都算一次，出错的搜索不计费。
+- **搜索结果与引用**：结果有 `url`、`title`、`page_age`、`encrypted_content`；多轮对话要把助手的内容块原样带回，`encrypted_content` 缺失或被改动时请求返回 400。引用总是开着，类型是 `web_search_result_location`，有 `url`、`title`、`encrypted_index`（多轮时要带回）与最多 150 字的 `cited_text`。搜索出错时整个响应仍是 200，结果块的 `content` 是 `web_search_tool_result_error`，`error_code` 为 `too_many_requests`、`invalid_tool_input`、`max_uses_exceeded`、`query_too_long`、`request_too_large`、`unavailable` 之一。展示要求：把接口的输出直接给最终用户看时，必须带上指向原始来源的引用。
+- **提示缓存**：缓存覆盖的前缀按 `tools`、`system`、`messages` 的顺序，到带 `cache_control` 的块为止。默认有效期 5 分钟，每次用到时免费续期。5 分钟的缓存写入按基础输入价的 1.25 倍计，读取按 0.1 倍计，Opus 5.5 与 Sonnet 5.5 的读取是 0.05 倍。Opus 5.5、Sonnet 5.5 最少 512 个 token 才能缓存，不够时照常处理、不报错。
+
+文档：[流式](https://platform.claude.com/docs/en/build-with-claude/streaming)、[结束原因](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons)、[拒答](https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback)、[错误](https://platform.claude.com/docs/en/api/errors)、[图片](https://platform.claude.com/docs/en/build-with-claude/vision)、[PDF](https://platform.claude.com/docs/en/build-with-claude/pdf-support)、[思考](https://platform.claude.com/docs/en/build-with-claude/thinking)、[搜索工具](https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool)、[提示缓存](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)、[功能一览](https://platform.claude.com/docs/en/build-with-claude/overview)。
 
 ## QQ 平台
 

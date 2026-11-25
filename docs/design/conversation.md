@@ -1,6 +1,6 @@
 # 对话
 
-一轮对话从收到消息到回复送达的全过程（里程碑 3、5b、5c）：流程、两家的对话接口、出错时的处理、流水与送达状态、用量、输出上限与时限、长回答分条、收消息与开轮、表情、插话、关停顺序。选模型见 [model-routing.md](model-routing.md)，附件见 [attachments.md](attachments.md)，过程消息与「正在输入」见 [search-and-process.md](search-and-process.md)。
+一轮对话从收到消息到回复送达的全过程（里程碑 3、5b、5c）：流程、各家的对话接口、出错时的处理、流水与送达状态、用量、输出上限与时限、长回答分条、收消息与开轮、表情、插话、关停顺序。选模型见 [model-routing.md](model-routing.md)，附件见 [attachments.md](attachments.md)，过程消息与「正在输入」见 [search-and-process.md](search-and-process.md)。
 
 ## 一轮对话的流程
 
@@ -70,7 +70,7 @@
 | 模块 | 职责 |
 | --- | --- |
 | `llm/__init__.py` | 与服务商无关的对话模型接口：请求、消息、流式事件、`ModelError`。不 import 任何 SDK |
-| `llm/openai_responses.py`、`llm/gemini_interactions.py` | 两个适配器，SDK 的类型只出现在这里 |
+| `llm/openai_responses.py`、`llm/gemini_interactions.py`、`llm/claude_messages.py` | 三个适配器，SDK 的类型只出现在这里 |
 | `llm/providers.py` | 按配置创建模型，同一家服务商共用一个客户端 |
 | `conversation.py` | 一轮对话的核心逻辑：收消息（`receive()`）与回答一轮（`respond()`），不依赖 pyqbot 与 SDK |
 | `batching.py` | 什么时候开始一轮、插话时重来还是停下、排队时回一句收到（`Batcher`） |
@@ -80,9 +80,9 @@
 | `prompt.py` | 拼系统提示词、组装请求 |
 | `markdown_guard.py` | 发出前处理模型的输出，对流式的分片边界安全 |
 
-## 两家的对话接口
+## 各家的对话接口
 
-OpenAI 用 Responses API，Gemini 用 Interactions API，都是流式，都关掉服务端存储（`store=False`），历史每次由本地完整带上。SDK 是 `openai` 3.55.1 与 `google-genai` 3.6.1。
+OpenAI 用 Responses API，Gemini 用 Interactions API，都关掉服务端存储（`store=False`）；Claude 用 Messages API，这个接口本来就不在服务端保存对话。三家都是流式，历史每次由本地完整带上。SDK 是 `openai` 3.55.1、`google-genai` 3.6.1 与 `anthropic` 2.14.0。各适配器的模块 docstring 写了请求的形状、处理的每种流式事件与出错的映射。
 
 事件接口：调用方必须忽略不认识的事件，加事件类型时不必改已有的调用方。现有的事件除文字增量、用量、结束外，还有搜索进展与引用（见[「内置搜索与来源」](search-and-process.md#内置搜索与来源)）、调用工具前的说明与思考摘要（见[「过程的来源」](search-and-process.md#过程的来源)）、函数调用，以及空闲时限用的心跳（见[「对话的输出上限与时限」](#对话的输出上限与时限)）。消息内容是若干「部分」：文字、图片、音频、文件。
 
@@ -90,8 +90,16 @@ SDK 的实际情况，与文档或预期不同的地方：
 
 - Gemini 的 SDK 请求的是 `/v1/interactions`，不是 `v1beta`。
 - Gemini 的 SDK 默认会自动续写，一次调用可能拆成多个 HTTP 请求，每次只报告当次的用量，适配器做了累加。关掉服务端存储后每次续写都会重发原始输入，输入会重复计费。
-- 两家 SDK 默认都会自动重试，已调低（OpenAI 重试 1 次，Gemini 共 2 次），更多的重试交给备用模型。
+- 各家 SDK 默认都会自动重试，已调低（OpenAI 与 Claude 重试 1 次，Gemini 共 2 次），更多的重试交给备用模型。
 - OpenAI 的输出消息带 `phase`，文档说回放历史时要原样带回。同一次调用里函数调用的多跳之间，上一跳的输出项（含带 `phase` 的消息）原样带回；跨轮的历史只存最终回答的纯文字，不带 `phase`。`phase` 为 `commentary` 的文字不进回答，见[「过程的来源」](search-and-process.md#过程的来源)。
+- Claude 的 SDK 不把流里的 `ping` 事件交给调用方。不要思考摘要时（思考关不掉、`display` 默认是 `omitted`，见[「查证过的外部事实」的「Claude」](external-facts.md#claude)），整段思考期间流里只有 `ping`，适配器交不出心跳，空闲时限会把还在思考的调用当成挂死。所以每次请求都带 `thinking={"type": "adaptive", "display": "summarized"}`，让思考期间有 `thinking_delta`；摘要只用来保持流里有事件，不交给调用方（构造参数 `summaries` 为假时思考的增量只产生心跳）。代价：不接受 `adaptive` 的旧模型（Claude 4.6 之前的）会被接口以 400 拒绝，这个适配器不支持它们；在 Opus 4.8、4.7 上这等于打开了思考。实测见[「Claude」](#claude2026-11-24)。
+- Claude 一帧里 `Usage` 与心跳的先后：`message_start` 这一帧总是先交出 `Usage`（即使累计的用量没变，例如后一跳报告的都是 0），再交出心跳；其它帧只有让累计的用量（token 或搜索次数）变了时才把新的 `Usage` 放在最前，没变时心跳在前。这样调用方拿到一帧的第一个事件就停读（空闲时限、插话、关停）时，这一帧带来的用量也已经交出；`message_start` 就带着输入的用量，每次请求的输入一开始就记下了。调用方不能依赖 `Usage` 与心跳的先后。
+- Claude 流里的 `error` 事件被 SDK 包成状态码为 200 的 `APIStatusError`：按错误体的 `type` 分类，不带状态码。SDK 读完流就关闭响应，关闭时抛出的传输异常会盖住它、只把它留在异常链上，所以读流时出错要沿异常链找属于这条流的响应的那个（只认这条流的：链上也可能挂着调用方在处理上一次调用的错误时留下的异常）。
+- Claude 的 `message_delta` 可能不带 `usage`（文档的示例里就有），SDK 的类型却写成必填；用量按项覆盖，没给的项沿用之前的。
+- Claude 的 SDK 发 API key 用的是 `Authorization: Bearer`，不是 `x-api-key`；官方端点接受（实测）。
+- Claude 的接口拒绝文字为空串的文本块（400 `invalid_request_error`），只有空白的照常接受（实测）：组装请求时不发空串的文本块，去掉之后没有内容的消息不发，全部消息都没有内容时不发请求。
+- Claude 同一次调用的多跳之间（函数调用、`pause_turn` 续写），上一跳助手的全部内容块从流里自己累积，作为一条助手消息带回。出自这一跳的流、又不该被改动的字符串原样带回：思考块整块（文字与签名，接口拒绝改过的思考块）、`redacted_thinking` 的 `data`、搜索结果的 `encrypted_content`、引用的 `encrypted_index`，以及服务端给的编号与函数名（调用块的 `id` 与 `name`、结果块的 `tool_use_id` 等，改了就与服务端那边对不上），按所在对象的类型认，不按同名的键（函数的参数里也可能有叫 `data` 的键）。其余的字符串去掉孤立的代理码位，函数与搜索块的 `input` 整个清理（只清理值），交给执行方的参数就是带回的这一份；先清理再去掉空串的文本块。块开始时就带着的 `input` 取 SDK 解析出的原值（它的 `to_dict(mode="json")` 会把无穷大悄悄换成 `null`），之后的增量拼出来是空串时保留它。执行任何函数之前先确认下一跳发得出去：带回的消息整条构造好后，确认函数与搜索块的 `input` 是 JSON 对象、整条消息能写成合法的 JSON 并按 UTF-8 编码（键也算），不过就按坏响应处理，一个函数都不执行（如思考的文字、调用的编号或参数的键里有孤立代理码位、参数里有 `1e400` 读成的无穷大）。要执行的调用（编号、函数名、参数）都取自这条校验过的消息，所以函数结果的 `tool_use_id` 与带回的调用块的 `id` 逐个相同。细节在 `llm/claude_messages.py` 的模块 docstring。函数以 `strict: true` 声明；函数调用的结果放在同一条用户消息里（接口要求）。实测先搜索、再调用函数时，两个模型都接受带回的内容（见[「Claude 接口的实测」](live-tests.md#claude-接口的实测2026-11-24)）。
+- Claude 的提示词缓存只有一个断点：请求带了工具时，`tools` 的最后一项带 `"cache_control": {"type": "ephemeral"}`，每一跳都带。函数声明在同一个部署里对所有用户都一样，又排在缓存顺序的最前面（tools → system → messages），不受系统提示词末尾的当前时间影响。`tools` 的顺序是确定的（搜索工具在前，之后按函数的声明顺序），顺序变了缓存就失效。缓存的价格与有效期见[「查证过的外部事实」的「Claude」](external-facts.md#claude)。系统提示词没有缓存，见[「已知的薄弱处」](open-questions.md#已知的薄弱处)。
 
 ## 出错时
 
@@ -100,6 +108,7 @@ SDK 的实际情况，与文档或预期不同的地方：
 - 发送出错、说不准是否送达：立即停止读模型，不改发，免得用户收到重复内容。
 - 机器人关停时：限时收拢在途的发送，把已确认送达的部分和已知用量写进流水。这是尽力而为，事件循环提前结束时仍会丢。
 - 回答停在围栏代码块里时，接任何说明（中断、没写完、插话停下）之前先补上闭合围栏的那一行，免得说明被渲染进代码块；闭合行算回答的一部分，与接「来源」之前的处理相同。
+- Claude 的安全分类器拒答（`stop_reason: "refusal"`，HTTP 200）：这次调用还没交出过正文（不全是空白的文字）时按调用失败处理（`ModelError(BLOCKED)`），可以换备用模型；已经交出过正文时以「没写完」结束（`Finished(OTHER, refused=True)`），接「没写完」的说明。计不计入模型的连续失败见[「告警」](deployment.md#模型)。
 
 ## Markdown 的处理
 
@@ -146,20 +155,31 @@ SDK 的实际情况，与文档或预期不同的地方：
 
 每次模型调用记一条，含用户、模型的内部名字、当时的服务商与实际的模型名、输入与输出的 token 数。服务商没有返回时记空，不估算；失败的调用也记一条。`/usage` 的显示见[「接入与授权」的管理员命令](access.md)。
 
-缓存命中的输入 token（用量表的 `cached_input_tokens` 列，含在输入 token 里）：OpenAI 取 `usage.input_tokens_details.cached_tokens`，Gemini 取 `usage.total_cached_tokens`（SDK 说明它是提示里被缓存的部分），两家 Decisions 与出图有就取；多跳时逐跳累加。一跳的缓存数超过这一跳的输入、或这一跳没报告输入时，这一跳的缓存数当作没报告。没报告的为空。
+缓存命中的输入 token（用量表的 `cached_input_tokens` 列，含在输入 token 里）：OpenAI 取 `usage.input_tokens_details.cached_tokens`，Gemini 取 `usage.total_cached_tokens`（SDK 说明它是提示里被缓存的部分），Claude 取 `usage.cache_read_input_tokens`，两家 Decisions 与出图有就取；多跳时逐跳累加。一跳的缓存数超过这一跳的输入、或这一跳没报告输入时，这一跳的缓存数当作没报告。没报告的为空。
+
+Claude 的 `usage.input_tokens` 不含缓存的部分，所以输入取 `input_tokens`、`cache_creation_input_tokens`、`cache_read_input_tokens` 三项之和（写入缓存的那部分算输入、不算命中）；`output_tokens` 已含思考。各项先校验再相加，缓存的两项无效或没给时不计入。搜索次数的口径见[「内置搜索与来源」](search-and-process.md#内置搜索与来源)。
 
 ## 配置与环境变量
 
 完整的写法见 `config.example.toml`。
 
-- `[[models]]`：`name`（内部名字）、`provider`（`openai` / `gemini`）、`model`、`default`、可选的 `fallback`、`reasoning` 与 `persona_extra`（只给这个模型的补充提示词，见[「上下文与系统提示词」](#上下文与系统提示词)）。至少一项，恰好一个默认。`reasoning` 原样传给服务商，本地不维护取值表。其它项（`inputs`、`search`、`show_process`、`image_generation`）见附件、搜索与过程、生成图片各自的文件。
+- `[[models]]`：`name`（内部名字）、`provider`（`openai` / `gemini` / `claude`）、`model`、`default`、可选的 `fallback`、`reasoning` 与 `persona_extra`（只给这个模型的补充提示词，见[「上下文与系统提示词」](#上下文与系统提示词)）。至少一项，恰好一个默认。`reasoning` 原样传给服务商，本地不维护取值表。其它项（`inputs`、`search`、`show_process`、`image_generation`）见附件、搜索与过程、生成图片各自的文件。
 - `[chat]`：`persona`、`history_turns`（默认 10）、可选的 `max_output_tokens`（默认不设）、`idle_timeout_seconds`（默认 300）、`timeout_seconds`（默认 1800）。后三项见[「对话的输出上限与时限」](#对话的输出上限与时限)。
 - `[turns]`：`text_debounce_seconds`（默认 0）、`attachment_wait_seconds`（默认 60）、`attachment_timeout_action`（默认 `ask`）、`max_restarts`（默认 3），见[「收消息与开轮」](#收消息与开轮)与[「插话」](#插话)。
-- `[providers.openai]`、`[providers.gemini]`：可选的 `base_url` 与 `proxy`。代理支持 http、https、socks5、socks5h，地址不进 `repr`、日志与报错。
+- `[providers.openai]`、`[providers.gemini]`、`[providers.claude]`：可选的 `base_url` 与 `proxy`。代理支持 http、https、socks5、socks5h，地址不进 `repr`、日志与报错。Claude 的 `base_url` 不带版本号（如 `https://api.anthropic.com`，SDK 自己拼上 `/v1/messages`）。
 - `[qq]`：可选的 `base_url` 与 `proxy`。代理的校验与写法同 `[providers.*].proxy`，原样传给 `pyqbot.Bot(proxy=...)`，作用于开放平台的接口请求、网关的 WebSocket 与经 `bot.http_client` 的附件下载；不设时系统级的代理变量照常生效。地址不进本项目的 `repr`、日志与报错，pyqbot 也保证账号密码不出现在它的 `repr`、日志与异常里（有测试）。
-- 启动时交叉校验：配置里用到哪家服务商，对应的密钥就必须在环境变量里。
+- 启动时交叉校验：配置里用到哪家服务商，对应的密钥（`OPENAI_API_KEY`、`GEMINI_API_KEY`、`CLAUDE_API_KEY`）就必须在环境变量里。`[decisions]` 与 `[image_generation]` 的 `provider` 只能是 `openai` 或 `gemini`，写了 `claude` 在读配置时报错；`[describe]` 与 `[memory]` 三家都可以。
 
 环境变量的影响：端点只有两个来源，配置里的 `base_url` 或官方默认值；`OPENAI_BASE_URL`、`GOOGLE_GEMINI_BASE_URL` 这类变量不采用，改走 Vertex、改接口版本的变量也都压住了。`OPENAI_CUSTOM_HEADERS`（SDK 会把它的内容作为附加请求头，还可能顶替鉴权头）没有对应的参数可以关掉，所以程序在创建 OpenAI 客户端之前把它从本进程的环境里去掉，并记一条日志。唯一照常生效的是系统级的代理变量：没配 `proxy` 时由它们决定。
+
+Claude 一侧（`llm/claude_messages.py` 的 `create_client()`）：
+
+- 凭证：显式传了 API key，SDK 就不读 `ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`，也不走 profile 文件与联合身份的自动发现（`ANTHROPIC_PROFILE`、`ANTHROPIC_CONFIG_DIR`、`ANTHROPIC_IDENTITY_TOKEN*` 等），profile 里的端点与附加请求头也就带不进来。
+- 端点总是显式传入，`ANTHROPIC_BASE_URL` 不采用。
+- `ANTHROPIC_CUSTOM_HEADERS` 同 `OPENAI_CUSTOM_HEADERS`：没有参数能关掉，创建客户端之前从本进程的环境里去掉，并记一条日志。
+- `ANTHROPIC_OPEN_TELEMETRY*`：不显式配置时 SDK 按它们决定是否给每次调用建 span、是否把请求与响应的正文写进 span、是否在请求头里带追踪上下文；客户端显式关掉 span 与传播，SDK 就不读这些变量。
+- `ANTHROPIC_LOG`（以及 OpenAI 的 `OPENAI_LOG`）设成 `debug` 或 `info` 时，导入 SDK 就抢先调用一次 `logging.basicConfig()` 并调低 SDK 与 `httpx2` 日志器的级别。`__main__.configure_logging()` 以 `force=True` 重新配置根日志器，随后照旧把这些日志器压回 WARNING，否则程序自己的日志格式与 INFO 级别会丢。
+- SDK 构造客户端时出错（如没配 `proxy`、系统的代理变量又用了 SDK 不支持的协议，SDK 的原文里有代理的用户名与主机），`create_client()` 换成不带原文、不带异常链的 `llm.ClientSetupError`，`main()` 打印它的文案（只有服务商与固定的提示）并以配置错误的状态退出。
 
 两个要留意的地方：`base_url` 不能带查询串或片段，SDK 和 pyqbot 都是在它后面直接拼路径；Gemini SDK 的配置对象（`HttpOptions`）的 `repr` 里有明文的 API key，那是 SDK 自己放进请求头的，诊断时不要打印它。代理地址交给 SDK 之前包了一层，不会出现在这些 `repr` 里。
 
@@ -167,10 +187,10 @@ SDK 的实际情况，与文档或预期不同的地方：
 
 向 ChatGPT app 看齐：它在 Thinking 模式下不在模型之外另设单条回答的输出上限（总上下文 256K = 输入 128K + 最多输出 128K，正好是模型自己的上限），长回答写几分钟也照样等。固定的输出上限（如含推理的 8192）会让高推理强度的难题推理到一半就被截断；「从开始调用到写完」的单段时限（如 120 秒）也容易被高推理加搜索加长回答超过。
 
-- **输出上限默认不设**：`[chat].max_output_tokens` 是可选的，不写就不向服务商传（OpenAI 不带 `max_output_tokens`，Gemini 的 `generation_config` 里不带），由模型自己的上限兜底；写了照常传，校验范围 1 到 131072，含推理所用的 token。做法与[「后台任务的输出上限」](memory.md#后台任务的输出上限)相同。Gemini 不传时实际是 65,536（见[「查证过的外部事实」的「模型」](external-facts.md#模型)）。
+- **输出上限默认不设**：`[chat].max_output_tokens` 是可选的，不写就不向服务商传（OpenAI 不带 `max_output_tokens`，Gemini 的 `generation_config` 里不带），由模型自己的上限兜底；写了照常传，校验范围 1 到 131072，含推理所用的 token。做法与[「后台任务的输出上限」](memory.md#后台任务的输出上限)相同。Gemini 不传时实际是 65,536（见[「查证过的外部事实」的「模型」](external-facts.md#模型)）。Claude 的 `max_tokens` 是必填项，没配时传 64000（`claude_messages.DEFAULT_MAX_TOKENS`），含思考；`[memory]`、`[describe]` 没配上限时同样传 64000。
 - Gemini 的 `generation_config` 什么都不设时（没有上限、没有推理强度、不要思考摘要）整个字段不带，不发空对象 `{}`；后台任务同样适用。
 - **时限分两段**：
-  - 空闲时限 `[chat].idle_timeout_seconds`（默认 300，1 到 3600）：模型流这么久没有任何动静就放弃。「动静」以适配器从 SDK 收到的任何事件为准，而不只是本项目认识的那几种：适配器每收到一个 SDK 流式事件（含不认识的）就先交出一个 `llm.Heartbeat`，调用方照「忽略不认识的事件」的约定处理它，只有对话拿它重新计时。OpenAI 推理时可能很久只有本项目不关心的事件。
+  - 空闲时限 `[chat].idle_timeout_seconds`（默认 300，1 到 3600）：模型流这么久没有任何动静就放弃。「动静」以适配器从 SDK 收到的任何事件为准，而不只是本项目认识的那几种：适配器每收到一个 SDK 流式事件（含不认识的）就交出一个 `llm.Heartbeat`（它与 `Usage` 的先后见[「各家的对话接口」](#各家的对话接口)里 Claude 的那条），调用方照「忽略不认识的事件」的约定处理它，只有对话拿它重新计时。OpenAI 推理时可能很久只有本项目不关心的事件。Claude 的 SDK 吞掉 `ping`，思考期间的动静靠每次都请求的思考摘要（见[「各家的对话接口」](#各家的对话接口)）。
   - 总时限 `[chat].timeout_seconds`（默认 1800，上限 3600）：一次调用从发出请求到写完最多这么久。QQ 被动回复的有效期是从用户那条消息算起的 60 分钟，前面还有决策、下载附件，换备用模型又要重新计时，所以留出余量。
   - 时限按每次模型调用计，换备用模型时两个时限都重新计时。两种超时之后的处理相同（给用户的说明、记账、`Ending.TIMEOUT`），日志写明是空闲时限还是总时限。
 - 实现（`conversation._Deadlines`）：读流的任务旁边起一个看门的任务，按注入的单调时钟（`Conversation` 的 `timer` 与 `sleep`，测试换成可控的）算两个到期时刻，到期就取消读流的任务；读流的任务按 `asyncio.timeout()` 的办法（`cancelling()` / `uncancel()`）区分这里的超时与别处的取消（关停、发送出错后停读）。流已经给出 `Finished`、只是关闭响应流时到期的，不算超时。
@@ -294,9 +314,9 @@ SDK 的实际情况，与文档或预期不同的地方：
 
 ## 实测记录
 
-实测用例在 `tests/live/`，默认不运行：`uv run --env-file .env pytest -m live -s tests/live`，对两家各发一句话，只打印事件种类、字数与用量。
+实测用例在 `tests/live/`，默认不运行。各说一句话的是 `uv run --env-file .env pytest -m live -s tests/live/test_live_models.py`，对各家各发一句话，只打印事件种类、字数与用量；只写目录会把其余的实测（搜索、出图、对话全流程等）一起跑掉。
 
-### 两家各发一句话
+### OpenAI 与 Gemini 各发一句话
 
 2026-11-18，两家各一次，都正常结束：
 
@@ -318,3 +338,20 @@ SDK 的实际情况，与文档或预期不同的地方：
 | 1 到 2026 里任意两数之和都不是平方数，最多选几个（难题） | 368 秒 | 第 357 秒 | 929 | 12.7 秒 | 18,868 |
 
 结论：默认 300 秒的空闲时限有很大余量；难题推理了 6 分钟，「120 秒内写完」的单段时限会把它截断，30 分钟的总时限够用。
+
+### Claude（2026-11-24）
+
+`claude-opus-5-5` 与 `claude-sonnet-5-5`，SDK `anthropic` 2.14.0，经适配器：
+
+- 各说一句话：都正常结束，事件的种类依次是用量（`message_start` 带来的输入，排在这一帧的心跳之前）、心跳与文字、用量、结束；官方端点接受 SDK 的 Bearer 鉴权头，`max_tokens=64000` 可用。`output_config.effort = "high"` 被接受。
+- 思考期间的静默（同一道推理题，effort 为 high）：
+
+| 模型 | 思考摘要 | 总耗时 | 首字 | 事件之间最长 |
+| --- | --- | --- | --- | --- |
+| `claude-opus-5-5` | 不要 | 38.5 秒 | 18.7 秒 | 18.1 秒（整段思考都没有事件） |
+| `claude-opus-5-5` | 要（`display: "summarized"`） | 37.1 秒 | 21.4 秒 | 3.7 秒 |
+| `claude-sonnet-5-5` | 不要 | 21.2 秒 | — | 9.4 秒 |
+
+要摘要时输出 4233 token，不要时 4837 token，没有额外的开销。所以每次请求都要摘要（见[「各家的对话接口」](#各家的对话接口)）。
+
+其余的实测（附件、搜索、函数、缓存、对话全流程）见[「Claude 接口的实测」](live-tests.md#claude-接口的实测2026-11-24)。

@@ -67,4 +67,4 @@ pyqbot 已有的能力（实测结论见 pyqbot 的 `docs/errata.md`）：
 
 对话处理器：`ChatHandler.handle(user, message)`，`message` 是 pyqbot 的原始消息。放行决定与真正开始处理之间有一个很小的窗口，所以实现者必须在开始有代价的操作之前，在自己的事务里调用 `access.chat_allowed()` 再确认一次。
 
-日志：不记 openid 与消息正文，提到用户时用编号和名字。`httpx2`、`httpcore2` 的日志压到 WARNING，因为 `httpx2` 在 INFO 级别会记下带 openid 的请求地址；两家大模型 SDK（`openai`、`google_genai`、`google.genai`）的日志也压到 WARNING，因为它们的 DEBUG 日志里有请求体（聊天内容）。
+日志：不记 openid 与消息正文，提到用户时用编号和名字。`httpx2`、`httpcore2` 的日志压到 WARNING，因为 `httpx2` 在 INFO 级别会记下带 openid 的请求地址；各家大模型 SDK（`openai`、`google_genai`、`google.genai`、`anthropic`）的日志也压到 WARNING，因为它们的 DEBUG 日志里有请求体（聊天内容）。

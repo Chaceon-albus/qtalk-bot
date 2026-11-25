@@ -91,10 +91,10 @@
 `model_watch.py`：
 
 - **统计范围**：按服务商加服务商那边的模型名统计，几个用途共用一个模型时合在一起。所有用模型的地方都算：对话、决策、图片描述、摘要与档案、出图。观察点在 `ChatModels(observer=...)`：给了就把它创建的所有模型包一层，调用点不用改。
-- **立即告警**：鉴权失败（401、403）；OpenAI 返回 `insufficient_quota`（额度用尽）。额度用尽是 `ModelError.quota_exhausted`（SDK 的 `APIError.code == "insufficient_quota"`），不加新的 `ErrorKind`，面向用户的回复与决策记录不变。
+- **立即告警**：鉴权失败（401、403）；额度用尽：OpenAI 返回 `insufficient_quota`，Claude 返回 HTTP 402 或错误体的 `type` 是 `billing_error`（含流里的 `error` 事件）。额度用尽是 `ModelError.quota_exhausted`（OpenAI 看 SDK 的 `APIError.code == "insufficient_quota"`），不加新的 `ErrorKind`，面向用户的回复与决策记录不变。
 - **连续失败**：其它失败（连接失败或超时、限流、服务端出错、生成失败、响应不完整、其它）连续 `[alerts].model_failures` 次（默认 5）、中间没有一次成功时告警。
 - **成功与失败的判定**：
-  - 对话的流：`COMPLETED`（不是拒答）与 `MAX_TOKENS`（写到输出上限，服务本身是好的）算成功。`OTHER`（内容过滤、Gemini 的不完整、原因不明）与拒答两边都不算，不计数也不清零。Gemini 的不完整多半是输出预算写满，流里又没有具体原因，算失败会误报，所以不计入。OpenAI 的纯拒答以 `COMPLETED` 结束，所以 `llm.Finished` 有 `refused`（只有正文是 refusal 时为真），面向用户的行为不变。
+  - 对话的流：`COMPLETED`（不是拒答）与 `MAX_TOKENS`（写到输出上限，服务本身是好的）算成功。`OTHER`（内容过滤、Gemini 的不完整、原因不明）与拒答两边都不算，不计数也不清零。Gemini 的不完整多半是输出预算写满，流里又没有具体原因，算失败会误报，所以不计入。OpenAI 的纯拒答以 `COMPLETED` 结束，所以 `llm.Finished` 有 `refused`（只有正文是 refusal 时为真），面向用户的行为不变。Claude 的拒答按[「出错时」](conversation.md#出错时)的映射，不论哪种都不计入。
   - 决策：至少一题正常作答才算成功，全部拒答或解析失败两边都不算。
   - 抛 `ModelError` 算失败：备用模型接手成功时，主模型照样记一次失败。被取消（被插话或关停取消）、调用方中途关掉流、`ModelError` 之外的异常都不算。
   - 不计入失败的错误：被安全策略拦截、出图被内容审核拦下、拒答、不支持的输入、其它 4xx（多半是输入的问题）。

@@ -1,6 +1,6 @@
 # 搜索与过程展示
 
-服务商内置的联网搜索与回答后面的「来源」（里程碑 7a），以及处理过程怎样展示给用户：过程消息、「正在输入」与被动回复次数的预算（里程碑 7b）。两家接口的事实见 [external-facts.md](external-facts.md)。
+服务商内置的联网搜索与回答后面的「来源」（里程碑 7a），以及处理过程怎样展示给用户：过程消息、「正在输入」与被动回复次数的预算（里程碑 7b）。各家接口的事实见 [external-facts.md](external-facts.md)。
 
 ## 展示处理过程
 
@@ -25,15 +25,16 @@ QQ 侧的限制（官方文档快照与 pyqbot 的实测）：
 
 ### 过程的来源
 
-过程的内容可以有三个来源，两家服务商给的形式不同，见[「查证过的外部事实」的「思考摘要与过程标记」](external-facts.md#思考摘要与过程标记)：思考摘要、调用工具前的说明、搜索的查询词。现在用的是后两种，另加程序自己给出的画图：
+过程的内容可以有三个来源，各家服务商给的形式不同，见[「查证过的外部事实」的「思考摘要与过程标记」](external-facts.md#思考摘要与过程标记)：思考摘要、调用工具前的说明、搜索的查询词。现在用的是后两种，另加程序自己给出的画图：
 
 - OpenAI 消息项 `phase` 为 `commentary` 的文字（事件 `Commentary`，**一律不进回答**，不论是否展示）。文字增量里不带 `phase`，按 `output_item.added` 记下的消息项编号分流。`phase` 在 `output_item.added` 时就已给出（2026-11-19 实测：三个消息项分别是 `commentary`、`commentary`、`final_answer`，`added` 与 `done` 一致），所以按 `added` 分流即可，不需要暂存。万一某个消息项在 `added` 时没有 `phase`，它的文字按回答处理。
 - 内置搜索的进展（`SearchProgress`，见[「内置搜索与来源」](#内置搜索与来源)）。
 - 程序执行画图函数时写的一行「正在绘制🎨」（`process.Drawing`，不是模型流里的事件），见 [image-generation.md](image-generation.md)。
 - Gemini 没有说明的标记，它的文字一律算回答；官方也不建议强制模型在调用工具前输出文字。所以让模型在调用工具前先说明的提示词只加给 OpenAI。
+- Claude 同样没有说明的标记，文本块里的文字一律算回答（调用函数之前先写的一小段也照常是回答的一部分）。实测带着真实的系统提示词时，它在调用函数或搜索之前没有写开场白，见[「Claude 接口的实测」](live-tests.md#claude-接口的实测2026-11-24)。
 - 跨轮的历史不带回 OpenAI 的 `phase`（同一次调用的多跳之间原样带回）。
 
-**不请求、不展示思考摘要**：实测两家的摘要都很稀疏、标题都是英文，提示词也改不了它的语言（见[「搜索与过程展示的模型实测」](live-tests.md#搜索与过程展示的模型实测2026-11-19)）。适配器保留请求摘要的能力（`summaries` 参数与事件 `ThoughtSummary`，只供实测使用），收到了也不展示、不存档。OpenAI 的推理摘要可能要求组织验证：带摘要的请求被 4xx（401、429 除外）拒绝时不带摘要重试一次，重试被接受才在本次运行期间对这个模型停用摘要；现在不请求摘要，这条只在实测时用到。
+**不展示思考摘要**：实测 OpenAI 与 Gemini 的摘要都很稀疏、标题都是英文，提示词也改不了它的语言（见[「搜索与过程展示的模型实测」](live-tests.md#搜索与过程展示的模型实测2026-11-19)）；Claude 的摘要实测也是英文（见[「Claude 接口的实测」](live-tests.md#claude-接口的实测2026-11-24)）。三家都不展示、不存档。OpenAI 与 Gemini 不请求摘要；Claude 每次都请求、但不交给调用方，原因见[「各家的对话接口」](conversation.md#各家的对话接口)。适配器保留把摘要交给调用方的能力（`summaries` 参数与事件 `ThoughtSummary`，只供实测使用）。OpenAI 的推理摘要可能要求组织验证：带摘要的请求被 4xx（401、429 除外）拒绝时不带摘要重试一次，重试被接受才在本次运行期间对这个模型停用摘要；现在不请求摘要，这条只在实测时用到。
 
 ### 过程消息的格式
 
@@ -63,10 +64,13 @@ QQ 侧的限制（官方文档快照与 pyqbot 的实测）：
 
 ## 内置搜索与来源
 
-- `[[models]].search`（默认 `false`）打开时，调用这个模型带上服务商内置的搜索：OpenAI 是 `{"type": "web_search", "user_location": {"type": "approximate"}}`（只写 `type`，免得服务商默认用户在美国），Gemini 是 `{"type": "google_search"}`。模型不支持或服务商拒绝时按普通的调用失败处理。写描述的模型不带搜索。
-- 流式事件（`llm`）：`SearchProgress(call_id, stage, queries)`，同一次搜索依次是开始、零到多次更新（Gemini 在搜索过程中给出查询词）、完成（OpenAI 只在这时给出查询词）；`Citation(url, title)`，同一次调用里同一个来源只给一次。过程消息用它们展示「正在搜索」。
-- 搜索次数：OpenAI 按 `action` 为 `search` 的调用数（`open_page`、`find_in_page` 不算，失败的照样算）；Gemini 按这次调用里（含自动续写的各跳）不重复的非空查询词数。每执行一次就交出一个新的累计 `Usage`，被打断时次数不丢。用量表的 `searches` 列：带了搜索工具的调用记整数，没带的记空；`/usage` 显示本月和累计的搜索次数（见[「接入与授权」](access.md)）。
+- `[[models]].search`（默认 `false`）打开时，调用这个模型带上服务商内置的搜索：OpenAI 是 `{"type": "web_search", "user_location": {"type": "approximate"}}`（只写 `type`，免得服务商默认用户在美国），Gemini 是 `{"type": "google_search"}`，Claude 是基础版 `{"type": "web_search_20250305", "name": "web_search"}`（由模型直接调用，不设 `max_uses`、`user_location`、域名名单）。模型不支持或服务商拒绝（如组织关闭了搜索）时按普通的调用失败处理。写描述的模型不带搜索。
+- Claude 不用带动态筛选的新版（`web_search_20260209`、`web_search_20260318`）：它们默认经代码执行来调用搜索，流里会多出代码执行的内容块；实测简单的问题反而更费 token、更慢，要搜两次的问题省了一些输入、但更慢（见[「Claude 接口的实测」](live-tests.md#claude-接口的实测2026-11-24)）。
+- 流式事件（`llm`）：`SearchProgress(call_id, stage, queries)`，同一次搜索依次是开始、零到多次更新（Gemini 在搜索过程中给出查询词）、完成（OpenAI 只在这时给出查询词）。Claude 的对应：`server_tool_use` 块（`name` 是 `web_search`）开始时是开始，调用编号取块的 `id`；查询词以 `input_json_delta` 分段给出，块结束时拼完整、解析出 `query` 才给更新（解析不了时不给，不算错）；对应的 `web_search_tool_result` 块（按 `tool_use_id` 对上）出现时是完成，结果是错误对象（如 `max_uses_exceeded`、`unavailable`）时也照常完成、回答继续。模型在同一跳里既搜索又调用函数时，接口先以 `tool_use` 结束这一跳、交回函数结果后才执行搜索，完成在下一跳；`Citation(url, title)`，同一次调用里同一个来源只给一次。过程消息用它们展示「正在搜索」。
+- 搜索次数：OpenAI 按 `action` 为 `search` 的调用数（`open_page`、`find_in_page` 不算，失败的照样算）；Gemini 按这次调用里（含自动续写的各跳）不重复的非空查询词数；Claude 每一跳以 `message_delta` 里接口报告的 `server_tool_use.web_search_requests` 为准，没报告时取 `message_start` 报告的值与自己数的成功结果数中较大的那个（失败的结果接口不计费，不数），各跳相加。每执行一次就交出一个新的累计 `Usage`，被打断时次数不丢。用量表的 `searches` 列：带了搜索工具的调用记整数，没带的记空；`/usage` 显示本月和累计的搜索次数（见[「接入与授权」](access.md)）。
 - 「来源」（`citations.py`）：回答有正文时，在正文之后、中断说明之前追加，最多 5 条，按规整后的链接去重。每条是 Markdown 链接：链接只接受 `http(s)://主机`、不带用户信息、主机是 ASCII 且不是 IPv6 字面量、不超过 500 字符，主机之后的括号、引号等特殊字符与非 ASCII 字符做百分号编码；标题压成一行、超过 60 字截断、没有标题时用主机名，再经 `escape_markdown()` 转义。它算进用户实际看到的内容；改发纯文本时写成「标题 链接」。
+- Claude 的引用是文本块上 `type` 为 `web_search_result_location` 的引用（文本块开始时带的 `citations` 与流里的 `citations_delta`），取 `url` 与 `title`，`cited_text`、`encrypted_index` 不采用；别的引用类型忽略。去重与另两家共用 `llm.CitationFilter`。
+- Claude 的 `pause_turn`：接口把一段长的搜索中途停下时，这一跳不结束回答，把这一跳助手的全部内容块原样接在消息后面再发一跳（带回的规则见[「各家的对话接口」](conversation.md#各家的对话接口)），用量、搜索次数、引用去重各跳共用。连续续写最多 8 跳（`MAX_CONTINUATIONS`），之后仍是 `pause_turn` 时以「没写完」结束；中间执行过一轮函数就重新计。
 - Gemini 的「搜索建议」在搜索结果的单独字段里（`google_search_result` 步骤的 `search_suggestions`，一段 HTML），不在回答正文里；QQ 渲染不了 HTML，适配器忽略它，不发给用户。
 - 日志不记查询词与引用的链接，只记次数。
 
@@ -87,4 +91,4 @@ QQ 侧的限制（官方文档快照与 pyqbot 的实测）：
 
 - 「正在输入」每次 8 秒、有进展再请求，用起来是否自然，见[「需要实测」](live-tests.md#需要实测)。
 - Gemini 用量里的 `total_tool_use_tokens`（工具结果的 token）是否计费，现在没有计入输入。
-- 两家计费口径的细节：OpenAI 的 `open_page` 是否收费、Gemini 的查询去重范围。
+- 计费口径的细节：OpenAI 的 `open_page` 是否收费、Gemini 的查询去重范围。
